@@ -1,0 +1,191 @@
+/*
+package store
+
+import (
+	"container/heap"
+	"sync"
+	"time"
+)
+
+// ttlEntry — запись о времени жизни ключа.
+type ttlEntry struct {
+	key       string
+	expiresAt time.Time
+	index     int // позиция в heap — нужна для heap.Fix() и heap.Remove()
+}
+
+// ttlHeap — минимальная куча по expiresAt.
+// Самый ближайший к удалению ключ всегда на вершине (index 0).
+type ttlHeap []*ttlEntry
+
+func (h ttlHeap) Len() int           { return len(h) }
+func (h ttlHeap) Less(i, j int) bool { return h[i].expiresAt.Before(h[j].expiresAt) }
+func (h ttlHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+
+func (h *ttlHeap) Push(x any) {
+	entry := x.(*ttlEntry)
+	entry.index = len(*h)
+	*h = append(*h, entry)
+}
+
+func (h *ttlHeap) Pop() any {
+	old := *h
+	n := len(old)
+	entry := old[n-1]
+	old[n-1] = nil  // GC — не держим ссылку
+	entry.index = -1
+	*h = old[:n-1]
+	return entry
+}
+
+// TTLManager управляет временем жизни ключей.
+// Потокобезопасный — можно вызывать из любой горутины.
+type TTLManager struct {
+	mu      sync.Mutex
+	heap    ttlHeap
+	entries map[string]*ttlEntry // key → entry для быстрого поиска O(1)
+	store   *ArenaStore          // для удаления просроченных ключей
+	stop    chan struct{}
+}
+
+// NewTTLManager создаёт менеджер и запускает фоновую очистку.
+func NewTTLManager(store *ArenaStore) *TTLManager {
+	m := &TTLManager{
+		entries: make(map[string]*ttlEntry),
+		store:   store,
+		stop:    make(chan struct{}),
+	}
+	heap.Init(&m.heap)
+	go m.activeExpiry()
+	return m
+}
+
+// Set устанавливает TTL для ключа.
+// Если ключ уже имеет TTL — перезаписывает.
+func (m *TTLManager) Set(key string, ttl time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	expiresAt := time.Now().Add(ttl)
+
+	if existing, ok := m.entries[key]; ok {
+		// Ключ уже есть — обновляем время
+		existing.expiresAt = expiresAt
+		heap.Fix(&m.heap, existing.index) // перебалансировка O(log n)
+		return
+	}
+
+	// Новый ключ
+	entry := &ttlEntry{
+		key:       key,
+		expiresAt: expiresAt,
+	}
+	heap.Push(&m.heap, entry)
+	m.entries[key] = entry
+}
+
+// Remove убирает TTL для ключа (команда PERSIST).
+func (m *TTLManager) Remove(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.entries[key]
+	if !ok {
+		return false
+	}
+
+	heap.Remove(&m.heap, entry.index)
+	delete(m.entries, key)
+	return true
+}
+
+// TTL возвращает оставшееся время жизни.
+// -1 = ключ без TTL, -2 = ключ не существует.
+func (m *TTLManager) TTL(key string) time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.entries[key]
+	if !ok {
+		return -1 // нет TTL
+	}
+
+	remaining := time.Until(entry.expiresAt)
+	if remaining <= 0 {
+		return 0 // уже просрочен
+	}
+	return remaining
+}
+
+// IsExpired проверяет, просрочен ли ключ (lazy expiration).
+// Если просрочен — удаляет из store и из TTL-менеджера.
+// Вызывается при каждом GET.
+func (m *TTLManager) IsExpired(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.entries[key]
+	if !ok {
+		return false // нет TTL — ключ бессмертный
+	}
+
+	if time.Now().Before(entry.expiresAt) {
+		return false // ещё не просрочен
+	}
+
+	// Просрочен! Удаляем
+	heap.Remove(&m.heap, entry.index)
+	delete(m.entries, key)
+	m.store.Del(key) // удаляем из основного хранилища
+	return true
+}
+
+// activeExpiry — фоновая горутина.
+// Каждые 100ms проверяет вершину heap и удаляет просроченные ключи.
+func (m *TTLManager) activeExpiry() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.expireKeys()
+		case <-m.stop:
+			return
+		}
+	}
+}
+
+// expireKeys удаляет все просроченные ключи с вершины heap.
+// За один тик удаляем максимум 100 ключей — чтобы не блокировать надолго.
+func (m *TTLManager) expireKeys() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	expired := 0
+	maxPerTick := 100
+
+	for m.heap.Len() > 0 && expired < maxPerTick {
+		top := m.heap[0]
+		if now.Before(top.expiresAt) {
+			break // вершина ещё не просрочена → все остальные тоже
+		}
+
+		// Удаляем!
+		heap.Pop(&m.heap)
+		delete(m.entries, top.key)
+		m.store.Del(top.key)
+		expired++
+	}
+}
+
+// Stop останавливает фоновую очистку.
+func (m *TTLManager) Stop() {
+	close(m.stop)
+}
+*/

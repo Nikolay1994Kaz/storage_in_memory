@@ -333,118 +333,206 @@ GODEBUG=gctrace=1 go test -bench=BenchmarkArenaStore -benchtime=30s
 
 ---
 
-## Уровень 4: Epoll Event Loop (Reactor Pattern)
-
-**Цель:** Обрабатывать 100 000+ одновременных соединений без 100 000 горутин.
-
-### Проблема стандартного `net` пакета
-
-```
-1 соединение = 1 горутина = ~8KB стека
-100 000 соединений = 100 000 горутин ≈ 800MB только на стеки
-```
-
-### Решение: Reactor Pattern
-
-```
-                    ┌─────────────┐
-                    │   epoll_wait │  ← Один системный вызов
-                    └──────┬──────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-         ┌────────┐  ┌────────┐  ┌────────┐
-         │Worker 1│  │Worker 2│  │Worker N│  ← Фиксированный пул
-         └────────┘  └────────┘  └────────┘     (GOMAXPROCS штук)
-              │            │            │
-         ┌────┴────┐  ┌───┴───┐  ┌────┴────┐
-         │conn 1-33│  │conn 34│  │conn 67-N│  ← Тысячи соединений
-         │   ...   │  │ - 66  │  │   ...   │     на горутину
-         └─────────┘  └───────┘  └─────────┘
-```
-
-### Ключевые системные вызовы
-
-```go
-// Создаём epoll instance
-epfd, _ := syscall.EpollCreate1(0)
-
-// Регистрируем файловый дескриптор сокета
-syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, fd, &syscall.EpollEvent{
-    Events: syscall.EPOLLIN | syscall.EPOLLET,  // Edge-Triggered!
-    Fd:     int32(fd),
-})
-
-// Ждём событий (неблокирующий мультиплексор)
-events := make([]syscall.EpollEvent, 1024)
-n, _ := syscall.EpollWait(epfd, events, -1)
-for i := 0; i < n; i++ {
-    handleConnection(events[i].Fd)
-}
-```
-
-### Level-Triggered vs Edge-Triggered
-
-| Режим | Поведение | Применение |
-|-------|-----------|------------|
-| Level-Triggered | epoll сигнализирует пока данные есть | Проще, но больше syscalls |
-| Edge-Triggered | Сигнал только при **изменении** состояния | Эффективнее, но нужно читать до `EAGAIN` |
-
-Рекомендация: начать с **Level-Triggered**, потом оптимизировать в **Edge-Triggered**.
-
-### Бенчмарки
-
-```bash
-# Сравниваем стандартный net vs epoll
-# 100 000 одновременных подключений
-redis-benchmark -p 6380 -c 100000 -n 1000000 -t SET,GET
-```
-
-Ожидаемый результат:
-- Потребление памяти: **800MB → ~50MB** (16x экономия)
-- Latency p99: значительно стабильнее
-
----
-
-## Уровень 5: WAL + Persistence (Бонус)
+## Уровень 5: WAL + Persistence ✅
 
 **Цель:** Данные переживают рестарт процесса.
 
-### Write-Ahead Log
+### Реализовано
+
+- Binary WAL с CRC32 чексуммой для crash recovery
+- `bufio.Writer` для батчинга записей (zero-syscall на уровне записи)
+- `Syncer` — фоновый fsync каждые 100ms
+- **Log Rotation** — мгновенное переключение WAL-файла (наносекунды под локом)
+- **Background Snapshot** — неблокирующая компактизация в фоновой горутине
+- **Auto-Compact** — автоматическая компактизация при размере WAL > 64MB
+- `atomic.Bool` для безопасного флага компактизации
+- `PutUint32` вместо `binary.Write` — zero-alloc, zero-reflect
+
+### Восстановление при старте
 
 ```
-┌──────────────────────────────────────────┐
-│              WAL File (.wal)             │
-├──────┬──────┬───────┬──────┬─────────────┤
-│ CRC  │ Len  │  Op   │ Key  │   Value     │
-│ 4B   │ 4B   │  1B   │ var  │   var       │
-├──────┴──────┴───────┴──────┴─────────────┤
-│ Entry 1 │ Entry 2 │ Entry 3 │ ...        │
-└──────────────────────────────────────────┘
+1. Читаем snapshot.wal (если есть)
+2. Читаем все wal_*.log по порядку
+3. Применяем каждую запись к store
+= Полное восстановление
 ```
 
-### Батчинг записей (критическая оптимизация)
+---
 
-`fsync` — дорогая операция (~1-10ms на HDD, ~50-200μs на SSD).
-Батчим записи: копим за 1ms, потом один `fsync` на всю пачку.
+## Уровень 6: TTL + Key Expiration
+
+**Цель:** Ключи автоматически удаляются после заданного времени жизни.
+
+### Новые команды
+
+| Команда | Описание |
+|---------|----------|
+| `SET key value EX seconds` | Записать ключ с временем жизни |
+| `EXPIRE key seconds` | Установить TTL на существующий ключ |
+| `TTL key` | Сколько секунд осталось до удаления |
+| `PERSIST key` | Убрать TTL (ключ живёт вечно) |
+
+### Архитектура
+
+```
+                     ┌───────────────────────┐
+                     │   MinHeap (по времени) │
+                     │ ┌────────────────────┐│
+                     │ │ 12:00:05 → key_1   ││ ← ближайший к удалению
+                     │ │ 12:00:10 → key_2   ││
+                     │ │ 12:01:00 → key_3   ││
+                     │ └────────────────────┘│
+                     └───────────┬───────────┘
+                                │
+          Фоновая горутина (каждые 100ms):
+            while heap.top().expires_at < now:
+                store.Del(heap.pop().key)
+```
+
+### Два подхода к удалению (как в Redis)
+
+| Подход | Описание | Плюсы | Минусы |
+|--------|----------|-------|--------|
+| **Lazy** | Проверяем TTL при GET | Простой, без overhead | Мёртвые ключи занимают RAM |
+| **Active** | Фоновая горутина + MinHeap | Чистит RAM | CPU overhead |
+
+Реализуем **оба** (как Redis): lazy при каждом GET + active в фоне.
+
+### Структура данных
 
 ```go
-type WAL struct {
-    file      *os.File
-    mu        sync.Mutex
-    buf       *bufio.Writer
-    syncEvery time.Duration  // например, 1ms
+type TTLEntry struct {
+    Key       string
+    ExpiresAt time.Time
+    Index     int        // позиция в heap (для O(log n) удаления)
+}
+
+type TTLHeap []*TTLEntry  // реализует container/heap.Interface
+```
+
+### Чему учит
+
+- `container/heap` — приоритетная очередь в стандартной библиотеке Go
+- Lazy vs Active expiration — trade-off CPU vs RAM
+- Интеграция TTL с WAL (для persistence)
+
+---
+
+## Уровень 7: Pub/Sub (Publish/Subscribe)
+
+**Цель:** Клиенты могут подписываться на каналы и получать сообщения в реальном времени.
+
+### Новые команды
+
+| Команда | Описание |
+|---------|----------|
+| `SUBSCRIBE channel [channel ...]` | Подписаться на канал(ы) |
+| `UNSUBSCRIBE [channel ...]` | Отписаться |
+| `PUBLISH channel message` | Отправить сообщение всем подписчикам |
+
+### Архитектура
+
+```
+Publisher                         Subscribers
+─────────                         ───────────
+
+  PUBLISH "chat" "hello"
+       │
+       ▼
+  ┌─────────────────────┐
+  │     PubSub Hub      │
+  │                     │
+  │  channels:          │
+  │   "chat" → [c1, c2] ──────► conn1: *3\r\n$7\r\nmessage\r\n...
+  │   "logs" → [c3]     │       conn2: *3\r\n$7\r\nmessage\r\n...
+  └─────────────────────┘
+```
+
+### Ключевые решения
+
+```go
+type PubSub struct {
+    mu       sync.RWMutex
+    channels map[string]map[*Subscriber]struct{} // channel → set of subscribers
+}
+
+type Subscriber struct {
+    ch   chan protocol.Value  // буферизованный канал для сообщений
+    conn net.Conn
 }
 ```
 
-### Восстановление после падения
+### Особенности реализации
+
+1. **Subscriber переходит в read-only режим** — после SUBSCRIBE клиент не может отправлять другие команды (как в Redis)
+2. **Буферизованный канал** — если подписчик медленный, сообщения копятся в буфере
+3. **Backpressure** — при переполнении буфера отключаем медленного подписчика
+4. **Pub/Sub НЕ пишется в WAL** — сообщения ephemeral (как в Redis)
+
+### Чему учит
+
+- Go channels для межгорутинной коммуникации
+- Fan-out паттерн (одно сообщение → множество получателей)
+- Backpressure и обработка медленных потребителей
+- Изменение протокола взаимодействия (push vs pull)
+
+---
+
+## Уровень 8: Кластеризация (Distributed KV Store)
+
+**Цель:** Несколько нод работают как единое хранилище, данные распределены между ними.
+
+### Архитектура кластера
 
 ```
-1. Открыть WAL-файл
-2. Читать записи последовательно
-3. Для каждой записи: проверить CRC → применить операцию к store
-4. Продолжить работу
+                    ┌─────────── Client ───────────┐
+                    │  SET user:1 → hash(user:1)   │
+                    │             = slot 5649       │
+                    │             → Node B          │
+                    └──────────────┬────────────────┘
+                                   │
+           ┌───────────────────────┼───────────────────────┐
+           ▼                       ▼                       ▼
+     ┌──────────┐           ┌──────────┐           ┌──────────┐
+     │  Node A  │           │  Node B  │           │  Node C  │
+     │ slots    │           │ slots    │           │ slots    │
+     │ 0-5460   │           │ 5461-10922│          │10923-16383│
+     └──────────┘           └──────────┘           └──────────┘
 ```
+
+### Consistent Hashing (16384 слотов)
+
+```go
+func KeySlot(key string) uint16 {
+    return crc16(key) % 16384
+}
+```
+
+Каждая нода отвечает за диапазон слотов (как в Redis Cluster).
+
+### Межнодовое взаимодействие
+
+| Компонент | Описание |
+|-----------|----------|
+| **Gossip Protocol** | Ноды обмениваются информацией о топологии |
+| **MOVED redirect** | Если ключ на другой ноде — клиент получает `-MOVED slot host:port` |
+| **Slot Migration** | Перенос слотов между нодами при масштабировании |
+
+### Новые команды
+
+| Команда | Описание |
+|---------|----------|
+| `CLUSTER NODES` | Показать все ноды кластера |
+| `CLUSTER SLOTS` | Показать распределение слотов |
+| `CLUSTER MEET host port` | Добавить ноду в кластер |
+
+### Чему учит
+
+- Распределённые системы и CAP-теорема
+- Consistent hashing
+- Gossip protocol
+- Обработка network partition
+- Leader election (упрощённый)
 
 ---
 
@@ -454,14 +542,18 @@ type WAL struct {
 
 ```go
 type Metrics struct {
-    OpsTotal      uint64        // Всего операций
-    OpsPerSecond  float64       // Текущий RPS
-    LatencyP50    time.Duration // 50-й перцентиль
-    LatencyP95    time.Duration // 95-й перцентиль
-    LatencyP99    time.Duration // 99-й перцентиль
-    GCPauseNs     uint64        // Последняя GC-пауза
-    HeapAllocMB   float64       // Потребление heap
-    GoroutineCount int          // Активные горутины
+    OpsTotal       uint64        // Всего операций
+    OpsPerSecond   float64       // Текущий RPS
+    LatencyP50     time.Duration // 50-й перцентиль
+    LatencyP95     time.Duration // 95-й перцентиль
+    LatencyP99     time.Duration // 99-й перцентиль
+    GCPauseNs      uint64        // Последняя GC-пауза
+    HeapAllocMB    float64       // Потребление heap
+    GoroutineCount int           // Активные горутины
+    ExpiredKeys    uint64        // Удалённых по TTL ключей
+    PubSubChannels int           // Активных каналов
+    PubSubClients  int           // Подписчиков
+    ClusterNodes   int           // Нод в кластере
 }
 ```
 
@@ -480,12 +572,10 @@ type Metrics struct {
 
 | Метрика | Уровень 1 | Уровень 2 | Уровень 3 | Уровень 4 |
 |---------|-----------|-----------|-----------|-----------|
-| ops/sec (10K горутин) | ? | ? | ? | ? |
-| p99 latency | ? | ? | ? | ? |
-| GC pause | ? | ? | ? | ? |
-| Память (20M ключей) | ? | ? | ? | ? |
-
----
+| ops/sec (10K горутин) | ~2.4M | ~11.2M | ~5.4M | 234K (network) |
+| p99 latency | — | — | — | 155ms (10K conn) |
+| GC pause (5M keys) | 54ms | 54ms | 833μs | 833μs |
+| Память (5M ключей) | 461MB | 461MB | 1169MB | 1169MB |
 
 ---
 
@@ -665,23 +755,28 @@ lsmdb/
 # Рекомендуемый порядок работы
 
 ```
-Месяц 1-2: KV Store (Уровни 0-3)
+Месяц 1-2: KV Store (Уровни 0-3) ✅
     → Парсер RESP
     → Наивная реализация + профилирование
     → Шардирование
     → Arena allocator + Zero-GC
 
-Месяц 2-3: KV Store (Уровни 4-5)
-    → Epoll Event Loop
-    → WAL + Persistence
+Месяц 2-3: KV Store (Уровни 4-5) ✅
+    → Epoll Event Loop (per-worker, Round Robin)
+    → WAL + Log Rotation + Background Snapshot
 
-Месяц 3-5: LSM-Tree (Уровни 1-4)
+Месяц 3: KV Store (Уровни 6-8) ← ТЫ ЗДЕСЬ
+    → TTL + Key Expiration (MinHeap, lazy + active)
+    → Pub/Sub (Fan-out, backpressure)
+    → Кластеризация (Consistent Hashing, Gossip, MOVED)
+
+Месяц 4-6: LSM-Tree (Уровни 1-4)
     → SkipList MemTable
     → SSTable (write + read)
     → Bloom Filter
     → Compaction
 
-Месяц 5-6: LSM-Tree (Уровни 5-6)
+Месяц 6-7: LSM-Tree (Уровни 5-6)
     → MVCC
     → Transactions
 ```

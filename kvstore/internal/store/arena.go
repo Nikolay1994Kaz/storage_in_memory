@@ -150,3 +150,15 @@ func (s *ArenaStore) Len() int {
 	}
 	return total
 }
+
+func (s *ArenaStore) ForEach(fn func(key string, value []byte)) {
+	for i := 0; i < numShards; i++ {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for _, offset := range sh.index {
+			key, value := sh.arena.GetValue(offset)
+			fn(key, value)
+		}
+		sh.mu.RUnlock()
+	}
+}

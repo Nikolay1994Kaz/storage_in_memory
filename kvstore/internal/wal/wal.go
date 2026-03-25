@@ -7,6 +7,9 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -18,23 +21,22 @@ const (
 
 // Entry — одна запись в WAL.
 type Entry struct {
-	Op    byte // OpSet или OpDel
+	Op    byte
 	Key   string
-	Value []byte // пустой для OpDel
+	Value []byte
 }
 
-// WAL — Write-Ahead Log.
-// Все мутирующие операции сначала пишутся сюда,
-// потом применяются к in-memory store.
+// WAL — Write-Ahead Log с поддержкой ротации.
 type WAL struct {
 	mu     sync.Mutex
 	file   *os.File
 	writer *bufio.Writer
+	dir    string // директория, где лежат WAL-файлы
 }
 
 // Open открывает или создаёт WAL-файл.
-// Файл открывается в режиме append — новые записи добавляются в конец.
 func Open(path string) (*WAL, error) {
+	dir := filepath.Dir(path)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("wal open: %w", err)
@@ -42,6 +44,7 @@ func Open(path string) (*WAL, error) {
 	return &WAL{
 		file:   file,
 		writer: bufio.NewWriter(file),
+		dir:    dir,
 	}, nil
 }
 
@@ -51,23 +54,24 @@ func (w *WAL) Write(entry Entry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// 1. Собираем payload (всё после CRC и TotalLen)
 	payload := encodeEntry(entry)
-
-	// 2. Считаем CRC32 для защиты целостности
 	checksum := crc32.ChecksumIEEE(payload)
 
-	// 3. Пишем: CRC32 (4 байта)
-	if err := binary.Write(w.writer, binary.LittleEndian, checksum); err != nil {
-		return fmt.Errorf("wal write crc: %w", err)
+	// 1. Создаем локальный массив на 8 байт (4 байта для CRC32 + 4 байта для длины).
+	// Важно: так как размер фиксирован, Go выделит эту память на стеке,
+	// а не в куче. Это значит — НОЛЬ нагрузки на сборщик мусора (GC)!
+	var header [8]byte
+
+	// 2. Вручную раскладываем числа по байтам (без рефлексии, работает мгновенно)
+	binary.LittleEndian.PutUint32(header[0:4], checksum)
+	binary.LittleEndian.PutUint32(header[4:8], uint32(len(payload)))
+
+	// 3. Пишем весь заголовок (8 байт) за один вызов
+	if _, err := w.writer.Write(header[:]); err != nil {
+		return fmt.Errorf("wal write header: %w", err)
 	}
 
-	// 4. Пишем: длина payload (4 байта)
-	if err := binary.Write(w.writer, binary.LittleEndian, uint32(len(payload))); err != nil {
-		return fmt.Errorf("wal write len: %w", err)
-	}
-
-	// 5. Пишем сам payload
+	// 4. Пишем сами данные
 	if _, err := w.writer.Write(payload); err != nil {
 		return fmt.Errorf("wal write payload: %w", err)
 	}
@@ -76,7 +80,6 @@ func (w *WAL) Write(entry Entry) error {
 }
 
 // Sync сбрасывает буфер на диск (fsync).
-// Дорогая операция! Поэтому вызываем её батчами, а не на каждую запись.
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -84,7 +87,38 @@ func (w *WAL) Sync() error {
 	if err := w.writer.Flush(); err != nil {
 		return err
 	}
-	return w.file.Sync() // fsync — гарантия, что данные на диске
+	return w.file.Sync()
+}
+
+// Rotate переключает WAL на новый файл.
+// Старый файл закрывается и возвращается его путь.
+// Эта операция МГНОВЕННАЯ — блокировка на наносекунды.
+//
+// Схема:
+//  1. Создаём новый файл (wal_0002.log)
+//  2. Lock → переключаем writer → Unlock
+//  3. Возвращаем путь к старому файлу (wal_0001.log)
+func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
+	// Создаём новый файл ДО блокировки — тяжёлая FS-операция вне лока
+	newFile, err := os.OpenFile(newPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return "", fmt.Errorf("wal rotate: %w", err)
+	}
+
+	w.mu.Lock()
+	// --- Критическая секция: наносекунды ---
+	w.writer.Flush()
+	w.file.Sync()
+
+	oldPath = w.file.Name()
+	w.file.Close()
+
+	w.file = newFile
+	w.writer = bufio.NewWriter(newFile)
+	// --- Конец критической секции ---
+	w.mu.Unlock()
+
+	return oldPath, nil
 }
 
 // Close закрывает WAL.
@@ -96,28 +130,30 @@ func (w *WAL) Close() error {
 	return w.file.Close()
 }
 
-// encodeEntry превращает Entry в байты (payload).
+// Path возвращает текущий путь WAL-файла.
+func (w *WAL) Path() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.file.Name()
+}
+
+// --- Кодирование/декодирование ---
+
 func encodeEntry(e Entry) []byte {
-	// Op (1) + KeyLen (4) + Key + Value
 	keyBytes := []byte(e.Key)
 	size := 1 + 4 + len(keyBytes) + len(e.Value)
 	buf := make([]byte, size)
 
 	offset := 0
-
-	// Op
 	buf[offset] = e.Op
 	offset++
 
-	// KeyLen
 	binary.LittleEndian.PutUint32(buf[offset:], uint32(len(keyBytes)))
 	offset += 4
 
-	// Key
 	copy(buf[offset:], keyBytes)
 	offset += len(keyBytes)
 
-	// Value (только для SET)
 	if len(e.Value) > 0 {
 		copy(buf[offset:], e.Value)
 	}
@@ -125,14 +161,12 @@ func encodeEntry(e Entry) []byte {
 	return buf
 }
 
-// ReadAll читает все записи из WAL-файла.
-// Используется при старте для восстановления состояния store.
-// Повреждённые записи (неверный CRC) пропускаются.
-func ReadAll(path string) ([]Entry, error) {
+// ReadEntries читает все записи из одного WAL-файла.
+func ReadEntries(path string) ([]Entry, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil // Файл не существует — первый запуск
+			return nil, nil
 		}
 		return nil, fmt.Errorf("wal read: %w", err)
 	}
@@ -142,33 +176,28 @@ func ReadAll(path string) ([]Entry, error) {
 	var entries []Entry
 
 	for {
-		// 1. Читаем CRC32
 		var checksum uint32
 		if err := binary.Read(reader, binary.LittleEndian, &checksum); err != nil {
 			if err == io.EOF {
-				break // Конец файла — нормальное завершение
+				break
 			}
-			break // Повреждённая запись — останавливаемся
+			break
 		}
 
-		// 2. Читаем длину payload
 		var length uint32
 		if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
 			break
 		}
 
-		// 3. Читаем payload
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			break
 		}
 
-		// 4. Проверяем CRC — если не совпадает, запись повреждена
 		if crc32.ChecksumIEEE(payload) != checksum {
-			break // Данные повреждены — дальше читать нельзя
+			break
 		}
 
-		// 5. Декодируем Entry
 		entry, err := decodeEntry(payload)
 		if err != nil {
 			break
@@ -179,30 +208,24 @@ func ReadAll(path string) ([]Entry, error) {
 	return entries, nil
 }
 
-// decodeEntry разбирает payload обратно в Entry.
 func decodeEntry(data []byte) (Entry, error) {
-	if len(data) < 5 { // минимум: Op(1) + KeyLen(4)
+	if len(data) < 5 {
 		return Entry{}, fmt.Errorf("entry too short: %d bytes", len(data))
 	}
 
 	offset := 0
-
-	// Op
 	op := data[offset]
 	offset++
 
-	// KeyLen
 	keyLen := binary.LittleEndian.Uint32(data[offset:])
 	offset += 4
 
-	// Key
 	if offset+int(keyLen) > len(data) {
 		return Entry{}, fmt.Errorf("invalid key length")
 	}
 	key := string(data[offset : offset+int(keyLen)])
 	offset += int(keyLen)
 
-	// Value (оставшиеся байты)
 	var value []byte
 	if offset < len(data) {
 		value = make([]byte, len(data)-offset)
@@ -210,4 +233,48 @@ func decodeEntry(data []byte) (Entry, error) {
 	}
 
 	return Entry{Op: op, Key: key, Value: value}, nil
+}
+
+// ReadAllWALs читает snapshot + все WAL-файлы в правильном порядке.
+// Порядок: snapshot.wal (если есть) → wal_0001.log → wal_0002.log → ...
+func ReadAllWALs(dir string) ([]Entry, error) {
+	var allEntries []Entry
+
+	// 1. Сначала snapshot
+	snapshotPath := filepath.Join(dir, "snapshot.wal")
+	if entries, err := ReadEntries(snapshotPath); err != nil {
+		return nil, fmt.Errorf("read snapshot: %w", err)
+	} else if entries != nil {
+		allEntries = append(allEntries, entries...)
+	}
+
+	// 2. Потом все WAL-файлы по порядку
+	matches, _ := filepath.Glob(filepath.Join(dir, "wal_*.log"))
+	sort.Strings(matches) // wal_0001.log, wal_0002.log, ...
+
+	for _, path := range matches {
+		entries, err := ReadEntries(path)
+		if err != nil {
+			return nil, fmt.Errorf("read wal %s: %w", path, err)
+		}
+		allEntries = append(allEntries, entries...)
+	}
+
+	return allEntries, nil
+}
+
+// CleanupOldWALs удаляет WAL-файлы, которые старше snapshot.
+// Вызывается после успешного создания snapshot.
+func CleanupOldWALs(dir string, keepPath string) error {
+	matches, _ := filepath.Glob(filepath.Join(dir, "wal_*.log"))
+	for _, path := range matches {
+		if path == keepPath {
+			continue // не удаляем текущий WAL
+		}
+		// Удаляем только если имя файла "меньше" текущего (более старый)
+		if strings.Compare(filepath.Base(path), filepath.Base(keepPath)) < 0 {
+			os.Remove(path)
+		}
+	}
+	return nil
 }
