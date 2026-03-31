@@ -27,7 +27,7 @@ type ConnState struct {
 }
 
 // Handler — функция обработки RESP-команды.
-type Handler func(args []protocol.Value) protocol.Value
+type Handler func(conn net.Conn, args []protocol.Value) protocol.Value
 
 // worker — один воркер со своим epoll instance.
 // Каждый воркер независим: свой epoll, своя очередь событий.
@@ -149,7 +149,7 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 		return
 	}
 
-	result := s.handler(value.Array)
+	result := s.handler(cs.Conn, value.Array)
 	cs.Writer.Write(result)
 }
 

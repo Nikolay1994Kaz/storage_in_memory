@@ -1,4 +1,3 @@
-/*
 package store
 
 import (
@@ -188,4 +187,4 @@ func (m *TTLManager) expireKeys() {
 func (m *TTLManager) Stop() {
 	close(m.stop)
 }
-*/
+
