@@ -1,5 +1,6 @@
 # Binaries
 kvstore-server
+kvstore/kvstore
 store.test
 *.test
 

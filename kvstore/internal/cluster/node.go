@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ============================================================
@@ -57,6 +58,7 @@ type Node struct {
 	GossipPort int       // Порт для gossip: 6381
 	State      NodeState // online / pfail / fail
 	Slots      []bool    // Slots[i] = true → эта нода владеет слотом i
+	LastPong   time.Time // когда последний раз получили PONG от этой ноды
 }
 
 // NewNode создаёт ноду с пустыми слотами.
@@ -67,6 +69,7 @@ func NewNode(id, addr string, gossipPort int) *Node {
 		GossipPort: gossipPort,
 		State:      NodeOnline,
 		Slots:      make([]bool, TotalSlots), // 16384 bool = все false
+		LastPong:   time.Now(),
 	}
 }
 
@@ -101,44 +104,46 @@ func (n *Node) SlotCount() int {
 	return count
 }
 
-// SlotRanges возвращает слоты в виде диапазонов для красивого вывода.
+// SlotPairs возвращает слоты как пары [start, end].
+// Это БАЗОВЫЙ метод — его используют и SlotRanges, и nodeToInfo.
 //
-// Пример: Slots[0..5460] = true, остальные false
-// Вернёт: "0-5460"
-//
-// Пример: Slots[0..100] = true, Slots[200..300] = true
-// Вернёт: "0-100,200-300"
-func (n *Node) SlotRanges() string {
-	var ranges []string
+// Пример: Slots[0..5460]=true → [][2]int{{0, 5460}}
+func (n *Node) SlotPairs() [][2]int {
+	var pairs [][2]int
 	start := -1
 
 	for i := 0; i < TotalSlots; i++ {
 		if n.Slots[i] {
 			if start == -1 {
-				start = i // начало нового диапазона
+				start = i
 			}
 		} else {
 			if start != -1 {
-				// Закончился диапазон
-				if start == i-1 {
-					ranges = append(ranges, fmt.Sprintf("%d", start))
-				} else {
-					ranges = append(ranges, fmt.Sprintf("%d-%d", start, i-1))
-				}
+				pairs = append(pairs, [2]int{start, i - 1})
 				start = -1
 			}
 		}
 	}
-
-	// Последний диапазон (если слоты до конца)
 	if start != -1 {
-		if start == TotalSlots-1 {
-			ranges = append(ranges, fmt.Sprintf("%d", start))
-		} else {
-			ranges = append(ranges, fmt.Sprintf("%d-%d", start, TotalSlots-1))
-		}
+		pairs = append(pairs, [2]int{start, TotalSlots - 1})
 	}
 
+	return pairs
+}
+
+// SlotRanges — строковое представление для CLUSTER NODES.
+
+func (n *Node) SlotRanges() string {
+	pairs := n.SlotPairs()
+	var ranges []string
+	for _, p := range pairs {
+		if p[0] == p[1] {
+			ranges = append(ranges, fmt.Sprintf("%d", p[0]))
+		} else {
+			ranges = append(ranges, fmt.Sprintf("%d-%d", p[0], p[1]))
+
+		}
+	}
 	return strings.Join(ranges, ",")
 }
 

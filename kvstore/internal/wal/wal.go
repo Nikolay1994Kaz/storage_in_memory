@@ -15,8 +15,10 @@ import (
 
 // Типы операций
 const (
-	OpSet byte = 1
-	OpDel byte = 2
+	OpSet     byte = 1
+	OpDel     byte = 2
+	OpExpire  byte = 3 // TTL: Value = 8 байт unix nano (абсолютное время смерти)
+	OpPersist byte = 4 // Убрать TTL: Value пустой
 )
 
 // Entry — одна запись в WAL.
@@ -106,9 +108,21 @@ func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
 	}
 
 	w.mu.Lock()
-	// --- Критическая секция: наносекунды ---
-	w.writer.Flush()
-	w.file.Sync()
+	// --- Критическая секция ---
+
+	// Сбрасываем буфер старого WAL на диск
+	if err := w.writer.Flush(); err != nil {
+		w.mu.Unlock()
+		newFile.Close()
+		os.Remove(newPath)
+		return "", fmt.Errorf("wal rotate flush: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		w.mu.Unlock()
+		newFile.Close()
+		os.Remove(newPath)
+		return "", fmt.Errorf("wal rotate sync: %w", err)
+	}
 
 	oldPath = w.file.Name()
 	w.file.Close()

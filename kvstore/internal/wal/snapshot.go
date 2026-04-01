@@ -32,13 +32,31 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value [
 	}
 
 	count := 0
+	var writeErr error
 	iterate(func(key string, value []byte) {
-		w.Write(Entry{Op: OpSet, Key: key, Value: value})
+		if writeErr != nil {
+			return // предыдущая запись упала — пропускаем остальные
+		}
+		if err := w.Write(Entry{Op: OpSet, Key: key, Value: value}); err != nil {
+			writeErr = err
+			return
+		}
 		count++
 	})
 
+	// Если хоть одна запись не прошла — snapshot битый, не используем
+	if writeErr != nil {
+		w.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("snapshot write: %w", writeErr)
+	}
+
 	// Sync — гарантируем, что данные на диске
-	w.Sync()
+	if err := w.Sync(); err != nil {
+		w.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("snapshot sync: %w", err)
+	}
 	w.Close()
 
 	// Атомарная замена: tmp → snapshot.wal

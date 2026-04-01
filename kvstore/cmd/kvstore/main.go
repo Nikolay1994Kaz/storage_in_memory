@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -38,7 +39,11 @@ func main() {
 
 	os.MkdirAll(dataDir, 0755)
 
-	// === 1. Восстановление ===
+	// === 1. TTL Manager (до восстановления, чтобы восстановить TTL из WAL) ===
+	ttl := store.NewTTLManager(s)
+	defer ttl.Stop()
+
+	// === 2. Восстановление ===
 	entries, err := wal.ReadAllWALs(dataDir)
 	if err != nil {
 		log.Fatalf("Failed to read WALs: %v", err)
@@ -52,6 +57,23 @@ func main() {
 			restored++
 		case wal.OpDel:
 			s.Del(entry.Key)
+			ttl.OnDelete(entry.Key)
+			restored++
+		case wal.OpExpire:
+			if len(entry.Value) == 8 {
+				expiresAt := time.Unix(0, int64(binary.BigEndian.Uint64(entry.Value)))
+				remaining := time.Until(expiresAt)
+				if remaining > 0 {
+					ttl.Set(entry.Key, remaining)
+				} else {
+					// Ключ уже просрочен — удаляем
+					s.Del(entry.Key)
+					ttl.OnDelete(entry.Key)
+				}
+			}
+			restored++
+		case wal.OpPersist:
+			ttl.Remove(entry.Key)
 			restored++
 		}
 	}
@@ -60,7 +82,7 @@ func main() {
 		log.Printf("Restored %d operations from WAL", restored)
 	}
 
-	// === 2. WAL ===
+	// === 3. WAL ===
 	walPath := filepath.Join(dataDir, fmt.Sprintf("wal_%s.log", time.Now().Format("20060102_150405")))
 	w, err := wal.Open(walPath)
 	if err != nil {
@@ -68,13 +90,9 @@ func main() {
 	}
 	defer w.Close()
 
-	// === 3. Syncer ===
+	// === 4. Syncer ===
 	syncer := wal.NewSyncer(w, syncInterval, dataDir, s.ForEach)
 	defer syncer.Stop()
-
-	// === 4. TTL Manager ===
-	ttl := store.NewTTLManager(s)
-	defer ttl.Stop()
 
 	// === 5. Pub/Sub Hub ===
 	hub := pubsub.NewHub()
@@ -88,6 +106,12 @@ func main() {
 		cl.State.RebuildSlotTable()
 		log.Printf("Cluster mode: node %s, slots %d-%d",
 			cl.State.Self.ID, *clusterSlotStart, *clusterSlotEnd)
+
+		// Запуск Gossip (PING/PONG между нодами)
+		if err := cl.StartGossip(); err != nil {
+			log.Fatalf("Failed to start gossip: %v", err)
+		}
+		defer cl.StopGossip()
 	}
 
 	// === 7. Handler ===
@@ -140,7 +164,9 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 		}
 		value := []byte(args[1].Str)
 
-		w.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value})
+		if err := w.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value}); err != nil {
+			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
+		}
 		s.Set(key, value)
 
 		if len(args) >= 4 && strings.ToUpper(args[2].Str) == "EX" {
@@ -148,7 +174,14 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 			if err != nil || seconds <= 0 {
 				return protocol.Value{Typ: '-', Str: "ERR invalid expire time"}
 			}
-			ttl.Set(key, time.Duration(seconds)*time.Second)
+			dur := time.Duration(seconds) * time.Second
+			expiresAt := time.Now().Add(dur)
+			var buf [8]byte
+			binary.BigEndian.PutUint64(buf[:], uint64(expiresAt.UnixNano()))
+			if err := w.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: buf[:]}); err != nil {
+				return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
+			}
+			ttl.Set(key, dur)
 		}
 
 		return protocol.Value{Typ: '+', Str: "OK"}
@@ -184,7 +217,9 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 				return *moved
 			}
 		}
-		w.Write(wal.Entry{Op: wal.OpDel, Key: key})
+		if err := w.Write(wal.Entry{Op: wal.OpDel, Key: key}); err != nil {
+			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
+		}
 		ok := s.Del(key)
 		ttl.OnDelete(key)
 		if ok {
@@ -209,7 +244,14 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 		if err != nil || seconds <= 0 {
 			return protocol.Value{Typ: '-', Str: "ERR invalid expire time"}
 		}
-		ttl.Set(key, time.Duration(seconds)*time.Second)
+		dur := time.Duration(seconds) * time.Second
+		expiresAt := time.Now().Add(dur)
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(expiresAt.UnixNano()))
+		if err := w.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: buf[:]}); err != nil {
+			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
+		}
+		ttl.Set(key, dur)
 		return protocol.Value{Typ: ':', Num: 1}
 
 	case "TTL":
@@ -241,6 +283,9 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 			}
 		}
 		if ttl.Remove(args[0].Str) {
+			if err := w.Write(wal.Entry{Op: wal.OpPersist, Key: args[0].Str}); err != nil {
+				return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
+			}
 			return protocol.Value{Typ: ':', Num: 1}
 		}
 		return protocol.Value{Typ: ':', Num: 0}

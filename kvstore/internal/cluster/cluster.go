@@ -3,8 +3,10 @@ package cluster
 import (
 	"crypto/rand"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
+	"sync"
 
 	"kvstore/kvstore/internal/protocol"
 )
@@ -27,7 +29,10 @@ import (
 //
 // ============================================================
 type Cluster struct {
-	State *ClusterState
+	State          *ClusterState
+	gossipListener net.Listener   // TCP listener для gossip
+	stopCh         chan struct{}  // Сигнал остановки всех горутин
+	wg             sync.WaitGroup // Ожидание завершения горутин
 }
 
 // New создаёт кластер с текущей нодой.
@@ -40,9 +45,9 @@ type Cluster struct {
 func New(addr string, gossipPort int) *Cluster {
 	id := generateNodeID()
 	self := NewNode(id, addr, gossipPort)
-
 	return &Cluster{
-		State: NewClusterState(self),
+		State:  NewClusterState(self),
+		stopCh: make(chan struct{}),
 	}
 }
 

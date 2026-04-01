@@ -536,6 +536,113 @@ func KeySlot(key string) uint16 {
 
 ---
 
+## Уровень 9: Tunable Guarantees (Переключаемые гарантии)
+
+**Цель:** Клиент сам выбирает уровень гарантий для каждой операции.
+По умолчанию — быстрый режим (как Redis). По запросу — транзакции с `fsync`.
+
+> Паттерн из индустрии: Cassandra (`CONSISTENCY LEVEL`), DynamoDB (`ConsistentRead`),
+> MongoDB (`writeConcern`), Redis (`WAIT`). Все дают клиенту "ручку" —
+> "мне сейчас нужна скорость" или "мне сейчас нужна надёжность".
+
+### Зачем
+
+Один KVStore, два сценария:
+
+```
+Сценарий 1: Кэш / сессии (99% трафика)
+  SET user:session "abc123"      → буфер WAL, fsync через 100ms
+  Скорость: ~500K ops/sec
+  Потеряли данные? Не страшно — перечитаем из основной БД.
+
+Сценарий 2: Критичная операция (1% трафика)
+  TXBEGIN
+  SET account:1 "900"
+  SET account:2 "1100"
+  TXCOMMIT                       → atomарная запись + fsync СЕЙЧАС
+  Скорость: ~10K ops/sec (fsync дорог)
+  Гарантия: всё или ничего, данные на диске.
+```
+
+### Новые команды
+
+| Команда | Описание |
+|---------|----------|
+| `TXBEGIN` | Начать транзакцию (команды буферизуются) |
+| `TXCOMMIT` | Применить все команды атомарно + fsync |
+| `TXDISCARD` | Отменить транзакцию (очистить буфер) |
+
+### Архитектура
+
+```
+  Обычный SET (fast path):
+  ─────────────────────────
+  Client → SET key value → WAL.Write(entry) → Store.Set() → +OK
+                            └── буфер, fsync позже (100ms)
+
+  Транзакция (safe path):
+  ─────────────────────────
+  Client → TXBEGIN
+         → SET key1 val1     → буфер (не применяется)
+         → SET key2 val2     → буфер (не применяется)
+         → TXCOMMIT
+              │
+              ▼
+         WAL.WriteBatch([entry1, entry2])  ← одна запись в WAL
+              │
+              ▼
+         WAL.Sync()                        ← fsync СЕЙЧАС
+              │
+              ▼
+         Store.Set(key1, val1)             ← применяем ВСЕ
+         Store.Set(key2, val2)             ← или НИЧЕГО
+              │
+              ▼
+         +OK
+```
+
+### Ключевые структуры
+
+```go
+// Transaction — буфер операций одного клиента.
+type Transaction struct {
+    ops     []wal.Entry    // накопленные операции
+    active  bool           // true после TXBEGIN
+}
+
+// WAL Batch — группа записей как один атомарный блок.
+// При чтении: если batch не полный (crash) — пропускаем ВЕСЬ batch.
+func (w *WAL) WriteBatch(entries []Entry) error {
+    w.mu.Lock()
+    defer w.mu.Unlock()
+
+    // Один CRC32 на весь batch — если хоть один байт повреждён,
+    // отбрасываем все операции.
+    payload := encodeBatch(entries)
+    checksum := crc32.ChecksumIEEE(payload)
+    // ...
+}
+```
+
+### Граница реализации (что НЕ делаем)
+
+| Делаем ✅ | Не делаем ❌ |
+|-----------|-------------|
+| Атомарный batch write | ROLLBACK с восстановлением старых значений |
+| fsync при TXCOMMIT | MVCC (это для LSM-Tree Проекта 2) |
+| Буферизация до COMMIT | Deadlock detection между транзакциями |
+| Batch CRC32 | Serializable isolation с конфликтами |
+
+### Чему учит
+
+- Tunable consistency — ключевой паттерн распределённых систем
+- Batch WAL writes — амортизация стоимости fsync
+- Per-connection state management (буфер транзакции на клиента)
+- Trade-off: latency vs durability на уровне API
+- Паттерны Cassandra/DynamoDB/MongoDB в своём проекте
+
+---
+
 ## Observability (на каждом уровне)
 
 ### Метрики для сбора
@@ -769,6 +876,11 @@ lsmdb/
     → TTL + Key Expiration (MinHeap, lazy + active)
     → Pub/Sub (Fan-out, backpressure)
     → Кластеризация (Consistent Hashing, Gossip, MOVED)
+
+Месяц 3-4: KV Store (Уровень 9)
+    → Tunable Guarantees (TXBEGIN/TXCOMMIT/TXDISCARD)
+    → WAL Batch writes + per-operation fsync
+    → Bugfixes: WAL error handling, TTL persistence
 
 Месяц 4-6: LSM-Tree (Уровни 1-4)
     → SkipList MemTable
