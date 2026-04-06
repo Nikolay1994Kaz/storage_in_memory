@@ -62,32 +62,13 @@ type GossipMessage struct {
 
 // nodeToInfo конвертирует внутренний Node в компактный NodeInfo.
 func nodeToInfo(n *Node) NodeInfo {
-	info := NodeInfo{
+	return NodeInfo{
 		ID:         n.ID,
 		Addr:       n.Addr,
 		GossipPort: n.GossipPort,
 		State:      n.State.String(),
+		Slots:      n.SlotPairs(),
 	}
-
-	// Конвертируем []bool в пары [start, end]
-	start := -1
-	for i := 0; i < TotalSlots; i++ {
-		if n.Slots[i] {
-			if start == -1 {
-				start = i
-			}
-		} else {
-			if start != -1 {
-				info.Slots = append(info.Slots, [2]int{start, i - 1})
-				start = -1
-			}
-		}
-	}
-	if start != -1 {
-		info.Slots = append(info.Slots, [2]int{start, TotalSlots - 1})
-	}
-
-	return info
 }
 
 // applyNodeInfo обновляет или создаёт ноду из полученной NodeInfo.

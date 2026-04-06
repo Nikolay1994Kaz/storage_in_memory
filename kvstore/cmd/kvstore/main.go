@@ -106,6 +106,16 @@ func main() {
 		cl.State.RebuildSlotTable()
 		log.Printf("Cluster mode: node %s, slots %d-%d",
 			cl.State.Self.ID, *clusterSlotStart, *clusterSlotEnd)
+		cl.GetKeysInSlotFunc = func(slot uint16, count int) []string {
+			return s.GetKeysInSlot(slot, count, cluster.KeySlot)
+		}
+		cl.MigrateGetFunc = func(key string) ([]byte, bool) {
+			return s.Get(key)
+		}
+		cl.MigrateDelFunc = func(key string) {
+			s.Del(key)
+			ttl.OnDelete(key)
+		}
 
 		// Запуск Gossip (PING/PONG между нодами)
 		if err := cl.StartGossip(); err != nil {
@@ -150,6 +160,21 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 			return cl.HandleClusterCommand(args)
 		}
 		return protocol.Value{Typ: '-', Str: "ERR cluster mode is not enabled"}
+	case "MIGRATE":
+		// MIGRATE <host> <port> <key>
+		if cl == nil {
+			return protocol.Value{Typ: '-', Str: "ERR cluster mode is not enabled"}
+		}
+		if len(args) < 3 {
+			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'MIGRATE'"}
+		}
+		host := args[0].Str
+		port, err := strconv.Atoi(args[1].Str)
+		if err != nil {
+			return protocol.Value{Typ: '-', Str: "ERR invalid port"}
+		}
+		key := args[2].Str
+		return cl.MigrateKey(host, port, key)
 
 	case "SET":
 		if len(args) < 2 {
@@ -203,6 +228,12 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 
 		val, ok := s.Get(key)
 		if !ok {
+			// Ключа нет — может, он уже мигрировал?
+			if cl != nil {
+				if ask := cl.CheckKeyAsk(key); ask != nil {
+					return *ask
+				}
+			}
 			return protocol.Value{Typ: '$', Num: -1}
 		}
 		return protocol.Value{Typ: '$', Str: string(val)}

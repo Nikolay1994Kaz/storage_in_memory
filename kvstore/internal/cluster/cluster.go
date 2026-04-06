@@ -3,6 +3,7 @@ package cluster
 import (
 	"crypto/rand"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -33,6 +34,12 @@ type Cluster struct {
 	gossipListener net.Listener   // TCP listener для gossip
 	stopCh         chan struct{}  // Сигнал остановки всех горутин
 	wg             sync.WaitGroup // Ожидание завершения горутин
+
+	GetKeysInSlotFunc    func(slot uint16, count int) []string
+	MigrateGetFunc       func(key string) ([]byte, bool)
+	MigrateDelFunc       func(key string)
+	MigrateSetRemoteFunc func(addr, key string, value []byte) error
+	Repl                 *ReplicationManager
 }
 
 // New создаёт кластер с текущей нодой.
@@ -45,10 +52,13 @@ type Cluster struct {
 func New(addr string, gossipPort int) *Cluster {
 	id := generateNodeID()
 	self := NewNode(id, addr, gossipPort)
-	return &Cluster{
-		State:  NewClusterState(self),
-		stopCh: make(chan struct{}),
+	c := &Cluster{
+		State:                NewClusterState(self),
+		stopCh:               make(chan struct{}),
+		MigrateSetRemoteFunc: SendSetToNode,
 	}
+	c.Repl = NewReplicationManager(c)
+	return c
 }
 
 // generateNodeID создаёт случайный ID для ноды.
@@ -94,6 +104,20 @@ func (c *Cluster) CheckKey(key string) *protocol.Value {
 
 	// Слот мой → nil (выполняем команду)
 	if c.State.IsMySlot(slot) {
+		c.State.mu.RLock()
+		_, migrating := c.State.Migrating[slot]
+		c.State.mu.RUnlock()
+
+		if migrating {
+
+		}
+		return nil
+
+	}
+	c.State.mu.RLock()
+	_, importing := c.State.Importing[slot]
+	c.State.mu.RUnlock()
+	if importing {
 		return nil
 	}
 
@@ -110,6 +134,29 @@ func (c *Cluster) CheckKey(key string) *protocol.Value {
 	// Пример: -MOVED 9425 10.0.2.1:6380
 	moved := fmt.Sprintf("MOVED %d %s", slot, owner.Addr)
 	return &protocol.Value{Typ: '-', Str: moved}
+}
+
+// CheckKeyAsk проверяет, нужно ли отправить ASK при миграции.
+// Вызывается из main.go ПОСЛЕ CheckKey вернул nil и ключ НЕ найден в Store.
+// Если слот MIGRATING и ключа нет — значит ключ уже мигрировал → ASK.
+
+func (c *Cluster) CheckKeyAsk(key string) *protocol.Value {
+	slot := KeySlot(key)
+	c.State.mu.RLock()
+	targetID, migrating := c.State.Migrating[slot]
+	c.State.mu.RUnlock()
+
+	if !migrating {
+		return nil
+	}
+	c.State.mu.RLock()
+	target, ok := c.State.Nodes[targetID]
+	c.State.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	ask := fmt.Sprintf("ASK %d %s", slot, target.Addr)
+	return &protocol.Value{Typ: '-', Str: ask}
 }
 
 // ============================================================
@@ -155,12 +202,50 @@ func (c *Cluster) HandleClusterCommand(args []protocol.Value) protocol.Value {
 	case "MEET":
 		return c.clusterMeet(args[1:])
 
+	case "REPLICATE":
+		return c.clusterReplicate(args[1:])
+
+	case "SETSLOT":
+		return c.clusterSetSlot(args[1:])
+
+	case "GETKEYSINSLOT":
+		return c.clusterGetKeysInSlot(args[1:])
+
 	default:
 		return protocol.Value{
 			Typ: '-',
 			Str: fmt.Sprintf("ERR unknown subcommand '%s'", subcommand),
 		}
 	}
+}
+
+// clusterReplicate — CLUSTER REPLICATE <master-id>
+// Текущая нода становится репликой указанного мастера.
+func (c *Cluster) clusterReplicate(args []protocol.Value) protocol.Value {
+	if len(args) < 1 {
+		return protocol.Value{Typ: '-', Str: "ERR missing master-id"}
+	}
+	masterID := args[0].Str
+
+	c.State.mu.Lock()
+	master, ok := c.State.Nodes[masterID]
+	if !ok {
+		c.State.mu.Unlock()
+		return protocol.Value{Typ: '-', Str: "ERR unknown node " + masterID}
+	}
+
+	// Меняем роль
+	c.State.Self.Role = RoleReplica
+	c.State.Self.MasterID = masterID
+	masterAddr := master.Addr
+	c.State.mu.Unlock()
+
+	log.Printf("[replication] Becoming replica of %s (%s)", masterID, masterAddr)
+
+	// Подключаемся к мастеру в горутине
+	go c.Repl.ConnectToMaster(masterAddr)
+
+	return protocol.Value{Typ: '+', Str: "OK"}
 }
 
 // ============================================================

@@ -162,3 +162,22 @@ func (s *ArenaStore) ForEach(fn func(key string, value []byte)) {
 		sh.mu.RUnlock()
 	}
 }
+
+func (s *ArenaStore) GetKeysInSlot(slot uint16, count int, slotFunc func(string) uint16) []string {
+	var keys []string
+	for i := 0; i < numShards && len(keys) < count; i++ {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for _, offset := range sh.index {
+			key, _ := sh.arena.GetValue(offset)
+			if slotFunc(key) == slot {
+				keys = append(keys, key)
+				if len(keys) >= count {
+					break
+				}
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return keys
+}

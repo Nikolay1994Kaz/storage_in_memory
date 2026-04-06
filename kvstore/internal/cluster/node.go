@@ -38,6 +38,12 @@ func (s NodeState) String() string {
 	}
 }
 
+type SlotMigration struct {
+	Slot   uint16
+	Target string
+	Source string
+}
+
 // ============================================================
 // Node — одна нода кластера.
 //
@@ -52,6 +58,25 @@ func (s NodeState) String() string {
 //	}
 //
 // ============================================================
+
+type NodeRole int
+
+const (
+	RoleMaster  NodeRole = iota // 0 — мастер (по умолчанию)
+	RoleReplica                 // 1 — реплика
+)
+
+func (r NodeRole) String() string {
+	switch r {
+	case RoleMaster:
+		return "master"
+	case RoleReplica:
+		return "replica"
+	default:
+		return "unknown"
+	}
+}
+
 type Node struct {
 	ID         string    // Уникальный идентификатор (генерируется при первом запуске)
 	Addr       string    // Адрес для клиентов: "10.0.1.1:6380"
@@ -59,6 +84,8 @@ type Node struct {
 	State      NodeState // online / pfail / fail
 	Slots      []bool    // Slots[i] = true → эта нода владеет слотом i
 	LastPong   time.Time // когда последний раз получили PONG от этой ноды
+	Role       NodeRole
+	MasterID   string
 }
 
 // NewNode создаёт ноду с пустыми слотами.
@@ -173,13 +200,17 @@ type ClusterState struct {
 	Self      *Node             // Текущая нода (я)
 	Nodes     map[string]*Node  // Все известные ноды (ID → Node)
 	SlotTable [TotalSlots]*Node // Для каждого слота — какая нода владеет
+	Migrating map[uint16]string // slot → targetNodeID (мы отдаём)
+	Importing map[uint16]string // slot → sourceNodeID (мы принимаем)
 }
 
 // NewClusterState создаёт состояние кластера для текущей ноды.
 func NewClusterState(self *Node) *ClusterState {
 	cs := &ClusterState{
-		Self:  self,
-		Nodes: make(map[string]*Node),
+		Self:      self,
+		Nodes:     make(map[string]*Node),
+		Migrating: make(map[uint16]string),
+		Importing: make(map[uint16]string),
 	}
 	cs.Nodes[self.ID] = self
 
