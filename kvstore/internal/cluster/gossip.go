@@ -82,6 +82,12 @@ func (cs *ClusterState) applyNodeInfo(info NodeInfo) bool {
 		return false
 	}
 
+	// Игнорируем ноды с нашим собственным адресом, но другим ID
+	// (это фантомные tmp-ноды от CLUSTER MEET)
+	if info.Addr == cs.Self.Addr {
+		return false
+	}
+
 	node, exists := cs.Nodes[info.ID]
 	if !exists {
 		// Новая нода! Добавляем.
@@ -415,12 +421,47 @@ func (c *Cluster) checkNodeHealth() {
 				node.ID, node.Addr, since.Round(time.Second))
 			node.State = NodeFail
 
+			// Leader Election: если мастер упал и я его реплика → промоутим
+			if c.State.Self.Role == RoleReplica && c.State.Self.MasterID == node.ID {
+				c.promoteToMaster(node)
+			}
+
 		case since > pfailTimeout && node.State == NodeOnline:
 			log.Printf("[gossip] Node %s (%s) → PFAIL (no pong for %v)",
 				node.ID, node.Addr, since.Round(time.Second))
 			node.State = NodePFail
 		}
 	}
+}
+
+// promoteToMaster — реплика продвигает себя в мастер.
+// Вызывается когда мастер в состоянии FAIL.
+// ВАЖНО: вызывается под mu.Lock() из checkNodeHealth.
+func (c *Cluster) promoteToMaster(deadMaster *Node) {
+	log.Printf("[election] Master %s is FAIL — promoting self to master!", deadMaster.ID)
+
+	// 1. Меняем роль
+	c.State.Self.Role = RoleMaster
+	c.State.Self.MasterID = ""
+
+	// 2. Забираем слоты мёртвого мастера
+	for slot := 0; slot < TotalSlots; slot++ {
+		if deadMaster.Slots[slot] {
+			deadMaster.Slots[slot] = false
+			c.State.Self.Slots[slot] = true
+			c.State.SlotTable[slot] = c.State.Self
+		}
+	}
+
+	// 3. Считаем сколько слотов забрали
+	count := 0
+	for _, v := range c.State.Self.Slots {
+		if v {
+			count++
+		}
+	}
+
+	log.Printf("[election] Promoted! Now master with %d slots", count)
 }
 
 // extractHost вытаскивает хост из "127.0.0.1:6380" → "127.0.0.1"

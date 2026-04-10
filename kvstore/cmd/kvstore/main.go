@@ -117,6 +117,17 @@ func main() {
 			ttl.OnDelete(key)
 		}
 
+		// Callback-функции для репликации:
+		cl.Repl.StoreForEach = func(fn func(key string, value []byte)) {
+			s.ForEach(fn)
+		}
+		cl.Repl.StoreSet = func(key string, value []byte) {
+			s.Set(key, value)
+		}
+		cl.Repl.StoreDel = func(key string) {
+			s.Del(key)
+		}
+
 		// Запуск Gossip (PING/PONG между нодами)
 		if err := cl.StartGossip(); err != nil {
 			log.Fatalf("Failed to start gossip: %v", err)
@@ -176,6 +187,17 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 		key := args[2].Str
 		return cl.MigrateKey(host, port, key)
 
+	case "PSYNC":
+		if cl == nil {
+			return protocol.Value{Typ: '-', Str: "ERR cluster mode is not enabled"}
+		}
+		if len(args) < 1 {
+			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'PSYNC'"}
+		}
+		replicaID := args[0].Str
+		cl.Repl.HandlePsync(conn, replicaID)
+		return protocol.Value{Typ: '+', Str: ""}
+
 	case "SET":
 		if len(args) < 2 {
 			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'SET'"}
@@ -193,6 +215,11 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
 		}
 		s.Set(key, value)
+
+		// Репликация: пересылаем всем репликам
+		if cl != nil && cl.Repl != nil {
+			cl.Repl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
+		}
 
 		if len(args) >= 4 && strings.ToUpper(args[2].Str) == "EX" {
 			seconds, err := strconv.Atoi(args[3].Str)
@@ -216,7 +243,8 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'GET'"}
 		}
 		key := args[0].Str
-		if cl != nil {
+		// Реплики отдают GET напрямую (read-only), без MOVED
+		if cl != nil && cl.State.Self.Role != cluster.RoleReplica {
 			if moved := cl.CheckKey(key); moved != nil {
 				return *moved
 			}
@@ -253,6 +281,12 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 		}
 		ok := s.Del(key)
 		ttl.OnDelete(key)
+
+		// Репликация: пересылаем удаление
+		if cl != nil && cl.Repl != nil {
+			cl.Repl.ForwardWrite(fmt.Sprintf("DEL %s", key))
+		}
+
 		if ok {
 			return protocol.Value{Typ: ':', Num: 1}
 		}
