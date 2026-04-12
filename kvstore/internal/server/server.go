@@ -21,13 +21,15 @@ const (
 // ConnState хранит состояние соединения: Reader и Writer переиспользуются
 // между командами, чтобы избежать аллокации bufio.Reader (4KB) на каждый запрос.
 type ConnState struct {
-	Conn   net.Conn
-	Reader *protocol.Reader
-	Writer *protocol.Writer
+	Conn    net.Conn
+	Reader  *protocol.Reader
+	Writer  *protocol.Writer
+	InTx    bool
+	TxQueue [][]protocol.Value
 }
 
 // Handler — функция обработки RESP-команды.
-type Handler func(conn net.Conn, args []protocol.Value) protocol.Value
+type Handler func(cs *ConnState, args []protocol.Value) protocol.Value
 
 // worker — один воркер со своим epoll instance.
 // Каждый воркер независим: свой epoll, своя очередь событий.
@@ -149,7 +151,7 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 		return
 	}
 
-	result := s.handler(cs.Conn, value.Array)
+	result := s.handler(cs, value.Array)
 	cs.Writer.Write(result)
 }
 

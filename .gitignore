@@ -22,3 +22,7 @@ data.wal
 
 # Runtime data
 data/
+*.log
+*.txt
+*_bin
+tinygo/

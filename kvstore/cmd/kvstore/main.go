@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"kvstore/kvstore/internal/cluster"
+	"kvstore/kvstore/internal/compute"
 	"kvstore/kvstore/internal/protocol"
 	"kvstore/kvstore/internal/pubsub"
 	"kvstore/kvstore/internal/server"
@@ -26,6 +28,8 @@ const (
 	dataDir      = "data"
 	syncInterval = 100 * time.Millisecond
 )
+
+var globalTxMu sync.Mutex
 
 func main() {
 	// CLI-флаги
@@ -135,11 +139,101 @@ func main() {
 		defer cl.StopGossip()
 	}
 
-	// === 7. Handler ===
-	handler := func(conn net.Conn, args []protocol.Value) protocol.Value {
+	// === 7. WASM Compute Engine ===
+	wasm := compute.NewEngine()
+	defer wasm.Close()
+
+	wasm.GlobalLock = func() { globalTxMu.Lock() }
+	wasm.GlobalUnlock = func() { globalTxMu.Unlock() }
+
+	// Callback-мостики для WASM → Store/PubSub
+	wasm.StoreGet = func(key string) ([]byte, bool) {
+		return s.Get(key)
+	}
+	wasm.StoreSet = func(key string, value []byte) {
+		s.Set(key, value)
+	}
+	wasm.StoreDel = func(key string) {
+		s.Del(key)
+	}
+	wasm.Publish = func(channel, message string) {
+		hub.Publish(channel, message)
+	}
+
+	// WAL-aware callbacks: данные из WASM переживают рестарт
+	wasm.StoreSetWithWAL = func(key string, value []byte) error {
+		if err := w.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value}); err != nil {
+			return err
+		}
+		s.Set(key, value)
+		return nil
+	}
+	wasm.StoreDelWithWAL = func(key string) error {
+		if err := w.Write(wal.Entry{Op: wal.OpDel, Key: key}); err != nil {
+			return err
+		}
+		s.Del(key)
+		ttl.OnDelete(key)
+		return nil
+	}
+
+	triggers := compute.NewTriggerManager(wasm)
+	if err := compute.LoadAll(dataDir, wasm, triggers); err != nil {
+		log.Printf("WARNING: WASM restore failed: %v", err)
+	}
+
+	// === 8. Handler ===
+	// === 8. Handler ===
+	handler := func(cs *server.ConnState, args []protocol.Value) protocol.Value {
 		cmd := strings.ToUpper(args[0].Str)
 		cmdArgs := args[1:]
-		return executeCommand(s, w, ttl, hub, cl, conn, cmd, cmdArgs)
+
+		// --- Транзакционный перехват ---
+		// Команды управления транзакцией обрабатываются всегда:
+		switch cmd {
+		case "MULTI":
+			if cs.InTx {
+				return protocol.Value{Typ: '-', Str: "ERR MULTI calls can not be nested"}
+			}
+			cs.InTx = true
+			cs.TxQueue = nil // очищаем буфер на всякий случай
+			return protocol.Value{Typ: '+', Str: "OK"}
+
+		case "DISCARD":
+			if !cs.InTx {
+				return protocol.Value{Typ: '-', Str: "ERR DISCARD without MULTI"}
+			}
+			cs.InTx = false
+			cs.TxQueue = nil
+			return protocol.Value{Typ: '+', Str: "OK"}
+
+		case "EXEC":
+			if !cs.InTx {
+				return protocol.Value{Typ: '-', Str: "ERR EXEC without MULTI"}
+			}
+			// Захватываем глобальный лок → выполняем ВСЕ команды атомарно
+			globalTxMu.Lock()
+			results := make([]protocol.Value, len(cs.TxQueue))
+			for i, queuedArgs := range cs.TxQueue {
+				qCmd := strings.ToUpper(queuedArgs[0].Str)
+				qCmdArgs := queuedArgs[1:]
+				results[i] = executeCommand(s, w, ttl, hub, cl, wasm, triggers, cs.Conn, qCmd, qCmdArgs)
+			}
+			globalTxMu.Unlock()
+			// Сбрасываем состояние транзакции
+			cs.InTx = false
+			cs.TxQueue = nil
+			return protocol.Value{Typ: '*', Array: results}
+		}
+
+		// Если клиент в транзакции — складываем команду в очередь
+		if cs.InTx {
+			cs.TxQueue = append(cs.TxQueue, args)
+			return protocol.Value{Typ: '+', Str: "QUEUED"}
+		}
+
+		// Обычный режим — выполняем сразу
+		return executeCommand(s, w, ttl, hub, cl, wasm, triggers, cs.Conn, cmd, cmdArgs)
 	}
 
 	// === 8. Сервер ===
@@ -160,7 +254,7 @@ func main() {
 	srv.Stop()
 }
 
-func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub *pubsub.Hub, cl *cluster.Cluster, conn net.Conn, cmd string, args []protocol.Value) protocol.Value {
+func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine, triggers *compute.TriggerManager, conn net.Conn, cmd string, args []protocol.Value) protocol.Value {
 	switch cmd {
 	case "PING":
 		return protocol.Value{Typ: '+', Str: "PONG"}
@@ -220,6 +314,9 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 		if cl != nil && cl.Repl != nil {
 			cl.Repl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
 		}
+
+		// WASM триггеры: уведомляем о SET
+		triggers.Fire(compute.OnSet, key)
 
 		if len(args) >= 4 && strings.ToUpper(args[2].Str) == "EX" {
 			seconds, err := strconv.Atoi(args[3].Str)
@@ -286,6 +383,9 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 		if cl != nil && cl.Repl != nil {
 			cl.Repl.ForwardWrite(fmt.Sprintf("DEL %s", key))
 		}
+
+		// WASM триггеры: уведомляем о DEL
+		triggers.Fire(compute.OnDel, key)
 
 		if ok {
 			return protocol.Value{Typ: ':', Num: 1}
@@ -389,6 +489,115 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 	case "COMPACT":
 		wal.BackgroundCompact(w, dataDir, s.ForEach)
 		return protocol.Value{Typ: '+', Str: "OK compaction started"}
+
+	// === WASM команды ===
+	case "WASM.LOAD":
+		// WASM.LOAD <module_name> <wasm_bytes_as_string>
+		if len(args) < 2 {
+			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.LOAD'"}
+		}
+		name := args[0].Str
+		wasmBytes := []byte(args[1].Str)
+		if err := wasm.LoadModule(name, wasmBytes); err != nil {
+			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+		}
+		compute.SaveModule(dataDir, name, wasmBytes)
+		return protocol.Value{Typ: '+', Str: "OK"}
+
+	case "WASM.LOADFILE":
+		// WASM.LOADFILE <module_name> <filepath>
+		// Загружает WASM-модуль из файла на диске.
+		// Удобнее чем WASM.LOAD для тестирования.
+		if len(args) < 2 {
+			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.LOADFILE'"}
+		}
+		name := args[0].Str
+		filePath := args[1].Str
+		wasmBytes, err := os.ReadFile(filePath)
+		if err != nil {
+			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR cannot read file: %v", err)}
+		}
+		if err := wasm.LoadModule(name, wasmBytes); err != nil {
+			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+		}
+		compute.SaveModule(dataDir, name, wasmBytes)
+		return protocol.Value{Typ: '+', Str: fmt.Sprintf("OK loaded %d bytes", len(wasmBytes))}
+
+	case "WASM.DROP":
+		if len(args) < 1 {
+			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.DROP'"}
+		}
+		if err := wasm.DropModule(args[0].Str); err != nil {
+			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+		}
+		compute.DeleteModule(dataDir, args[0].Str)
+		return protocol.Value{Typ: '+', Str: "OK"}
+
+	case "WASM.LIST":
+		names := wasm.ListModules()
+		vals := make([]protocol.Value, len(names))
+		for i, n := range names {
+			vals[i] = protocol.Value{Typ: '$', Str: n}
+		}
+		return protocol.Value{Typ: '*', Array: vals}
+
+	case "WASM.EXEC":
+		// WASM.EXEC <module_name> <func_name>
+		if len(args) < 2 {
+			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.EXEC'"}
+		}
+		results, err := wasm.ExecFunction(args[0].Str, args[1].Str)
+		if err != nil {
+			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+		}
+		if len(results) > 0 {
+			return protocol.Value{Typ: ':', Num: int(results[0])}
+		}
+		return protocol.Value{Typ: '+', Str: "OK"}
+
+	case "WASM.INFO":
+		// WASM.INFO <module_name> — метаданные модуля
+		if len(args) < 1 {
+			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.INFO'"}
+		}
+		loadedAt, execCount, found := wasm.ModuleInfo(args[0].Str)
+		if !found {
+			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR module '%s' not found", args[0].Str)}
+		}
+		info := fmt.Sprintf("module:%s loaded_at:%s exec_count:%d",
+			args[0].Str, loadedAt.Format(time.RFC3339), execCount)
+		return protocol.Value{Typ: '$', Str: info}
+
+	case "WASM.TRIGGER":
+		// WASM.TRIGGER SET "tx:*" fraud_scorer score_transaction
+		if len(args) < 4 {
+			return protocol.Value{Typ: '-', Str: "ERR usage: WASM.TRIGGER <SET|DEL> <pattern> <module> <func>"}
+		}
+		event := compute.TriggerEvent(strings.ToUpper(args[0].Str))
+		pattern := args[1].Str
+		moduleName := args[2].Str
+		funcName := args[3].Str
+		id := triggers.AddTrigger(event, pattern, moduleName, funcName)
+		compute.SaveTriggers(dataDir, triggers)
+		return protocol.Value{Typ: '+', Str: id}
+
+	case "WASM.UNTRIGGER":
+		if len(args) < 1 {
+			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.UNTRIGGER'"}
+		}
+		if triggers.RemoveTrigger(args[0].Str) {
+			compute.SaveTriggers(dataDir, triggers)
+			return protocol.Value{Typ: '+', Str: "OK"}
+		}
+		return protocol.Value{Typ: '-', Str: "ERR trigger not found"}
+
+	case "WASM.TRIGGERS":
+		all := triggers.ListTriggers()
+		vals := make([]protocol.Value, len(all))
+		for i, t := range all {
+			vals[i] = protocol.Value{Typ: '$', Str: fmt.Sprintf("%s %s %s %s.%s", t.ID, t.Event, t.Pattern, t.ModuleName, t.FuncName)}
+		}
+		return protocol.Value{Typ: '*', Array: vals}
 
 	default:
 		return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR unknown command '%s'", cmd)}
