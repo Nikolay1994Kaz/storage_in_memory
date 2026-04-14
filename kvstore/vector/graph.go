@@ -374,3 +374,83 @@ func (g *Graph) pruneNeighbors(node *Node, level int, maxCount int) {
 	}
 	node.Neighbors[level] = pruned
 }
+
+// SearchResult — один результат поиска.
+//
+// Это экспортируемая структура (с большой буквы) — её увидит вызывающий код.
+// Внутренний тип item (с маленькой) остаётся деталью реализации.
+type SearchResult struct {
+	ID       uint64
+	Distance float32
+}
+
+// Search находит K ближайших соседей к запросу.
+//
+// Параметры:
+//
+//	query    — вектор, к которому ищем ближайших
+//	K        — сколько результатов вернуть
+//	efSearch — ширина поиска. Больше = точнее, но медленнее.
+//	           Должен быть >= K. Типичные значения: 50–200.
+//
+// Возвращает: до K ближайших, отсортированных по расстоянию.
+//
+// Аналогия:
+//
+//	efSearch = "скольких людей спросить на улице"
+//	K        = "скольких показать в ответе"
+//	Можно спросить 100 (efSearch=100), но показать только 10 (K=10).
+//	Чем больше спросишь — тем вероятнее найдёшь лучших.
+func (g *Graph) Search(query []float32, K int, efSearch int) []SearchResult {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	// Пустой граф — пустой результат
+	if len(g.nodes) == 0 {
+		return nil
+	}
+
+	// efSearch не может быть меньше K
+	// (иначе мы найдём меньше кандидатов, чем нужно вернуть)
+	if efSearch < K {
+		efSearch = K
+	}
+
+	ep := g.entryPointID
+
+	// ═══════════════════════════════════════════════════
+	// ФАЗА 1: Спуск по верхним слоям (слой maxLevel → слой 1)
+	// ═══════════════════════════════════════════════════
+	//
+	// Точно как в Insert: ef=1, жадная навигация.
+	// Цель: найти хорошую «стартовую позицию» для слоя 0.
+	for lc := g.maxLevel; lc > 0; lc-- {
+		results := g.searchLayer(query, ep, 1, lc)
+		if len(results) > 0 {
+			ep = results[0].id
+		}
+	}
+
+	// ═══════════════════════════════════════════════════
+	// ФАЗА 2: Полный поиск на слое 0
+	// ═══════════════════════════════════════════════════
+	//
+	// Слой 0 содержит ВСЕ ноды. Здесь ищем efSearch ближайших.
+	results := g.searchLayer(query, ep, efSearch, 0)
+
+	// Обрезаем до K
+	if len(results) > K {
+		results = results[:K]
+	}
+
+	// Конвертируем внутренний item → экспортируемый SearchResult
+	out := make([]SearchResult, len(results))
+	for i, r := range results {
+		out[i] = SearchResult{
+			ID:       r.id,
+			Distance: r.dist,
+		}
+	}
+
+	return out
+}
