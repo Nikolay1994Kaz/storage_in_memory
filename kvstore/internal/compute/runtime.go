@@ -55,7 +55,11 @@ type Engine struct {
 	StoreDelWithWAL func(key string) error
 
 	// Publish — отправка сообщения в Pub/Sub канал.
-	Publish func(channel, message string)
+	Publish    func(channel, message string)
+	VSimSearch func(query []float32, K int) []struct {
+		Key      string
+		Distance float32
+	}
 }
 
 // NewEngine создаёт WASM compute engine.

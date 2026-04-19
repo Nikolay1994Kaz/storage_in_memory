@@ -22,6 +22,7 @@ import (
 	"kvstore/kvstore/internal/server"
 	"kvstore/kvstore/internal/store"
 	"kvstore/kvstore/internal/wal"
+	"kvstore/kvstore/vector"
 )
 
 const (
@@ -53,7 +54,11 @@ func main() {
 		log.Fatalf("Failed to read WALs: %v", err)
 	}
 
+	// === Vector Store (до восстановления, чтобы восстановить вектора из WAL) ===
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
+
 	restored := 0
+	vecRestored := 0
 	for _, entry := range entries {
 		switch entry.Op {
 		case wal.OpSet:
@@ -70,7 +75,6 @@ func main() {
 				if remaining > 0 {
 					ttl.Set(entry.Key, remaining)
 				} else {
-					// Ключ уже просрочен — удаляем
 					s.Del(entry.Key)
 					ttl.OnDelete(entry.Key)
 				}
@@ -79,11 +83,18 @@ func main() {
 		case wal.OpPersist:
 			ttl.Remove(entry.Key)
 			restored++
+		case wal.OpVSimAdd:
+			vec := vector.DeserializeVector(entry.Value)
+			if err := vecStore.Add(entry.Key, vec); err != nil {
+				log.Printf("WARNING: failed to restore vector %s: %v", entry.Key, err)
+			}
+			vecRestored++
+			restored++
 		}
 	}
 
 	if restored > 0 {
-		log.Printf("Restored %d operations from WAL", restored)
+		log.Printf("Restored %d operations from WAL (%d vectors)", restored, vecRestored)
 	}
 
 	// === 3. WAL ===
@@ -158,6 +169,26 @@ func main() {
 	}
 	wasm.Publish = func(channel, message string) {
 		hub.Publish(channel, message)
+
+	}
+	// vecStore уже создан выше (перед восстановлением из WAL)
+	wasm.VSimSearch = func(query []float32, K int) []struct {
+		Key      string
+		Distance float32
+	} {
+		results, err := vecStore.Search(query, K)
+		if err != nil {
+			return nil
+		}
+		out := make([]struct {
+			Key      string
+			Distance float32
+		}, len(results))
+		for i, r := range results {
+			out[i].Key = r.Key
+			out[i].Distance = r.Distance
+		}
+		return out
 	}
 
 	// WAL-aware callbacks: данные из WASM переживают рестарт
@@ -217,7 +248,7 @@ func main() {
 			for i, queuedArgs := range cs.TxQueue {
 				qCmd := strings.ToUpper(queuedArgs[0].Str)
 				qCmdArgs := queuedArgs[1:]
-				results[i] = executeCommand(s, w, ttl, hub, cl, wasm, triggers, cs.Conn, qCmd, qCmdArgs)
+				results[i] = executeCommand(s, w, ttl, hub, cl, wasm, triggers, vecStore, cs.Conn, qCmd, qCmdArgs)
 			}
 			globalTxMu.Unlock()
 			// Сбрасываем состояние транзакции
@@ -233,7 +264,7 @@ func main() {
 		}
 
 		// Обычный режим — выполняем сразу
-		return executeCommand(s, w, ttl, hub, cl, wasm, triggers, cs.Conn, cmd, cmdArgs)
+		return executeCommand(s, w, ttl, hub, cl, wasm, triggers, vecStore, cs.Conn, cmd, cmdArgs)
 	}
 
 	// === 8. Сервер ===
@@ -254,7 +285,11 @@ func main() {
 	srv.Stop()
 }
 
-func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine, triggers *compute.TriggerManager, conn net.Conn, cmd string, args []protocol.Value) protocol.Value {
+func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager,
+	hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine,
+	triggers *compute.TriggerManager, vecStore *vector.VectorStore,
+	conn net.Conn, cmd string, args []protocol.Value) protocol.Value {
+
 	switch cmd {
 	case "PING":
 		return protocol.Value{Typ: '+', Str: "PONG"}
@@ -598,6 +633,70 @@ func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager, hub 
 			vals[i] = protocol.Value{Typ: '$', Str: fmt.Sprintf("%s %s %s %s.%s", t.ID, t.Event, t.Pattern, t.ModuleName, t.FuncName)}
 		}
 		return protocol.Value{Typ: '*', Array: vals}
+
+		// === Vector Search команды ===
+	case "VSIM.ADD":
+		// VSIM.ADD <key> <v1> <v2> ... <vN>
+		if len(args) < 2 {
+			return protocol.Value{Typ: '-', Str: "ERR usage: VSIM.ADD <key> <v1> <v2> ... <vN>"}
+		}
+		key := args[0].Str
+		vec := make([]float32, len(args)-1)
+		for i := 1; i < len(args); i++ {
+			f, err := strconv.ParseFloat(args[i].Str, 32)
+			if err != nil {
+				return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR invalid float at position %d: %s", i, args[i].Str)}
+			}
+			vec[i-1] = float32(f)
+		}
+
+		// WAL: записываем ПЕРЕД записью в память (write-ahead!)
+		walValue := vector.SerializeVector(vec)
+		if err := w.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue}); err != nil {
+			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
+		}
+
+		if err := vecStore.Add(key, vec); err != nil {
+			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+		}
+		return protocol.Value{Typ: '+', Str: "OK"}
+
+	case "VSIM.SEARCH":
+		// VSIM.SEARCH <K> <v1> <v2> ... <vN>
+		if len(args) < 2 {
+			return protocol.Value{Typ: '-', Str: "ERR usage: VSIM.SEARCH <K> <v1> <v2> ... <vN>"}
+		}
+		K, err := strconv.Atoi(args[0].Str)
+		if err != nil || K <= 0 {
+			return protocol.Value{Typ: '-', Str: "ERR invalid K (must be positive integer)"}
+		}
+		query := make([]float32, len(args)-1)
+		for i := 1; i < len(args); i++ {
+			f, err := strconv.ParseFloat(args[i].Str, 32)
+			if err != nil {
+				return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR invalid float at position %d: %s", i, args[i].Str)}
+			}
+			query[i-1] = float32(f)
+		}
+		results, err := vecStore.Search(query, K)
+		if err != nil {
+			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+		}
+		// Формат ответа: [key1, dist1, key2, dist2, ...]
+		// Как ZRANGEBYSCORE с WITHSCORES
+		vals := make([]protocol.Value, 0, len(results)*2)
+		for _, r := range results {
+			vals = append(vals,
+				protocol.Value{Typ: '$', Str: r.Key},
+				protocol.Value{Typ: '$', Str: fmt.Sprintf("%.6f", r.Distance)},
+			)
+		}
+		return protocol.Value{Typ: '*', Array: vals}
+
+	case "VSIM.INFO":
+		count, dim, maxLevel := vecStore.Info()
+		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d", count, dim, maxLevel)
+		return protocol.Value{Typ: '$', Str: info}
 
 	default:
 		return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR unknown command '%s'", cmd)}

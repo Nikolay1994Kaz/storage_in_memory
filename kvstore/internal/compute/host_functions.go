@@ -3,6 +3,7 @@ package compute
 import (
 	"context"
 	"log"
+	"math"
 	"time"
 
 	"github.com/tetratelabs/wazero/api"
@@ -203,6 +204,75 @@ func (e *Engine) registerHostFunctions(ctx context.Context) (api.Module, error) 
 			return uint64(time.Now().UnixMilli())
 		}).
 		Export("current_time_ms").
+
+		// ─── vsim_search(query_ptr, dim, k) → result_count ───
+		//
+		// Семантический поиск из WASM-модуля.
+		// WASM-модуль кладёт query-вектор ([]float32) в свою memory,
+		// передаёт (ptr, dimension, K).
+		//
+		// Результаты записываются в WASM-memory начиная с offset 4096:
+		// Формат: [count:u32] [key1_len:u32] [key1_bytes...] [dist1:f32] [key2_len:u32] ...
+		//
+		// Возвращает количество найденных результатов.
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, queryPtr, dim, k uint32) uint32 {
+			if e.VSimSearch == nil {
+				return 0
+			}
+
+			// 1. Читаем query вектор из WASM-памяти
+			//    Каждый float32 = 4 байта
+			queryBytes, ok := m.Memory().Read(queryPtr, dim*4)
+			if !ok {
+				return 0
+			}
+
+			// 2. Конвертируем []byte → []float32
+			query := make([]float32, dim)
+			for i := uint32(0); i < dim; i++ {
+				bits := uint32(queryBytes[i*4]) |
+					uint32(queryBytes[i*4+1])<<8 |
+					uint32(queryBytes[i*4+2])<<16 |
+					uint32(queryBytes[i*4+3])<<24
+				query[i] = math.Float32frombits(bits)
+			}
+
+			// 3. Вызываем поиск
+			results := e.VSimSearch(query, int(k))
+
+			// 4. Записываем результаты в WASM-memory по offset 4096
+			//    Формат: [key_len:u32][key_bytes...][dist:f32] для каждого результата
+			offset := uint32(4096)
+			count := uint32(0)
+
+			for _, r := range results {
+				keyBytes := []byte(r.Key)
+				keyLen := uint32(len(keyBytes))
+
+				// key length (4 bytes, little-endian)
+				m.Memory().WriteUint32Le(offset, keyLen)
+				offset += 4
+
+				// key bytes
+				m.Memory().Write(offset, keyBytes)
+				offset += keyLen
+
+				// distance (float32 as 4 bytes, little-endian)
+				m.Memory().WriteFloat32Le(offset, r.Distance)
+				offset += 4
+
+				count++
+
+				// Защита от переполнения памяти
+				if offset > 60000 {
+					break
+				}
+			}
+
+			return count
+		}).
+		Export("vsim_search").
 
 		// Компилируем и создаём host-модуль
 		Instantiate(ctx)

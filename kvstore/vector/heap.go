@@ -1,63 +1,148 @@
 package vector
 
-import "container/heap"
-
 // item — пара: ID ноды + расстояние до точки запроса.
-//
-// Это «конверт» с двумя полями. Когда мы ищем ближайших соседей,
-// нам нужно знать: КОГО мы нашли (id) и НАСКОЛЬКО далеко он (dist).
 type item struct {
 	id   uint64
 	dist float32
 }
 
-// ─── minHeap: ближайший элемент = первый ───
+// ═════════════════════════════════════════════════════════
+// minHeap — ближайший элемент = первый (корень).
+// ═════════════════════════════════════════════════════════
 //
-// Используется для КАНДИДАТОВ при поиске.
-// «Дай мне следующего самого близкого кандидата для проверки».
-//
-// Ты уже видел этот паттерн в TTL MinHeap (store/ttl_heap.go):
-// там heap отдаёт ключ с НАИМЕНЬШИМ временем жизни.
-// Здесь — элемент с НАИМЕНЬШИМ расстоянием.
+// TYPED реализация: push/pop работают напрямую с item.
+// Без container/heap, без any, без interface boxing = ZERO ALLOC.
+
 type minHeap []item
 
-func (h minHeap) Len() int           { return len(h) }
-func (h minHeap) Less(i, j int) bool { return h[i].dist < h[j].dist } // меньше = ближе = приоритетнее
-func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *minHeap) Push(x any)        { *h = append(*h, x.(item)) }
-func (h *minHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
+func (h *minHeap) Len() int { return len(*h) }
+
+// peek возвращает минимальный элемент БЕЗ удаления.
+func (h *minHeap) peek() item { return (*h)[0] }
+
+// push добавляет элемент и восстанавливает свойство кучи.
+//
+// 1. Добавляем в конец массива
+// 2. «Всплываем» наверх: если новый < родителя — меняем местами
+func (h *minHeap) push(it item) {
+	*h = append(*h, it)
+	h.siftUp(len(*h) - 1)
 }
 
-// ─── maxHeap: самый далёкий элемент = первый ───
+// pop удаляет и возвращает минимальный элемент.
 //
-// Используется для РЕЗУЛЬТАТОВ поиска.
-// «У меня есть ef лучших результатов. Если новый кандидат ближе,
-// чем мой ХУДШИЙ результат — выкинь худший, добавь нового».
+// 1. Запоминаем корень (минимум)
+// 2. Ставим последний элемент на место корня
+// 3. «Топим» вниз: если новый корень > ребёнка — меняем с меньшим
+func (h *minHeap) pop() item {
+	old := *h
+	n := len(old)
+	result := old[0]  // запоминаем корень
+	old[0] = old[n-1] // последний → на место корня
+	*h = old[:n-1]    // уменьшаем размер
+	if len(*h) > 0 {
+		h.siftDown(0) // восстанавливаем свойство кучи
+	}
+	return result
+}
+
+// siftUp — «всплытие». Элемент i поднимается к корню,
+// пока он меньше своего родителя.
+func (h *minHeap) siftUp(i int) {
+	data := *h
+	for i > 0 {
+		parent := (i - 1) / 2
+		if data[parent].dist <= data[i].dist {
+			break // родитель меньше или равен — порядок верный
+		}
+		data[parent], data[i] = data[i], data[parent]
+		i = parent
+	}
+}
+
+// siftDown — «погружение». Элемент i опускается вниз,
+// пока он больше одного из своих детей.
+func (h *minHeap) siftDown(i int) {
+	data := *h
+	n := len(data)
+	for {
+		smallest := i
+		left := 2*i + 1
+		right := 2*i + 2
+
+		if left < n && data[left].dist < data[smallest].dist {
+			smallest = left
+		}
+		if right < n && data[right].dist < data[smallest].dist {
+			smallest = right
+		}
+		if smallest == i {
+			break // элемент на своём месте
+		}
+		data[i], data[smallest] = data[smallest], data[i]
+		i = smallest
+	}
+}
+
+// ═════════════════════════════════════════════════════════
+// maxHeap — самый далёкий элемент = первый (корень).
+// ═════════════════════════════════════════════════════════
 //
-// Единственная разница с minHeap — знак в Less():
-//
-//	minHeap: h[i].dist < h[j].dist  (ближайший первый)
-//	maxHeap: h[i].dist > h[j].dist  (дальний первый)
+// Единственная разница с minHeap: знаки сравнения ОБРАТНЫЕ.
+
 type maxHeap []item
 
-func (h maxHeap) Len() int           { return len(h) }
-func (h maxHeap) Less(i, j int) bool { return h[i].dist > h[j].dist } // больше = дальше = приоритетнее
-func (h maxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *maxHeap) Push(x any)        { *h = append(*h, x.(item)) }
-func (h *maxHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
+func (h *maxHeap) Len() int { return len(*h) }
+
+func (h *maxHeap) peek() item { return (*h)[0] }
+
+func (h *maxHeap) push(it item) {
+	*h = append(*h, it)
+	h.siftUp(len(*h) - 1)
 }
 
-// Проверка на этапе компиляции: наши типы реализуют heap.Interface.
-// Если забудем метод — компилятор скажет ошибку.
-var _ heap.Interface = (*minHeap)(nil)
-var _ heap.Interface = (*maxHeap)(nil)
+func (h *maxHeap) pop() item {
+	old := *h
+	n := len(old)
+	result := old[0]
+	old[0] = old[n-1]
+	*h = old[:n-1]
+	if len(*h) > 0 {
+		h.siftDown(0)
+	}
+	return result
+}
+
+func (h *maxHeap) siftUp(i int) {
+	data := *h
+	for i > 0 {
+		parent := (i - 1) / 2
+		if data[parent].dist >= data[i].dist { // ← ОБРАТНЫЙ знак
+			break
+		}
+		data[parent], data[i] = data[i], data[parent]
+		i = parent
+	}
+}
+
+func (h *maxHeap) siftDown(i int) {
+	data := *h
+	n := len(data)
+	for {
+		largest := i
+		left := 2*i + 1
+		right := 2*i + 2
+
+		if left < n && data[left].dist > data[largest].dist { // ← ОБРАТНЫЙ знак
+			largest = left
+		}
+		if right < n && data[right].dist > data[largest].dist {
+			largest = right
+		}
+		if largest == i {
+			break
+		}
+		data[i], data[largest] = data[largest], data[i]
+		i = largest
+	}
+}
