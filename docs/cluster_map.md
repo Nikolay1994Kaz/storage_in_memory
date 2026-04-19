@@ -6,7 +6,7 @@
 
 ## 1. Файлы → Функции (что где лежит)
 
-### 📄 [slots.go](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/slots.go) — САМЫЙ МАЛЕНЬКИЙ (41 строка)
+### 📄 [slots.go](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/slots.go) — САМЫЙ МАЛЕНЬКИЙ (41 строка)
 
 ```
 crc16Table  [256]uint16          ← предвычисленная таблица (init)
@@ -17,7 +17,7 @@ KeySlot(key string) → uint16    ← CRC16(key) % 16384
 
 ---
 
-### 📄 [node.go](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/node.go) — СТРУКТУРЫ ДАННЫХ (273 строки)
+### 📄 [node.go](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/node.go) — СТРУКТУРЫ ДАННЫХ (273 строки)
 
 ```
 ┌─ ТИПЫ ────────────────────────────────────────────────────┐
@@ -64,7 +64,7 @@ KeySlot(key string) → uint16    ← CRC16(key) % 16384
 
 ---
 
-### 📄 [cluster.go](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/cluster.go) — ЯДРО (503 строки)
+### 📄 [cluster.go](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/cluster.go) — ЯДРО (503 строки)
 
 ```
 ┌─ Cluster (главная структура) ─────────────────────────────┐
@@ -101,7 +101,7 @@ KeySlot(key string) → uint16    ← CRC16(key) % 16384
 
 ---
 
-### 📄 [gossip.go](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go) — ОБЩЕНИЕ (475 строк)
+### 📄 [gossip.go](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go) — ОБЩЕНИЕ (475 строк)
 
 ```
 СТРУКТУРЫ ДЛЯ СЕТИ:
@@ -138,7 +138,7 @@ KeySlot(key string) → uint16    ← CRC16(key) % 16384
 
 ---
 
-### 📄 [migration.go](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/migration.go) — ПЕРЕНОС (176 строк)
+### 📄 [migration.go](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/migration.go) — ПЕРЕНОС (176 строк)
 
 ```
 ┌───────────────────────┬──────────┬─────────────────────────┐
@@ -155,7 +155,7 @@ KeySlot(key string) → uint16    ← CRC16(key) % 16384
 
 ---
 
-### 📄 [replication.go](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/replication.go) — КОПИЯ (168 строк)
+### 📄 [replication.go](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/replication.go) — КОПИЯ (168 строк)
 
 ```
 ┌─ ReplicationManager ──────────────────────────────────────┐

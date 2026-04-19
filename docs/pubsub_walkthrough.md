@@ -51,7 +51,7 @@
 
 ### Структура Hub
 
-[pubsub.go:23-28](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L23-L28):
+[pubsub.go:23-28](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L23-L28):
 
 ```go
 type Hub struct {
@@ -79,7 +79,7 @@ channels:                                subscribers:
 
 ### Структура Subscriber
 
-[pubsub.go:16-21](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L16-L21):
+[pubsub.go:16-21](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L16-L21):
 
 ```go
 type Subscriber struct {
@@ -109,7 +109,7 @@ Subscriber:
 
 ### Создание Hub
 
-[main.go:113](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L113):
+[main.go:113](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L113):
 ```go
 hub := pubsub.NewHub()
 ```
@@ -137,7 +137,7 @@ redis-cli → TCP → epoll → handleConn → executeCommand
                                         hub.Subscribe(conn, ["news", "tech"])
 ```
 
-[main.go:494-504](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L494-L504):
+[main.go:494-504](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L494-L504):
 ```go
 case "SUBSCRIBE":
     channels := make([]string, len(args))
@@ -153,7 +153,7 @@ case "SUBSCRIBE":
 
 ### hub.Subscribe() — пошагово
 
-[pubsub.go:38-90](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L38-L90):
+[pubsub.go:38-90](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L38-L90):
 
 ```go
 func (h *Hub) Subscribe(conn net.Conn, channels []string) *Subscriber {
@@ -270,7 +270,7 @@ SubA:
 
 ### writePump — код
 
-[pubsub.go:207-220](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L207-L220):
+[pubsub.go:207-220](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L207-L220):
 
 ```go
 func (s *Subscriber) writePump() {
@@ -333,7 +333,7 @@ writePump:
 
 Издатель — это **обычный клиент** (не подписчик). Он подключён к тому же серверу.
 
-[main.go:514-519](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L514-L519):
+[main.go:514-519](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L514-L519):
 ```go
 case "PUBLISH":
     count := hub.Publish(args[0].Str, args[1].Str)
@@ -342,7 +342,7 @@ case "PUBLISH":
 
 ### hub.Publish() — пошагово
 
-[pubsub.go:141-189](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L141-L189):
+[pubsub.go:141-189](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L141-L189):
 
 ```go
 func (h *Hub) Publish(channel string, message string) int {
@@ -404,7 +404,7 @@ func (h *Hub) Publish(channel string, message string) int {
 
 ### Зачем sync.Pool?
 
-[pubsub.go:133-138](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L133-L138):
+[pubsub.go:133-138](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L133-L138):
 
 ```go
 var subscriberSlicePool = sync.Pool{
@@ -470,7 +470,7 @@ SubB не читает из `ch` → буфер 256 сообщений запо�
 
 ### disconnectSlow — идемпотентное отключение
 
-[pubsub.go:224-246](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L224-L246):
+[pubsub.go:224-246](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L224-L246):
 
 ```go
 func (h *Hub) disconnectSlow(sub *Subscriber) {
@@ -533,7 +533,7 @@ default:              // Буфер полон
 
 ### Явная отписка: `UNSUBSCRIBE news`
 
-[pubsub.go:93-131](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L93-L131):
+[pubsub.go:93-131](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L93-L131):
 
 ```go
 func (h *Hub) Unsubscribe(conn net.Conn, channels []string) {
@@ -576,7 +576,7 @@ func (h *Hub) Unsubscribe(conn net.Conn, channels []string) {
 
 Когда клиент просто закрывает соединение (Ctrl+C), сервер видит ошибку чтения. Нужен `RemoveConn`:
 
-[pubsub.go:192-194](file:///home/nikolay/storage_in_memory/kvstore/internal/pubsub/pubsub.go#L192-L194):
+[pubsub.go:192-194](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/pubsub/pubsub.go#L192-L194):
 ```go
 func (h *Hub) RemoveConn(conn net.Conn) {
     h.Unsubscribe(conn, nil)  // nil = отписка от всех

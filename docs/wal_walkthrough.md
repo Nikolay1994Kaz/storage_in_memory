@@ -52,7 +52,7 @@ T=3:   Рестарт → Читаем WAL-файл → Повторяем вс�
 
 ### Шаг 0.1: Создание ArenaStore
 
-[main.go:43](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L43):
+[main.go:43](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L43):
 ```go
 s := store.NewArenaStore()
 ```
@@ -61,7 +61,7 @@ ArenaStore — пустой. Никаких данных.
 
 ### Шаг 0.2: Создание TTL Manager
 
-[main.go:48-49](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L48-L49):
+[main.go:48-49](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L48-L49):
 ```go
 ttl := store.NewTTLManager(s)
 ```
@@ -69,7 +69,7 @@ ttl := store.NewTTLManager(s)
 
 ### Шаг 0.3: Восстановление из WAL (ПОДРОБНО в Фазе 5)
 
-[main.go:52-55](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L52-L55):
+[main.go:52-55](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L52-L55):
 ```go
 entries, err := wal.ReadAllWALs(dataDir)
 ```
@@ -77,7 +77,7 @@ entries, err := wal.ReadAllWALs(dataDir)
 
 ### Шаг 0.4: Создание VectorStore
 
-[main.go:58](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L58):
+[main.go:58](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L58):
 ```go
 vecStore := vector.NewVectorStore(vector.EuclideanDistance)
 ```
@@ -85,7 +85,7 @@ vecStore := vector.NewVectorStore(vector.EuclideanDistance)
 
 ### Шаг 0.5: Проигрывание восстановленных записей
 
-[main.go:62-94](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L62-L94):
+[main.go:62-94](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L62-L94):
 ```go
 for _, entry := range entries {
     switch entry.Op {
@@ -100,7 +100,7 @@ for _, entry := range entries {
 
 ### Шаг 0.6: Открытие НОВОГО WAL-файла
 
-[main.go:101-105](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L101-L105):
+[main.go:101-105](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L101-L105):
 ```go
 walPath := filepath.Join(dataDir, fmt.Sprintf("wal_%s.log", time.Now().Format("20060102_150405")))
 // → "data/wal_20260419_144800.log"
@@ -108,7 +108,7 @@ walPath := filepath.Join(dataDir, fmt.Sprintf("wal_%s.log", time.Now().Format("2
 w, err := wal.Open(walPath)
 ```
 
-**`wal.Open()`** — [wal.go:41-52](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L41-L52):
+**`wal.Open()`** — [wal.go:41-52](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L41-L52):
 
 ```go
 func Open(path string) (*WAL, error) {
@@ -130,7 +130,7 @@ func Open(path string) (*WAL, error) {
 
 ### Шаг 0.7: Запуск Syncer
 
-[main.go:109](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L109):
+[main.go:109](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L109):
 ```go
 syncer := wal.NewSyncer(w, 100*time.Millisecond, dataDir, s.ForEach)
 ```
@@ -202,7 +202,7 @@ case "SET":                          ← main.go:330
 
 ### Шаг 1.1: `w.Write()` — запись в WAL
 
-[wal.go:56-83](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L56-L83):
+[wal.go:56-83](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L56-L83):
 
 ```go
 func (w *WAL) Write(entry Entry) error {
@@ -237,7 +237,7 @@ func (w *WAL) Write(entry Entry) error {
 
 ### Шаг 1.2: `encodeEntry()` — кодирование в байты
 
-[wal.go:157-177](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L157-L177):
+[wal.go:157-177](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L157-L177):
 
 ```go
 func encodeEntry(e Entry) []byte {
@@ -324,7 +324,7 @@ WAL-файл:
 Все предыдущие данные в безопасности.
 ```
 
-[wal.go:212-214](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L212-L214):
+[wal.go:212-214](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L212-L214):
 ```go
 if crc32.ChecksumIEEE(payload) != checksum {
     break  // Битая запись → прекращаем чтение
@@ -345,7 +345,7 @@ w.Write(entry)  →  bufio buffer (4KB RAM)  →  ???  →  Диск
 
 ### Syncer — структура
 
-[syncer.go:14-21](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/syncer.go#L14-L21):
+[syncer.go:14-21](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/syncer.go#L14-L21):
 
 ```go
 type Syncer struct {
@@ -360,7 +360,7 @@ type Syncer struct {
 
 ### Syncer.run() — тикер
 
-[syncer.go:35-55](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/syncer.go#L35-L55):
+[syncer.go:35-55](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/syncer.go#L35-L55):
 
 ```go
 func (s *Syncer) run() {
@@ -387,7 +387,7 @@ func (s *Syncer) run() {
 
 ### WAL.Sync() — Flush + fsync
 
-[wal.go:86-94](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L86-L94):
+[wal.go:86-94](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L86-L94):
 
 ```go
 func (w *WAL) Sync() error {
@@ -468,7 +468,7 @@ SET в T=110ms   → в буфере
 
 ## 6. Фаза 4: Все 5 типов операций
 
-[wal.go:17-23](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L17-L23):
+[wal.go:17-23](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L17-L23):
 
 ```go
 const (
@@ -484,7 +484,7 @@ const (
 
 Когда: Клиент → `SET user:1001 "Николай"`
 
-[main.go:343-346](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L343-L346):
+[main.go:343-346](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L343-L346):
 ```go
 w.Write(wal.Entry{Op: wal.OpSet, Key: "user:1001", Value: []byte("Николай")})
 s.Set("user:1001", []byte("Николай"))
@@ -500,7 +500,7 @@ s.Set("user:1001", []byte("Николай"))
 
 Когда: Клиент → `DEL user:1001`
 
-[main.go:411-415](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L411-L415):
+[main.go:411-415](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L411-L415):
 ```go
 w.Write(wal.Entry{Op: wal.OpDel, Key: "user:1001"})
 s.Del("user:1001")
@@ -520,7 +520,7 @@ ttl.OnDelete("user:1001")
 
 Когда: Клиент → `SET key value EX 60` или `EXPIRE key 60`
 
-[main.go:356-368](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L356-L368):
+[main.go:356-368](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L356-L368):
 ```go
 dur := time.Duration(seconds) * time.Second         // 60 секунд
 expiresAt := time.Now().Add(dur)                     // абсолютное время смерти
@@ -546,7 +546,7 @@ ttl.Set(key, dur)
 
 Когда: Клиент → `PERSIST key` (убрать TTL)
 
-[main.go:486-488](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L486-L488):
+[main.go:486-488](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L486-L488):
 ```go
 w.Write(wal.Entry{Op: wal.OpPersist, Key: args[0].Str})
 ```
@@ -561,7 +561,7 @@ w.Write(wal.Entry{Op: wal.OpPersist, Key: args[0].Str})
 
 Когда: Клиент → `VSIM.ADD product:shoes 0.1 0.7 0.3 0.9`
 
-[main.go:643-661](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L643-L661):
+[main.go:643-661](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L643-L661):
 ```go
 // 1. Парсим float'ы из строк
 vec := make([]float32, len(args)-1)
@@ -582,7 +582,7 @@ vecStore.Add("product:shoes", vec)
 
 ### Сериализация вектора
 
-[store.go:122-128](file:///home/nikolay/storage_in_memory/kvstore/vector/store.go#L122-L128):
+[store.go:122-128](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/vector/store.go#L122-L128):
 ```go
 func SerializeVector(vec []float32) []byte {
     buf := make([]byte, len(vec)*4)      // 4 float32 x 4 байта = 16 байт
@@ -648,7 +648,7 @@ walValue = [CD CC CC 3D 33 33 33 3F 9A 99 99 3E 66 66 66 3F]
 
 ### Шаг 5.1: ReadAllWALs — читаем все файлы
 
-[wal.go:255-279](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L255-L279):
+[wal.go:255-279](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L255-L279):
 
 ```go
 func ReadAllWALs(dir string) ([]Entry, error) {
@@ -677,7 +677,7 @@ func ReadAllWALs(dir string) ([]Entry, error) {
 
 ### Шаг 5.2: ReadEntries — чтение одного файла
 
-[wal.go:180-224](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L180-L224):
+[wal.go:180-224](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L180-L224):
 
 ```go
 func ReadEntries(path string) ([]Entry, error) {
@@ -712,7 +712,7 @@ func ReadEntries(path string) ([]Entry, error) {
 
 ### Шаг 5.3: Проигрывание записей
 
-[main.go:62-94](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L62-L94):
+[main.go:62-94](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L62-L94):
 
 ```go
 for _, entry := range entries {
@@ -778,7 +778,7 @@ WAL-файл на диске:
 
 ### Десериализация вектора
 
-[store.go:130-138](file:///home/nikolay/storage_in_memory/kvstore/vector/store.go#L130-L138):
+[store.go:130-138](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/vector/store.go#L130-L138):
 
 ```go
 func DeserializeVector(data []byte) []float32 {
@@ -826,7 +826,7 @@ data/                              data/
 
 ### Шаг 6.1: WAL.Rotate() — атомарное переключение
 
-[wal.go:104-137](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/wal.go#L104-L137):
+[wal.go:104-137](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/wal.go#L104-L137):
 
 ```go
 func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
@@ -857,7 +857,7 @@ func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
 
 ### Шаг 6.2: WriteSnapshot — полный дамп Store
 
-[snapshot.go:24-69](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/snapshot.go#L24-L69):
+[snapshot.go:24-69](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/snapshot.go#L24-L69):
 
 ```go
 func (sw *SnapshotWriter) WriteSnapshot(iterate) error {
@@ -884,7 +884,7 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate) error {
 
 ### Шаг 6.3: BackgroundCompact — полный цикл
 
-[snapshot.go:76-98](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/snapshot.go#L76-L98):
+[snapshot.go:76-98](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/snapshot.go#L76-L98):
 
 ```go
 func BackgroundCompact(w *WAL, dir string, iterate) {
@@ -928,7 +928,7 @@ data/                        data/                  data/
 
 ### Syncer.checkWALSize() — когда WAL слишком большой
 
-[syncer.go:57-75](file:///home/nikolay/storage_in_memory/kvstore/internal/wal/syncer.go#L57-L75):
+[syncer.go:57-75](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/wal/syncer.go#L57-L75):
 
 ```go
 const MaxWALSize = 64 * 1024 * 1024  // 64 MB

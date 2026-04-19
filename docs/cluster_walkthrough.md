@@ -23,7 +23,7 @@
 
 ### Что происходит при запуске `./kvstore --cluster --port 6380 --slot-start 0 --slot-end 5460`
 
-**Шаг 0.1: Парсинг флагов** — [main.go:37-41](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L37-L41)
+**Шаг 0.1: Парсинг флагов** — [main.go:37-41](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L37-L41)
 
 ```
 port = 6380
@@ -32,7 +32,7 @@ clusterSlotStart = 0
 clusterSlotEnd = 5460
 ```
 
-**Шаг 0.2: Создание Cluster** — [main.go:117-121](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L117-L121)
+**Шаг 0.2: Создание Cluster** — [main.go:117-121](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L117-L121)
 
 ```go
 addr := "127.0.0.1:6380"
@@ -41,7 +41,7 @@ cl.State.Self.AssignSlots(0, 5460)
 cl.State.RebuildSlotTable()
 ```
 
-Внутри `cluster.New()` — [cluster.go:52-62](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/cluster.go#L52-L62):
+Внутри `cluster.New()` — [cluster.go:52-62](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/cluster.go#L52-L62):
 
 ```
 1. generateNodeID()  → "a1b2c3d4"  (4 случайных байта → 8 hex-символов)
@@ -50,7 +50,7 @@ cl.State.RebuildSlotTable()
 4. NewReplicationManager(c)
 ```
 
-**Шаг 0.3: Создание Node** — [node.go:92-101](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/node.go#L92-L101)
+**Шаг 0.3: Создание Node** — [node.go:92-101](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/node.go#L92-L101)
 
 ```go
 &Node{
@@ -66,7 +66,7 @@ cl.State.RebuildSlotTable()
 > [!IMPORTANT]
 > `Slots` — это массив из **16384 булевых значений**. Каждый bool говорит: «эта нода владеет слотом с этим номером?» Это bitmap — быстрый O(1) lookup по индексу.
 
-**Шаг 0.4: Назначение слотов** — [node.go:112-116](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/node.go#L112-L116)
+**Шаг 0.4: Назначение слотов** — [node.go:112-116](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/node.go#L112-L116)
 
 ```go
 func (n *Node) AssignSlots(0, 5460) {
@@ -78,7 +78,7 @@ func (n *Node) AssignSlots(0, 5460) {
 
 Теперь нода "владеет" 5461 слотом из 16384.
 
-**Шаг 0.5: Построение SlotTable** — [node.go:225-242](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/node.go#L225-L242)
+**Шаг 0.5: Построение SlotTable** — [node.go:225-242](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/node.go#L225-L242)
 
 ```go
 func (cs *ClusterState) RebuildSlotTable() {
@@ -108,7 +108,7 @@ SlotTable[5461] = nil                ← никому не назначен
 SlotTable[16383] = nil
 ```
 
-**Шаг 0.6: Подключение callback-функций** — [main.go:124-144](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L124-L144)
+**Шаг 0.6: Подключение callback-функций** — [main.go:124-144](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L124-L144)
 
 ```go
 cl.GetKeysInSlotFunc = func(slot uint16, count int) []string {
@@ -121,13 +121,13 @@ cl.MigrateDelFunc = func(key string) { s.Del(key); ttl.OnDelete(key) }
 > [!TIP]
 > Кластер **не знает** о Store напрямую. Вместо этого он получает **callback-функции**. Это чистая архитектура — кластер зависит от интерфейсов, а не от конкретных реализаций. Если завтра заменить ArenaStore на другой движок, кластерный код не изменится.
 
-**Шаг 0.7: Запуск Gossip** — [main.go:147-150](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L147-L150)
+**Шаг 0.7: Запуск Gossip** — [main.go:147-150](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L147-L150)
 
 ```go
 cl.StartGossip()
 ```
 
-Это запускает **3 горутины** — [gossip.go:139-182](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L139-L182):
+Это запускает **3 горутины** — [gossip.go:139-182](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L139-L182):
 
 | # | Горутина | Что делает | Интервал |
 |---|---------|-----------|----------|
@@ -184,7 +184,7 @@ redis-cli -p 6380
 > CLUSTER MEET 127.0.0.1 6381
 ```
 
-**Шаг 1.2: Обработка CLUSTER MEET** — [cluster.go:447-490](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/cluster.go#L447-L490)
+**Шаг 1.2: Обработка CLUSTER MEET** — [cluster.go:447-490](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/cluster.go#L447-L490)
 
 ```go
 func (c *Cluster) clusterMeet(args []protocol.Value) protocol.Value {
@@ -243,7 +243,7 @@ Node-B **до сих пор не знает** о Node-A! Знакомство �
 
 Через 2 секунды после MEET сработает `gossipTicker()` на Node-A.
 
-**`pingRandomNode()`** — [gossip.go:276-337](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L276-L337):
+**`pingRandomNode()`** — [gossip.go:276-337](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L276-L337):
 
 ```go
 func (c *Cluster) pingRandomNode() {
@@ -271,7 +271,7 @@ func (c *Cluster) pingRandomNode() {
 }
 ```
 
-**`buildMessage("PING")`** — [gossip.go:352-369](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L352-L369) формирует JSON:
+**`buildMessage("PING")`** — [gossip.go:352-369](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L352-L369) формирует JSON:
 
 ```json
 {
@@ -300,7 +300,7 @@ func (c *Cluster) pingRandomNode() {
 
 ### Шаг 2.2: Node-B принимает PING
 
-На Node-B горутина `acceptLoop` принимает соединение → `handleGossipConn()` — [gossip.go:205-242](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L205-L242):
+На Node-B горутина `acceptLoop` принимает соединение → `handleGossipConn()` — [gossip.go:205-242](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L205-L242):
 
 ```go
 func (c *Cluster) handleGossipConn(conn net.Conn) {
@@ -330,7 +330,7 @@ func (c *Cluster) handleGossipConn(conn net.Conn) {
 
 ### Шаг 2.3: applyNodeInfo — ядро распространения
 
-**`applyNodeInfo()`** — [gossip.go:76-121](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L76-L121):
+**`applyNodeInfo()`** — [gossip.go:76-121](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L76-L121):
 
 ```go
 func (cs *ClusterState) applyNodeInfo(info NodeInfo) bool {
@@ -479,7 +479,7 @@ T=6s:   ✅ ВСЕ ЗНАЮТ ВСЕХ
 
 ### Шаг 3.1: Как ключ превращается в слот
 
-**CRC16 + модуль** — [slots.go](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/slots.go):
+**CRC16 + модуль** — [slots.go](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/slots.go):
 
 ```go
 // При старте программы — предвычисление таблицы
@@ -516,7 +516,7 @@ KeySlot("session:abc")= CRC16("session:abc") % 16384 = 12847
 
 Клиент подключился к Node-A (`127.0.0.1:6380`) и делает `SET user:1001 Николай`:
 
-**`CheckKey("user:1001")`** — [cluster.go:102-137](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/cluster.go#L102-L137):
+**`CheckKey("user:1001")`** — [cluster.go:102-137](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/cluster.go#L102-L137):
 
 ```go
 func (c *Cluster) CheckKey(key string) *protocol.Value {
@@ -600,7 +600,7 @@ cluster_slots_assigned:10922
 
 На Node-B: `CLUSTER SETSLOT 5000 IMPORTING a1b2c3d4`
 
-[migration.go:48-62](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/migration.go#L48-L62):
+[migration.go:48-62](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/migration.go#L48-L62):
 
 ```go
 case "IMPORTING":
@@ -622,7 +622,7 @@ case "IMPORTING":
 
 На Node-A: `CLUSTER SETSLOT 5000 MIGRATING e5f6g7h8`
 
-[migration.go:28-46](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/migration.go#L28-L46):
+[migration.go:28-46](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/migration.go#L28-L46):
 
 ```go
 case "MIGRATING":
@@ -647,7 +647,7 @@ case "MIGRATING":
 
 На Node-A: `CLUSTER GETKEYSINSLOT 5000 100`
 
-[migration.go:98-120](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/migration.go#L98-L120):
+[migration.go:98-120](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/migration.go#L98-L120):
 
 ```go
 func (c *Cluster) clusterGetKeysInSlot(args) protocol.Value {
@@ -668,9 +668,9 @@ func (c *Cluster) clusterGetKeysInSlot(args) protocol.Value {
 
 Для каждого ключа: `MIGRATE 127.0.0.1 6381 user:500`
 
-Обработчик в [main.go:303-317](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L303-L317) → вызывает `cl.MigrateKey()`:
+Обработчик в [main.go:303-317](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L303-L317) → вызывает `cl.MigrateKey()`:
 
-[migration.go:122-144](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/migration.go#L122-L144):
+[migration.go:122-144](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/migration.go#L122-L144):
 
 ```go
 func (c *Cluster) MigrateKey(host string, port int, key string) protocol.Value {
@@ -688,7 +688,7 @@ func (c *Cluster) MigrateKey(host string, port int, key string) protocol.Value {
 }
 ```
 
-**`SendSetToNode()`** — [migration.go:147-175](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/migration.go#L147-L175):
+**`SendSetToNode()`** — [migration.go:147-175](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/migration.go#L147-L175):
 
 ```go
 func SendSetToNode(addr, key string, value []byte) error {
@@ -717,7 +717,7 @@ func SendSetToNode(addr, key string, value []byte) error {
 
 Когда слот 5000 в состоянии MIGRATING на Node-A:
 
-[cluster.go:102-137](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/cluster.go#L102-L137):
+[cluster.go:102-137](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/cluster.go#L102-L137):
 
 ```go
 func (c *Cluster) CheckKey(key string) *protocol.Value {
@@ -735,7 +735,7 @@ func (c *Cluster) CheckKey(key string) *protocol.Value {
 
 Потом, если GET не нашёл ключ (уже мигрировал), вызывается **CheckKeyAsk**:
 
-[cluster.go:143-160](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/cluster.go#L143-L160) (вызов из [main.go:392-396](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L392-L396)):
+[cluster.go:143-160](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/cluster.go#L143-L160) (вызов из [main.go:392-396](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L392-L396)):
 
 ```go
 func (c *Cluster) CheckKeyAsk(key string) *protocol.Value {
@@ -770,7 +770,7 @@ if importing {
 
 На обеих нодах: `CLUSTER SETSLOT 5000 NODE e5f6g7h8`
 
-[migration.go:64-91](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/migration.go#L64-L91):
+[migration.go:64-91](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/migration.go#L64-L91):
 
 ```go
 case "NODE":
@@ -830,7 +830,7 @@ case "NODE":
 
 ### Шаг 5.1: Три состояния ноды
 
-[node.go:19-25](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/node.go#L19-L25):
+[node.go:19-25](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/node.go#L19-L25):
 
 ```
 ONLINE  ──(10 сек без ответа)──▶  PFAIL  ──(30 сек без ответа)──▶  FAIL
@@ -846,7 +846,7 @@ ONLINE  ──(10 сек без ответа)──▶  PFAIL  ──(30 сек 
 
 ### Шаг 5.2: failureDetector() — тикер проверки
 
-[gossip.go:391-435](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L391-L435):
+[gossip.go:391-435](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L391-L435):
 
 ```go
 func (c *Cluster) failureDetector() {
@@ -892,7 +892,7 @@ func (c *Cluster) checkNodeHealth() {
 
 Если нода вернулась (ответила на PING), она автоматически становится ONLINE.
 
-В `handleGossipConn()` ([gossip.go:220-229](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L220-L229)):
+В `handleGossipConn()` ([gossip.go:220-229](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L220-L229)):
 
 ```go
 if node.State != NodeOnline {
@@ -901,7 +901,7 @@ if node.State != NodeOnline {
 }
 ```
 
-То же самое в `pingRandomNode()` ([gossip.go:324-330](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L324-L330)).
+То же самое в `pingRandomNode()` ([gossip.go:324-330](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L324-L330)).
 
 ### Временная шкала обнаружения сбоя:
 
@@ -932,7 +932,7 @@ redis-cli -p 6382
 > CLUSTER REPLICATE a1b2c3d4
 ```
 
-[cluster.go:224-249](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/cluster.go#L224-L249):
+[cluster.go:224-249](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/cluster.go#L224-L249):
 
 ```go
 func (c *Cluster) clusterReplicate(args) protocol.Value {
@@ -950,7 +950,7 @@ func (c *Cluster) clusterReplicate(args) protocol.Value {
 
 ### Шаг 6.2: ConnectToMaster — полная синхронизация
 
-[replication.go:84-129](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/replication.go#L84-L129):
+[replication.go:84-129](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/replication.go#L84-L129):
 
 ```go
 func (rm *ReplicationManager) ConnectToMaster(masterAddr string) {
@@ -984,7 +984,7 @@ func (rm *ReplicationManager) ConnectToMaster(masterAddr string) {
 
 ### Шаг 6.3: HandlePsync — мастер отвечает реплике
 
-На мастере (Node-A) приходит команда PSYNC → [main.go:319-328](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L319-L328):
+На мастере (Node-A) приходит команда PSYNC → [main.go:319-328](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L319-L328):
 
 ```go
 case "PSYNC":
@@ -992,7 +992,7 @@ case "PSYNC":
     cl.Repl.HandlePsync(conn, replicaID)
 ```
 
-[replication.go:43-65](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/replication.go#L43-L65):
+[replication.go:43-65](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/replication.go#L43-L65):
 
 ```go
 func (rm *ReplicationManager) HandlePsync(conn net.Conn, replicaID string) {
@@ -1016,7 +1016,7 @@ func (rm *ReplicationManager) HandlePsync(conn net.Conn, replicaID string) {
 
 После FULLSYNC_DONE **соединение остаётся открытым**. Каждый SET/DEL на мастере пересылается:
 
-[replication.go:69-80](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/replication.go#L69-L80):
+[replication.go:69-80](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/replication.go#L69-L80):
 
 ```go
 func (rm *ReplicationManager) ForwardWrite(command string) {
@@ -1027,7 +1027,7 @@ func (rm *ReplicationManager) ForwardWrite(command string) {
 }
 ```
 
-Вызывается из SET и DEL в [main.go:349-351](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L349-L351):
+Вызывается из SET и DEL в [main.go:349-351](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L349-L351):
 
 ```go
 if cl != nil && cl.Repl != nil {
@@ -1058,7 +1058,7 @@ if cl != nil && cl.Repl != nil {
 
 ### Шаг 6.5: GET на реплике — read-only
 
-[main.go:378-383](file:///home/nikolay/storage_in_memory/kvstore/cmd/kvstore/main.go#L378-L383):
+[main.go:378-383](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/cmd/kvstore/main.go#L378-L383):
 
 ```go
 case "GET":
@@ -1088,7 +1088,7 @@ T=34s:   Node-C (реплика A): failureDetector → Node-A FAIL
 
 ### promoteToMaster — автоматическое повышение
 
-[gossip.go:440-465](file:///home/nikolay/storage_in_memory/kvstore/internal/cluster/gossip.go#L440-L465):
+[gossip.go:440-465](https://github.com/Nikolay1994Kaz/storage_in_memory/blob/master/kvstore/internal/cluster/gossip.go#L440-L465):
 
 ```go
 func (c *Cluster) promoteToMaster(deadMaster *Node) {
