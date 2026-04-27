@@ -1,5 +1,15 @@
 package tcmalloc
 
+// sweepInterval — каждые N аллокаций worker проверяет свои span'ы.
+//
+// Если span полностью пуст (все объекты были выделены и все освобождены),
+// он возвращается в MCentral для переиспользования другими worker'ами.
+//
+// 4096 — компромисс:
+//   - Слишком маленькое = sweep вызывается часто, overhead на горячем пути
+//   - Слишком большое = span'ы долго лежат "в заложниках" у idle worker'а
+const sweepInterval = 4096
+
 // MCache — per-worker кеш аллокатора.
 //
 // Аналог runtime.mcache в Go runtime.
@@ -55,6 +65,9 @@ func NewMCache(centrals [numSizeClasses]*MCentral) *MCache {
 // Горячий путь (99% вызовов): span.Alloc() → 0 locks, ~5ns
 // Холодный путь (1% вызовов):  refill из MCentral → 1 mutex, ~100ns
 //
+// Каждые sweepInterval аллокаций — self-sweep:
+// проверяем свои span'ы, возвращаем полностью пустые в MCentral.
+//
 // ZERO LOCKS на горячем пути!
 func (c *MCache) Alloc(size int) ([]byte, Handle) {
 	sc := SizeClassForSize(size)
@@ -70,6 +83,14 @@ func (c *MCache) Alloc(size int) ([]byte, Handle) {
 	if s != nil {
 		if buf, idx := s.Alloc(); buf != nil {
 			c.AllocCount++
+
+			// Self-sweep: каждые N аллокаций проверяем свои span'ы.
+			// Это дёшево: одно сравнение + побитовое И на горячем пути.
+			// sweep() вызывается ~0.02% операций.
+			if c.AllocCount&(sweepInterval-1) == 0 {
+				c.sweep()
+			}
+
 			return buf, MakeHandle(s.spanID, idx)
 		}
 
@@ -90,20 +111,28 @@ func (c *MCache) Alloc(size int) ([]byte, Handle) {
 
 // Free освобождает объект по его Handle.
 //
-// Находит span по spanID, вызывает span.Free(objIndex).
+// Находит span по spanID и определяет тип:
 //
-// Важно: в нашей модели Free может вызывать ЛЮБОЙ worker
-// (не обязательно тот, кто аллоцировал). Это нормально:
-//   - Если span принадлежит нашему mcache → lock-free
-//   - Если span принадлежит другому mcache → тоже ок, потому что
-//     span.Free() — это просто append в freeStack
+//   - Large span (sizeClass == -1):
+//     Возвращает span в heap.largeFree пул.
+//     Без этого large span'ы копились бы мёртвым грузом → OOM.
 //
-// В Go runtime это сложнее (GC), у нас — проще.
+//   - Normal span:
+//     Вызывает span.Free(objIndex), который сам определяет
+//     нужен ли mutex (spanInCentral) или нет (spanInCache).
 func (c *MCache) Free(heap *MHeap, handle Handle) {
 	s := heap.GetSpan(handle.SpanID())
 	if s == nil {
 		return
 	}
+
+	// Large object → возвращаем в heap pool для переиспользования.
+	if s.sizeClass < 0 {
+		heap.FreeLarge(s)
+		return
+	}
+
+	// Normal object → push в freeStack (lock-free или с mutex).
 	s.Free(handle.ObjIndex())
 }
 
@@ -114,6 +143,34 @@ func (c *MCache) allocLarge(size int) ([]byte, Handle) {
 	buf, handle := c.centrals[0].heap.AllocLarge(size)
 	c.AllocCount++
 	return buf, handle
+}
+
+// sweep проверяет span'ы в alloc[] и возвращает полностью пустые в MCentral.
+//
+// «Полностью пустой» = все объекты были выделены (allocIndex == capacity)
+// И все были освобождены (len(freeStack) == capacity).
+//
+// Это решает проблему «заложников»:
+//   - Worker 1 получил нагрузку, забрал span'ы
+//   - Нагрузка ушла, все ключи удалены (DEL)
+//   - Span'ы пустые, но лежат в alloc[] Worker'а 1
+//   - Worker 2 не может их получить, идёт в MHeap за новой памятью
+//   - sweep() возвращает пустые span'ы в MCentral → Worker 2 получит их
+//
+// RACE-SAFE: вызывается только владельцем mcache (single-writer).
+func (c *MCache) sweep() {
+	for sc := 0; sc < numSizeClasses; sc++ {
+		s := c.alloc[sc]
+		if s == nil {
+			continue
+		}
+
+		// Span полностью пуст: все слоты были использованы и все освобождены.
+		if s.allocIndex >= s.capacity && len(s.freeStack) >= s.capacity {
+			c.centrals[sc].ReturnSpan(s)
+			c.alloc[sc] = nil
+		}
+	}
 }
 
 // Flush возвращает все span'ы обратно в MCentral.

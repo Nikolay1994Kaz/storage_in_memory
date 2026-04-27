@@ -7,8 +7,6 @@ import (
 	"runtime"
 	"sync/atomic"
 	"time"
-
-	"kvstore/kvstore/internal/protocol"
 )
 
 const (
@@ -18,21 +16,30 @@ const (
 	ReadTimeout = 5 * time.Second
 )
 
-// ConnState хранит состояние соединения: Reader и Writer переиспользуются
-// между командами, чтобы избежать аллокации bufio.Reader (4KB) на каждый запрос.
+// ConnState хранит состояние соединения.
+//
+// Buf — per-connection ring buffer (заменяет bufio.Reader + bufio.Writer).
+// WorkerID — идентификатор epoll-воркера для TCMallocStore MCache.
 type ConnState struct {
-	Conn    net.Conn
-	Reader  *protocol.Reader
-	Writer  *protocol.Writer
-	InTx    bool
-	TxQueue [][]protocol.Value
+	Conn     net.Conn
+	Buf      *ConnBuf // ← заменяет Reader + Writer
+	WorkerID int
+	InTx     bool
+	TxQueue  [][][]byte // ← was [][]protocol.Value
 }
 
 // Handler — функция обработки RESP-команды.
-type Handler func(cs *ConnState, args []protocol.Value) protocol.Value
+//
+// Было:  func(cs, args []Value) Value   — создаёт Value, возвращает Value
+// Стало: func(cs, args [][]byte)        — читает из ring buffer, пишет в ring buffer
+//
+// Handler НЕ возвращает значение. Вместо этого пишет ответ прямо в cs.Buf:
+//   cs.Buf.WriteSimpleString("OK")
+//   cs.Buf.WriteBulk(value)
+//   cs.Buf.WriteError("ERR ...")
+type Handler func(cs *ConnState, args [][]byte)
 
 // worker — один воркер со своим epoll instance.
-// Каждый воркер независим: свой epoll, своя очередь событий.
 type worker struct {
 	id    int
 	epoll *Epoll
@@ -44,7 +51,7 @@ type Server struct {
 	handler  Handler
 	listener net.Listener
 	workers  []*worker
-	next     atomic.Uint64 // счётчик для Round Robin
+	next     atomic.Uint64
 }
 
 func NewServer(addr string, handler Handler) *Server {
@@ -63,7 +70,6 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen on %s: %w", s.addr, err)
 	}
 
-	// Создаём по одному воркеру на каждый CPU
 	numWorkers := runtime.NumCPU()
 	s.workers = make([]*worker, numWorkers)
 
@@ -74,7 +80,6 @@ func (s *Server) Start() error {
 		}
 		s.workers[i] = &worker{id: i, epoll: ep}
 
-		// Каждый воркер крутит свой event loop на своём epoll
 		go s.eventLoop(s.workers[i])
 	}
 
@@ -85,7 +90,6 @@ func (s *Server) Start() error {
 }
 
 // nextWorker выбирает следующего воркера по Round Robin.
-// atomic.Uint64 — lock-free, zero contention.
 func (s *Server) nextWorker() *worker {
 	idx := s.next.Add(1)
 	return s.workers[idx%uint64(len(s.workers))]
@@ -100,15 +104,14 @@ func (s *Server) acceptLoop() {
 			return
 		}
 
-		// Создаём ConnState с Reader/Writer один раз при подключении
+		w := s.nextWorker()
+
 		cs := &ConnState{
-			Conn:   conn,
-			Reader: protocol.NewReader(conn),
-			Writer: protocol.NewWriter(conn),
+			Conn:     conn,
+			Buf:      NewConnBuf(conn), // ← ConnBuf вместо Reader+Writer
+			WorkerID: w.id,
 		}
 
-		// Round Robin: каждое новое соединение → следующий воркер
-		w := s.nextWorker()
 		if err := w.epoll.Add(cs); err != nil {
 			log.Printf("Epoll Add error (worker %d): %v", w.id, err)
 			conn.Close()
@@ -118,7 +121,6 @@ func (s *Server) acceptLoop() {
 }
 
 // eventLoop — главный цикл воркера.
-// Каждый воркер ждёт событий ТОЛЬКО на своих соединениях.
 func (s *Server) eventLoop(w *worker) {
 	for {
 		states, err := w.epoll.Wait()
@@ -133,26 +135,48 @@ func (s *Server) eventLoop(w *worker) {
 	}
 }
 
-// handleConn обрабатывает одну команду от клиента.
+// handleConn обрабатывает команды от клиента.
+//
+// ★ HYBRID: RING BUFFER + GREEDY DRAIN ★
+//
+// Цикл:
+//   1. ReadFromConn() — основной read (epoll гарантирует данные)
+//   2. ParseCommand() loop — разбираем ВСЕ команды из буфера
+//   3. TryRead() — non-blocking raw syscall.Read:
+//      пока мы обрабатывали команды (~100μs), клиент уже мог
+//      отправить следующую. Ловим её БЕЗ нового epoll_wait.
+//   4. Если TryRead вернул данные — обрабатываем и повторяем
+//   5. Flush() — ONE write() для всех ответов
+//
+// Это то, что делает bufio.Reader "бесплатно" — жадно читает
+// больше данных чем нужно. Мы делаем то же, но осознанно и
+// без overhead bufio (без двойного буфера, без лишних memcpy).
 func (s *Server) handleConn(w *worker, cs *ConnState) {
-	// Защита от Slowloris / partial read
-	cs.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
-
-	value, err := cs.Reader.Read()
-	if err != nil {
+	n, err := cs.Buf.ReadFromConn()
+	if n == 0 || err != nil {
 		w.epoll.Remove(cs)
 		return
 	}
 
-	cs.Conn.SetReadDeadline(time.Time{}) // сброс дедлайна
+	for {
+		// Разбираем и обрабатываем ВСЕ команды из буфера
+		for {
+			args := cs.Buf.ParseCommand()
+			if args == nil {
+				break
+			}
+			s.handler(cs, args)
+		}
 
-	if value.Typ != '*' || len(value.Array) == 0 {
-		cs.Writer.Write(protocol.Value{Typ: '-', Str: "ERR invalid command"})
-		return
+		// Greedy drain: пробуем забрать ещё данные (non-blocking)
+		if cs.Buf.TryRead() == 0 {
+			break // нет данных — выходим
+		}
+		// Есть данные — продолжаем обработку
 	}
 
-	result := s.handler(cs, value.Array)
-	cs.Writer.Write(result)
+	// Один write() для ВСЕХ ответов (включая greedy drain)
+	cs.Buf.Flush()
 }
 
 // Stop останавливает сервер.

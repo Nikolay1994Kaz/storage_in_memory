@@ -11,6 +11,8 @@
 //   - Google TCMalloc: https://google.github.io/tcmalloc/design.html
 package tcmalloc
 
+import "sync"
+
 // ─── Size Classes ───────────────────────────────────────────
 //
 // Каждый аллоцируемый объект попадает в ближайший size class.
@@ -73,6 +75,21 @@ func SizeClassForSize(size int) int {
 	return -1 // large object
 }
 
+// ─── Span State ─────────────────────────────────────────────
+//
+// Span может находиться в двух состояниях:
+//
+//   spanInCache   — span принадлежит конкретному mcache.
+//                   Alloc/Free вызываются ОДНИМ worker'ом → lock-free.
+//
+//   spanInCentral — span лежит в MCentral (в partial или full).
+//                   Free может вызвать ЛЮБОЙ worker → нужен mutex.
+//                   При Free, если span был в full → ReturnToPartial.
+const (
+	spanInCache   uint32 = 0
+	spanInCentral uint32 = 1
+)
+
 // ─── Span ───────────────────────────────────────────────────
 //
 // Span — непрерывный блок памяти, разбитый на N объектов одного size class.
@@ -86,14 +103,24 @@ func SizeClassForSize(size int) int {
 //	mheap.AllocSpan() → mcentral (partial list) → mcache.alloc[class]
 //	                                              ↕ (alloc/free)
 //	                  ← mcentral (full list)    ← mcache (когда span полон)
+//
+// Ownership tracking:
+//
+//	state == spanInCache   → принадлежит mcache, lock-free доступ
+//	state == spanInCentral → лежит в mcentral, Free() берёт mu
+//
+//	При Free() + state==spanInCentral:
+//	  1. Берём s.mu (защита freeStack от параллельных Free)
+//	  2. Если span был полон → вызываем central.ReturnToPartial(s)
 type Span struct {
 	// Память, из которой нарезаются объекты.
 	// Это slice из chunk'а mheap (НЕ отдельная аллокация).
 	data []byte
 
 	// Метаданные
-	elemSize int // размер одного объекта (= sizeClasses[sizeClass])
-	capacity int // максимальное количество объектов в span
+	elemSize  int // размер одного объекта (= sizeClasses[sizeClass])
+	capacity  int // максимальное количество объектов в span
+	sizeClass int // индекс size class (для back-reference на MCentral)
 
 	// ─── Аллокатор: bump pointer + freelist ───
 	//
@@ -119,21 +146,36 @@ type Span struct {
 	freeStack  []int // стек индексов освобождённых объектов
 
 	spanID uint32
+
+	// ─── Ownership tracking ───
+	//
+	// mu защищает freeStack когда span в состоянии spanInCentral.
+	// Когда span в spanInCache — mu НЕ берётся (single-writer, lock-free).
+	//
+	// central — back-reference для вызова ReturnToPartial.
+	// Устанавливается один раз при AllocSpan и не меняется.
+	mu      sync.Mutex
+	state   uint32    // spanInCache или spanInCentral
+	central *MCentral // back-reference на «свой» MCentral
 }
 
 // NewSpan создаёт span над существующим блоком памяти.
 //
 // data — slice из chunk'а mheap (не копируется, не аллоцируется).
 // elemSize — размер одного объекта.
-// chunkID, chunkOffset — координаты для handle.
-func NewSpan(data []byte, elemSize int) *Span {
+// sizeClass — индекс size class (для back-reference).
+// central — MCentral, которому принадлежит span (для ReturnToPartial).
+func NewSpan(data []byte, elemSize, sizeClass int, central *MCentral) *Span {
 	cap := len(data) / elemSize
 	return &Span{
 		data:       data,
 		elemSize:   elemSize,
+		sizeClass:  sizeClass,
 		capacity:   cap,
 		allocIndex: 0,
 		freeStack:  make([]int, 0, cap/4),
+		state:      spanInCentral, // рождается в central (до выдачи в mcache)
+		central:    central,
 	}
 }
 
@@ -166,14 +208,37 @@ func (s *Span) Alloc() ([]byte, int) {
 
 // Free возвращает объект по индексу обратно в span.
 //
-// ZERO LOCKS — вызывается только из mcache владельца.
+// Поведение зависит от состояния span'а:
+//
+//   state == spanInCache:
+//     Lock-free. Вызывается только владельцем-mcache.
+//     Просто push в freeStack.
+//
+//   state == spanInCentral:
+//     Берёт s.mu (защита от параллельных Free из разных workers).
+//     Если span БЫЛ полон (wasFull) → вызывает central.ReturnToPartial(s),
+//     чтобы вернуть span в оборот.
 //
 // Примечание: НЕ обнуляем память. Данные будут перезаписаны
 // при следующем Alloc+encodeInto. Обнуление стоило 10% CPU (pprof).
-// Для security-critical систем — раскомментировать.
 func (s *Span) Free(objIndex int) {
-	// Помещаем индекс в free stack (O(1), просто append)
+	if s.state == spanInCache {
+		// Span принадлежит нашему mcache → single writer, lock-free.
+		s.freeStack = append(s.freeStack, objIndex)
+		return
+	}
+
+	// Span в MCentral → нужен mutex (любой worker может вызвать Free).
+	s.mu.Lock()
+	wasFull := s.IsFull() // проверяем ДО добавления в freeStack
 	s.freeStack = append(s.freeStack, objIndex)
+	s.mu.Unlock()
+
+	// Если span был полностью заполнен, а теперь появилось место →
+	// переводим из full в partial, чтобы другие mcache могли его получить.
+	if wasFull && s.central != nil {
+		s.central.ReturnToPartial(s)
+	}
 }
 
 // IsFull возвращает true если в span нет свободных объектов.

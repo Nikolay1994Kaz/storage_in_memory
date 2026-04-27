@@ -54,9 +54,13 @@ func NewMCentral(sizeClass int, heap *MHeap) *MCentral {
 //  1. Есть partial span? → отдаём его (дёшево, переиспользование)
 //  2. Нет partial? → аллоцируем НОВЫЙ span из mheap (дорого, редко)
 //
+// Устанавливает span.state = spanInCache перед выдачей.
+// Это гарантирует, что Free() не будет брать mutex на freeStack
+// пока span в mcache (lock-free путь).
+//
 // MUTEX: берёт c.mu на время операции.
 // Но mcache вызывает GetSpan РЕДКО — только когда его текущий
-// span полностью заполнен (каждые 64-128 аллокаций).
+// span полностью заполнен (каждые 64-1024 аллокации).
 func (c *MCentral) GetSpan() *Span {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -66,15 +70,21 @@ func (c *MCentral) GetSpan() *Span {
 		// Берём последний (O(1), без сдвига массива)
 		s := c.partial[n-1]
 		c.partial = c.partial[:n-1]
+		s.state = spanInCache // передаём владение mcache
 		return s
 	}
 
 	// Путь 2: partial пуст — просим новый span у mheap
 	c.totalSpansAllocated++
-	return c.heap.AllocSpan(c.sizeClass)
+	s := c.heap.AllocSpan(c.sizeClass, c)
+	s.state = spanInCache // сразу отдаём в mcache
+	return s
 }
 
 // ReturnSpan возвращает span обратно в mcentral.
+//
+// Устанавливает span.state = spanInCentral.
+// После этого Free() на этом span'е будет брать mutex.
 //
 // Вызывается из mcache когда:
 //   - span полон → кладём в full
@@ -82,6 +92,8 @@ func (c *MCentral) GetSpan() *Span {
 func (c *MCentral) ReturnSpan(s *Span) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	s.state = spanInCentral // теперь span принадлежит central
 
 	if s.IsFull() {
 		c.full = append(c.full, s)

@@ -5,10 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +21,7 @@ import (
 	"kvstore/kvstore/internal/pubsub"
 	"kvstore/kvstore/internal/server"
 	"kvstore/kvstore/internal/store"
+	"kvstore/kvstore/internal/store/tcmalloc"
 	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
 )
@@ -40,12 +41,13 @@ func main() {
 	clusterSlotEnd := flag.Int("slot-end", 16383, "конец диапазона слотов")
 	flag.Parse()
 
-	s := store.NewArenaStore()
+	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
+	s := tcmalloc.NewTCMallocStore(runtime.NumCPU())
 
 	os.MkdirAll(dataDir, 0755)
 
-	// === 1. TTL Manager (до восстановления, чтобы восстановить TTL из WAL) ===
-	ttl := store.NewTTLManager(s)
+	// === 1. TTL Manager ===
+	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
 	defer ttl.Stop()
 
 	// === 2. Восстановление ===
@@ -54,7 +56,6 @@ func main() {
 		log.Fatalf("Failed to read WALs: %v", err)
 	}
 
-	// === Vector Store (до восстановления, чтобы восстановить вектора из WAL) ===
 	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
 
 	restored := 0
@@ -62,10 +63,10 @@ func main() {
 	for _, entry := range entries {
 		switch entry.Op {
 		case wal.OpSet:
-			s.Set(entry.Key, entry.Value)
+			s.Set(0, entry.Key, entry.Value)
 			restored++
 		case wal.OpDel:
-			s.Del(entry.Key)
+			s.Del(0, entry.Key)
 			ttl.OnDelete(entry.Key)
 			restored++
 		case wal.OpExpire:
@@ -75,7 +76,7 @@ func main() {
 				if remaining > 0 {
 					ttl.Set(entry.Key, remaining)
 				} else {
-					s.Del(entry.Key)
+					s.Del(0, entry.Key)
 					ttl.OnDelete(entry.Key)
 				}
 			}
@@ -99,14 +100,16 @@ func main() {
 
 	// === 3. WAL ===
 	walPath := filepath.Join(dataDir, fmt.Sprintf("wal_%s.log", time.Now().Format("20060102_150405")))
-	w, err := wal.Open(walPath)
+	rawWAL, err := wal.Open(walPath)
 	if err != nil {
 		log.Fatalf("Failed to open WAL: %v", err)
 	}
-	defer w.Close()
+
+	bw := wal.NewBatchWAL(rawWAL)
+	defer bw.Close()
 
 	// === 4. Syncer ===
-	syncer := wal.NewSyncer(w, syncInterval, dataDir, s.ForEach)
+	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, s.ForEach)
 	defer syncer.Stop()
 
 	// === 5. Pub/Sub Hub ===
@@ -128,22 +131,20 @@ func main() {
 			return s.Get(key)
 		}
 		cl.MigrateDelFunc = func(key string) {
-			s.Del(key)
+			s.Del(0, key)
 			ttl.OnDelete(key)
 		}
 
-		// Callback-функции для репликации:
 		cl.Repl.StoreForEach = func(fn func(key string, value []byte)) {
 			s.ForEach(fn)
 		}
 		cl.Repl.StoreSet = func(key string, value []byte) {
-			s.Set(key, value)
+			s.Set(0, key, value)
 		}
 		cl.Repl.StoreDel = func(key string) {
-			s.Del(key)
+			s.Del(0, key)
 		}
 
-		// Запуск Gossip (PING/PONG между нодами)
 		if err := cl.StartGossip(); err != nil {
 			log.Fatalf("Failed to start gossip: %v", err)
 		}
@@ -157,21 +158,18 @@ func main() {
 	wasm.GlobalLock = func() { globalTxMu.Lock() }
 	wasm.GlobalUnlock = func() { globalTxMu.Unlock() }
 
-	// Callback-мостики для WASM → Store/PubSub
 	wasm.StoreGet = func(key string) ([]byte, bool) {
 		return s.Get(key)
 	}
 	wasm.StoreSet = func(key string, value []byte) {
-		s.Set(key, value)
+		s.Set(0, key, value)
 	}
 	wasm.StoreDel = func(key string) {
-		s.Del(key)
+		s.Del(0, key)
 	}
 	wasm.Publish = func(channel, message string) {
 		hub.Publish(channel, message)
-
 	}
-	// vecStore уже создан выше (перед восстановлением из WAL)
 	wasm.VSimSearch = func(query []float32, K int) []struct {
 		Key      string
 		Distance float32
@@ -191,80 +189,80 @@ func main() {
 		return out
 	}
 
-	// WAL-aware callbacks: данные из WASM переживают рестарт
 	wasm.StoreSetWithWAL = func(key string, value []byte) error {
-		if err := w.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value}); err != nil {
-			return err
-		}
-		s.Set(key, value)
+		bw.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value})
+		s.Set(0, key, value)
 		return nil
 	}
 	wasm.StoreDelWithWAL = func(key string) error {
-		if err := w.Write(wal.Entry{Op: wal.OpDel, Key: key}); err != nil {
-			return err
-		}
-		s.Del(key)
+		bw.Write(wal.Entry{Op: wal.OpDel, Key: key})
+		s.Del(0, key)
 		ttl.OnDelete(key)
 		return nil
 	}
 
+	// Загрузка WASM модулей с диска
 	triggers := compute.NewTriggerManager(wasm)
-	if err := compute.LoadAll(dataDir, wasm, triggers); err != nil {
-		log.Printf("WARNING: WASM restore failed: %v", err)
-	}
+	compute.LoadAll(dataDir, wasm, triggers)
 
-	// === 8. Handler ===
-	// === 8. Handler ===
-	handler := func(cs *server.ConnState, args []protocol.Value) protocol.Value {
-		cmd := strings.ToUpper(args[0].Str)
+	// ═══════════════════════════════════════════════════
+	// HANDLER — zero-alloc: args = [][]byte из ring buffer
+	// ═══════════════════════════════════════════════════
+
+	handler := func(cs *server.ConnState, args [][]byte) {
+		if len(args) == 0 {
+			cs.Buf.WriteError("ERR empty command")
+			return
+		}
+
+		cmd := strings.ToUpper(string(args[0]))
 		cmdArgs := args[1:]
 
-		// --- Транзакционный перехват ---
-		// Команды управления транзакцией обрабатываются всегда:
+		// Транзакции
 		switch cmd {
 		case "MULTI":
-			if cs.InTx {
-				return protocol.Value{Typ: '-', Str: "ERR MULTI calls can not be nested"}
-			}
 			cs.InTx = true
-			cs.TxQueue = nil // очищаем буфер на всякий случай
-			return protocol.Value{Typ: '+', Str: "OK"}
-
+			cs.Buf.WriteSimpleString("OK")
+			return
 		case "DISCARD":
 			if !cs.InTx {
-				return protocol.Value{Typ: '-', Str: "ERR DISCARD without MULTI"}
+				cs.Buf.WriteError("ERR DISCARD without MULTI")
+				return
 			}
 			cs.InTx = false
 			cs.TxQueue = nil
-			return protocol.Value{Typ: '+', Str: "OK"}
-
+			cs.Buf.WriteSimpleString("OK")
+			return
 		case "EXEC":
 			if !cs.InTx {
-				return protocol.Value{Typ: '-', Str: "ERR EXEC without MULTI"}
+				cs.Buf.WriteError("ERR EXEC without MULTI")
+				return
 			}
-			// Захватываем глобальный лок → выполняем ВСЕ команды атомарно
 			globalTxMu.Lock()
-			results := make([]protocol.Value, len(cs.TxQueue))
-			for i, queuedArgs := range cs.TxQueue {
-				qCmd := strings.ToUpper(queuedArgs[0].Str)
+			cs.Buf.WriteArrayHeader(len(cs.TxQueue))
+			for _, queuedArgs := range cs.TxQueue {
+				qCmd := strings.ToUpper(string(queuedArgs[0]))
 				qCmdArgs := queuedArgs[1:]
-				results[i] = executeCommand(s, w, ttl, hub, cl, wasm, triggers, vecStore, cs.Conn, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, cs, qCmd, qCmdArgs)
 			}
 			globalTxMu.Unlock()
-			// Сбрасываем состояние транзакции
 			cs.InTx = false
 			cs.TxQueue = nil
-			return protocol.Value{Typ: '*', Array: results}
+			return
 		}
 
-		// Если клиент в транзакции — складываем команду в очередь
 		if cs.InTx {
-			cs.TxQueue = append(cs.TxQueue, args)
-			return protocol.Value{Typ: '+', Str: "QUEUED"}
+			// Копируем args — ring buffer будет перезаписан!
+			argsCopy := make([][]byte, len(args))
+			for i, a := range args {
+				argsCopy[i] = append([]byte(nil), a...)
+			}
+			cs.TxQueue = append(cs.TxQueue, argsCopy)
+			cs.Buf.WriteSimpleString("QUEUED")
+			return
 		}
 
-		// Обычный режим — выполняем сразу
-		return executeCommand(s, w, ttl, hub, cl, wasm, triggers, vecStore, cs.Conn, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, cs, cmd, cmdArgs)
 	}
 
 	// === 8. Сервер ===
@@ -285,420 +283,475 @@ func main() {
 	srv.Stop()
 }
 
-func executeCommand(s *store.ArenaStore, w *wal.WAL, ttl *store.TTLManager,
+// writeValue — helper для записи protocol.Value в ConnBuf.
+// Используется для cluster API (CheckKey, MigrateKey), которые
+// всё ещё возвращают protocol.Value.
+func writeValue(buf *server.ConnBuf, v protocol.Value) {
+	switch v.Typ {
+	case '+':
+		buf.WriteSimpleString(v.Str)
+	case '-':
+		buf.WriteError(v.Str)
+	case ':':
+		buf.WriteInt(v.Num)
+	case '$':
+		if v.Num == -1 {
+			buf.WriteNull()
+		} else {
+			buf.WriteBulkString(v.Str)
+		}
+	case '*':
+		buf.WriteArrayHeader(len(v.Array))
+		for _, item := range v.Array {
+			writeValue(buf, item)
+		}
+	case 0:
+		// пустой ответ (SUBSCRIBE — writePump сам отправляет)
+	}
+}
+
+// arg — helper: безопасное получение string из args.
+func arg(args [][]byte, i int) string {
+	if i >= len(args) {
+		return ""
+	}
+	return string(args[i])
+}
+
+func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
 	hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine,
 	triggers *compute.TriggerManager, vecStore *vector.VectorStore,
-	conn net.Conn, cmd string, args []protocol.Value) protocol.Value {
+	cs *server.ConnState, cmd string, args [][]byte) {
+
+	buf := cs.Buf
+	workerID := cs.WorkerID
 
 	switch cmd {
 	case "PING":
-		return protocol.Value{Typ: '+', Str: "PONG"}
+		buf.WriteSimpleString("PONG")
 
-	// === Cluster команды ===
+	// === Cluster ===
 	case "CLUSTER":
 		if cl != nil {
-			return cl.HandleClusterCommand(args)
+			// Конвертируем [][]byte → []protocol.Value для legacy cluster API
+			pArgs := make([]protocol.Value, len(args))
+			for i, a := range args {
+				pArgs[i] = protocol.Value{Typ: '$', Str: string(a)}
+			}
+			writeValue(buf, cl.HandleClusterCommand(pArgs))
+		} else {
+			buf.WriteError("ERR cluster mode is not enabled")
 		}
-		return protocol.Value{Typ: '-', Str: "ERR cluster mode is not enabled"}
+
 	case "MIGRATE":
-		// MIGRATE <host> <port> <key>
 		if cl == nil {
-			return protocol.Value{Typ: '-', Str: "ERR cluster mode is not enabled"}
+			buf.WriteError("ERR cluster mode is not enabled")
+			return
 		}
 		if len(args) < 3 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'MIGRATE'"}
+			buf.WriteError("ERR wrong number of arguments for 'MIGRATE'")
+			return
 		}
-		host := args[0].Str
-		port, err := strconv.Atoi(args[1].Str)
+		host := string(args[0])
+		port, err := strconv.Atoi(string(args[1]))
 		if err != nil {
-			return protocol.Value{Typ: '-', Str: "ERR invalid port"}
+			buf.WriteError("ERR invalid port")
+			return
 		}
-		key := args[2].Str
-		return cl.MigrateKey(host, port, key)
+		key := string(args[2])
+		writeValue(buf, cl.MigrateKey(host, port, key))
 
 	case "PSYNC":
 		if cl == nil {
-			return protocol.Value{Typ: '-', Str: "ERR cluster mode is not enabled"}
+			buf.WriteError("ERR cluster mode is not enabled")
+			return
 		}
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'PSYNC'"}
+			buf.WriteError("ERR wrong number of arguments for 'PSYNC'")
+			return
 		}
-		replicaID := args[0].Str
-		cl.Repl.HandlePsync(conn, replicaID)
-		return protocol.Value{Typ: '+', Str: ""}
+		replicaID := string(args[0])
+		cl.Repl.HandlePsync(cs.Conn, replicaID)
 
 	case "SET":
 		if len(args) < 2 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'SET'"}
+			buf.WriteError("ERR wrong number of arguments for 'SET'")
+			return
 		}
-		key := args[0].Str
-		// Кластерная маршрутизация: проверяем, наш ли слот
+		key := string(args[0])
 		if cl != nil {
 			if moved := cl.CheckKey(key); moved != nil {
-				return *moved
+				writeValue(buf, *moved)
+				return
 			}
 		}
-		value := []byte(args[1].Str)
+		// args[1] — слайс ring buffer. Нужна копия для TCMalloc (буфер будет перезаписан).
+		value := make([]byte, len(args[1]))
+		copy(value, args[1])
 
-		if err := w.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value}); err != nil {
-			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
-		}
-		s.Set(key, value)
+		bw.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value})
+		s.Set(workerID, key, value)
 
-		// Репликация: пересылаем всем репликам
 		if cl != nil && cl.Repl != nil {
 			cl.Repl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
 		}
-
-		// WASM триггеры: уведомляем о SET
 		triggers.Fire(compute.OnSet, key)
 
-		if len(args) >= 4 && strings.ToUpper(args[2].Str) == "EX" {
-			seconds, err := strconv.Atoi(args[3].Str)
+		if len(args) >= 4 && strings.ToUpper(string(args[2])) == "EX" {
+			seconds, err := strconv.Atoi(string(args[3]))
 			if err != nil || seconds <= 0 {
-				return protocol.Value{Typ: '-', Str: "ERR invalid expire time"}
+				buf.WriteError("ERR invalid expire time")
+				return
 			}
 			dur := time.Duration(seconds) * time.Second
 			expiresAt := time.Now().Add(dur)
-			var buf [8]byte
-			binary.BigEndian.PutUint64(buf[:], uint64(expiresAt.UnixNano()))
-			if err := w.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: buf[:]}); err != nil {
-				return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
-			}
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], uint64(expiresAt.UnixNano()))
+			bw.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: b[:]})
 			ttl.Set(key, dur)
 		}
 
-		return protocol.Value{Typ: '+', Str: "OK"}
+		buf.WriteSimpleString("OK")
 
 	case "GET":
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'GET'"}
+			buf.WriteError("ERR wrong number of arguments for 'GET'")
+			return
 		}
-		key := args[0].Str
-		// Реплики отдают GET напрямую (read-only), без MOVED
+		key := string(args[0])
 		if cl != nil && cl.State.Self.Role != cluster.RoleReplica {
 			if moved := cl.CheckKey(key); moved != nil {
-				return *moved
+				writeValue(buf, *moved)
+				return
 			}
 		}
-
 		if ttl.IsExpired(key) {
-			return protocol.Value{Typ: '$', Num: -1}
+			buf.WriteNull()
+			return
 		}
-
 		val, ok := s.Get(key)
 		if !ok {
-			// Ключа нет — может, он уже мигрировал?
 			if cl != nil {
 				if ask := cl.CheckKeyAsk(key); ask != nil {
-					return *ask
+					writeValue(buf, *ask)
+					return
 				}
 			}
-			return protocol.Value{Typ: '$', Num: -1}
+			buf.WriteNull()
+			return
 		}
-		return protocol.Value{Typ: '$', Str: string(val)}
+		buf.WriteBulk(val)
 
 	case "DEL":
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'DEL'"}
+			buf.WriteError("ERR wrong number of arguments for 'DEL'")
+			return
 		}
-		key := args[0].Str
+		key := string(args[0])
 		if cl != nil {
 			if moved := cl.CheckKey(key); moved != nil {
-				return *moved
+				writeValue(buf, *moved)
+				return
 			}
 		}
-		if err := w.Write(wal.Entry{Op: wal.OpDel, Key: key}); err != nil {
-			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
-		}
-		ok := s.Del(key)
+		bw.Write(wal.Entry{Op: wal.OpDel, Key: key})
+		ok := s.Del(workerID, key)
 		ttl.OnDelete(key)
-
-		// Репликация: пересылаем удаление
 		if cl != nil && cl.Repl != nil {
 			cl.Repl.ForwardWrite(fmt.Sprintf("DEL %s", key))
 		}
-
-		// WASM триггеры: уведомляем о DEL
 		triggers.Fire(compute.OnDel, key)
-
 		if ok {
-			return protocol.Value{Typ: ':', Num: 1}
+			buf.WriteInt(1)
+		} else {
+			buf.WriteInt(0)
 		}
-		return protocol.Value{Typ: ':', Num: 0}
 
 	case "EXPIRE":
 		if len(args) < 2 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'EXPIRE'"}
+			buf.WriteError("ERR wrong number of arguments for 'EXPIRE'")
+			return
 		}
-		key := args[0].Str
+		key := string(args[0])
 		if cl != nil {
 			if moved := cl.CheckKey(key); moved != nil {
-				return *moved
+				writeValue(buf, *moved)
+				return
 			}
 		}
 		if _, ok := s.Get(key); !ok {
-			return protocol.Value{Typ: ':', Num: 0}
+			buf.WriteInt(0)
+			return
 		}
-		seconds, err := strconv.Atoi(args[1].Str)
+		seconds, err := strconv.Atoi(string(args[1]))
 		if err != nil || seconds <= 0 {
-			return protocol.Value{Typ: '-', Str: "ERR invalid expire time"}
+			buf.WriteError("ERR invalid expire time")
+			return
 		}
 		dur := time.Duration(seconds) * time.Second
 		expiresAt := time.Now().Add(dur)
-		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(expiresAt.UnixNano()))
-		if err := w.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: buf[:]}); err != nil {
-			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
-		}
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(expiresAt.UnixNano()))
+		bw.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: b[:]})
 		ttl.Set(key, dur)
-		return protocol.Value{Typ: ':', Num: 1}
+		buf.WriteInt(1)
 
 	case "TTL":
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'TTL'"}
+			buf.WriteError("ERR wrong number of arguments for 'TTL'")
+			return
 		}
-		key := args[0].Str
+		key := string(args[0])
 		if cl != nil {
 			if moved := cl.CheckKey(key); moved != nil {
-				return *moved
+				writeValue(buf, *moved)
+				return
 			}
 		}
 		if _, ok := s.Get(key); !ok {
-			return protocol.Value{Typ: ':', Num: -2}
+			buf.WriteInt(-2)
+			return
 		}
 		remaining := ttl.TTL(key)
 		if remaining == -1 {
-			return protocol.Value{Typ: ':', Num: -1}
+			buf.WriteInt(-1)
+			return
 		}
-		return protocol.Value{Typ: ':', Num: int(remaining.Seconds())}
+		buf.WriteInt(int(remaining.Seconds()))
 
 	case "PERSIST":
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'PERSIST'"}
+			buf.WriteError("ERR wrong number of arguments for 'PERSIST'")
+			return
 		}
+		key := string(args[0])
 		if cl != nil {
-			if moved := cl.CheckKey(args[0].Str); moved != nil {
-				return *moved
+			if moved := cl.CheckKey(key); moved != nil {
+				writeValue(buf, *moved)
+				return
 			}
 		}
-		if ttl.Remove(args[0].Str) {
-			if err := w.Write(wal.Entry{Op: wal.OpPersist, Key: args[0].Str}); err != nil {
-				return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
-			}
-			return protocol.Value{Typ: ':', Num: 1}
+		if ttl.Remove(key) {
+			bw.Write(wal.Entry{Op: wal.OpPersist, Key: key})
+			buf.WriteInt(1)
+		} else {
+			buf.WriteInt(0)
 		}
-		return protocol.Value{Typ: ':', Num: 0}
 
 	// === Pub/Sub ===
 	case "SUBSCRIBE":
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'SUBSCRIBE'"}
+			buf.WriteError("ERR wrong number of arguments for 'SUBSCRIBE'")
+			return
 		}
 		channels := make([]string, len(args))
-		for i, arg := range args {
-			channels[i] = arg.Str
+		for i, a := range args {
+			channels[i] = string(a)
 		}
-		hub.Subscribe(conn, channels)
-		// Подтверждения отправляются через writePump, не через обычный handler
-		return protocol.Value{Typ: 0} // пустой ответ — writePump уже отправил
+		hub.Subscribe(cs.Conn, channels)
+		// writePump отправляет подтверждения, не пишем в buf
 
 	case "UNSUBSCRIBE":
 		channels := make([]string, len(args))
-		for i, arg := range args {
-			channels[i] = arg.Str
+		for i, a := range args {
+			channels[i] = string(a)
 		}
-		hub.Unsubscribe(conn, channels)
-		return protocol.Value{Typ: '+', Str: "OK"}
+		hub.Unsubscribe(cs.Conn, channels)
+		buf.WriteSimpleString("OK")
 
 	case "PUBLISH":
 		if len(args) < 2 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'PUBLISH'"}
+			buf.WriteError("ERR wrong number of arguments for 'PUBLISH'")
+			return
 		}
-		count := hub.Publish(args[0].Str, args[1].Str)
-		return protocol.Value{Typ: ':', Num: count}
+		count := hub.Publish(string(args[0]), string(args[1]))
+		buf.WriteInt(count)
 
 	case "DBSIZE":
-		return protocol.Value{Typ: ':', Num: s.Len()}
+		buf.WriteInt(s.Len())
 
 	case "COMPACT":
-		wal.BackgroundCompact(w, dataDir, s.ForEach)
-		return protocol.Value{Typ: '+', Str: "OK compaction started"}
+		wal.BackgroundCompact(bw.RawWAL(), dataDir, s.ForEach)
+		buf.WriteSimpleString("OK compaction started")
 
-	// === WASM команды ===
+	// === WASM ===
 	case "WASM.LOAD":
-		// WASM.LOAD <module_name> <wasm_bytes_as_string>
 		if len(args) < 2 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.LOAD'"}
+			buf.WriteError("ERR wrong number of arguments for 'WASM.LOAD'")
+			return
 		}
-		name := args[0].Str
-		wasmBytes := []byte(args[1].Str)
+		name := string(args[0])
+		wasmBytes := make([]byte, len(args[1]))
+		copy(wasmBytes, args[1])
 		if err := wasm.LoadModule(name, wasmBytes); err != nil {
-			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
 		}
 		compute.SaveModule(dataDir, name, wasmBytes)
-		return protocol.Value{Typ: '+', Str: "OK"}
+		buf.WriteSimpleString("OK")
 
 	case "WASM.LOADFILE":
-		// WASM.LOADFILE <module_name> <filepath>
-		// Загружает WASM-модуль из файла на диске.
-		// Удобнее чем WASM.LOAD для тестирования.
 		if len(args) < 2 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.LOADFILE'"}
+			buf.WriteError("ERR wrong number of arguments for 'WASM.LOADFILE'")
+			return
 		}
-		name := args[0].Str
-		filePath := args[1].Str
+		name := string(args[0])
+		filePath := string(args[1])
 		wasmBytes, err := os.ReadFile(filePath)
 		if err != nil {
-			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR cannot read file: %v", err)}
+			buf.WriteError(fmt.Sprintf("ERR cannot read file: %v", err))
+			return
 		}
 		if err := wasm.LoadModule(name, wasmBytes); err != nil {
-			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
 		}
 		compute.SaveModule(dataDir, name, wasmBytes)
-		return protocol.Value{Typ: '+', Str: fmt.Sprintf("OK loaded %d bytes", len(wasmBytes))}
+		buf.WriteSimpleString(fmt.Sprintf("OK loaded %d bytes", len(wasmBytes)))
 
 	case "WASM.DROP":
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.DROP'"}
+			buf.WriteError("ERR wrong number of arguments for 'WASM.DROP'")
+			return
 		}
-		if err := wasm.DropModule(args[0].Str); err != nil {
-			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+		name := string(args[0])
+		if err := wasm.DropModule(name); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
 		}
-		compute.DeleteModule(dataDir, args[0].Str)
-		return protocol.Value{Typ: '+', Str: "OK"}
+		compute.DeleteModule(dataDir, name)
+		buf.WriteSimpleString("OK")
 
 	case "WASM.LIST":
 		names := wasm.ListModules()
-		vals := make([]protocol.Value, len(names))
-		for i, n := range names {
-			vals[i] = protocol.Value{Typ: '$', Str: n}
+		buf.WriteArrayHeader(len(names))
+		for _, n := range names {
+			buf.WriteBulkString(n)
 		}
-		return protocol.Value{Typ: '*', Array: vals}
 
 	case "WASM.EXEC":
-		// WASM.EXEC <module_name> <func_name>
 		if len(args) < 2 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.EXEC'"}
+			buf.WriteError("ERR wrong number of arguments for 'WASM.EXEC'")
+			return
 		}
-		results, err := wasm.ExecFunction(args[0].Str, args[1].Str)
+		results, err := wasm.ExecFunction(string(args[0]), string(args[1]))
 		if err != nil {
-			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
 		}
 		if len(results) > 0 {
-			return protocol.Value{Typ: ':', Num: int(results[0])}
+			buf.WriteInt(int(results[0]))
+		} else {
+			buf.WriteSimpleString("OK")
 		}
-		return protocol.Value{Typ: '+', Str: "OK"}
 
 	case "WASM.INFO":
-		// WASM.INFO <module_name> — метаданные модуля
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.INFO'"}
+			buf.WriteError("ERR wrong number of arguments for 'WASM.INFO'")
+			return
 		}
-		loadedAt, execCount, found := wasm.ModuleInfo(args[0].Str)
+		name := string(args[0])
+		loadedAt, execCount, found := wasm.ModuleInfo(name)
 		if !found {
-			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR module '%s' not found", args[0].Str)}
+			buf.WriteError(fmt.Sprintf("ERR module '%s' not found", name))
+			return
 		}
 		info := fmt.Sprintf("module:%s loaded_at:%s exec_count:%d",
-			args[0].Str, loadedAt.Format(time.RFC3339), execCount)
-		return protocol.Value{Typ: '$', Str: info}
+			name, loadedAt.Format(time.RFC3339), execCount)
+		buf.WriteBulkString(info)
 
 	case "WASM.TRIGGER":
-		// WASM.TRIGGER SET "tx:*" fraud_scorer score_transaction
 		if len(args) < 4 {
-			return protocol.Value{Typ: '-', Str: "ERR usage: WASM.TRIGGER <SET|DEL> <pattern> <module> <func>"}
+			buf.WriteError("ERR usage: WASM.TRIGGER <SET|DEL> <pattern> <module> <func>")
+			return
 		}
-		event := compute.TriggerEvent(strings.ToUpper(args[0].Str))
-		pattern := args[1].Str
-		moduleName := args[2].Str
-		funcName := args[3].Str
+		event := compute.TriggerEvent(strings.ToUpper(string(args[0])))
+		pattern := string(args[1])
+		moduleName := string(args[2])
+		funcName := string(args[3])
 		id := triggers.AddTrigger(event, pattern, moduleName, funcName)
 		compute.SaveTriggers(dataDir, triggers)
-		return protocol.Value{Typ: '+', Str: id}
+		buf.WriteSimpleString(id)
 
 	case "WASM.UNTRIGGER":
 		if len(args) < 1 {
-			return protocol.Value{Typ: '-', Str: "ERR wrong number of arguments for 'WASM.UNTRIGGER'"}
+			buf.WriteError("ERR wrong number of arguments for 'WASM.UNTRIGGER'")
+			return
 		}
-		if triggers.RemoveTrigger(args[0].Str) {
+		if triggers.RemoveTrigger(string(args[0])) {
 			compute.SaveTriggers(dataDir, triggers)
-			return protocol.Value{Typ: '+', Str: "OK"}
+			buf.WriteSimpleString("OK")
+		} else {
+			buf.WriteError("ERR trigger not found")
 		}
-		return protocol.Value{Typ: '-', Str: "ERR trigger not found"}
 
 	case "WASM.TRIGGERS":
 		all := triggers.ListTriggers()
-		vals := make([]protocol.Value, len(all))
-		for i, t := range all {
-			vals[i] = protocol.Value{Typ: '$', Str: fmt.Sprintf("%s %s %s %s.%s", t.ID, t.Event, t.Pattern, t.ModuleName, t.FuncName)}
+		buf.WriteArrayHeader(len(all))
+		for _, t := range all {
+			buf.WriteBulkString(fmt.Sprintf("%s %s %s %s.%s", t.ID, t.Event, t.Pattern, t.ModuleName, t.FuncName))
 		}
-		return protocol.Value{Typ: '*', Array: vals}
 
-		// === Vector Search команды ===
+	// === Vector Search ===
 	case "VSIM.ADD":
-		// VSIM.ADD <key> <v1> <v2> ... <vN>
 		if len(args) < 2 {
-			return protocol.Value{Typ: '-', Str: "ERR usage: VSIM.ADD <key> <v1> <v2> ... <vN>"}
+			buf.WriteError("ERR usage: VSIM.ADD <key> <v1> <v2> ... <vN>")
+			return
 		}
-		key := args[0].Str
+		key := string(args[0])
 		vec := make([]float32, len(args)-1)
 		for i := 1; i < len(args); i++ {
-			f, err := strconv.ParseFloat(args[i].Str, 32)
+			f, err := strconv.ParseFloat(string(args[i]), 32)
 			if err != nil {
-				return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR invalid float at position %d: %s", i, args[i].Str)}
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, string(args[i])))
+				return
 			}
 			vec[i-1] = float32(f)
 		}
-
-		// WAL: записываем ПЕРЕД записью в память (write-ahead!)
 		walValue := vector.SerializeVector(vec)
-		if err := w.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue}); err != nil {
-			return protocol.Value{Typ: '-', Str: "ERR WAL write failed"}
-		}
-
+		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		if err := vecStore.Add(key, vec); err != nil {
-			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
 		}
-		return protocol.Value{Typ: '+', Str: "OK"}
+		buf.WriteSimpleString("OK")
 
 	case "VSIM.SEARCH":
-		// VSIM.SEARCH <K> <v1> <v2> ... <vN>
 		if len(args) < 2 {
-			return protocol.Value{Typ: '-', Str: "ERR usage: VSIM.SEARCH <K> <v1> <v2> ... <vN>"}
+			buf.WriteError("ERR usage: VSIM.SEARCH <K> <v1> <v2> ... <vN>")
+			return
 		}
-		K, err := strconv.Atoi(args[0].Str)
+		K, err := strconv.Atoi(string(args[0]))
 		if err != nil || K <= 0 {
-			return protocol.Value{Typ: '-', Str: "ERR invalid K (must be positive integer)"}
+			buf.WriteError("ERR invalid K (must be positive integer)")
+			return
 		}
 		query := make([]float32, len(args)-1)
 		for i := 1; i < len(args); i++ {
-			f, err := strconv.ParseFloat(args[i].Str, 32)
+			f, err := strconv.ParseFloat(string(args[i]), 32)
 			if err != nil {
-				return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR invalid float at position %d: %s", i, args[i].Str)}
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, string(args[i])))
+				return
 			}
 			query[i-1] = float32(f)
 		}
 		results, err := vecStore.Search(query, K)
 		if err != nil {
-			return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR %v", err)}
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
 		}
-		// Формат ответа: [key1, dist1, key2, dist2, ...]
-		// Как ZRANGEBYSCORE с WITHSCORES
-		vals := make([]protocol.Value, 0, len(results)*2)
+		buf.WriteArrayHeader(len(results) * 2)
 		for _, r := range results {
-			vals = append(vals,
-				protocol.Value{Typ: '$', Str: r.Key},
-				protocol.Value{Typ: '$', Str: fmt.Sprintf("%.6f", r.Distance)},
-			)
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
 		}
-		return protocol.Value{Typ: '*', Array: vals}
 
 	case "VSIM.INFO":
 		count, dim, maxLevel := vecStore.Info()
 		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d", count, dim, maxLevel)
-		return protocol.Value{Typ: '$', Str: info}
+		buf.WriteBulkString(info)
 
 	default:
-		return protocol.Value{Typ: '-', Str: fmt.Sprintf("ERR unknown command '%s'", cmd)}
+		buf.WriteError(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
 }

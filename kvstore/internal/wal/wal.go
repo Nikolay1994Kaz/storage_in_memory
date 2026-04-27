@@ -293,3 +293,25 @@ func CleanupOldWALs(dir string, keepPath string) error {
 	}
 	return nil
 }
+
+// WriteBatch записывает pre-encoded batch за одну блокировку.
+//
+// buf уже содержит все entries в формате [CRC32][Len][Payload]...
+// Вызывается из BatchWAL.flushBatch — один раз на batch.
+//
+// Стоимость: 1 mutex lock + 1 bufio write.
+// Сравни с Write(): 1 mutex lock + encode + CRC + 2 writes PER ENTRY.
+func (w *WAL) WriteBatch(buf []byte) error {
+	if len(buf) == 0 {
+		return nil
+	}
+
+	w.mu.Lock()
+	_, err := w.writer.Write(buf)
+	w.mu.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("wal write batch: %w", err)
+	}
+	return nil
+}
