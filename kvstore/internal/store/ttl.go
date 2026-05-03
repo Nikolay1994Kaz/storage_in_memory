@@ -9,6 +9,16 @@ const (
 	sampleSize       = 20
 	expiredThreshold = sampleSize / 4 // 5 из 20 = 25%
 	maxLoops         = 16
+
+	// Количество шардов TTL-таблицы.
+	// 256 = степень двойки → быстрый modulo через bitwise AND.
+	// При 12 workers: каждый шард конкурирует максимум с 12/256 ≈ 0.05 воркерами.
+	ttlShardCount = 256
+	ttlShardMask  = ttlShardCount - 1
+
+	// Сколько шардов обрабатывать за один тик activeExpiry (100ms).
+	// 4 шарда × 10 тиков/сек = 40 шардов/сек → полный обход за ~6 секунд.
+	shardsPerCycle = 4
 )
 
 // Evictor — минимальный интерфейс для удаления ключей.
@@ -18,46 +28,88 @@ type Evictor interface {
 	Del(key string) bool
 }
 
-// TTLManager — управление временем жизни ключей.
-// Вероятностный алгоритм Redis: random sampling + adaptive aggressiveness.
-type TTLManager struct {
-	mu      sync.Mutex
+// ttlShard — один шард TTL-таблицы.
+//
+// Каждый шард имеет свой RWMutex → параллельные GET'ы
+// (IsExpired) к разным ключам не блокируют друг друга.
+type ttlShard struct {
+	mu      sync.RWMutex
 	expires map[string]time.Time
-	store   Evictor
-	stop    chan struct{}
+}
+
+// TTLManager — шардированное управление временем жизни ключей.
+//
+// ПРОБЛЕМА (до шардирования):
+//
+//	Один sync.Mutex на всю map[string]time.Time.
+//	IsExpired() вызывается на КАЖДОМ GET.
+//	При 5M GET/sec → 5M блокировок/сек на одном мьютексе.
+//	12 Epoll-воркеров выстраиваются в очередь → сериализация.
+//
+// РЕШЕНИЕ:
+//
+//	256 шардов с независимыми RWMutex.
+//	IsExpired() использует RLock → полный параллелизм на чтение.
+//	Только удаление просроченного ключа берёт WLock (на одном шарде).
+//
+// Результат: contention снижается в ~256 раз.
+type TTLManager struct {
+	shards   [ttlShardCount]ttlShard
+	store    Evictor
+	stop     chan struct{}
+	stopOnce sync.Once // защита от двойного close(stop)
+	shardIdx uint32    // round-robin для activeExpiry
 }
 
 func NewTTLManager(store Evictor) *TTLManager {
 	m := &TTLManager{
-		expires: make(map[string]time.Time),
-		store:   store,
-		stop:    make(chan struct{}),
+		store: store,
+		stop:  make(chan struct{}),
+	}
+	for i := range m.shards {
+		m.shards[i].expires = make(map[string]time.Time)
 	}
 	go m.activeExpiry()
 	return m
 }
 
+// getShard возвращает шард для ключа (FNV-1a hash).
+//
+// FNV-1a — быстрый, без аллокаций, хорошее распределение.
+// Не нужна криптографическая стойкость — нужна только равномерность.
+func (m *TTLManager) getShard(key string) *ttlShard {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return &m.shards[h&ttlShardMask]
+}
+
 // Set устанавливает TTL для ключа.
 func (m *TTLManager) Set(key string, ttl time.Duration) {
-	m.mu.Lock()
-	m.expires[key] = time.Now().Add(ttl)
-	m.mu.Unlock()
+	s := m.getShard(key)
+	s.mu.Lock()
+	s.expires[key] = time.Now().Add(ttl)
+	s.mu.Unlock()
 }
 
 // Remove убирает TTL (команда PERSIST).
 func (m *TTLManager) Remove(key string) bool {
-	m.mu.Lock()
-	_, ok := m.expires[key]
-	delete(m.expires, key)
-	m.mu.Unlock()
+	s := m.getShard(key)
+	s.mu.Lock()
+	_, ok := s.expires[key]
+	delete(s.expires, key)
+	s.mu.Unlock()
 	return ok
 }
 
 // TTL возвращает оставшееся время жизни.
 func (m *TTLManager) TTL(key string) time.Duration {
-	m.mu.Lock()
-	expiresAt, ok := m.expires[key]
-	m.mu.Unlock()
+	s := m.getShard(key)
+	s.mu.RLock()
+	expiresAt, ok := s.expires[key]
+	s.mu.RUnlock()
 
 	if !ok {
 		return -1
@@ -70,25 +122,52 @@ func (m *TTLManager) TTL(key string) time.Duration {
 	return remaining
 }
 
-// IsExpired — lazy expiration.
-// Проверяет и удаляет просроченный ключ при обращении.
+// IsExpired — lazy expiration (горячий путь GET).
+//
+// Оптимизация: два уровня блокировки.
+//
+//	Fast path (99.9% вызовов): RLock → lookup → RUnlock.
+//	  Полностью параллелен с другими GET'ами на этом шарде.
+//
+//	Slow path (ключ просрочен): WLock → double-check → delete → WUnlock.
+//	  Блокирует только один шард (1/256 таблицы) и только на время delete.
 func (m *TTLManager) IsExpired(key string) bool {
-	m.mu.Lock()
-	expiresAt, ok := m.expires[key]
+	s := m.getShard(key)
+
+	// ── Fast path: RLock (параллельно с другими GET'ами) ──
+	s.mu.RLock()
+	expiresAt, ok := s.expires[key]
 
 	if !ok {
-		m.mu.Unlock()
+		s.mu.RUnlock()
 		return false
 	}
 
 	if time.Now().Before(expiresAt) {
-		m.mu.Unlock()
+		s.mu.RUnlock()
 		return false
 	}
+	s.mu.RUnlock()
 
-	delete(m.expires, key)
-	m.mu.Unlock()
+	// ── Slow path: ключ просрочен, берём WLock для удаления ──
+	s.mu.Lock()
+	// Double-check: пока мы ждали WLock, другой воркер мог:
+	// 1. Уже удалить этот ключ (IsExpired или activeExpiry)
+	// 2. Обновить TTL (SET key value EX 3600)
+	expiresAt, ok = s.expires[key]
+	if !ok {
+		s.mu.Unlock()
+		return true // уже удалён другим воркером — ключ был просрочен
+	}
+	if time.Now().Before(expiresAt) {
+		s.mu.Unlock()
+		return false // TTL был обновлён (новый SET EX) пока мы ждали WLock
+	}
 
+	delete(s.expires, key)
+	s.mu.Unlock()
+
+	// Удаляем из store ВНЕ лока — store имеет свои блокировки
 	m.store.Del(key)
 	return true
 }
@@ -108,22 +187,32 @@ func (m *TTLManager) activeExpiry() {
 	}
 }
 
-// expireCycle — адаптивный цикл: повторяет если >25% просрочены.
+// expireCycle — проходит по нескольким шардам за один тик.
+//
+// Round-robin: каждый тик обрабатываем shardsPerCycle шардов.
+// За ~6 секунд обходим все 256 шардов.
 func (m *TTLManager) expireCycle() {
-	for loop := 0; loop < maxLoops; loop++ {
-		expired := m.sampleAndExpire()
-		if expired < expiredThreshold {
-			return
+	for i := 0; i < shardsPerCycle; i++ {
+		idx := m.shardIdx % ttlShardCount
+		m.shardIdx++
+
+		for loop := 0; loop < maxLoops; loop++ {
+			expired := m.sampleAndExpireShard(idx)
+			if expired < expiredThreshold {
+				break
+			}
 		}
 	}
 }
 
-// sampleAndExpire — zero-alloc random sampling.
-func (m *TTLManager) sampleAndExpire() int {
-	m.mu.Lock()
+// sampleAndExpireShard — zero-alloc random sampling одного шарда.
+func (m *TTLManager) sampleAndExpireShard(idx uint32) int {
+	s := &m.shards[idx]
 
-	if len(m.expires) == 0 {
-		m.mu.Unlock()
+	s.mu.Lock()
+
+	if len(s.expires) == 0 {
+		s.mu.Unlock()
 		return 0
 	}
 
@@ -135,12 +224,12 @@ func (m *TTLManager) sampleAndExpire() int {
 	checked := 0
 
 	// Один проход: итерация + проверка + удаление
-	for key, expiresAt := range m.expires {
+	for key, expiresAt := range s.expires {
 		checked++
 
 		if now.After(expiresAt) {
 			expiredKeys = append(expiredKeys, key)
-			delete(m.expires, key)
+			delete(s.expires, key)
 		}
 
 		if checked >= sampleSize {
@@ -148,7 +237,7 @@ func (m *TTLManager) sampleAndExpire() int {
 		}
 	}
 
-	m.mu.Unlock()
+	s.mu.Unlock()
 
 	// Удаляем из store ВНЕ лока TTLManager
 	for _, key := range expiredKeys {
@@ -160,20 +249,27 @@ func (m *TTLManager) sampleAndExpire() int {
 
 // OnDelete убирает TTL при ручном удалении ключа (DEL).
 func (m *TTLManager) OnDelete(key string) {
-	m.mu.Lock()
-	delete(m.expires, key)
-	m.mu.Unlock()
+	s := m.getShard(key)
+	s.mu.Lock()
+	delete(s.expires, key)
+	s.mu.Unlock()
 }
 
 // Len возвращает количество ключей с TTL.
 func (m *TTLManager) Len() int {
-	m.mu.Lock()
-	n := len(m.expires)
-	m.mu.Unlock()
-	return n
+	total := 0
+	for i := range m.shards {
+		m.shards[i].mu.RLock()
+		total += len(m.shards[i].expires)
+		m.shards[i].mu.RUnlock()
+	}
+	return total
 }
 
 // Stop останавливает фоновую очистку.
+// Безопасен для повторного вызова (sync.Once).
 func (m *TTLManager) Stop() {
-	close(m.stop)
+	m.stopOnce.Do(func() {
+		close(m.stop)
+	})
 }

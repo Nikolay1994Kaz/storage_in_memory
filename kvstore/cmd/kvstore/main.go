@@ -36,6 +36,7 @@ var globalTxMu sync.Mutex
 func main() {
 	// CLI-флаги
 	port := flag.Int("port", 6380, "порт для клиентов")
+	maxMemoryMB := flag.Int("maxmemory", 0, "лимит памяти в МБ (0 = без лимита)")
 	clusterEnabled := flag.Bool("cluster", false, "включить кластерный режим")
 	clusterSlotStart := flag.Int("slot-start", 0, "начало диапазона слотов")
 	clusterSlotEnd := flag.Int("slot-end", 16383, "конец диапазона слотов")
@@ -43,6 +44,12 @@ func main() {
 
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
 	s := tcmalloc.NewTCMallocStore(runtime.NumCPU())
+
+	// Лимит памяти
+	if *maxMemoryMB > 0 {
+		s.SetMaxMemory(int64(*maxMemoryMB) * 1024 * 1024)
+		log.Printf("Max memory: %d MB", *maxMemoryMB)
+	}
 
 	os.MkdirAll(dataDir, 0755)
 
@@ -91,6 +98,9 @@ func main() {
 			}
 			vecRestored++
 			restored++
+		case wal.OpVSimDel:
+			vecStore.Delete(entry.Key)
+			restored++
 		}
 	}
 
@@ -137,6 +147,15 @@ func main() {
 
 		cl.Repl.StoreForEach = func(fn func(key string, value []byte)) {
 			s.ForEach(fn)
+		}
+		cl.Repl.VecStoreAdd = func(key string, vec []float32) {
+			vecStore.Add(key, vec)
+		}
+		cl.Repl.VecStoreDel = func(key string) {
+			vecStore.Delete(key)
+		}
+		cl.Repl.VecStoreForEach = func(fn func(key string, vec []float32)) {
+			vecStore.ForEach(fn)
 		}
 		cl.Repl.StoreSet = func(key string, value []byte) {
 			s.Set(0, key, value)
@@ -384,6 +403,11 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				writeValue(buf, *moved)
 				return
 			}
+		}
+		// Проверка лимита памяти (OOM protection)
+		if s.IsOOM() {
+			buf.WriteError("OOM command not allowed when used memory > 'maxmemory'")
+			return
 		}
 		// args[1] — слайс ring buffer. Нужна копия для TCMalloc (буфер будет перезаписан).
 		value := make([]byte, len(args[1]))
@@ -714,7 +738,34 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
+		if cl != nil && cl.Repl != nil {
+			// Формат: VSIM.ADD key 0.1 0.2 0.3 ...
+			var sb strings.Builder
+			sb.WriteString("VSIM.ADD ")
+			sb.WriteString(key)
+			for _, v := range vec {
+				sb.WriteByte(' ')
+				sb.WriteString(strconv.FormatFloat(float64(v), 'f', -1, 32))
+			}
+			cl.Repl.ForwardWrite(sb.String())
+		}
 		buf.WriteSimpleString("OK")
+
+	case "VSIM.DEL":
+		if len(args) < 1 {
+			buf.WriteError("ERR usage: VSIM.DEL <key>")
+			return
+		}
+		key := string(args[0])
+		if vecStore.Delete(key) {
+			bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: key})
+			if cl != nil && cl.Repl != nil {
+				cl.Repl.ForwardWrite("VSIM.DEL " + key)
+			}
+			buf.WriteInt(1)
+		} else {
+			buf.WriteInt(0)
+		}
 
 	case "VSIM.SEARCH":
 		if len(args) < 2 {

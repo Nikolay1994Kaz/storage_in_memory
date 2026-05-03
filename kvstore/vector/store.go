@@ -48,7 +48,7 @@ func NewVectorStore(distance DistanceFunc) *VectorStore {
 
 // Add добавляет вектор с указанным ключом.
 //
-// Если ключ уже существует — обновляет вектор.
+// Если ключ уже существует — удаляет старую ноду из графа и вставляет новую.
 // Если размерность не совпадает с первым вектором — ошибка.
 func (vs *VectorStore) Add(key string, vec []float32) error {
 	vs.mu.Lock()
@@ -61,12 +61,12 @@ func (vs *VectorStore) Add(key string, vec []float32) error {
 		return fmt.Errorf("dimension mismatch: expected %d, got %d", vs.dim, len(vec))
 	}
 
-	// Если ключ уже есть — удаляем старый и вставляем новый.
-	// HNSW не поддерживает in-place update, поэтому re-insert.
-	// TODO: реализовать Delete для HNSW-графа.
-	if _, exists := vs.ids[key]; exists {
-		// Пока просто перезаписываем маппинг (старая нода остаётся в графе).
-		// Это неидеально, но для первой версии достаточно.
+	// Если ключ уже есть — удаляем старую ноду из графа.
+	// Без этого старая нода остаётся как «зомби»: занимает память,
+	// участвует в поиске, но маппинг уже указывает на новый ID.
+	if oldID, exists := vs.ids[key]; exists {
+		vs.graph.Delete(oldID)
+		delete(vs.keys, oldID)
 	}
 
 	id := vs.nextID.Add(1)
@@ -75,6 +75,26 @@ func (vs *VectorStore) Add(key string, vec []float32) error {
 
 	vs.graph.Insert(id, vec)
 	return nil
+}
+
+// Delete удаляет вектор по ключу.
+//
+// Удаляет ноду из HNSW-графа (с ремонтом связей) и очищает маппинги.
+// Возвращает true если ключ существовал, false если нечего было удалять.
+func (vs *VectorStore) Delete(key string) bool {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	id, exists := vs.ids[key]
+	if !exists {
+		return false
+	}
+
+	vs.graph.Delete(id)
+	delete(vs.ids, key)
+	delete(vs.keys, id)
+
+	return true
 }
 
 // Search находит K ближайших векторов к запросу.
@@ -117,6 +137,22 @@ func (vs *VectorStore) Info() (nodeCount int, dim int, maxLevel int) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 	return len(vs.ids), vs.dim, vs.graph.MaxLevel()
+}
+
+// ForEach вызывает fn для каждого вектора в хранилище.
+// Используется для полной синхронизации при репликации.
+func (vs *VectorStore) ForEach(fn func(key string, vec []float32)) {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	vs.graph.mu.RLock()
+	defer vs.graph.mu.RUnlock()
+
+	for id, key := range vs.keys {
+		if node, ok := vs.graph.nodes[id]; ok {
+			fn(key, node.Vector)
+		}
+	}
 }
 
 func SerializeVector(vec []float32) []byte {

@@ -375,3 +375,25 @@ func (s *TCMallocStore) GetKeysInSlot(slot uint16, count int, slotFunc func(stri
 func (s *TCMallocStore) DelSimple(key string) bool {
 	return s.Del(0, key)
 }
+
+// ══════════════════════════════════════════════════
+// MEMORY LIMITS
+// ══════════════════════════════════════════════════
+
+// IsOOM проверяет, превышен ли лимит памяти.
+// Вызывается перед каждым SET в обработчике команд.
+func (s *TCMallocStore) IsOOM() bool {
+	return s.heap.IsOOM()
+}
+
+// SetMaxMemory устанавливает лимит памяти в байтах.
+// 0 = без лимита (по умолчанию).
+func (s *TCMallocStore) SetMaxMemory(bytes int64) {
+	s.heap.SetMaxMemory(bytes)
+}
+
+// UsedMemory возвращает текущее потребление памяти.
+func (s *TCMallocStore) UsedMemory() int64 {
+	return s.heap.UsedMemory()
+}
+

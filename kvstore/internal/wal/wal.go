@@ -19,7 +19,8 @@ const (
 	OpDel     byte = 2
 	OpExpire  byte = 3 // TTL: Value = 8 байт unix nano (абсолютное время смерти)
 	OpPersist byte = 4 // Убрать TTL: Value пустой
-	OpVSimAdd byte = 5 //  вектор добавлен в HNSW
+	OpVSimAdd byte = 5 // вектор добавлен в HNSW
+	OpVSimDel byte = 6 // вектор удалён из HNSW
 )
 
 // Entry — одна запись в WAL.

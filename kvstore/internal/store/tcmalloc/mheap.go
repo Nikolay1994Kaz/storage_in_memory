@@ -64,9 +64,11 @@ func (r *spanRegistry) len() int {
 //	chunks — большие блоки памяти (1MB), из них нарезаются span'ы
 //	spans  — реестр всех span'ов (append-only, lock-free чтение)
 type MHeap struct {
-	mu     sync.Mutex
-	chunks [][]byte
-	offset int
+	mu        sync.Mutex
+	chunks    [][]byte
+	offset    int
+	usedBytes atomic.Int64
+	maxMemory int64
 
 	// ─── Span Registry ───
 	//
@@ -121,6 +123,7 @@ func (h *MHeap) AllocSpan(sizeClass int, central *MCentral) *Span {
 
 	// Создаём span с back-reference на central
 	s := NewSpan(data, elemSize, sizeClass, central)
+	h.usedBytes.Add(int64(spanSize))
 
 	// Регистрируем в реестре (под mu, потокобезопасно)
 	s.spanID = uint32(h.registry.len())
@@ -173,6 +176,7 @@ func (h *MHeap) AllocLarge(size int) ([]byte, Handle) {
 		// Сбрасываем состояние для переиспользования
 		s.allocIndex = 1
 		s.freeStack = s.freeStack[:0]
+		// НЕ добавляем к usedBytes — эта память уже была учтена при первой аллокации
 		return s.data[:size], MakeHandle(s.spanID, 0)
 	}
 
@@ -190,6 +194,7 @@ func (h *MHeap) AllocLarge(size int) ([]byte, Handle) {
 			}
 			s.spanID = uint32(h.registry.len())
 			h.registry.append(s)
+			h.usedBytes.Add(int64(size))
 			return newChunk, MakeHandle(s.spanID, 0)
 		}
 
@@ -208,6 +213,7 @@ func (h *MHeap) AllocLarge(size int) ([]byte, Handle) {
 	s.spanID = uint32(h.registry.len())
 	h.registry.append(s)
 	h.offset += size
+	h.usedBytes.Add(int64(size))
 
 	return data, MakeHandle(s.spanID, 0)
 }
@@ -223,6 +229,40 @@ func (h *MHeap) FreeLarge(s *Span) {
 	s.freeStack = s.freeStack[:0]
 	h.largeFree = append(h.largeFree, s)
 	h.mu.Unlock()
+
+	// Вычитаем из usedBytes — память вернулась в пул
+	h.usedBytes.Add(-int64(s.elemSize))
+}
+
+// ══════════════════════════════════════════════════
+// MEMORY LIMITS
+// ══════════════════════════════════════════════════
+
+// UsedMemory возвращает текущее потребление памяти (в байтах).
+//
+// Атомарное чтение (atomic.Int64.Load) — одна CPU-инструкция.
+// Можно вызывать на каждый SET без overhead'а.
+func (h *MHeap) UsedMemory() int64 {
+	return h.usedBytes.Load()
+}
+
+// SetMaxMemory устанавливает лимит памяти в байтах.
+// 0 = без лимита (по умолчанию).
+func (h *MHeap) SetMaxMemory(bytes int64) {
+	h.maxMemory = bytes
+}
+
+// IsOOM проверяет, превышен ли лимит памяти.
+// Если maxMemory == 0 — лимита нет, всегда false.
+//
+// Вызывается перед каждым SET в обработчике команд.
+// Стоимость: один atomic Load (~1ns).
+func (h *MHeap) IsOOM() bool {
+	max := h.maxMemory
+	if max == 0 {
+		return false
+	}
+	return h.usedBytes.Load() >= max
 }
 
 // Stats возвращает статистику аллокатора.

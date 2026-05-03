@@ -403,6 +403,144 @@ func (g *Graph) pruneNeighbors(node *Node, level int, maxCount int) {
 	node.Neighbors[level] = pruned
 }
 
+// Delete удаляет ноду из HNSW-графа.
+//
+// Это обратная операция к Insert. Удаление из графа — нетривиальная задача,
+// потому что нода может быть «мостом» между двумя частями графа.
+// Если просто вырезать ноду, граф может распасться на куски,
+// и часть нод станет недостижимой при поиске.
+//
+// Алгоритм:
+//
+//  1. Для каждого слоя, на котором нода присутствует:
+//     a. У каждого соседа удаляем ссылку на удаляемую ноду
+//     b. Переподключаем соседей друг к другу (чтобы не порвать граф)
+//     c. Обрезаем лишние связи (если у соседа стало > M соседей)
+//  2. Если удалённая нода была entry point — выбираем нового
+//  3. Удаляем ноду из хранилища
+//
+// Аналогия: сносим город на карте. Все дороги, которые шли ЧЕРЕЗ этот город,
+// нужно перенаправить напрямую между оставшимися городами,
+// иначе часть страны окажется в изоляции.
+func (g *Graph) Delete(id uint64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	node, exists := g.nodes[id]
+	if !exists {
+		return false
+	}
+
+	// ═══════════════════════════════════════════════════
+	// ФАЗА 1: Ремонт связей на каждом слое
+	// ═══════════════════════════════════════════════════
+	for level := 0; level <= node.Level; level++ {
+		neighbors := node.Neighbors[level]
+		M := g.maxNeighbors(level)
+
+		for _, neighborID := range neighbors {
+			neighbor := g.nodes[neighborID]
+			if neighbor == nil {
+				continue
+			}
+
+			// Шаг A: Убираем удалённую ноду из списка соседей
+			neighbor.Neighbors[level] = removeID(neighbor.Neighbors[level], id)
+
+			// Шаг B: Переподключаем — добавляем других соседей удаляемой ноды.
+			//
+			// Пример: если удаляем B, а граф был A—B—C,
+			// то A теряет связь с C. Нужно добавить A—C напрямую.
+			for _, otherID := range neighbors {
+				if otherID == neighborID {
+					continue // не соединяем ноду саму с собой
+				}
+				if containsID(neighbor.Neighbors[level], otherID) {
+					continue // связь уже есть
+				}
+				neighbor.Neighbors[level] = append(neighbor.Neighbors[level], otherID)
+			}
+
+			// Шаг C: Обрезаем если соседей стало слишком много
+			if len(neighbor.Neighbors[level]) > M {
+				g.pruneNeighbors(neighbor, level, M)
+			}
+		}
+	}
+
+	// ═══════════════════════════════════════════════════
+	// ФАЗА 2: Полная зачистка — убираем ВСЕ ссылки на удалённую ноду
+	// ═══════════════════════════════════════════════════
+	//
+	// Почему недостаточно Фазы 1?
+	// pruneNeighbors может создать асимметричные рёбра:
+	// если A → B существует, но B → A было обрезано при прунинге.
+	// Тогда B ссылается на A, но A не знает о B.
+	// Фаза 1 чистит только соседей A (из A.Neighbors).
+	// Фаза 2 проходит по ВСЕМ нодам и удаляет любые оставшиеся ссылки.
+	for _, n := range g.nodes {
+		if n.ID == id {
+			continue
+		}
+		for level := 0; level <= n.Level; level++ {
+			n.Neighbors[level] = removeID(n.Neighbors[level], id)
+		}
+	}
+
+	// ═══════════════════════════════════════════════════
+	// ФАЗА 3: Удаляем ноду из хранилища
+	// ═══════════════════════════════════════════════════
+	delete(g.nodes, id)
+
+	// ═══════════════════════════════════════════════════
+	// ФАЗА 4: Обновляем entry point (если удалили именно его)
+	// ═══════════════════════════════════════════════════
+	if id == g.entryPointID {
+		if len(g.nodes) == 0 {
+			// Граф стал пустым
+			g.entryPointID = 0
+			g.maxLevel = 0
+		} else {
+			// Ищем ноду с максимальным уровнем — она станет новым entry point.
+			// Entry point всегда должен быть на самом верхнем слое,
+			// иначе поиск не сможет начаться с верхних слоёв.
+			newMaxLevel := 0
+			var newEP uint64
+			for nid, n := range g.nodes {
+				if n.Level > newMaxLevel {
+					newMaxLevel = n.Level
+					newEP = nid
+				}
+			}
+			g.entryPointID = newEP
+			g.maxLevel = newMaxLevel
+		}
+	}
+
+	return true
+}
+
+// removeID удаляет первое вхождение val из слайса.
+// Не делает аллокаций — сдвигает элементы на месте.
+func removeID(s []uint64, val uint64) []uint64 {
+	for i, v := range s {
+		if v == val {
+			return append(s[:i], s[i+1:]...)
+		}
+	}
+	return s
+}
+
+// containsID проверяет, есть ли val в слайсе.
+func containsID(s []uint64, val uint64) bool {
+	for _, v := range s {
+		if v == val {
+			return true
+		}
+	}
+	return false
+}
+
 // SearchResult — один результат поиска.
 //
 // Это экспортируемая структура (с большой буквы) — её увидит вызывающий код.

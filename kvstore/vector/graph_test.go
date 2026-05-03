@@ -457,3 +457,216 @@ func BenchmarkSearch(b *testing.B) {
 		g.Search(queries[i%len(queries)], k, efSearch)
 	}
 }
+
+// ─────────────────────────────────────────────────
+// Тест 9: Delete — базовое удаление
+// ─────────────────────────────────────────────────
+
+func TestDelete_Basic(t *testing.T) {
+	g := NewGraph(EuclideanDistance)
+
+	g.Insert(1, []float32{0, 0})
+	g.Insert(2, []float32{1, 0})
+	g.Insert(3, []float32{2, 0})
+	g.Insert(4, []float32{3, 0})
+	g.Insert(5, []float32{4, 0})
+
+	if g.Len() != 5 {
+		t.Fatalf("expected 5 nodes, got %d", g.Len())
+	}
+
+	// Удаляем ноду 3 (средняя)
+	ok := g.Delete(3)
+	if !ok {
+		t.Fatal("Delete returned false for existing node")
+	}
+	if g.Len() != 4 {
+		t.Fatalf("expected 4 nodes after delete, got %d", g.Len())
+	}
+
+	// Повторное удаление — должно вернуть false
+	ok = g.Delete(3)
+	if ok {
+		t.Fatal("Delete returned true for already-deleted node")
+	}
+
+	// Поиск должен найти только оставшиеся ноды
+	results := g.Search([]float32{2, 0}, 5, 10)
+	for _, r := range results {
+		if r.ID == 3 {
+			t.Error("deleted node ID=3 found in search results")
+		}
+	}
+
+	// Ни у кого не должно быть ссылки на удалённую ноду
+	g.mu.RLock()
+	for id, node := range g.nodes {
+		for level, neighbors := range node.Neighbors {
+			for _, nid := range neighbors {
+				if nid == 3 {
+					t.Errorf("node %d level %d still references deleted node 3", id, level)
+				}
+			}
+		}
+	}
+	g.mu.RUnlock()
+}
+
+// ─────────────────────────────────────────────────
+// Тест 10: Delete entry point
+// ─────────────────────────────────────────────────
+
+func TestDelete_EntryPoint(t *testing.T) {
+	g := NewGraph(EuclideanDistance)
+
+	// Вставляем 100 нод
+	rng := rand.New(rand.NewSource(55))
+	for i := 0; i < 100; i++ {
+		vec := []float32{rng.Float32(), rng.Float32()}
+		g.Insert(uint64(i), vec)
+	}
+
+	// Удаляем entry point
+	ep := g.entryPointID
+	g.Delete(ep)
+
+	// Entry point должен смениться
+	if g.entryPointID == ep {
+		t.Error("entry point should have changed after deletion")
+	}
+
+	// Новый entry point должен существовать
+	g.mu.RLock()
+	if _, ok := g.nodes[g.entryPointID]; !ok {
+		t.Error("new entry point does not exist in nodes")
+	}
+	g.mu.RUnlock()
+
+	// Поиск всё ещё работает
+	results := g.Search([]float32{0.5, 0.5}, 5, 50)
+	if len(results) == 0 {
+		t.Error("search returned 0 results after entry point deletion")
+	}
+}
+
+// ─────────────────────────────────────────────────
+// Тест 11: Удалить все, потом снова вставить
+// ─────────────────────────────────────────────────
+
+func TestDelete_AllAndRebuild(t *testing.T) {
+	g := NewGraph(EuclideanDistance)
+
+	// Вставляем 10 нод
+	for i := 0; i < 10; i++ {
+		g.Insert(uint64(i), []float32{float32(i), 0})
+	}
+
+	// Удаляем все
+	for i := 0; i < 10; i++ {
+		g.Delete(uint64(i))
+	}
+
+	if g.Len() != 0 {
+		t.Fatalf("expected 0 nodes, got %d", g.Len())
+	}
+
+	// Вставляем снова — не должно паниковать
+	for i := 100; i < 105; i++ {
+		g.Insert(uint64(i), []float32{float32(i), 0})
+	}
+
+	if g.Len() != 5 {
+		t.Fatalf("expected 5 nodes after rebuild, got %d", g.Len())
+	}
+
+	// Поиск работает
+	results := g.Search([]float32{102, 0}, 3, 10)
+	if len(results) != 3 {
+		t.Errorf("expected 3 results, got %d", len(results))
+	}
+}
+
+// ─────────────────────────────────────────────────
+// Тест 12: Recall после массового удаления
+// ─────────────────────────────────────────────────
+//
+// Вставляем 500 нод, удаляем 200, проверяем что поиск
+// по оставшимся 300 всё ещё имеет хороший recall.
+
+func TestDelete_RecallAfterMassDelete(t *testing.T) {
+	const (
+		totalNodes  = 500
+		deleteCount = 200
+		dim         = 16
+		K           = 10
+		efSearch    = 100
+	)
+
+	rng := rand.New(rand.NewSource(42))
+
+	// Вставляем
+	g := NewGraph(EuclideanDistance)
+	vectors := make(map[uint64][]float32)
+	for i := 0; i < totalNodes; i++ {
+		vec := make([]float32, dim)
+		for j := range vec {
+			vec[j] = rng.Float32()
+		}
+		g.Insert(uint64(i), vec)
+		vectors[uint64(i)] = vec
+	}
+
+	// Удаляем первые deleteCount
+	for i := 0; i < deleteCount; i++ {
+		g.Delete(uint64(i))
+		delete(vectors, uint64(i))
+	}
+
+	if g.Len() != totalNodes-deleteCount {
+		t.Fatalf("expected %d nodes, got %d", totalNodes-deleteCount, g.Len())
+	}
+
+	// Генерируем запрос
+	query := make([]float32, dim)
+	for j := range query {
+		query[j] = rng.Float32()
+	}
+
+	// HNSW поиск
+	results := g.Search(query, K, efSearch)
+	hnswIDs := make(map[uint64]bool)
+	for _, r := range results {
+		hnswIDs[r.ID] = true
+		// Убеждаемся что удалённые ноды не возвращаются
+		if r.ID < uint64(deleteCount) {
+			t.Errorf("deleted node ID=%d found in results", r.ID)
+		}
+	}
+
+	// Brute-force по оставшимся
+	type bi struct {
+		id   uint64
+		dist float32
+	}
+	var brute []bi
+	for id, vec := range vectors {
+		brute = append(brute, bi{id, EuclideanDistance(query, vec)})
+	}
+	sort.Slice(brute, func(i, j int) bool {
+		return brute[i].dist < brute[j].dist
+	})
+
+	// Recall
+	hits := 0
+	for i := 0; i < K && i < len(brute); i++ {
+		if hnswIDs[brute[i].id] {
+			hits++
+		}
+	}
+	recall := float64(hits) / float64(K)
+	t.Logf("Recall after deleting %d/%d nodes: %.0f%%", deleteCount, totalNodes, recall*100)
+
+	if recall < 0.60 {
+		t.Errorf("recall too low after mass delete: %.0f%%", recall*100)
+	}
+}

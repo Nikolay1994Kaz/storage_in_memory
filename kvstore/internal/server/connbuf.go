@@ -268,6 +268,9 @@ func parseIntBytes(b []byte) (int, bool) {
 	if b[0] == '-' {
 		neg = true
 		i = 1
+		if len(b) == 1 {
+			return 0, false
+		}
 	}
 	n := 0
 	for ; i < len(b); i++ {
