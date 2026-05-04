@@ -66,3 +66,40 @@ func TestSizeClassForSize(t *testing.T) {
 		})
 	}
 }
+
+func TestSizeClass_FitsData(t *testing.T) {
+	for size := 1; size <= 4096; size++ {
+		sc := SizeClassForSize(size)
+		if sc < 0 {
+			t.Fatalf("size %d shoud have a class, got -1", size)
+		}
+		if sizeClasses[sc] < size {
+			t.Fatalf("size %d -> class %d (capacity %d): doesn t fit!", size, sc, sizeClasses[sc])
+		}
+	}
+}
+
+func TestSpan_AllocBumpPointer(t *testing.T) {
+	data := make([]byte, 128)
+	s := NewSpan(data, 32, 0, nil)
+
+	for i := 0; i < 4; i++ {
+		buf, idx := s.Alloc()
+		if buf == nil {
+			t.Fatalf("Alloc #%d returned nil", i)
+		}
+		if idx != i {
+			t.Fatalf("Alloc #%d: idx=%d, want %d", i, idx, i)
+		}
+		if len(buf) != 32 {
+			t.Fatalf("Alloc #%d: len=%d, want 32", i, len(buf))
+		}
+	}
+	buf, idx := s.Alloc()
+	if buf != nil {
+		t.Fatalf("Alloc on full span shoud return nil")
+	}
+	if idx != -1 {
+		t.Fatalf("full span idx = %d, want -1", idx)
+	}
+}
