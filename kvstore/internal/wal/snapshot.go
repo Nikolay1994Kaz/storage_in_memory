@@ -1,7 +1,10 @@
 package wal
 
 import (
+	"bufio"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"log"
 	"os"
 	"path/filepath"
@@ -21,15 +24,22 @@ func NewSnapshotWriter(dir string) *SnapshotWriter {
 // WriteSnapshot записывает текущее состояние в snapshot.wal.
 // Принимает функцию iterate, которая обходит все ключи store.
 // Вызывается в фоновой горутине.
+//
+// Оптимизация: пишет напрямую в файл через bufio (256KB буфер)
+// с pre-allocated encode buffer. Без промежуточного WAL.Write() —
+// нет mutex lock и аллокаций на каждый ключ.
 func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value []byte))) error {
 	tmpPath := filepath.Join(sw.dir, "snapshot.wal.tmp")
 	finalPath := filepath.Join(sw.dir, "snapshot.wal")
 
-	// Создаём временный файл
-	w, err := Open(tmpPath)
+	// Открываем временный файл напрямую (без WAL-обёртки)
+	file, err := os.Create(tmpPath)
 	if err != nil {
-		return fmt.Errorf("snapshot open: %w", err)
+		return fmt.Errorf("snapshot create: %w", err)
 	}
+
+	writer := bufio.NewWriterSize(file, 256*1024) // 256KB буфер
+	encodeBuf := make([]byte, 0, 64*1024)         // pre-allocated encode buffer
 
 	count := 0
 	var writeErr error
@@ -37,7 +47,41 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value [
 		if writeErr != nil {
 			return // предыдущая запись упала — пропускаем остальные
 		}
-		if err := w.Write(Entry{Op: OpSet, Key: key, Value: value}); err != nil {
+
+		// Кодируем entry прямо в encodeBuf (zero-alloc если capacity хватает)
+		payloadSize := 1 + 4 + len(key) + len(value)
+		totalSize := 8 + payloadSize
+
+		// Grow буфер если нужно
+		if cap(encodeBuf) < totalSize {
+			encodeBuf = make([]byte, totalSize)
+		}
+		encodeBuf = encodeBuf[:totalSize]
+
+		// Заполняем payload: [Op 1B][KeyLen 4B][Key][Value]
+		off := 8
+		encodeBuf[off] = OpSet
+		off++
+
+		binary.LittleEndian.PutUint32(encodeBuf[off:], uint32(len(key)))
+		off += 4
+
+		copy(encodeBuf[off:], key)
+		off += len(key)
+
+		if len(value) > 0 {
+			copy(encodeBuf[off:], value)
+		}
+
+		// CRC32 по payload
+		payload := encodeBuf[8 : 8+payloadSize]
+		checksum := crc32.ChecksumIEEE(payload)
+
+		// Header: [CRC32 4B][PayloadLen 4B]
+		binary.LittleEndian.PutUint32(encodeBuf[0:4], checksum)
+		binary.LittleEndian.PutUint32(encodeBuf[4:8], uint32(payloadSize))
+
+		if _, err := writer.Write(encodeBuf[:totalSize]); err != nil {
 			writeErr = err
 			return
 		}
@@ -46,18 +90,23 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value [
 
 	// Если хоть одна запись не прошла — snapshot битый, не используем
 	if writeErr != nil {
-		w.Close()
+		file.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("snapshot write: %w", writeErr)
 	}
 
-	// Sync — гарантируем, что данные на диске
-	if err := w.Sync(); err != nil {
-		w.Close()
+	// Flush + Sync — гарантируем, что данные на диске
+	if err := writer.Flush(); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("snapshot flush: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("snapshot sync: %w", err)
 	}
-	w.Close()
+	file.Close()
 
 	// Атомарная замена: tmp → snapshot.wal
 	if err := os.Rename(tmpPath, finalPath); err != nil {
@@ -72,10 +121,14 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value [
 // BackgroundCompact выполняет полный цикл компактизации:
 // 1. Rotate WAL (мгновенно)
 // 2. Записать snapshot (фон)
-// 3. Удалить старые WAL
+// 3. Удалить старые WAL (ТОЛЬКО после успешного snapshot!)
 func BackgroundCompact(w *WAL, dir string, iterate func(fn func(key string, value []byte))) {
-	// 1. Ротация — переключаем WAL на новый файл
-	newWALPath := filepath.Join(dir, fmt.Sprintf("wal_%s.log", time.Now().Format("20060102_150405")))
+	// 1. Ротация — переключаем WAL на новый файл.
+	// Наносекундная точность в имени предотвращает коллизии при быстрой ротации.
+	now := time.Now()
+	newWALPath := filepath.Join(dir, fmt.Sprintf("wal_%s_%09d.log",
+		now.Format("20060102_150405"), now.Nanosecond()))
+
 	oldPath, err := w.Rotate(newWALPath)
 	if err != nil {
 		log.Printf("Compact rotate failed: %v", err)
@@ -88,10 +141,13 @@ func BackgroundCompact(w *WAL, dir string, iterate func(fn func(key string, valu
 		sw := NewSnapshotWriter(dir)
 		if err := sw.WriteSnapshot(iterate); err != nil {
 			log.Printf("Snapshot failed: %v", err)
+			// НЕ удаляем старые WAL — snapshot не прошёл,
+			// старые WAL нужны для recovery!
 			return
 		}
 
-		// 3. Удаляем старые WAL-файлы (snapshot уже содержит их данные)
+		// 3. Удаляем старые WAL-файлы ТОЛЬКО после успешного snapshot.
+		// Snapshot уже содержит их данные + атомарно переименован.
 		CleanupOldWALs(dir, newWALPath)
 		log.Printf("Old WAL files cleaned up")
 	}()

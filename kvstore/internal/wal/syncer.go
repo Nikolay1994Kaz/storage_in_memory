@@ -3,21 +3,29 @@ package wal
 import (
 	"log"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
 	MaxWALSize = 64 * 1024 * 1024 // 64MB
+
+	// sizeCheckEvery — проверять размер WAL каждые N тиков Syncer'а.
+	// При syncInterval=100ms → проверка раз в 5 секунд.
+	// os.Stat — syscall, нет смысла дёргать его каждые 100ms.
+	sizeCheckEvery = 50
 )
 
 type Syncer struct {
 	wal        *WAL
 	interval   time.Duration
 	stop       chan struct{}
+	done       chan struct{} // закрывается когда run() завершается
 	dir        string
 	iterate    func(fn func(key string, value []byte))
-	compacting atomic.Bool // ← atomic вместо обычного bool
+	compacting atomic.Bool
+	wg         sync.WaitGroup
 }
 
 func NewSyncer(w *WAL, interval time.Duration, dir string, iterate func(fn func(key string, value []byte))) *Syncer {
@@ -25,16 +33,23 @@ func NewSyncer(w *WAL, interval time.Duration, dir string, iterate func(fn func(
 		wal:      w,
 		interval: interval,
 		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 		dir:      dir,
 		iterate:  iterate,
 	}
+	s.wg.Add(1)
 	go s.run()
 	return s
 }
 
 func (s *Syncer) run() {
+	defer s.wg.Done()
+	defer close(s.done)
+
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
+
+	sizeCheckCounter := 0
 
 	for {
 		select {
@@ -43,8 +58,13 @@ func (s *Syncer) run() {
 				log.Printf("WAL sync error: %v", err)
 			}
 
-			if !s.compacting.Load() { // ← atomic чтение
-				s.checkWALSize()
+			// Проверяем размер WAL реже — os.Stat каждые 100ms избыточен.
+			sizeCheckCounter++
+			if sizeCheckCounter >= sizeCheckEvery {
+				sizeCheckCounter = 0
+				if !s.compacting.Load() {
+					s.checkWALSize()
+				}
 			}
 
 		case <-s.stop:
@@ -66,14 +86,24 @@ func (s *Syncer) checkWALSize() {
 			float64(info.Size())/(1024*1024),
 			float64(MaxWALSize)/(1024*1024))
 
-		s.compacting.Store(true) // ← atomic запись
+		s.compacting.Store(true)
 		go func() {
+			// defer гарантирует сброс флага даже при panic —
+			// без этого auto-compact навсегда отключится.
+			defer s.compacting.Store(false)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("WAL compact panic: %v", r)
+				}
+			}()
 			BackgroundCompact(s.wal, s.dir, s.iterate)
-			s.compacting.Store(false) // ← atomic запись из другой горутины — БЕЗОПАСНО
 		}()
 	}
 }
 
+// Stop останавливает Syncer и ждёт завершения run-горутины.
+// Гарантирует, что последний Sync() выполнен перед возвратом.
 func (s *Syncer) Stop() {
 	close(s.stop)
+	s.wg.Wait()
 }

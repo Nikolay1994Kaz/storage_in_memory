@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"log"
 	"sync"
 	"time"
 )
@@ -67,6 +68,12 @@ const (
 //
 // Вместо N mutex locks → 1 mutex lock на batch.
 // При batch=256: contention снижается в 256 раз.
+//
+// Durability: fire-and-forget (аналог Redis AOF everysec).
+// Write() возвращает управление сразу после отправки в канал.
+// Данные попадают на диск асинхронно. Окно потери ≤100ms при crash.
+// Это осознанный trade-off: throughput > strict durability.
+// См. WAL doc для деталей.
 type BatchWAL struct {
 	wal *WAL           // нижележащий WAL (запись на диск)
 	ch  chan Entry     // канал: workers → flusher
@@ -104,6 +111,10 @@ func NewBatchWAL(w *WAL) *BatchWAL {
 //
 // Блокируется ТОЛЬКО если канал полон (backpressure).
 // При channelSize=8192 это происходит при burst > 8K entries.
+//
+// ВАЖНО: fire-and-forget. Ошибки записи на диск логируются,
+// но НЕ возвращаются вызывающему. Это осознанный trade-off
+// (аналог Redis AOF): throughput важнее strict durability.
 func (bw *BatchWAL) Write(entry Entry) {
 	bw.ch <- entry
 }
@@ -267,7 +278,9 @@ func (bw *BatchWAL) flushBatch(batch []Entry) {
 	}
 
 	// Одна запись в WAL — один mutex lock на весь batch!
-	bw.wal.WriteBatch(bw.encodeBuf)
+	if err := bw.wal.WriteBatch(bw.encodeBuf); err != nil {
+		log.Printf("WAL batch write failed (%d entries lost): %v", len(batch), err)
+	}
 }
 
 // grow расширяет buf на n байт, возвращая новый slice.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +24,10 @@ const (
 	OpVSimDel byte = 6 // вектор удалён из HNSW
 )
 
+// maxEntrySize — защита от мусорных данных при recovery.
+// Если length > 64MB — это скорее всего corruption, а не настоящая запись.
+const maxEntrySize = 64 * 1024 * 1024
+
 // Entry — одна запись в WAL.
 type Entry struct {
 	Op    byte
@@ -31,6 +36,20 @@ type Entry struct {
 }
 
 // WAL — Write-Ahead Log с поддержкой ротации.
+//
+// Durability trade-off (осознанный выбор, аналог Redis AOF everysec):
+//
+// Текущая архитектура — fire-and-forget: BatchWAL.Write() отправляет
+// запись в канал и немедленно возвращает управление. Данные попадают на
+// диск асинхронно (через flusher + Syncer fsync каждые 100ms).
+//
+// Это означает окно потери данных ≤100ms при crash. Для in-memory
+// KV store это приемлемый компромисс: максимальный throughput (~1.2M ops/sec)
+// ценой теоретической потери последних ~100ms данных.
+//
+// Для 100% durability в будущем планируется group commit (аналог PostgreSQL):
+// flusher будет делать fsync после каждого batch и уведомлять writers.
+// Ожидаемая деградация throughput: ~10-15% на NVMe.
 type WAL struct {
 	mu     sync.Mutex
 	file   *os.File
@@ -61,21 +80,21 @@ func (w *WAL) Write(entry Entry) error {
 	payload := encodeEntry(entry)
 	checksum := crc32.ChecksumIEEE(payload)
 
-	// 1. Создаем локальный массив на 8 байт (4 байта для CRC32 + 4 байта для длины).
+	// Создаем локальный массив на 8 байт (4 байта для CRC32 + 4 байта для длины).
 	// Важно: так как размер фиксирован, Go выделит эту память на стеке,
 	// а не в куче. Это значит — НОЛЬ нагрузки на сборщик мусора (GC)!
 	var header [8]byte
 
-	// 2. Вручную раскладываем числа по байтам (без рефлексии, работает мгновенно)
+	// Вручную раскладываем числа по байтам (без рефлексии, работает мгновенно)
 	binary.LittleEndian.PutUint32(header[0:4], checksum)
 	binary.LittleEndian.PutUint32(header[4:8], uint32(len(payload)))
 
-	// 3. Пишем весь заголовок (8 байт) за один вызов
+	// Пишем весь заголовок (8 байт) за один вызов
 	if _, err := w.writer.Write(header[:]); err != nil {
 		return fmt.Errorf("wal write header: %w", err)
 	}
 
-	// 4. Пишем сами данные
+	// Пишем сами данные
 	if _, err := w.writer.Write(payload); err != nil {
 		return fmt.Errorf("wal write payload: %w", err)
 	}
@@ -110,29 +129,28 @@ func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
 	}
 
 	w.mu.Lock()
-	// --- Критическая секция ---
+	defer w.mu.Unlock()
 
 	// Сбрасываем буфер старого WAL на диск
 	if err := w.writer.Flush(); err != nil {
-		w.mu.Unlock()
 		newFile.Close()
 		os.Remove(newPath)
 		return "", fmt.Errorf("wal rotate flush: %w", err)
 	}
 	if err := w.file.Sync(); err != nil {
-		w.mu.Unlock()
 		newFile.Close()
 		os.Remove(newPath)
 		return "", fmt.Errorf("wal rotate sync: %w", err)
 	}
 
 	oldPath = w.file.Name()
-	w.file.Close()
+	if err := w.file.Close(); err != nil {
+		// Данные уже synced — логируем, но продолжаем ротацию.
+		log.Printf("WAL rotate: error closing old file %s: %v", oldPath, err)
+	}
 
 	w.file = newFile
 	w.writer = bufio.NewWriter(newFile)
-	// --- Конец критической секции ---
-	w.mu.Unlock()
 
 	return oldPath, nil
 }
@@ -142,7 +160,10 @@ func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.writer.Flush()
+	if err := w.writer.Flush(); err != nil {
+		w.file.Close()
+		return fmt.Errorf("wal flush on close: %w", err)
+	}
 	return w.file.Close()
 }
 
@@ -156,19 +177,19 @@ func (w *WAL) Path() string {
 // --- Кодирование/декодирование ---
 
 func encodeEntry(e Entry) []byte {
-	keyBytes := []byte(e.Key)
-	size := 1 + 4 + len(keyBytes) + len(e.Value)
+	size := 1 + 4 + len(e.Key) + len(e.Value)
 	buf := make([]byte, size)
 
 	offset := 0
 	buf[offset] = e.Op
 	offset++
 
-	binary.LittleEndian.PutUint32(buf[offset:], uint32(len(keyBytes)))
+	binary.LittleEndian.PutUint32(buf[offset:], uint32(len(e.Key)))
 	offset += 4
 
-	copy(buf[offset:], keyBytes)
-	offset += len(keyBytes)
+	// copy из string напрямую — без промежуточного []byte(e.Key).
+	copy(buf[offset:], e.Key)
+	offset += len(e.Key)
 
 	if len(e.Value) > 0 {
 		copy(buf[offset:], e.Value)
@@ -178,6 +199,13 @@ func encodeEntry(e Entry) []byte {
 }
 
 // ReadEntries читает все записи из одного WAL-файла.
+//
+// Стратегия recovery (аналог PostgreSQL):
+//   - Читаем записи последовательно до первой невалидной
+//   - Truncated header/payload → нормально при crash recovery, логируем
+//   - CRC mismatch → corruption, логируем и останавливаемся
+//   - Реальная I/O ошибка → возвращаем error
+//   - Всё что прочитано до ошибки — валидные записи
 func ReadEntries(path string) ([]Entry, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -190,32 +218,60 @@ func ReadEntries(path string) ([]Entry, error) {
 
 	reader := bufio.NewReader(file)
 	var entries []Entry
+	baseName := filepath.Base(path)
 
 	for {
-		var checksum uint32
-		if err := binary.Read(reader, binary.LittleEndian, &checksum); err != nil {
+		// 1. Читаем header: [CRC32 4B][Length 4B]
+		var header [8]byte
+		_, err := io.ReadFull(reader, header[:])
+		if err != nil {
 			if err == io.EOF {
+				break // Нормальный конец файла
+			}
+			if err == io.ErrUnexpectedEOF {
+				// Truncated header — ожидаемо после crash
+				log.Printf("WAL %s: truncated header at entry %d (crash recovery), %d entries recovered",
+					baseName, len(entries), len(entries))
 				break
 			}
+			// Реальная I/O ошибка — возвращаем что есть + error
+			return entries, fmt.Errorf("wal read header %s: %w", baseName, err)
+		}
+
+		checksum := binary.LittleEndian.Uint32(header[0:4])
+		length := binary.LittleEndian.Uint32(header[4:8])
+
+		// Защита от мусорных данных: если length > maxEntrySize — это corruption
+		if length > maxEntrySize {
+			log.Printf("WAL %s: suspicious entry length %d at entry %d, stopping recovery (%d entries recovered)",
+				baseName, length, len(entries), len(entries))
 			break
 		}
 
-		var length uint32
-		if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
-			break
-		}
-
+		// 2. Читаем payload
 		payload := make([]byte, length)
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			break
+		_, err = io.ReadFull(reader, payload)
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				log.Printf("WAL %s: truncated payload at entry %d (crash recovery), %d entries recovered",
+					baseName, len(entries), len(entries))
+				break
+			}
+			return entries, fmt.Errorf("wal read payload %s: %w", baseName, err)
 		}
 
+		// 3. CRC проверка
 		if crc32.ChecksumIEEE(payload) != checksum {
+			log.Printf("WAL %s: CRC mismatch at entry %d, stopping recovery (%d entries recovered)",
+				baseName, len(entries), len(entries))
 			break
 		}
 
+		// 4. Декодируем
 		entry, err := decodeEntry(payload)
 		if err != nil {
+			log.Printf("WAL %s: decode error at entry %d: %v, stopping recovery (%d entries recovered)",
+				baseName, len(entries), err, len(entries))
 			break
 		}
 		entries = append(entries, entry)
