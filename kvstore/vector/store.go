@@ -155,6 +155,21 @@ func (vs *VectorStore) ForEach(fn func(key string, vec []float32)) {
 	}
 }
 
+// Clear удаляет ВСЕ векторы из хранилища.
+//
+// Используется при Full Sync репликации: реплика получает +FULLSYNC
+// и очищает все данные перед приёмом свежего слепка от мастера.
+// Аналог FLUSHALL в Redis.
+func (vs *VectorStore) Clear() {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	vs.graph = NewGraph(vs.graph.Distance)
+	vs.keys = make(map[uint64]string)
+	vs.ids = make(map[string]uint64)
+	vs.dim = 0
+}
+
 func SerializeVector(vec []float32) []byte {
 	buf := make([]byte, len(vec)*4)
 	for i, v := range vec {

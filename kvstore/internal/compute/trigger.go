@@ -88,36 +88,38 @@ func (tm *TriggerManager) ListTriggers() []*Trigger {
 }
 
 // Fire вызывается при каждом SET/DEL/EXPIRE.
-// Проверяет все триггеры — если паттерн совпадает, запускает WASM-функцию.
+// workerID определяет какой worker-local WASM-инстанс использовать.
 //
-// BUG FIX: Теперь передаёт key в WASM-функцию через ExecFunctionWithKey.
-// Раньше вызывал ExecFunction() без аргументов — WASM не знал, какой ключ
-// вызвал триггер, что делало триггеры бесполезными.
-func (tm *TriggerManager) Fire(event TriggerEvent, key string) {
+// Два пути выполнения:
+//   - Reactor-модуль (worker-local): WorkerLocal.Exec() — ~1µs, 0 allocs
+//   - Command-модуль (legacy):       ExecFunctionWithKey() — ~14ms, 53K allocs
+func (tm *TriggerManager) Fire(event TriggerEvent, key string, workerID int) {
 	tm.mu.RLock()
 	triggers := make([]*Trigger, len(tm.triggers))
 	copy(triggers, tm.triggers)
 	tm.mu.RUnlock()
 
 	for _, t := range triggers {
-		// Проверяем: событие совпадает?
 		if t.Event != event {
 			continue
 		}
 
-		// Проверяем: паттерн совпадает?
 		matched, err := filepath.Match(t.Pattern, key)
 		if err != nil || !matched {
 			continue
 		}
 
-		// Совпало! Запускаем WASM-функцию с передачей ключа
 		log.Printf("[wasm] Trigger %s fired: %s on key '%s' → %s.%s",
 			t.ID, event, key, t.ModuleName, t.FuncName)
 
-		// Передаём ключ в WASM-memory и вызываем функцию
-		// WASM-функция получит (key_ptr, key_len) как аргументы
-		err = tm.engine.ExecFunctionWithKey(t.ModuleName, t.FuncName, key)
+		// Быстрый путь: Reactor-модуль через worker-local инстанс
+		if tm.engine.WorkerLocal != nil && tm.engine.WorkerLocal.HasModule(t.ModuleName) {
+			_, err = tm.engine.WorkerLocal.Exec(workerID, t.ModuleName, t.FuncName, []byte(key))
+		} else {
+			// Fallback: Command-модуль через per-call instantiation
+			err = tm.engine.ExecFunctionWithKey(t.ModuleName, t.FuncName, key)
+		}
+
 		if err != nil {
 			log.Printf("[wasm] Trigger %s error: %v", t.ID, err)
 		}

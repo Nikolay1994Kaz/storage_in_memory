@@ -6,6 +6,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 )
 
@@ -18,7 +19,21 @@ import (
 //   - Передаёт (offset, length) как i32
 //   - Go-код читает байты из memory по этому offset
 func (e *Engine) registerHostFunctions(ctx context.Context) (api.Module, error) {
-	return e.runtime.NewHostModuleBuilder("env").
+	return e.buildHostModule(e.runtime).Instantiate(ctx)
+}
+
+// registerHostFunctionsOn регистрирует host-функции на указанном runtime.
+// Используется WorkerLocalEngine для создания отдельного runtime.
+func (e *Engine) registerHostFunctionsOn(rt wazero.Runtime) {
+	ctx := context.Background()
+	if _, err := e.buildHostModule(rt).Instantiate(ctx); err != nil {
+		log.Fatalf("[wasm] Failed to register host functions on worker-local runtime: %v", err)
+	}
+}
+
+// buildHostModule создаёт HostModuleBuilder с host-функциями.
+func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
+	return rt.NewHostModuleBuilder("env").
 
 		// ─── kv_get(key_ptr, key_len) → val_len ───
 		// Читает значение из Store по ключу.
@@ -39,8 +54,8 @@ func (e *Engine) registerHostFunctions(ctx context.Context) (api.Module, error) 
 			}
 
 			// 3. Записываем значение обратно в WASM-память
-			// Используем фиксированный offset (1024) для результата
-			m.Memory().Write(1024, val)
+			// Используем фиксированный offset (ValueOffset) для результата
+			m.Memory().Write(ValueOffset, val)
 			return uint32(len(val))
 		}).
 		Export("kv_get").
@@ -274,6 +289,75 @@ func (e *Engine) registerHostFunctions(ctx context.Context) (api.Module, error) 
 		}).
 		Export("vsim_search").
 
-		// Компилируем и создаём host-модуль
-		Instantiate(ctx)
+		// ─── ai_embed(text_ptr, text_len) → dim ───
+		//
+		// Генерирует embedding через Ollama из WASM-модуля.
+		// WASM кладёт текст в memory → Go читает → Ollama → вектор.
+		// Результат ([]float32) записывается по offset 8192.
+		// Возвращает размерность вектора (0 = ошибка или AI недоступен).
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, textPtr, textLen uint32) uint32 {
+			if e.AIEmbed == nil {
+				return 0
+			}
+
+			text, ok := m.Memory().Read(textPtr, textLen)
+			if !ok {
+				return 0
+			}
+
+			// Отдельный контекст: AI занимает секунды, не 10ms как WASM
+			aiCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			embedding, err := e.AIEmbed(aiCtx, string(text))
+			if err != nil {
+				log.Printf("[wasm] ai_embed error: %v", err)
+				return 0
+			}
+
+			// Записываем []float32 в WASM-memory по offset 8192
+			offset := uint32(8192)
+			for _, v := range embedding {
+				m.Memory().WriteFloat32Le(offset, v)
+				offset += 4
+			}
+
+			return uint32(len(embedding))
+		}).
+		Export("ai_embed").
+
+		// ─── ai_chat(prompt_ptr, prompt_len) → response_len ───
+		//
+		// Отправляет промпт в LLM (Gemma) из WASM-модуля.
+		// Результат (строка ответа) записывается по offset 16384.
+		// Возвращает длину ответа в байтах (0 = ошибка).
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, promptPtr, promptLen uint32) uint32 {
+			if e.AIChat == nil {
+				return 0
+			}
+
+			prompt, ok := m.Memory().Read(promptPtr, promptLen)
+			if !ok {
+				return 0
+			}
+
+			aiCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			response, err := e.AIChat(aiCtx, string(prompt))
+			if err != nil {
+				log.Printf("[wasm] ai_chat error: %v", err)
+				return 0
+			}
+
+			respBytes := []byte(response)
+			if !m.Memory().Write(16384, respBytes) {
+				return 0
+			}
+
+			return uint32(len(respBytes))
+		}).
+		Export("ai_chat")
 }

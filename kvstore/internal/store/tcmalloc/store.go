@@ -397,3 +397,18 @@ func (s *TCMallocStore) UsedMemory() int64 {
 	return s.heap.UsedMemory()
 }
 
+// Clear удаляет ВСЕ данные из store.
+//
+// Используется при Full Sync репликации: реплика получает +FULLSYNC,
+// очищает все данные и принимает свежий слепок от мастера.
+// Аналог FLUSHALL в Redis.
+//
+// Реализация: проходим по всем шардам и пересоздаём индексы.
+// Под мьютексом каждого шарда — безопасно для параллельных GET.
+func (s *TCMallocStore) Clear() {
+	for i := range s.shards {
+		s.shards[i].mu.Lock()
+		s.shards[i].table.Store(NewHashTable(defaultInitialCap))
+		s.shards[i].mu.Unlock()
+	}
+}

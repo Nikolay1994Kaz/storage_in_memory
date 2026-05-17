@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"github.com/tetratelabs/wazero/sys"
 )
+
+var instanceCounter atomic.Uint64
 
 // CompiledModule — загруженный и скомпилированный WASM-модуль.
 type CompiledModule struct {
@@ -40,6 +43,10 @@ type Engine struct {
 	// Зависший модуль будет прерван после этого времени.
 	ExecTimeout time.Duration
 
+	// WorkerLocal — per-worker persistent WASM инстансы (Reactor pattern).
+	// nil если ни один reactor-модуль не загружен.
+	WorkerLocal *WorkerLocalEngine
+
 	GlobalLock   func()
 	GlobalUnlock func()
 
@@ -60,12 +67,23 @@ type Engine struct {
 		Key      string
 		Distance float32
 	}
+
+	// AI — мосты к Ollama. WASM-модули могут генерировать embeddings и вызывать LLM.
+	// Подключаются в main.go, если Ollama доступна.
+	AIEmbed func(ctx context.Context, text string) ([]float32, error)
+	AIChat  func(ctx context.Context, prompt string) (string, error)
 }
 
 // NewEngine создаёт WASM compute engine.
 func NewEngine() *Engine {
 	ctx := context.Background()
-	r := wazero.NewRuntime(ctx)
+	r := wazero.NewRuntimeWithConfig(ctx,
+		wazero.NewRuntimeConfig().
+			// WithCloseOnContextDone — критически важно!
+			// Без него context.Timeout НЕ прерывает tight CPU-bound loop в WASM.
+			// Зависший модуль (loop { br 0 }) навечно заблокирует worker.
+			WithCloseOnContextDone(true),
+	)
 
 	e := &Engine{
 		runtime:     r,
@@ -81,16 +99,21 @@ func NewEngine() *Engine {
 	// WASI нужен для Go-модулей (GOOS=wasip1)
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 
+	// Worker-local engine для Reactor-модулей
+	e.WorkerLocal = NewWorkerLocalEngine(e)
+
 	return e
+
 }
 
 // Close освобождает ресурсы WASM-рантайма.
 func (e *Engine) Close() {
+	if e.WorkerLocal != nil {
+		e.WorkerLocal.Close()
+	}
 	e.runtime.Close(context.Background())
 }
 
-// LoadModule загружает WASM-модуль из байтов.
-// После загрузки модуль доступен по имени для WASM.EXEC.
 func (e *Engine) LoadModule(name string, wasmBytes []byte) error {
 	ctx := context.Background()
 
@@ -108,7 +131,18 @@ func (e *Engine) LoadModule(name string, wasmBytes []byte) error {
 	}
 	e.mu.Unlock()
 
-	log.Printf("[wasm] Module '%s' loaded successfully", name)
+	// Автодетект: Reactor (есть _initialize) → worker-local инстансы
+	if IsReactorModule(compiled) {
+		tier := TierBudget // по умолчанию — с рециклингом (безопасно для стороннего кода)
+		if err := e.WorkerLocal.WarmUpFromBytes(name, wasmBytes, tier); err != nil {
+			log.Printf("[wasm] Worker-local warmup failed for '%s': %v (fallback to per-call)", name, err)
+		} else {
+			log.Printf("[wasm] Module '%s' loaded as Reactor (worker-local, tier=%d)", name, tier)
+			return nil
+		}
+	}
+
+	log.Printf("[wasm] Module '%s' loaded as Command (per-call instantiation)", name)
 	return nil
 }
 
@@ -120,6 +154,11 @@ func (e *Engine) DropModule(name string) error {
 	mod, exists := e.modules[name]
 	if !exists {
 		return fmt.Errorf("module '%s' not found", name)
+	}
+
+	// Если модуль был worker-local — закрываем все слоты
+	if e.WorkerLocal != nil {
+		e.WorkerLocal.DropModule(name)
 	}
 
 	mod.Compiled.Close(context.Background())
@@ -171,7 +210,7 @@ func (e *Engine) ExecFunction(moduleName, funcName string, args ...uint64) ([]ui
 	ctx = context.WithValue(ctx, execTxKey{}, tx)
 
 	// Уникальное имя для каждого инстанса (wazero требует уникальности)
-	instanceName := fmt.Sprintf("%s_%d", moduleName, time.Now().UnixNano())
+	instanceName := moduleName + "_" + strconv.FormatUint(instanceCounter.Add(1), 10)
 
 	// Создаём новый инстанс модуля (изолированный!)
 	instance, err := e.runtime.InstantiateModule(ctx, mod.Compiled,
@@ -225,7 +264,7 @@ func (e *Engine) ExecFunctionWithKey(moduleName, funcName, key string) error {
 	tx := &WasmTxCtx{}
 	ctx = context.WithValue(ctx, execTxKey{}, tx)
 
-	instanceName := fmt.Sprintf("%s_%d", moduleName, time.Now().UnixNano())
+	instanceName := moduleName + "_" + strconv.FormatUint(instanceCounter.Add(1), 10)
 
 	instance, err := e.runtime.InstantiateModule(ctx, mod.Compiled,
 		wazero.NewModuleConfig().WithName(instanceName).

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"kvstore/kvstore/internal/ai"
 	"kvstore/kvstore/internal/cluster"
 	"kvstore/kvstore/internal/compute"
 	"kvstore/kvstore/internal/protocol"
@@ -40,6 +42,7 @@ func main() {
 	clusterEnabled := flag.Bool("cluster", false, "включить кластерный режим")
 	clusterSlotStart := flag.Int("slot-start", 0, "начало диапазона слотов")
 	clusterSlotEnd := flag.Int("slot-end", 16383, "конец диапазона слотов")
+	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "URL Ollama API")
 	flag.Parse()
 
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
@@ -163,6 +166,12 @@ func main() {
 		cl.Repl.StoreDel = func(key string) {
 			s.Del(0, key)
 		}
+		cl.Repl.StoreClear = func() {
+			s.Clear()
+		}
+		cl.Repl.VecStoreClear = func() {
+			vecStore.Clear()
+		}
 
 		if err := cl.StartGossip(); err != nil {
 			log.Fatalf("Failed to start gossip: %v", err)
@@ -224,6 +233,40 @@ func main() {
 	triggers := compute.NewTriggerManager(wasm)
 	compute.LoadAll(dataDir, wasm, triggers)
 
+	// === 8. AI Engine (Ollama) ===
+	var aiClient *ai.Client
+	var aiWorker *ai.Worker
+
+	aiClient = ai.NewClient(*ollamaURL, "nomic-embed-text", "gemma4:e2b")
+	if err := aiClient.Ping(context.Background()); err != nil {
+		log.Printf("WARNING: Ollama not available (%v), AI commands disabled", err)
+		aiClient = nil
+	} else {
+		log.Println("Ollama connected: nomic-embed-text + gemma4:e2b")
+
+		// Подключаем AI к WASM Engine — WASM-модули получают доступ к Ollama
+		wasm.AIEmbed = func(ctx context.Context, text string) ([]float32, error) {
+			return aiClient.Embed(ctx, text)
+		}
+		wasm.AIChat = func(ctx context.Context, prompt string) (string, error) {
+			return aiClient.Chat(ctx, prompt)
+		}
+
+		// Background Worker: асинхронный embedding с PubSub-нотификациями
+		aiWorker = ai.NewWorker(aiClient, 256)
+		aiWorker.VecStoreAdd = func(key string, vec []float32) error {
+			return vecStore.Add(key, vec)
+		}
+		aiWorker.KVStoreSet = func(key string, value []byte) {
+			s.Set(0, key, value)
+		}
+		aiWorker.Publish = func(channel, message string) {
+			hub.Publish(channel, message)
+		}
+		aiWorker.Start(2) // 2 горутины (Ollama сама батчит)
+		defer aiWorker.Stop()
+	}
+
 	// ═══════════════════════════════════════════════════
 	// HANDLER — zero-alloc: args = [][]byte из ring buffer
 	// ═══════════════════════════════════════════════════
@@ -262,7 +305,7 @@ func main() {
 			for _, queuedArgs := range cs.TxQueue {
 				qCmd := strings.ToUpper(string(queuedArgs[0]))
 				qCmdArgs := queuedArgs[1:]
-				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, cs, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, cs, qCmd, qCmdArgs)
 			}
 			globalTxMu.Unlock()
 			cs.InTx = false
@@ -281,7 +324,7 @@ func main() {
 			return
 		}
 
-		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, cs, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, cs, cmd, cmdArgs)
 	}
 
 	// === 8. Сервер ===
@@ -340,6 +383,7 @@ func arg(args [][]byte, i int) string {
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
 	hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine,
 	triggers *compute.TriggerManager, vecStore *vector.VectorStore,
+	aiClient *ai.Client, aiWorker *ai.Worker,
 	cs *server.ConnState, cmd string, args [][]byte) {
 
 	buf := cs.Buf
@@ -419,7 +463,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		if cl != nil && cl.Repl != nil {
 			cl.Repl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
 		}
-		triggers.Fire(compute.OnSet, key)
+		triggers.Fire(compute.OnSet, key, workerID)
 
 		if len(args) >= 4 && strings.ToUpper(string(args[2])) == "EX" {
 			seconds, err := strconv.Atoi(string(args[3]))
@@ -484,7 +528,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		if cl != nil && cl.Repl != nil {
 			cl.Repl.ForwardWrite(fmt.Sprintf("DEL %s", key))
 		}
-		triggers.Fire(compute.OnDel, key)
+		triggers.Fire(compute.OnDel, key, workerID)
 		if ok {
 			buf.WriteInt(1)
 		} else {
@@ -801,6 +845,125 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		count, dim, maxLevel := vecStore.Info()
 		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d", count, dim, maxLevel)
 		buf.WriteBulkString(info)
+
+	// === AI Commands ===
+	case "AI.EMBED":
+		if aiClient == nil {
+			buf.WriteError("ERR Ollama not available")
+			return
+		}
+		if len(args) < 1 {
+			buf.WriteError("ERR usage: AI.EMBED <text>")
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		embedding, err := aiClient.Embed(ctx, string(args[0]))
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(embedding))
+		for _, v := range embedding {
+			buf.WriteBulkString(fmt.Sprintf("%.6f", v))
+		}
+
+	case "AI.SEARCH":
+		if aiClient == nil {
+			buf.WriteError("ERR Ollama not available")
+			return
+		}
+		if len(args) < 2 {
+			buf.WriteError("ERR usage: AI.SEARCH <K> <text>")
+			return
+		}
+		K, err := strconv.Atoi(string(args[0]))
+		if err != nil || K <= 0 {
+			buf.WriteError("ERR invalid K")
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		embedding, err := aiClient.Embed(ctx, string(args[1]))
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR embed: %v", err))
+			return
+		}
+		results, err := vecStore.Search(embedding, K)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR search: %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(results) * 2)
+		for _, r := range results {
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
+		}
+
+	case "AI.ASK":
+		if aiClient == nil {
+			buf.WriteError("ERR Ollama not available")
+			return
+		}
+		if len(args) < 1 {
+			buf.WriteError("ERR usage: AI.ASK <question>")
+			return
+		}
+		question := string(args[0])
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// RAG Step 1: вопрос → embedding
+		embedding, err := aiClient.Embed(ctx, question)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR embed: %v", err))
+			return
+		}
+
+		// RAG Step 2: поиск похожих документов
+		results, err := vecStore.Search(embedding, 3)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR search: %v", err))
+			return
+		}
+
+		// RAG Step 3: достаём оригинальные тексты из KV Store
+		var contextParts []string
+		for _, r := range results {
+			if val, ok := s.Get(r.Key); ok {
+				contextParts = append(contextParts, fmt.Sprintf("[%s]: %s", r.Key, string(val)))
+			}
+		}
+		if len(contextParts) == 0 {
+			buf.WriteError("ERR no documents found for context")
+			return
+		}
+
+		// RAG Step 4: собираем промпт и отправляем в LLM
+		prompt := fmt.Sprintf("Контекст:\n%s\n\nВопрос: %s\n\nОтветь кратко на основе контекста выше.",
+			strings.Join(contextParts, "\n"), question)
+
+		answer, err := aiClient.Chat(ctx, prompt)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR chat: %v", err))
+			return
+		}
+		buf.WriteBulkString(answer)
+
+	case "AI.INGEST":
+		if aiWorker == nil {
+			buf.WriteError("ERR Ollama not available")
+			return
+		}
+		if len(args) < 2 {
+			buf.WriteError("ERR usage: AI.INGEST <key> <text>")
+			return
+		}
+		if err := aiWorker.Submit(string(args[0]), string(args[1])); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteSimpleString("QUEUED")
 
 	default:
 		buf.WriteError(fmt.Sprintf("ERR unknown command '%s'", cmd))

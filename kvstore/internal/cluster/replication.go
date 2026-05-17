@@ -24,11 +24,22 @@ type ReplicationManager struct {
 	StoreSet     func(key string, value []byte)
 	StoreDel     func(key string)
 
+	// StoreClear очищает ВСЕ данные на реплике перед Full Sync.
+	//
+	// Зачем: если реплика была в отключке 5 минут, за это время
+	// мастер мог удалить (DEL) некоторые ключи. Без очистки
+	// эти ключи останутся на реплике как "призраки".
+	//
+	// В Redis это аналог FLUSHALL перед загрузкой RDB.
+	// Вызывается из replicationLoop при получении +FULLSYNC.
+	StoreClear func()
+
 	// Колбэки для репликации векторного индекса.
 	// Без них VSIM.ADD/DEL не реплицируются на реплики.
 	VecStoreAdd     func(key string, vec []float32)
 	VecStoreDel     func(key string)
 	VecStoreForEach func(fn func(key string, vec []float32))
+	VecStoreClear   func()
 }
 
 func NewReplicationManager(c *Cluster) *ReplicationManager {
@@ -219,7 +230,20 @@ func (rm *ReplicationManager) replicationLoop(masterAddr string) error {
 
 		// Служебные сообщения
 		if line == "+FULLSYNC" {
-			log.Println("[replication] Full sync started...")
+			log.Println("[replication] Full sync started, clearing local data...")
+
+			// Очищаем ВСЕ локальные данные перед полной синхронизацией.
+			// Без этого ключи, удалённые на мастере за время отключки,
+			// останутся на реплике как "призраки" (ghost keys).
+			if rm.StoreClear != nil {
+				rm.StoreClear()
+				log.Println("[replication] KV store cleared")
+			}
+			if rm.VecStoreClear != nil {
+				rm.VecStoreClear()
+				log.Println("[replication] Vector store cleared")
+			}
+
 			continue
 		}
 		if line == "+FULLSYNC_DONE" {
