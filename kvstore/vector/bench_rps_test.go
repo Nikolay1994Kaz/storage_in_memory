@@ -129,6 +129,132 @@ func TestRPSBenchmark(t *testing.T) {
 	t.Log("═══════════════════════════════════════")
 }
 
+// ─────────────────────────────────────────────
+// Сравнение производительности Go vs Rust WASM
+// ─────────────────────────────────────────────
+//
+// Этот тест автоматически переключает движки и сравнивает их на dim=128 и dim=768.
+//
+// Запуск:
+//   1. Запусти сервер: ./kvstore_bin
+//   2. go test ./kvstore/vector/ -run TestCompareEnginesRPS -v -count=1
+
+func TestCompareEnginesRPS(t *testing.T) {
+	addr := "localhost:6380"
+
+	// Проверяем, запущен ли сервер
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Skip("Server not running on :6380, skipping comparative RPS benchmark")
+	}
+	conn.Close()
+
+	dimensions := []int{128, 768}
+	numVectors := 1000
+	benchDuration := 3 * time.Second
+	concurrency := 24
+
+	t.Logf("═══ Automated Go vs Rust WASM Performance Comparison ═══")
+	t.Logf("Server: %s", addr)
+	t.Logf("Vectors: %d, Concurrency: %d, Duration per run: %v", numVectors, concurrency, benchDuration)
+
+	type Result struct {
+		Dim     int
+		GoRPS   int64
+		RustRPS int64
+	}
+	var results []Result
+
+	for _, dim := range dimensions {
+		t.Logf("\n=================== Dimension %d ===================", dim)
+
+		// 1. Сбрасываем движок на Go
+		t.Log("Setting engine to Go (0)...")
+		sendSimpleCommand(t, addr, "*2\r\n$14\r\nVSIM.SETENGINE\r\n$1\r\n0\r\n")
+
+		// 2. Очищаем старые векторы
+		t.Log("Cleaning old vectors...")
+		for i := 0; i < numVectors; i++ {
+			key := fmt.Sprintf("vec:%d", i)
+			sendSimpleCommand(t, addr, fmt.Sprintf("*2\r\n$8\r\nVSIM.DEL\r\n$%d\r\n%s\r\n", len(key), key))
+		}
+
+		// 3. Загружаем новые векторы
+		t.Logf("Loading %d vectors of dimension %d...", numVectors, dim)
+		loadStart := time.Now()
+		loadVectors(t, addr, numVectors, dim)
+		t.Logf("Loaded vectors in %v", time.Since(loadStart))
+
+		// 4. Тестируем Go Engine
+		t.Log("Benchmarking Go Engine (Hybrid WASM SIMD distance calculations)...")
+		searchCmd := buildSearchCommand(dim, 10)
+		goRPS := benchmarkCommand(t, addr, benchDuration, concurrency, func(c net.Conn) error {
+			_, err := c.Write(searchCmd)
+			if err != nil {
+				return err
+			}
+			buf := make([]byte, 4096)
+			_, err = c.Read(buf)
+			return err
+		})
+		t.Logf("Go Engine: %d RPS", goRPS)
+
+		// 5. Переключаемся на Rust WASM Engine
+		t.Log("Switching to Rust WASM Engine (1)...")
+		switchStart := time.Now()
+		sendSimpleCommand(t, addr, "*2\r\n$14\r\nVSIM.SETENGINE\r\n$1\r\n1\r\n")
+		t.Logf("Switch and synchronization of %d vectors completed in %v", numVectors, time.Since(switchStart))
+
+		// 6. Тестируем Rust WASM Engine
+		t.Log("Benchmarking Rust WASM Engine (Full Rust HNSW inside WASM)...")
+		rustRPS := benchmarkCommand(t, addr, benchDuration, concurrency, func(c net.Conn) error {
+			_, err := c.Write(searchCmd)
+			if err != nil {
+				return err
+			}
+			buf := make([]byte, 4096)
+			_, err = c.Read(buf)
+			return err
+		})
+		t.Logf("Rust WASM Engine: %d RPS", rustRPS)
+
+		results = append(results, Result{
+			Dim:     dim,
+			GoRPS:   goRPS,
+			RustRPS: rustRPS,
+		})
+	}
+
+	// Выводим красивую итоговую таблицу
+	t.Log("\n# Comparative Benchmark Results (RPS)")
+	t.Log("| Vector Dimension | Go Engine (Hybrid) | Rust WASM Engine (Full HNSW) | Performance Gain |")
+	t.Log("|-------------------|--------------------|-----------------------------|------------------|")
+	for _, r := range results {
+		gain := float64(r.RustRPS) / float64(r.GoRPS)
+		t.Logf("| %17d | %18d | %27d | %15.2fx |", r.Dim, r.GoRPS, r.RustRPS, gain)
+	}
+
+	// Сбрасываем движок обратно на Go в конце
+	sendSimpleCommand(t, addr, "*2\r\n$14\r\nVSIM.SETENGINE\r\n$1\r\n0\r\n")
+}
+
+func sendSimpleCommand(t *testing.T, addr string, cmd string) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to connect to server: %v", err)
+	}
+	defer conn.Close()
+	_, err = conn.Write([]byte(cmd))
+	if err != nil {
+		t.Fatalf("Failed to write command: %v", err)
+	}
+	buf := make([]byte, 256)
+	_, err = conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+}
+
 // benchmarkCommand запускает concurrency горутин, каждая шлёт команды в цикле duration.
 // Возвращает итоговый RPS.
 func benchmarkCommand(t *testing.T, addr string, duration time.Duration, concurrency int, fn func(net.Conn) error) int64 {

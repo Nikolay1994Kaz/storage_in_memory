@@ -3,10 +3,12 @@ package tcmalloc
 // TCMallocEvictor — адаптер для интерфейса store.Evictor.
 //
 // TTLManager требует интерфейс:
-//   Del(key string) bool
+//
+//	Del(key string) bool
 //
 // TCMallocStore имеет:
-//   Del(workerID int, key string) bool
+//
+//	Del(workerID int, key string) bool
 //
 // TCMallocEvictor оборачивает TCMallocStore и вызывает Del(0, key).
 // Worker 0 используется потому что TTL eviction — холодный путь:

@@ -521,9 +521,9 @@ func TestFlush_Empty(t *testing.T) {
 // maxArgs = 16. Если клиент пришлёт *17, парсер вернёт nil.
 // Это защита: массив args[maxArgs] на СТЕКЕ, переполнение = паника.
 func TestParse_MaxArgsOverflow(t *testing.T) {
-	input := []byte("*17\r\n")
-	// Добавляем 17 аргументов
-	for i := 0; i < 17; i++ {
+	input := []byte("*2049\r\n")
+	// Добавляем 2049 аргументов
+	for i := 0; i < 2049; i++ {
 		input = append(input, []byte("$1\r\nx\r\n")...)
 	}
 	cb := newTestParser(input)

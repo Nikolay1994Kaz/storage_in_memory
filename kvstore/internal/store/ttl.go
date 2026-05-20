@@ -41,9 +41,9 @@ type Evictor interface {
 //     два соседних шарда попадают в одну cache line → false sharing при
 //     параллельной записи разными ядрами CPU.
 type ttlShard struct {
-	mu      sync.RWMutex      // 24 байта
-	expires map[string]int64  // 8 байт (указатель на hmap)
-	_       [32]byte          // padding → итого 64 байта = 1 cache line
+	mu      sync.RWMutex     // 24 байта
+	expires map[string]int64 // 8 байт (указатель на hmap)
+	_       [32]byte         // padding → итого 64 байта = 1 cache line
 }
 
 // TTLManager — шардированное управление временем жизни ключей.

@@ -504,7 +504,7 @@ func (g *Graph) Delete(id uint64) bool {
 			// Ищем ноду с максимальным уровнем — она станет новым entry point.
 			// Entry point всегда должен быть на самом верхнем слое,
 			// иначе поиск не сможет начаться с верхних слоёв.
-			newMaxLevel := 0
+			newMaxLevel := -1
 			var newEP uint64
 			for nid, n := range g.nodes {
 				if n.Level > newMaxLevel {

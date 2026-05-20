@@ -33,9 +33,9 @@ const (
 //   Chunked:      ~9600 копирований указателей, 98 аллокаций chunks
 
 const (
-	regChunkBits = 10                    // 1024 span'ов на chunk
-	regChunkSize = 1 << regChunkBits     // 1024
-	regChunkMask = regChunkSize - 1      // 0x3FF
+	regChunkBits = 10                // 1024 span'ов на chunk
+	regChunkSize = 1 << regChunkBits // 1024
+	regChunkMask = regChunkSize - 1  // 0x3FF
 )
 
 // spanChunk — фиксированный массив указателей на span'ы.
@@ -62,8 +62,8 @@ func newSpanRegistry() *spanRegistry {
 // и COW на L1 массиве (копируем только указатели на chunks, не сами span'ы).
 func (r *spanRegistry) append(s *Span) {
 	id := r.count.Load()
-	ci := id >> regChunkBits   // chunk index
-	si := id & regChunkMask    // slot index внутри chunk'а
+	ci := id >> regChunkBits // chunk index
+	si := id & regChunkMask  // slot index внутри chunk'а
 
 	chunks := *r.chunks.Load()
 
@@ -86,8 +86,9 @@ func (r *spanRegistry) append(s *Span) {
 //
 // Два array access: chunks[ci][si].
 // Оба массива иммутабельны с точки зрения readers:
-//   L1 — подменяется через atomic.Pointer (старый живёт пока readers не уйдут)
-//   L2 — никогда не перемещается (фиксированный массив)
+//
+//	L1 — подменяется через atomic.Pointer (старый живёт пока readers не уйдут)
+//	L2 — никогда не перемещается (фиксированный массив)
 func (r *spanRegistry) get(spanID uint32) *Span {
 	chunks := *r.chunks.Load()
 	ci := spanID >> regChunkBits

@@ -9,7 +9,7 @@ import (
 
 const (
 	readBufSize = 65536 // 64KB — вмещает ~1000 команд SET
-	maxArgs     = 16    // покрывает 99.9% Redis команд
+	maxArgs     = 2048  // поддерживает высокоразмерные векторные команды (до 2046 floats)
 )
 
 // ConnBuf — per-connection zero-alloc буфер чтения/записи.
@@ -67,6 +67,11 @@ func NewConnBuf(conn net.Conn) *ConnBuf {
 // Перед чтением компактифицирует буфер.
 func (cb *ConnBuf) ReadFromConn() (int, error) {
 	cb.compact()
+	if cb.rend == len(cb.rbuf) {
+		newBuf := make([]byte, len(cb.rbuf)*2)
+		copy(newBuf, cb.rbuf)
+		cb.rbuf = newBuf
+	}
 	n, err := cb.conn.Read(cb.rbuf[cb.rend:])
 	cb.rend += n
 	return n, err
@@ -87,6 +92,11 @@ func (cb *ConnBuf) TryRead() int {
 		return 0
 	}
 	cb.compact()
+	if cb.rend == len(cb.rbuf) {
+		newBuf := make([]byte, len(cb.rbuf)*2)
+		copy(newBuf, cb.rbuf)
+		cb.rbuf = newBuf
+	}
 
 	var nRead int
 	cb.rawConn.Read(func(fd uintptr) bool {

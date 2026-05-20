@@ -78,12 +78,6 @@ func NewWorkerLocalEngine(e *Engine) *WorkerLocalEngine {
 	}
 }
 
-// WarmUp — deprecated, use WarmUpFromBytes.
-// CompiledModule привязан к конкретному runtime и не переносится.
-func (wle *WorkerLocalEngine) WarmUp(name string, compiled wazero.CompiledModule, tier ModuleTier) error {
-	return fmt.Errorf("use WarmUpFromBytes instead — CompiledModule is runtime-bound")
-}
-
 // WarmUpFromBytes компилирует и создаёт persistent инстансы из WASM-байтов.
 func (wle *WorkerLocalEngine) WarmUpFromBytes(name string, wasmBytes []byte, tier ModuleTier) error {
 	ctx := context.Background()

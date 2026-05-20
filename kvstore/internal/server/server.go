@@ -34,9 +34,10 @@ type ConnState struct {
 // Стало: func(cs, args [][]byte)        — читает из ring buffer, пишет в ring buffer
 //
 // Handler НЕ возвращает значение. Вместо этого пишет ответ прямо в cs.Buf:
-//   cs.Buf.WriteSimpleString("OK")
-//   cs.Buf.WriteBulk(value)
-//   cs.Buf.WriteError("ERR ...")
+//
+//	cs.Buf.WriteSimpleString("OK")
+//	cs.Buf.WriteBulk(value)
+//	cs.Buf.WriteError("ERR ...")
 type Handler func(cs *ConnState, args [][]byte)
 
 // worker — один воркер со своим epoll instance.
@@ -140,13 +141,13 @@ func (s *Server) eventLoop(w *worker) {
 // ★ HYBRID: RING BUFFER + GREEDY DRAIN ★
 //
 // Цикл:
-//   1. ReadFromConn() — основной read (epoll гарантирует данные)
-//   2. ParseCommand() loop — разбираем ВСЕ команды из буфера
-//   3. TryRead() — non-blocking raw syscall.Read:
-//      пока мы обрабатывали команды (~100μs), клиент уже мог
-//      отправить следующую. Ловим её БЕЗ нового epoll_wait.
-//   4. Если TryRead вернул данные — обрабатываем и повторяем
-//   5. Flush() — ONE write() для всех ответов
+//  1. ReadFromConn() — основной read (epoll гарантирует данные)
+//  2. ParseCommand() loop — разбираем ВСЕ команды из буфера
+//  3. TryRead() — non-blocking raw syscall.Read:
+//     пока мы обрабатывали команды (~100μs), клиент уже мог
+//     отправить следующую. Ловим её БЕЗ нового epoll_wait.
+//  4. Если TryRead вернул данные — обрабатываем и повторяем
+//  5. Flush() — ONE write() для всех ответов
 //
 // Это то, что делает bufio.Reader "бесплатно" — жадно читает
 // больше данных чем нужно. Мы делаем то же, но осознанно и

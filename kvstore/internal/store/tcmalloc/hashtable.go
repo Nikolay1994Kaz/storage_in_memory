@@ -16,9 +16,9 @@ const (
 
 // Пороги для grow и rebuild.
 const (
-	loadFactorThreshold  = 0.70 // grow при 70% заполнении
-	tombstoneThreshold   = 0.25 // rebuild при 25% tombstones
-	defaultInitialCap    = 1024 // начальный размер таблицы
+	loadFactorThreshold = 0.70 // grow при 70% заполнении
+	tombstoneThreshold  = 0.25 // rebuild при 25% tombstones
+	defaultInitialCap   = 1024 // начальный размер таблицы
 )
 
 // ─── Slot ───────────────────────────────────────────────────

@@ -79,12 +79,12 @@ func SizeClassForSize(size int) int {
 //
 // Span может находиться в двух состояниях:
 //
-//   spanInCache   — span принадлежит конкретному mcache.
-//                   Alloc/Free вызываются ОДНИМ worker'ом → lock-free.
+//	spanInCache   — span принадлежит конкретному mcache.
+//	                Alloc/Free вызываются ОДНИМ worker'ом → lock-free.
 //
-//   spanInCentral — span лежит в MCentral (в partial или full).
-//                   Free может вызвать ЛЮБОЙ worker → нужен mutex.
-//                   При Free, если span был в full → ReturnToPartial.
+//	spanInCentral — span лежит в MCentral (в partial или full).
+//	                Free может вызвать ЛЮБОЙ worker → нужен mutex.
+//	                При Free, если span был в full → ReturnToPartial.
 const (
 	spanInCache   uint32 = 0
 	spanInCentral uint32 = 1
@@ -210,14 +210,14 @@ func (s *Span) Alloc() ([]byte, int) {
 //
 // Поведение зависит от состояния span'а:
 //
-//   state == spanInCache:
-//     Lock-free. Вызывается только владельцем-mcache.
-//     Просто push в freeStack.
+//	state == spanInCache:
+//	  Lock-free. Вызывается только владельцем-mcache.
+//	  Просто push в freeStack.
 //
-//   state == spanInCentral:
-//     Берёт s.mu (защита от параллельных Free из разных workers).
-//     Если span БЫЛ полон (wasFull) → вызывает central.ReturnToPartial(s),
-//     чтобы вернуть span в оборот.
+//	state == spanInCentral:
+//	  Берёт s.mu (защита от параллельных Free из разных workers).
+//	  Если span БЫЛ полон (wasFull) → вызывает central.ReturnToPartial(s),
+//	  чтобы вернуть span в оборот.
 //
 // Примечание: НЕ обнуляем память. Данные будут перезаписаны
 // при следующем Alloc+encodeInto. Обнуление стоило 10% CPU (pprof).

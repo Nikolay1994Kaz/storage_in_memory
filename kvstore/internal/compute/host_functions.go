@@ -40,38 +40,50 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 		// Результат записывается в WASM-memory начиная с offset 1024.
 		// Возвращает длину значения (0 = не найден).
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, keyPtr, keyLen uint32) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			keyPtr := uint32(stack[0])
+			keyLen := uint32(stack[1])
+
 			// 1. Читаем ключ из WASM-памяти
 			key, ok := m.Memory().Read(keyPtr, keyLen)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			// 2. Получаем значение из Store
 			val, found := e.StoreGet(string(key))
 			if !found {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			// 3. Записываем значение обратно в WASM-память
 			// Используем фиксированный offset (ValueOffset) для результата
 			m.Memory().Write(ValueOffset, val)
-			return uint32(len(val))
-		}).
+			stack[0] = uint64(uint32(len(val)))
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
 		Export("kv_get").
 
 		// ─── kv_set(key_ptr, key_len, val_ptr, val_len) → 0/1 ───
 		// Записывает ключ-значение в Store + WAL.
 		// Возвращает 1 при успехе, 0 при ошибке.
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, keyPtr, keyLen, valPtr, valLen uint32) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			keyPtr := uint32(stack[0])
+			keyLen := uint32(stack[1])
+			valPtr := uint32(stack[2])
+			valLen := uint32(stack[3])
+
 			key, ok := m.Memory().Read(keyPtr, keyLen)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 			val, ok := m.Memory().Read(valPtr, valLen)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			// Копируем — WASM-memory может быть переиспользована
@@ -94,54 +106,62 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			}
 			if ok && tx.InTx {
 				tx.Queue = append(tx.Queue, writeFunc)
-				return 1
+				stack[0] = 1
+				return
 			}
 			writeFunc()
-			return 1
-		}).
+			stack[0] = 1
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
 		Export("kv_set").
 
 		// ─── kv_del(key_ptr, key_len) → 0/1 ───
 		// Удаляет ключ из Store + WAL.
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, keyPtr, keyLen uint32) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			keyPtr := uint32(stack[0])
+			keyLen := uint32(stack[1])
+
 			key, ok := m.Memory().Read(keyPtr, keyLen)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			// BUG FIX: Используем StoreDelWithWAL для durability.
 			if e.StoreDelWithWAL != nil {
 				if err := e.StoreDelWithWAL(string(key)); err != nil {
 					log.Printf("[wasm] kv_del WAL error: %v", err)
-					return 0
+					stack[0] = 0
+					return
 				}
 			} else {
 				e.StoreDel(string(key))
 			}
-			return 1
-		}).
+			stack[0] = 1
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
 		Export("kv_del").
+
 		// ─── tx_begin() → 1 ───
 		// Включает режим накопления команд в очередь для текущей WASM-сессии.
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
 			tx, ok := ctx.Value(execTxKey{}).(*WasmTxCtx)
 			if ok {
 				tx.InTx = true
 				tx.Queue = make([]func(), 0, 10) // выделим заранее место
 			}
-			return 1
-		}).
+			stack[0] = 1
+		}), []api.ValueType{}, []api.ValueType{api.ValueTypeI32}).
 		Export("tx_begin").
 
 		// ─── tx_commit() → 0/1 ───
 		// Выполняет всё накопленное под глобальным Lock-ом.
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
 			tx, ok := ctx.Value(execTxKey{}).(*WasmTxCtx)
 			if !ok || !tx.InTx {
-				return 0 // Ошибка: коммит без tx_begin
+				stack[0] = 0 // Ошибка: коммит без tx_begin
+				return
 			}
 
 			// 1. БЕРЕМ ГЛОБАЛЬНЫЙ ЛОК (Останавливаем мир!)
@@ -162,52 +182,63 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			// Очищаем состояние
 			tx.InTx = false
 			tx.Queue = nil
-			return 1
-		}).
+			stack[0] = 1
+		}), []api.ValueType{}, []api.ValueType{api.ValueTypeI32}).
 		Export("tx_commit").
 
 		// ─── publish(chan_ptr, chan_len, msg_ptr, msg_len) → 0/1 ───
 		// Публикует сообщение в Pub/Sub канал.
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, chanPtr, chanLen, msgPtr, msgLen uint32) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			chanPtr := uint32(stack[0])
+			chanLen := uint32(stack[1])
+			msgPtr := uint32(stack[2])
+			msgLen := uint32(stack[3])
+
 			ch, ok := m.Memory().Read(chanPtr, chanLen)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 			msg, ok := m.Memory().Read(msgPtr, msgLen)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			if e.Publish != nil {
 				e.Publish(string(ch), string(msg))
 			}
-			return 1
-		}).
+			stack[0] = 1
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
 		Export("publish").
 
 		// ─── log_info(msg_ptr, msg_len) ───
 		// Логирование из WASM-модуля (уровень INFO).
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, msgPtr, msgLen uint32) {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			msgPtr := uint32(stack[0])
+			msgLen := uint32(stack[1])
 			msg, ok := m.Memory().Read(msgPtr, msgLen)
 			if !ok {
 				return
 			}
 			log.Printf("[wasm] %s", string(msg))
-		}).
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{}).
 		Export("log_info").
 
 		// ─── log_error(msg_ptr, msg_len) ───
 		// Логирование из WASM-модуля (уровень ERROR).
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, msgPtr, msgLen uint32) {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			msgPtr := uint32(stack[0])
+			msgLen := uint32(stack[1])
 			msg, ok := m.Memory().Read(msgPtr, msgLen)
 			if !ok {
 				return
 			}
 			log.Printf("[wasm:ERROR] %s", string(msg))
-		}).
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{}).
 		Export("log_error").
 
 		// ─── current_time_ms() → i64 ───
@@ -215,9 +246,9 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 		// WASM-модуль не имеет доступа к системным часам,
 		// поэтому предоставляем время через host-функцию.
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context) uint64 {
-			return uint64(time.Now().UnixMilli())
-		}).
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			stack[0] = uint64(time.Now().UnixMilli())
+		}), []api.ValueType{}, []api.ValueType{api.ValueTypeI64}).
 		Export("current_time_ms").
 
 		// ─── vsim_search(query_ptr, dim, k) → result_count ───
@@ -231,16 +262,22 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 		//
 		// Возвращает количество найденных результатов.
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, queryPtr, dim, k uint32) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			queryPtr := uint32(stack[0])
+			dim := uint32(stack[1])
+			k := uint32(stack[2])
+
 			if e.VSimSearch == nil {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			// 1. Читаем query вектор из WASM-памяти
 			//    Каждый float32 = 4 байта
 			queryBytes, ok := m.Memory().Read(queryPtr, dim*4)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			// 2. Конвертируем []byte → []float32
@@ -285,8 +322,8 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 				}
 			}
 
-			return count
-		}).
+			stack[0] = uint64(count)
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
 		Export("vsim_search").
 
 		// ─── ai_embed(text_ptr, text_len) → dim ───
@@ -296,14 +333,19 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 		// Результат ([]float32) записывается по offset 8192.
 		// Возвращает размерность вектора (0 = ошибка или AI недоступен).
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, textPtr, textLen uint32) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			textPtr := uint32(stack[0])
+			textLen := uint32(stack[1])
+
 			if e.AIEmbed == nil {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			text, ok := m.Memory().Read(textPtr, textLen)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			// Отдельный контекст: AI занимает секунды, не 10ms как WASM
@@ -313,7 +355,8 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			embedding, err := e.AIEmbed(aiCtx, string(text))
 			if err != nil {
 				log.Printf("[wasm] ai_embed error: %v", err)
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			// Записываем []float32 в WASM-memory по offset 8192
@@ -323,8 +366,8 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 				offset += 4
 			}
 
-			return uint32(len(embedding))
-		}).
+			stack[0] = uint64(len(embedding))
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
 		Export("ai_embed").
 
 		// ─── ai_chat(prompt_ptr, prompt_len) → response_len ───
@@ -333,14 +376,19 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 		// Результат (строка ответа) записывается по offset 16384.
 		// Возвращает длину ответа в байтах (0 = ошибка).
 		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, promptPtr, promptLen uint32) uint32 {
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, m api.Module, stack []uint64) {
+			promptPtr := uint32(stack[0])
+			promptLen := uint32(stack[1])
+
 			if e.AIChat == nil {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			prompt, ok := m.Memory().Read(promptPtr, promptLen)
 			if !ok {
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			aiCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -349,15 +397,17 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			response, err := e.AIChat(aiCtx, string(prompt))
 			if err != nil {
 				log.Printf("[wasm] ai_chat error: %v", err)
-				return 0
+				stack[0] = 0
+				return
 			}
 
 			respBytes := []byte(response)
 			if !m.Memory().Write(16384, respBytes) {
-				return 0
+				stack[0] = 0
+				return
 			}
 
-			return uint32(len(respBytes))
-		}).
+			stack[0] = uint64(len(respBytes))
+		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
 		Export("ai_chat")
 }

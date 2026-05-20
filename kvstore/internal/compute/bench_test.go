@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -28,28 +29,20 @@ func loadFraudScorer(b *testing.B) (*Engine, []byte) {
 	e := NewEngine()
 
 	// Подключаем mock-колбэки для host-функций
-	store := map[string][]byte{}
+	store := map[string][]byte{
+		"tx:1001": []byte(`{"amount":15000,"country":"NK"}`),
+		"tx:1002": []byte(`{"amount":500,"country":"US"}`),
+		"tx:1003": []byte(`{"amount":75000,"country":"IR"}`),
+	}
 
 	e.StoreGet = func(key string) ([]byte, bool) {
 		v, ok := store[key]
 		return v, ok
 	}
-	e.StoreSet = func(key string, value []byte) {
-		store[key] = value
-	}
-	e.StoreDel = func(key string) {
-		delete(store, key)
-	}
-	e.StoreSetWithWAL = func(key string, value []byte) error {
-		store[key] = value
-		return nil
-	}
+	e.StoreSet = func(key string, value []byte) {}
+	e.StoreDel = func(key string) {}
+	e.StoreSetWithWAL = func(key string, value []byte) error { return nil }
 	e.Publish = func(channel, message string) {}
-
-	// Предзаполняем Store тестовой транзакцией
-	store["tx:1001"] = []byte(`{"amount":15000,"country":"NK"}`)
-	store["tx:1002"] = []byte(`{"amount":500,"country":"US"}`)
-	store["tx:1003"] = []byte(`{"amount":75000,"country":"IR"}`)
 
 	if err := e.LoadModule("fraud_scorer", wasmBytes); err != nil {
 		b.Fatalf("LoadModule: %v", err)
@@ -247,6 +240,14 @@ func BenchmarkTriggerFire_10Triggers(b *testing.B) {
 
 // ─── Benchmark: Worker-Local Reactor (Tier 0/1) ──────────
 
+/*
+Ключевые уроки архитектуры Worker-Local (WASM Reactor):
+1. -buildmode=c-shared — критически важный флаг TinyGo. Только он убирает _start и делает настоящий Reactor.
+2. Offset ≠ 0 — адрес 0 в WASM linear memory = nil pointer в TinyGo.
+3. Отдельный runtime для worker-local — WithCloseOnContextDone в основном runtime убивает persistent инстансы.
+4. ExportedFunctions() map keys ≠ def.Name() — ключи = export names, Name() = internal wasm names.
+*/
+
 func loadReactorFraudScorer(b *testing.B) (*Engine, []byte) {
 	b.Helper()
 
@@ -262,27 +263,19 @@ func loadReactorFraudScorer(b *testing.B) (*Engine, []byte) {
 	e := NewEngine()
 
 	// Mock-колбэки для host-функций
-	store := map[string][]byte{}
+	store := map[string][]byte{
+		"tx:1001": []byte(`{"amount":15000,"country":"NK"}`),
+		"tx:1002": []byte(`{"amount":500,"country":"US"}`),
+		"tx:1003": []byte(`{"amount":75000,"country":"IR"}`),
+	}
 	e.StoreGet = func(key string) ([]byte, bool) {
 		v, ok := store[key]
 		return v, ok
 	}
-	e.StoreSet = func(key string, value []byte) {
-		store[key] = value
-	}
-	e.StoreDel = func(key string) {
-		delete(store, key)
-	}
-	e.StoreSetWithWAL = func(key string, value []byte) error {
-		store[key] = value
-		return nil
-	}
+	e.StoreSet = func(key string, value []byte) {}
+	e.StoreDel = func(key string) {}
+	e.StoreSetWithWAL = func(key string, value []byte) error { return nil }
 	e.Publish = func(channel, message string) {}
-
-	// Предзаполняем Store тестовой транзакцией
-	store["tx:1001"] = []byte(`{"amount":15000,"country":"NK"}`)
-	store["tx:1002"] = []byte(`{"amount":500,"country":"US"}`)
-	store["tx:1003"] = []byte(`{"amount":75000,"country":"IR"}`)
 
 	if err := e.LoadModule("fraud_scorer", wasmBytes); err != nil {
 		b.Fatalf("LoadModule: %v", err)
@@ -344,4 +337,33 @@ func BenchmarkWorkerLocal_FraudScorer_Blocked(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkWorkerLocal_FraudScorer_Parallel — тест, чтобы задействовать все воркеры (напр. 12) параллельно.
+func BenchmarkWorkerLocal_FraudScorer_Parallel(b *testing.B) {
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(os.Stderr)
+	e, _ := loadReactorFraudScorer(b)
+	defer e.Close()
+
+	key := []byte("tx:1001")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(key)))
+	b.ResetTimer()
+
+	var counter uint32
+	numWorkers := uint32(e.WorkerLocal.numWorkers)
+	if numWorkers == 0 {
+		numWorkers = 1
+	}
+
+	b.RunParallel(func(pb *testing.PB) {
+		// Каждая горутина получает свой уникальный workerID (round-robin)
+		workerID := int(atomic.AddUint32(&counter, 1) % numWorkers)
+		for pb.Next() {
+			if _, err := e.WorkerLocal.Exec(workerID, "fraud_scorer", "process", key); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

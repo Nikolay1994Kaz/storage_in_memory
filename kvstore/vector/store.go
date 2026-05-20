@@ -1,9 +1,12 @@
 package vector
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 )
@@ -15,6 +18,7 @@ import (
 //   - Маппинг строковых ключей → внутренние uint64 ID
 //   - Потокобезопасность
 //   - Валидацию размерности
+//   - Динамическое переключение движков (0 = Go/WASM Hybrid, 1 = Rust/WASM Full HNSW)
 type VectorStore struct {
 	graph *Graph
 
@@ -32,6 +36,11 @@ type VectorStore struct {
 	// Все последующие вставки должны совпадать.
 	dim int
 
+	// Слой интеграции WebAssembly HNSW (Rust) движка
+	useWasmIndex bool
+	wasmGraph    *WasmGraphIndex
+	metric       uint32 // 0 = Euclidean, 1 = Cosine
+
 	mu sync.RWMutex
 }
 
@@ -39,11 +48,98 @@ type VectorStore struct {
 //
 // distance — функция расстояния (EuclideanDistance или CosineDistance).
 func NewVectorStore(distance DistanceFunc) *VectorStore {
-	return &VectorStore{
-		graph: NewGraph(distance),
-		keys:  make(map[uint64]string),
-		ids:   make(map[string]uint64),
+	metric := uint32(0)
+	// С помощью рефлексии определяем метрику (Euclidean или Cosine)
+	if reflect.ValueOf(distance).Pointer() == reflect.ValueOf(CosineDistance).Pointer() {
+		metric = 1
 	}
+
+	return &VectorStore{
+		graph:  NewGraph(distance),
+		keys:   make(map[uint64]string),
+		ids:    make(map[string]uint64),
+		metric: metric,
+	}
+}
+
+// findWasmFile пытается найти файл .wasm в возможных путях
+func findWasmFile() ([]byte, error) {
+	candidates := []string{
+		"rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm",
+		"../rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm",
+		"../../rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm",
+	}
+	var lastErr error
+	for _, c := range candidates {
+		data, err := os.ReadFile(c)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("failed to find compiled WASM binary: %w", lastErr)
+}
+
+// initWasmGraph инициализирует WASM Rust HNSW граф
+func (vs *VectorStore) initWasmGraph() error {
+	if vs.wasmGraph != nil {
+		return nil
+	}
+	wasmBytes, err := findWasmFile()
+	if err != nil {
+		return err
+	}
+	g, err := NewWasmGraphIndex(context.Background(), wasmBytes, vs.dim, vs.metric)
+	if err != nil {
+		return err
+	}
+	vs.wasmGraph = g
+	return nil
+}
+
+// SetEngine переключает движок векторного поиска:
+//
+//	0 = Go Engine (Current)
+//	1 = Rust/WASM Full HNSW Engine (New)
+//
+// При переключении на Rust автоматически синхронизирует все существующие векторы!
+func (vs *VectorStore) SetEngine(engine int) error {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	if engine == 1 {
+		if !vs.useWasmIndex {
+			vs.useWasmIndex = true
+			if vs.dim > 0 && vs.wasmGraph == nil {
+				if err := vs.initWasmGraph(); err != nil {
+					vs.useWasmIndex = false // Откатываемся при ошибке
+					return err
+				}
+				// Синхронизируем все существующие векторы из Go в Rust WASM
+				for id, key := range vs.keys {
+					if node, ok := vs.graph.nodes[id]; ok {
+						if err := vs.wasmGraph.Insert(id, node.Vector); err != nil {
+							vs.useWasmIndex = false
+							return fmt.Errorf("failed to sync vector %s to Rust HNSW: %w", key, err)
+						}
+					}
+				}
+			}
+		}
+	} else {
+		vs.useWasmIndex = false
+	}
+	return nil
+}
+
+// Engine возвращает текущий движок (0 = Go, 1 = Rust/WASM)
+func (vs *VectorStore) Engine() int {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	if vs.useWasmIndex {
+		return 1
+	}
+	return 0
 }
 
 // Add добавляет вектор с указанным ключом.
@@ -66,6 +162,9 @@ func (vs *VectorStore) Add(key string, vec []float32) error {
 	// участвует в поиске, но маппинг уже указывает на новый ID.
 	if oldID, exists := vs.ids[key]; exists {
 		vs.graph.Delete(oldID)
+		if vs.wasmGraph != nil {
+			vs.wasmGraph.Delete(oldID)
+		}
 		delete(vs.keys, oldID)
 	}
 
@@ -73,7 +172,21 @@ func (vs *VectorStore) Add(key string, vec []float32) error {
 	vs.ids[key] = id
 	vs.keys[id] = key
 
+	// Вставляем в Go граф (сохраняем всегда для возможности бесшовного отката обратно)
 	vs.graph.Insert(id, vec)
+
+	// Если включен или был инициализирован Rust WASM
+	if vs.useWasmIndex {
+		if err := vs.initWasmGraph(); err != nil {
+			return err
+		}
+	}
+	if vs.wasmGraph != nil {
+		if err := vs.wasmGraph.Insert(id, vec); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -90,7 +203,14 @@ func (vs *VectorStore) Delete(key string) bool {
 		return false
 	}
 
+	// Удаляем из Go графа
 	vs.graph.Delete(id)
+
+	// Удаляем из Rust WASM графа
+	if vs.wasmGraph != nil {
+		vs.wasmGraph.Delete(id)
+	}
+
 	delete(vs.ids, key)
 	delete(vs.keys, id)
 
@@ -120,7 +240,14 @@ func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 		efSearch = 100
 	}
 
-	results := vs.graph.Search(query, K, efSearch)
+	var results []SearchResult
+	if vs.useWasmIndex && vs.wasmGraph != nil {
+		// Полный поиск в Rust HNSW WASM
+		results = vs.wasmGraph.Search(query, K, efSearch)
+	} else {
+		// Поиск в Go HNSW
+		results = vs.graph.Search(query, K, efSearch)
+	}
 
 	out := make([]VSearchResult, len(results))
 	for i, r := range results {
@@ -136,6 +263,11 @@ func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 func (vs *VectorStore) Info() (nodeCount int, dim int, maxLevel int) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
+
+	if vs.useWasmIndex && vs.wasmGraph != nil {
+		return vs.wasmGraph.Info()
+	}
+
 	return len(vs.ids), vs.dim, vs.graph.MaxLevel()
 }
 
@@ -165,6 +297,9 @@ func (vs *VectorStore) Clear() {
 	defer vs.mu.Unlock()
 
 	vs.graph = NewGraph(vs.graph.Distance)
+	if vs.wasmGraph != nil {
+		vs.wasmGraph.Clear()
+	}
 	vs.keys = make(map[uint64]string)
 	vs.ids = make(map[string]uint64)
 	vs.dim = 0

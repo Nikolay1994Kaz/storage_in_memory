@@ -10,8 +10,8 @@ import (
 // Epoll оборачивает Linux epoll для неблокирующего I/O.
 // Позволяет одному потоку следить за тысячами соединений.
 type Epoll struct {
-	fd          int                 // файловый дескриптор epoll instance
-	connections map[int]*ConnState  // fd → состояние соединения
+	fd          int                // файловый дескриптор epoll instance
+	connections map[int]*ConnState // fd → состояние соединения
 	mu          sync.RWMutex
 }
 

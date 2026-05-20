@@ -843,8 +843,28 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 
 	case "VSIM.INFO":
 		count, dim, maxLevel := vecStore.Info()
-		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d", count, dim, maxLevel)
+		engineName := "go"
+		if vecStore.Engine() == 1 {
+			engineName = "rust_wasm"
+		}
+		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d engine:%s", count, dim, maxLevel, engineName)
 		buf.WriteBulkString(info)
+
+	case "VSIM.SETENGINE":
+		if len(args) < 1 {
+			buf.WriteError("ERR usage: VSIM.SETENGINE <0|1>")
+			return
+		}
+		engine, err := strconv.Atoi(string(args[0]))
+		if err != nil || (engine != 0 && engine != 1) {
+			buf.WriteError("ERR invalid engine (must be 0 or 1)")
+			return
+		}
+		if err := vecStore.SetEngine(engine); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteSimpleString("OK")
 
 	// === AI Commands ===
 	case "AI.EMBED":
