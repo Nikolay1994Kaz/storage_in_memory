@@ -63,7 +63,7 @@ type Engine struct {
 
 	// Publish — отправка сообщения в Pub/Sub канал.
 	Publish    func(channel, message string)
-	VSimSearch func(query []float32, K int) []struct {
+	VSimSearch func(workerID int, query []float32, K int) []struct {
 		Key      string
 		Distance float32
 	}

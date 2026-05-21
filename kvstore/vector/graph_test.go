@@ -15,13 +15,13 @@ import (
 func TestBasicInsertAndSearch(t *testing.T) {
 	g := NewGraph(EuclideanDistance)
 
-	g.Insert(1, []float32{0, 0})
-	g.Insert(2, []float32{0, 10})
-	g.Insert(3, []float32{5, 5})
-	g.Insert(4, []float32{10, 10})
-	g.Insert(5, []float32{10, 0})
+	g.Insert(0, 1, []float32{0, 0})
+	g.Insert(0, 2, []float32{0, 10})
+	g.Insert(0, 3, []float32{5, 5})
+	g.Insert(0, 4, []float32{10, 10})
+	g.Insert(0, 5, []float32{10, 0})
 
-	results := g.Search([]float32{1, 1}, 3, 10)
+	results := g.Search(0, []float32{1, 1}, 3, 10)
 
 	if len(results) != 3 {
 		t.Fatalf("expected 3 results, got %d", len(results))
@@ -49,21 +49,21 @@ func TestEdgeCases(t *testing.T) {
 	g := NewGraph(EuclideanDistance)
 
 	// Поиск в пустом графе — не должен паниковать
-	results := g.Search([]float32{1, 2, 3}, 5, 10)
+	results := g.Search(0, []float32{1, 2, 3}, 5, 10)
 	if len(results) != 0 {
 		t.Errorf("empty graph: expected 0 results, got %d", len(results))
 	}
 
 	// Одна нода
-	g.Insert(1, []float32{1, 2, 3})
-	results = g.Search([]float32{1, 2, 3}, 5, 10)
+	g.Insert(0, 1, []float32{1, 2, 3})
+	results = g.Search(0, []float32{1, 2, 3}, 5, 10)
 	if len(results) != 1 {
 		t.Errorf("single node: expected 1 result, got %d", len(results))
 	}
 
 	// K больше чем нод в графе
-	g.Insert(2, []float32{4, 5, 6})
-	results = g.Search([]float32{0, 0, 0}, 100, 200)
+	g.Insert(0, 2, []float32{4, 5, 6})
+	results = g.Search(0, []float32{0, 0, 0}, 100, 200)
 	if len(results) != 2 {
 		t.Errorf("K > nodes: expected 2 results, got %d", len(results))
 	}
@@ -103,7 +103,7 @@ func TestRecall(t *testing.T) {
 	// 2. Вставляем в HNSW
 	g := NewGraph(EuclideanDistance)
 	for i, vec := range vectors {
-		g.Insert(uint64(i), vec)
+		g.Insert(0, uint64(i), vec)
 	}
 
 	// 3. Для каждого запроса сравниваем HNSW и brute-force
@@ -116,7 +116,7 @@ func TestRecall(t *testing.T) {
 		}
 
 		// HNSW результат
-		hnswResults := g.Search(query, K, efSearch)
+		hnswResults := g.Search(0, query, K, efSearch)
 		hnswIDs := make(map[uint64]bool)
 		for _, r := range hnswResults {
 			hnswIDs[r.ID] = true
@@ -131,7 +131,7 @@ func TestRecall(t *testing.T) {
 		for i, vec := range vectors {
 			brute[i] = bruteItem{
 				id:   uint64(i),
-				dist: EuclideanDistance(query, vec),
+				dist: EuclideanDistance(0, query, vec),
 			}
 		}
 		sort.Slice(brute, func(i, j int) bool {
@@ -169,12 +169,12 @@ func TestCosineDistance(t *testing.T) {
 	// Три вектора с РАЗНЫМИ длинами, но одинаковым направлением
 	// A и B смотрят в одну сторону (Cosine distance ≈ 0)
 	// C смотрит в другую (Cosine distance ≈ 2)
-	g.Insert(1, []float32{1, 0})   // A: вправо
-	g.Insert(2, []float32{100, 0}) // B: тоже вправо, но "длиннее"
-	g.Insert(3, []float32{0, 1})   // C: вверх (перпендикулярно)
+	g.Insert(0, 1, []float32{1, 0})   // A: вправо
+	g.Insert(0, 2, []float32{100, 0}) // B: тоже вправо, но "длиннее"
+	g.Insert(0, 3, []float32{0, 1})   // C: вверх (перпендикулярно)
 
 	// Запрос: вектор "вправо" — A и B должны быть ближайшими
-	results := g.Search([]float32{5, 0}, 2, 10)
+	results := g.Search(0, []float32{5, 0}, 2, 10)
 
 	if len(results) < 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
@@ -221,9 +221,9 @@ func TestNormalizeEquivalence(t *testing.T) {
 	// Вариант 1: Cosine distance (без нормализации)
 	gCosine := NewGraph(CosineDistance)
 	for i, vec := range vectors {
-		gCosine.Insert(uint64(i), vec)
+		gCosine.Insert(0, uint64(i), vec)
 	}
-	cosineResults := gCosine.Search(query, K, 50)
+	cosineResults := gCosine.Search(0, query, K, 50)
 
 	// Вариант 2: Euclidean distance (с нормализацией)
 	gEuclid := NewGraph(EuclideanDistance)
@@ -231,12 +231,12 @@ func TestNormalizeEquivalence(t *testing.T) {
 		normalized := make([]float32, len(vec))
 		copy(normalized, vec)
 		Normalize(normalized)
-		gEuclid.Insert(uint64(i), normalized)
+		gEuclid.Insert(0, uint64(i), normalized)
 	}
 	normalizedQuery := make([]float32, len(query))
 	copy(normalizedQuery, query)
 	Normalize(normalizedQuery)
-	euclidResults := gEuclid.Search(normalizedQuery, K, 50)
+	euclidResults := gEuclid.Search(0, normalizedQuery, K, 50)
 
 	// Сравниваем: оба должны вернуть одинаковые ID
 	// (порядок может чуть отличаться из-за приближённости HNSW,
@@ -290,7 +290,7 @@ func TestEfSearchAffectsRecall(t *testing.T) {
 
 	g := NewGraph(EuclideanDistance)
 	for i, vec := range vectors {
-		g.Insert(uint64(i), vec)
+		g.Insert(0, uint64(i), vec)
 	}
 
 	query := make([]float32, dim)
@@ -305,7 +305,7 @@ func TestEfSearchAffectsRecall(t *testing.T) {
 	}
 	brute := make([]bi, numVectors)
 	for i, vec := range vectors {
-		brute[i] = bi{uint64(i), EuclideanDistance(query, vec)}
+		brute[i] = bi{uint64(i), EuclideanDistance(0, query, vec)}
 	}
 	sort.Slice(brute, func(i, j int) bool {
 		return brute[i].dist < brute[j].dist
@@ -317,7 +317,7 @@ func TestEfSearchAffectsRecall(t *testing.T) {
 
 	// Проверяем: ef=10 (маленький) vs ef=200 (большой)
 	calcRecall := func(ef int) float64 {
-		results := g.Search(query, K, ef)
+		results := g.Search(0, query, K, ef)
 		hits := 0
 		for _, r := range results {
 			if trueTopK[r.ID] {
@@ -375,7 +375,7 @@ func TestGraphStructure(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		vec := []float32{rng.Float32(), rng.Float32()}
-		g.Insert(uint64(i), vec)
+		g.Insert(0, uint64(i), vec)
 	}
 
 	// Проверяем: максимальный уровень > 0 (при 500 нодах почти наверняка)
@@ -439,7 +439,7 @@ func BenchmarkSearch(b *testing.B) {
 		for j := range vec {
 			vec[j] = rng.Float32()
 		}
-		g.Insert(uint64(i), vec)
+		g.Insert(0, uint64(i), vec)
 	}
 
 	queries := make([][]float32, 1000)
@@ -454,7 +454,7 @@ func BenchmarkSearch(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		g.Search(queries[i%len(queries)], k, efSearch)
+		g.Search(0, queries[i%len(queries)], k, efSearch)
 	}
 }
 
@@ -465,18 +465,18 @@ func BenchmarkSearch(b *testing.B) {
 func TestDelete_Basic(t *testing.T) {
 	g := NewGraph(EuclideanDistance)
 
-	g.Insert(1, []float32{0, 0})
-	g.Insert(2, []float32{1, 0})
-	g.Insert(3, []float32{2, 0})
-	g.Insert(4, []float32{3, 0})
-	g.Insert(5, []float32{4, 0})
+	g.Insert(0, 1, []float32{0, 0})
+	g.Insert(0, 2, []float32{1, 0})
+	g.Insert(0, 3, []float32{2, 0})
+	g.Insert(0, 4, []float32{3, 0})
+	g.Insert(0, 5, []float32{4, 0})
 
 	if g.Len() != 5 {
 		t.Fatalf("expected 5 nodes, got %d", g.Len())
 	}
 
 	// Удаляем ноду 3 (средняя)
-	ok := g.Delete(3)
+	ok := g.Delete(0, 3)
 	if !ok {
 		t.Fatal("Delete returned false for existing node")
 	}
@@ -485,13 +485,13 @@ func TestDelete_Basic(t *testing.T) {
 	}
 
 	// Повторное удаление — должно вернуть false
-	ok = g.Delete(3)
+	ok = g.Delete(0, 3)
 	if ok {
 		t.Fatal("Delete returned true for already-deleted node")
 	}
 
 	// Поиск должен найти только оставшиеся ноды
-	results := g.Search([]float32{2, 0}, 5, 10)
+	results := g.Search(0, []float32{2, 0}, 5, 10)
 	for _, r := range results {
 		if r.ID == 3 {
 			t.Error("deleted node ID=3 found in search results")
@@ -523,12 +523,12 @@ func TestDelete_EntryPoint(t *testing.T) {
 	rng := rand.New(rand.NewSource(55))
 	for i := 0; i < 100; i++ {
 		vec := []float32{rng.Float32(), rng.Float32()}
-		g.Insert(uint64(i), vec)
+		g.Insert(0, uint64(i), vec)
 	}
 
 	// Удаляем entry point
 	ep := g.entryPointID
-	g.Delete(ep)
+	g.Delete(0, ep)
 
 	// Entry point должен смениться
 	if g.entryPointID == ep {
@@ -543,7 +543,7 @@ func TestDelete_EntryPoint(t *testing.T) {
 	g.mu.RUnlock()
 
 	// Поиск всё ещё работает
-	results := g.Search([]float32{0.5, 0.5}, 5, 50)
+	results := g.Search(0, []float32{0.5, 0.5}, 5, 50)
 	if len(results) == 0 {
 		t.Error("search returned 0 results after entry point deletion")
 	}
@@ -558,12 +558,12 @@ func TestDelete_AllAndRebuild(t *testing.T) {
 
 	// Вставляем 10 нод
 	for i := 0; i < 10; i++ {
-		g.Insert(uint64(i), []float32{float32(i), 0})
+		g.Insert(0, uint64(i), []float32{float32(i), 0})
 	}
 
 	// Удаляем все
 	for i := 0; i < 10; i++ {
-		g.Delete(uint64(i))
+		g.Delete(0, uint64(i))
 	}
 
 	if g.Len() != 0 {
@@ -572,7 +572,7 @@ func TestDelete_AllAndRebuild(t *testing.T) {
 
 	// Вставляем снова — не должно паниковать
 	for i := 100; i < 105; i++ {
-		g.Insert(uint64(i), []float32{float32(i), 0})
+		g.Insert(0, uint64(i), []float32{float32(i), 0})
 	}
 
 	if g.Len() != 5 {
@@ -580,7 +580,7 @@ func TestDelete_AllAndRebuild(t *testing.T) {
 	}
 
 	// Поиск работает
-	results := g.Search([]float32{102, 0}, 3, 10)
+	results := g.Search(0, []float32{102, 0}, 3, 10)
 	if len(results) != 3 {
 		t.Errorf("expected 3 results, got %d", len(results))
 	}
@@ -612,13 +612,13 @@ func TestDelete_RecallAfterMassDelete(t *testing.T) {
 		for j := range vec {
 			vec[j] = rng.Float32()
 		}
-		g.Insert(uint64(i), vec)
+		g.Insert(0, uint64(i), vec)
 		vectors[uint64(i)] = vec
 	}
 
 	// Удаляем первые deleteCount
 	for i := 0; i < deleteCount; i++ {
-		g.Delete(uint64(i))
+		g.Delete(0, uint64(i))
 		delete(vectors, uint64(i))
 	}
 
@@ -633,7 +633,7 @@ func TestDelete_RecallAfterMassDelete(t *testing.T) {
 	}
 
 	// HNSW поиск
-	results := g.Search(query, K, efSearch)
+	results := g.Search(0, query, K, efSearch)
 	hnswIDs := make(map[uint64]bool)
 	for _, r := range results {
 		hnswIDs[r.ID] = true
@@ -650,7 +650,7 @@ func TestDelete_RecallAfterMassDelete(t *testing.T) {
 	}
 	var brute []bi
 	for id, vec := range vectors {
-		brute = append(brute, bi{id, EuclideanDistance(query, vec)})
+		brute = append(brute, bi{id, EuclideanDistance(0, query, vec)})
 	}
 	sort.Slice(brute, func(i, j int) bool {
 		return brute[i].dist < brute[j].dist

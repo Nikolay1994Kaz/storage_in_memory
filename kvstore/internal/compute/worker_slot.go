@@ -42,6 +42,9 @@ type WorkerSlot struct {
 	memoryBudget uint32                // максимальный размер memory (в страницах, 1 страница = 64KB)
 	compiled     wazero.CompiledModule // для пересоздания при recycle
 	moduleName   string
+
+	// Стек для zero-allocation вызовов CallWithStack
+	Stack [8]uint64
 }
 
 // WorkerLocalEngine управляет per-worker WASM-слотами.
@@ -184,16 +187,15 @@ func (wle *WorkerLocalEngine) Exec(workerID int, moduleName, funcName string, ke
 		return nil, fmt.Errorf("function '%s' not found in module '%s'", funcName, moduleName)
 	}
 
-	results, err := fn.Call(context.Background(), uint64(InputOffset), uint64(len(key)))
+	slot.Stack[0] = uint64(InputOffset)
+	slot.Stack[1] = uint64(len(key))
+	err := fn.CallWithStack(context.Background(), slot.Stack[:2])
 	if err != nil {
 		return nil, fmt.Errorf("exec error: %w", err)
 	}
 
 	// 3. Читаем результат из OUTPUT_REGION
-	var resultLen uint32
-	if len(results) > 0 {
-		resultLen = uint32(results[0])
-	}
+	resultLen := uint32(slot.Stack[0])
 	if resultLen == 0 {
 		return nil, nil
 	}
@@ -282,3 +284,33 @@ func IsReactorModule(compiled wazero.CompiledModule) bool {
 	_, hasInit := compiled.ExportedFunctions()["_initialize"]
 	return hasInit
 }
+
+// Slot returns the WorkerSlot for a specific worker and module name.
+func (wle *WorkerLocalEngine) Slot(workerID int, moduleName string) *WorkerSlot {
+	slots, ok := wle.modules[moduleName]
+	if !ok {
+		return nil
+	}
+	if workerID < 0 || workerID >= len(slots) {
+		return nil
+	}
+	return slots[workerID]
+}
+
+// GetFunction returns a cached exported function by name.
+func (ws *WorkerSlot) GetFunction(name string) api.Function {
+	if ws == nil {
+		return nil
+	}
+	return ws.funcs[name]
+}
+
+// Memory returns the WASM instance's linear memory.
+func (ws *WorkerSlot) Memory() api.Memory {
+	if ws == nil {
+		return nil
+	}
+	return ws.memory
+}
+
+

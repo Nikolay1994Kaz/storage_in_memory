@@ -195,13 +195,13 @@ func (g *Graph) maxNeighbors(level int) int {
 // ★ ZERO-ALLOC версия ★
 // Все буферы берутся из sync.Pool и возвращаются после использования.
 // На hot path (10K+ RPS) — ни одной аллокации.
-func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) []item {
+func (g *Graph) searchLayer(workerID int, query []float32, entryID uint64, ef int, level int) []item {
 
 	state := searchPool.Get().(*searchState)
 	state.acquire()
 
 	entryNode := g.nodes[entryID]
-	entryDist := g.Distance(query, entryNode.Vector)
+	entryDist := g.Distance(workerID, query, entryNode.Vector)
 
 	state.visited[entryID] = true
 
@@ -225,7 +225,7 @@ func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) 
 			state.visited[neighborID] = true
 
 			neighborNode := g.nodes[neighborID]
-			neighborDist := g.Distance(query, neighborNode.Vector)
+			neighborDist := g.Distance(workerID, query, neighborNode.Vector)
 
 			farthestResult = state.results.peek() // ← typed peek
 
@@ -262,7 +262,7 @@ func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) 
 //  1. Генерация случайного уровня для ноды
 //  2. Спуск по верхним слоям (навигация к нужному региону)
 //  3. Поиск и подключение соседей на каждом слое
-func (g *Graph) Insert(id uint64, vec []float32) {
+func (g *Graph) Insert(workerID int, id uint64, vec []float32) {
 	// 1. Кидаем «кубик» — на скольких слоях будет жить нода
 	level := g.randomLevel()
 
@@ -301,7 +301,7 @@ func (g *Graph) Insert(id uint64, vec []float32) {
 	// Аналогия: летим на самолёте. Не высаживаемся — просто выбираем
 	//           ближайший аэропорт для пересадки.
 	for lc := g.maxLevel; lc > level; lc-- {
-		results := g.searchLayer(vec, ep, 1, lc)
+		results := g.searchLayer(workerID, vec, ep, 1, lc)
 		if len(results) > 0 {
 			ep = results[0].id // спускаемся: entry point для следующего слоя
 		}
@@ -318,7 +318,7 @@ func (g *Graph) Insert(id uint64, vec []float32) {
 	//   3. Строим двусторонние связи
 	for lc := min(level, g.maxLevel); lc >= 0; lc-- {
 		// Шаг 1: Ищем efConstruction ближайших нод на этом слое
-		results := g.searchLayer(vec, ep, g.EfConstruction, lc)
+		results := g.searchLayer(workerID, vec, ep, g.EfConstruction, lc)
 
 		// Шаг 2: Выбираем M лучших (results уже отсортированы — ближайший первый)
 		M := g.maxNeighbors(lc)
@@ -344,7 +344,7 @@ func (g *Graph) Insert(id uint64, vec []float32) {
 			// Если у соседа стало слишком много связей — обрезаем.
 			// Оставляем только M самых близких к нему.
 			if len(neighbor.Neighbors[lc]) > M {
-				g.pruneNeighbors(neighbor, lc, M)
+				g.pruneNeighbors(workerID, neighbor, lc, M)
 			}
 		}
 
@@ -373,7 +373,7 @@ func (g *Graph) Insert(id uint64, vec []float32) {
 // Когда у ноды слишком много соседей (больше M), нужно оставить
 // только самых близких. Как в реальности: у города не бывает 100 автобанов,
 // содержать дорого — оставляем только дороги к ближайшим городам.
-func (g *Graph) pruneNeighbors(node *Node, level int, maxCount int) {
+func (g *Graph) pruneNeighbors(workerID int, node *Node, level int, maxCount int) {
 	// 1. Для каждого соседа считаем расстояние от НОДЫ (не от запроса!)
 	neighbors := node.Neighbors[level]
 	items := make([]item, len(neighbors))
@@ -381,7 +381,7 @@ func (g *Graph) pruneNeighbors(node *Node, level int, maxCount int) {
 	for i, nid := range neighbors {
 		items[i] = item{
 			id:   nid,
-			dist: g.Distance(node.Vector, g.nodes[nid].Vector),
+			dist: g.Distance(workerID, node.Vector, g.nodes[nid].Vector),
 		}
 	}
 
@@ -422,7 +422,7 @@ func (g *Graph) pruneNeighbors(node *Node, level int, maxCount int) {
 // Аналогия: сносим город на карте. Все дороги, которые шли ЧЕРЕЗ этот город,
 // нужно перенаправить напрямую между оставшимися городами,
 // иначе часть страны окажется в изоляции.
-func (g *Graph) Delete(id uint64) bool {
+func (g *Graph) Delete(workerID int, id uint64) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -463,7 +463,7 @@ func (g *Graph) Delete(id uint64) bool {
 
 			// Шаг C: Обрезаем если соседей стало слишком много
 			if len(neighbor.Neighbors[level]) > M {
-				g.pruneNeighbors(neighbor, level, M)
+				g.pruneNeighbors(workerID, neighbor, level, M)
 			}
 		}
 	}
@@ -567,7 +567,7 @@ type SearchResult struct {
 //	K        = "скольких показать в ответе"
 //	Можно спросить 100 (efSearch=100), но показать только 10 (K=10).
 //	Чем больше спросишь — тем вероятнее найдёшь лучших.
-func (g *Graph) Search(query []float32, K int, efSearch int) []SearchResult {
+func (g *Graph) Search(workerID int, query []float32, K int, efSearch int) []SearchResult {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -591,7 +591,7 @@ func (g *Graph) Search(query []float32, K int, efSearch int) []SearchResult {
 	// Точно как в Insert: ef=1, жадная навигация.
 	// Цель: найти хорошую «стартовую позицию» для слоя 0.
 	for lc := g.maxLevel; lc > 0; lc-- {
-		results := g.searchLayer(query, ep, 1, lc)
+		results := g.searchLayer(workerID, query, ep, 1, lc)
 		if len(results) > 0 {
 			ep = results[0].id
 		}
@@ -602,7 +602,7 @@ func (g *Graph) Search(query []float32, K int, efSearch int) []SearchResult {
 	// ═══════════════════════════════════════════════════
 	//
 	// Слой 0 содержит ВСЕ ноды. Здесь ищем efSearch ближайших.
-	results := g.searchLayer(query, ep, efSearch, 0)
+	results := g.searchLayer(workerID, query, ep, efSearch, 0)
 
 	// Обрезаем до K
 	if len(results) > K {

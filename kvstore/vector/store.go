@@ -5,134 +5,124 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"os"
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"unsafe"
+
+	"kvstore/kvstore/internal/compute"
 )
 
 // VectorStore — обёртка над HNSW-графом для интеграции с Molten.
 //
-// Аналог ArenaStore для KV, но для векторов.
 // Обеспечивает:
 //   - Маппинг строковых ключей → внутренние uint64 ID
 //   - Потокобезопасность
 //   - Валидацию размерности
-//   - Динамическое переключение движков (0 = Go/WASM Hybrid, 1 = Rust/WASM Full HNSW)
+//   - Динамическое переключение движков (0 = Go, 1 = Go/WASM SIMD Hybrid)
 type VectorStore struct {
 	graph *Graph
 
 	// Двусторонний маппинг: строковый ключ ↔ внутренний ID.
-	// Зачем? Graph работает с uint64 (для скорости),
-	// а пользователь работает со строками ("product:shoes").
 	keys map[uint64]string // internal ID → user key
 	ids  map[string]uint64 // user key → internal ID
 
 	// Атомарный счётчик для генерации уникальных ID.
-	// Каждый новый вектор получает nextID, потом nextID++.
 	nextID atomic.Uint64
 
 	// Размерность векторов. Устанавливается при первой вставке.
-	// Все последующие вставки должны совпадать.
 	dim int
 
 	// Слой интеграции WebAssembly HNSW (Rust) движка
 	useWasmIndex bool
-	wasmGraph    *WasmGraphIndex
+	workerLocal  *compute.WorkerLocalEngine
 	metric       uint32 // 0 = Euclidean, 1 = Cosine
 
 	mu sync.RWMutex
 }
 
 // NewVectorStore создаёт хранилище векторов.
-//
-// distance — функция расстояния (EuclideanDistance или CosineDistance).
 func NewVectorStore(distance DistanceFunc) *VectorStore {
 	metric := uint32(0)
-	// С помощью рефлексии определяем метрику (Euclidean или Cosine)
 	if reflect.ValueOf(distance).Pointer() == reflect.ValueOf(CosineDistance).Pointer() {
 		metric = 1
 	}
 
-	return &VectorStore{
-		graph:  NewGraph(distance),
+	vs := &VectorStore{
 		keys:   make(map[uint64]string),
 		ids:    make(map[string]uint64),
 		metric: metric,
 	}
+	vs.graph = NewGraph(vs.calculateDistance)
+	return vs
 }
 
-// findWasmFile пытается найти файл .wasm в возможных путях
-func findWasmFile() ([]byte, error) {
-	candidates := []string{
-		"rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm",
-		"../rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm",
-		"../../rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm",
-	}
-	var lastErr error
-	for _, c := range candidates {
-		data, err := os.ReadFile(c)
-		if err == nil {
-			return data, nil
+// SetWorkerLocalEngine устанавливает пул воркеров WASM.
+func (vs *VectorStore) SetWorkerLocalEngine(wle *compute.WorkerLocalEngine) {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	vs.workerLocal = wle
+}
+
+// calculateDistance вычисляет расстояние между векторами с возможностью WASM-ускорения.
+func (vs *VectorStore) calculateDistance(workerID int, a, b []float32) float32 {
+	if vs.useWasmIndex && vs.workerLocal != nil {
+		slot := vs.workerLocal.Slot(workerID, "vector_math")
+		if slot != nil {
+			var funcName string
+			if vs.metric == 0 {
+				funcName = "simd_euclidean_distance"
+			} else {
+				funcName = "simd_cosine_distance"
+			}
+
+			fn := slot.GetFunction(funcName)
+			if fn != nil {
+				// zero-alloc cast float32 slices to byte slices
+				aBytes := unsafe.Slice((*byte)(unsafe.Pointer(&a[0])), len(a)*4)
+				bBytes := unsafe.Slice((*byte)(unsafe.Pointer(&b[0])), len(b)*4)
+
+				// Write vectors to slot persistent memory buffers
+				slot.Memory().Write(compute.InputOffset, aBytes)
+				slot.Memory().Write(compute.ValueOffset, bBytes)
+
+				// Invoke optimized WASM SIMD kernel using zero-alloc CallWithStack
+				slot.Stack[0] = uint64(compute.InputOffset)
+				slot.Stack[1] = uint64(compute.ValueOffset)
+				slot.Stack[2] = uint64(len(a))
+
+				err := fn.CallWithStack(context.Background(), slot.Stack[:3])
+				if err == nil {
+					return math.Float32frombits(uint32(slot.Stack[0]))
+				}
+			}
 		}
-		lastErr = err
 	}
-	return nil, fmt.Errorf("failed to find compiled WASM binary: %w", lastErr)
-}
 
-// initWasmGraph инициализирует WASM Rust HNSW граф
-func (vs *VectorStore) initWasmGraph() error {
-	if vs.wasmGraph != nil {
-		return nil
+	// Fallback to pure Go calculation
+	if vs.metric == 0 {
+		return EuclideanDistance(workerID, a, b)
 	}
-	wasmBytes, err := findWasmFile()
-	if err != nil {
-		return err
-	}
-	g, err := NewWasmGraphIndex(context.Background(), wasmBytes, vs.dim, vs.metric)
-	if err != nil {
-		return err
-	}
-	vs.wasmGraph = g
-	return nil
+	return CosineDistance(workerID, a, b)
 }
 
 // SetEngine переключает движок векторного поиска:
 //
 //	0 = Go Engine (Current)
-//	1 = Rust/WASM Full HNSW Engine (New)
-//
-// При переключении на Rust автоматически синхронизирует все существующие векторы!
+//	1 = Go/WASM SIMD Hybrid Engine (New)
 func (vs *VectorStore) SetEngine(engine int) error {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
 	if engine == 1 {
-		if !vs.useWasmIndex {
-			vs.useWasmIndex = true
-			if vs.dim > 0 && vs.wasmGraph == nil {
-				if err := vs.initWasmGraph(); err != nil {
-					vs.useWasmIndex = false // Откатываемся при ошибке
-					return err
-				}
-				// Синхронизируем все существующие векторы из Go в Rust WASM
-				for id, key := range vs.keys {
-					if node, ok := vs.graph.nodes[id]; ok {
-						if err := vs.wasmGraph.Insert(id, node.Vector); err != nil {
-							vs.useWasmIndex = false
-							return fmt.Errorf("failed to sync vector %s to Rust HNSW: %w", key, err)
-						}
-					}
-				}
-			}
-		}
+		vs.useWasmIndex = true
 	} else {
 		vs.useWasmIndex = false
 	}
 	return nil
 }
 
-// Engine возвращает текущий движок (0 = Go, 1 = Rust/WASM)
+// Engine возвращает текущий движок (0 = Go, 1 = Go/WASM Hybrid)
 func (vs *VectorStore) Engine() int {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
@@ -143,28 +133,19 @@ func (vs *VectorStore) Engine() int {
 }
 
 // Add добавляет вектор с указанным ключом.
-//
-// Если ключ уже существует — удаляет старую ноду из графа и вставляет новую.
-// Если размерность не совпадает с первым вектором — ошибка.
-func (vs *VectorStore) Add(key string, vec []float32) error {
+func (vs *VectorStore) Add(workerID int, key string, vec []float32) error {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
 	// Валидация размерности
 	if vs.dim == 0 {
-		vs.dim = len(vec) // первый вектор задаёт размерность
+		vs.dim = len(vec)
 	} else if len(vec) != vs.dim {
 		return fmt.Errorf("dimension mismatch: expected %d, got %d", vs.dim, len(vec))
 	}
 
-	// Если ключ уже есть — удаляем старую ноду из графа.
-	// Без этого старая нода остаётся как «зомби»: занимает память,
-	// участвует в поиске, но маппинг уже указывает на новый ID.
 	if oldID, exists := vs.ids[key]; exists {
-		vs.graph.Delete(oldID)
-		if vs.wasmGraph != nil {
-			vs.wasmGraph.Delete(oldID)
-		}
+		vs.graph.Delete(workerID, oldID)
 		delete(vs.keys, oldID)
 	}
 
@@ -172,29 +153,14 @@ func (vs *VectorStore) Add(key string, vec []float32) error {
 	vs.ids[key] = id
 	vs.keys[id] = key
 
-	// Вставляем в Go граф (сохраняем всегда для возможности бесшовного отката обратно)
-	vs.graph.Insert(id, vec)
-
-	// Если включен или был инициализирован Rust WASM
-	if vs.useWasmIndex {
-		if err := vs.initWasmGraph(); err != nil {
-			return err
-		}
-	}
-	if vs.wasmGraph != nil {
-		if err := vs.wasmGraph.Insert(id, vec); err != nil {
-			return err
-		}
-	}
+	// Вставляем в Go граф с использованием calculateDistance
+	vs.graph.Insert(workerID, id, vec)
 
 	return nil
 }
 
 // Delete удаляет вектор по ключу.
-//
-// Удаляет ноду из HNSW-графа (с ремонтом связей) и очищает маппинги.
-// Возвращает true если ключ существовал, false если нечего было удалять.
-func (vs *VectorStore) Delete(key string) bool {
+func (vs *VectorStore) Delete(workerID int, key string) bool {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
@@ -204,12 +170,7 @@ func (vs *VectorStore) Delete(key string) bool {
 	}
 
 	// Удаляем из Go графа
-	vs.graph.Delete(id)
-
-	// Удаляем из Rust WASM графа
-	if vs.wasmGraph != nil {
-		vs.wasmGraph.Delete(id)
-	}
+	vs.graph.Delete(workerID, id)
 
 	delete(vs.ids, key)
 	delete(vs.keys, id)
@@ -217,13 +178,14 @@ func (vs *VectorStore) Delete(key string) bool {
 	return true
 }
 
-// Search находит K ближайших векторов к запросу.
+// SearchResult — один результат поиска.
 type VSearchResult struct {
 	Key      string
 	Distance float32
 }
 
-func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
+// Search находит K ближайших векторов к запросу.
+func (vs *VectorStore) Search(workerID int, query []float32, K int) ([]VSearchResult, error) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
@@ -234,20 +196,13 @@ func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 		return nil, fmt.Errorf("query dimension mismatch: expected %d, got %d", vs.dim, len(query))
 	}
 
-	// efSearch = max(K * 10, 100) — хороший баланс точность/скорость.
 	efSearch := K * 10
 	if efSearch < 100 {
 		efSearch = 100
 	}
 
-	var results []SearchResult
-	if vs.useWasmIndex && vs.wasmGraph != nil {
-		// Полный поиск в Rust HNSW WASM
-		results = vs.wasmGraph.Search(query, K, efSearch)
-	} else {
-		// Поиск в Go HNSW
-		results = vs.graph.Search(query, K, efSearch)
-	}
+	// Поиск в Go HNSW графе (который вызовет calculateDistance)
+	results := vs.graph.Search(workerID, query, K, efSearch)
 
 	out := make([]VSearchResult, len(results))
 	for i, r := range results {
@@ -263,16 +218,10 @@ func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 func (vs *VectorStore) Info() (nodeCount int, dim int, maxLevel int) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
-
-	if vs.useWasmIndex && vs.wasmGraph != nil {
-		return vs.wasmGraph.Info()
-	}
-
 	return len(vs.ids), vs.dim, vs.graph.MaxLevel()
 }
 
 // ForEach вызывает fn для каждого вектора в хранилище.
-// Используется для полной синхронизации при репликации.
 func (vs *VectorStore) ForEach(fn func(key string, vec []float32)) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
@@ -288,18 +237,11 @@ func (vs *VectorStore) ForEach(fn func(key string, vec []float32)) {
 }
 
 // Clear удаляет ВСЕ векторы из хранилища.
-//
-// Используется при Full Sync репликации: реплика получает +FULLSYNC
-// и очищает все данные перед приёмом свежего слепка от мастера.
-// Аналог FLUSHALL в Redis.
 func (vs *VectorStore) Clear() {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
 	vs.graph = NewGraph(vs.graph.Distance)
-	if vs.wasmGraph != nil {
-		vs.wasmGraph.Clear()
-	}
 	vs.keys = make(map[uint64]string)
 	vs.ids = make(map[string]uint64)
 	vs.dim = 0
