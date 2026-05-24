@@ -1,16 +1,10 @@
 package vector
 
 import (
-	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
-	"reflect"
 	"sync"
-	"sync/atomic"
-	"unsafe"
-
-	"kvstore/kvstore/internal/compute"
 )
 
 // VectorStore — обёртка над HNSW-графом для интеграции с Molten.
@@ -19,121 +13,58 @@ import (
 //   - Маппинг строковых ключей → внутренние uint64 ID
 //   - Потокобезопасность
 //   - Валидацию размерности
-//   - Динамическое переключение движков (0 = Go, 1 = Go/WASM SIMD Hybrid)
 type VectorStore struct {
 	graph *Graph
 
-	// Двусторонний маппинг: строковый ключ ↔ внутренний ID.
-	keys map[uint64]string // internal ID → user key
-	ids  map[string]uint64 // user key → internal ID
-
-	// Атомарный счётчик для генерации уникальных ID.
-	nextID atomic.Uint64
+	// Двусторонний маппинг: строковый ключ ↔ внутренний индекс в []Node.
+	keys map[uint64]string // internal index → user key
+	ids  map[string]uint64 // user key → internal index
 
 	// Размерность векторов. Устанавливается при первой вставке.
 	dim int
 
-	// Слой интеграции WebAssembly HNSW (Rust) движка
-	useWasmIndex bool
-	workerLocal  *compute.WorkerLocalEngine
-	metric       uint32 // 0 = Euclidean, 1 = Cosine
+	// autoNormalize: если true, все вставляемые векторы и запросы
+	// автоматически нормализуются. Это позволяет использовать DotProductDistance
+	// вместо CosineDistance (×3 быстрее).
+	autoNormalize bool
+
+	// normBuf — буфер для нормализации запроса без аллокаций.
+	// Защищён mu.RLock (Search берёт RLock, но normBuf пишется — нужен Lock).
+	// Поэтому в Search создаём копию запроса на стеке.
 
 	mu sync.RWMutex
 }
 
-// NewVectorStore создаёт хранилище векторов.
+// NewVectorStore создаёт хранилище векторов с произвольной метрикой.
 func NewVectorStore(distance DistanceFunc) *VectorStore {
-	metric := uint32(0)
-	if reflect.ValueOf(distance).Pointer() == reflect.ValueOf(CosineDistance).Pointer() {
-		metric = 1
-	}
-
 	vs := &VectorStore{
-		keys:   make(map[uint64]string),
-		ids:    make(map[string]uint64),
-		metric: metric,
+		keys: make(map[uint64]string),
+		ids:  make(map[string]uint64),
 	}
-	vs.graph = NewGraph(vs.calculateDistance)
+	vs.graph = NewGraph(distance)
 	return vs
 }
 
-// SetWorkerLocalEngine устанавливает пул воркеров WASM.
-func (vs *VectorStore) SetWorkerLocalEngine(wle *compute.WorkerLocalEngine) {
-	vs.mu.Lock()
-	defer vs.mu.Unlock()
-	vs.workerLocal = wle
-}
-
-// calculateDistance вычисляет расстояние между векторами с возможностью WASM-ускорения.
-func (vs *VectorStore) calculateDistance(workerID int, a, b []float32) float32 {
-	if vs.useWasmIndex && vs.workerLocal != nil {
-		slot := vs.workerLocal.Slot(workerID, "vector_math")
-		if slot != nil {
-			var funcName string
-			if vs.metric == 0 {
-				funcName = "simd_euclidean_distance"
-			} else {
-				funcName = "simd_cosine_distance"
-			}
-
-			fn := slot.GetFunction(funcName)
-			if fn != nil {
-				// zero-alloc cast float32 slices to byte slices
-				aBytes := unsafe.Slice((*byte)(unsafe.Pointer(&a[0])), len(a)*4)
-				bBytes := unsafe.Slice((*byte)(unsafe.Pointer(&b[0])), len(b)*4)
-
-				// Write vectors to slot persistent memory buffers
-				slot.Memory().Write(compute.InputOffset, aBytes)
-				slot.Memory().Write(compute.ValueOffset, bBytes)
-
-				// Invoke optimized WASM SIMD kernel using zero-alloc CallWithStack
-				slot.Stack[0] = uint64(compute.InputOffset)
-				slot.Stack[1] = uint64(compute.ValueOffset)
-				slot.Stack[2] = uint64(len(a))
-
-				err := fn.CallWithStack(context.Background(), slot.Stack[:3])
-				if err == nil {
-					return math.Float32frombits(uint32(slot.Stack[0]))
-				}
-			}
-		}
-	}
-
-	// Fallback to pure Go calculation
-	if vs.metric == 0 {
-		return EuclideanDistance(workerID, a, b)
-	}
-	return CosineDistance(workerID, a, b)
-}
-
-// SetEngine переключает движок векторного поиска:
+// NewVectorStoreCosine создаёт хранилище для косинусного поиска.
 //
-//	0 = Go Engine (Current)
-//	1 = Go/WASM SIMD Hybrid Engine (New)
-func (vs *VectorStore) SetEngine(engine int) error {
-	vs.mu.Lock()
-	defer vs.mu.Unlock()
-
-	if engine == 1 {
-		vs.useWasmIndex = true
-	} else {
-		vs.useWasmIndex = false
+// Под капотом: все вставляемые векторы автоматически нормализуются,
+// а вместо дорогого CosineDistance (3 цикла + 2×sqrt + деление)
+// используется DotProductDistance (1 цикл, 0 sqrt).
+//
+// Это стандартная оптимизация Milvus, Qdrant, Pinecone.
+// Пользователю не нужно знать детали — API тот же.
+func NewVectorStoreCosine() *VectorStore {
+	vs := &VectorStore{
+		keys:          make(map[uint64]string),
+		ids:           make(map[string]uint64),
+		autoNormalize: true,
 	}
-	return nil
-}
-
-// Engine возвращает текущий движок (0 = Go, 1 = Go/WASM Hybrid)
-func (vs *VectorStore) Engine() int {
-	vs.mu.RLock()
-	defer vs.mu.RUnlock()
-	if vs.useWasmIndex {
-		return 1
-	}
-	return 0
+	vs.graph = NewGraph(DotProductDistance)
+	return vs
 }
 
 // Add добавляет вектор с указанным ключом.
-func (vs *VectorStore) Add(workerID int, key string, vec []float32) error {
+func (vs *VectorStore) Add(key string, vec []float32) error {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
@@ -145,22 +76,30 @@ func (vs *VectorStore) Add(workerID int, key string, vec []float32) error {
 	}
 
 	if oldID, exists := vs.ids[key]; exists {
-		vs.graph.Delete(workerID, oldID)
+		vs.graph.Delete(oldID)
 		delete(vs.keys, oldID)
 	}
 
-	id := vs.nextID.Add(1)
+	// Pre-normalization: нормализуем копию вектора перед вставкой.
+	// Оригинал пользователя не трогаем.
+	insertVec := vec
+	if vs.autoNormalize {
+		normalized := make([]float32, len(vec))
+		copy(normalized, vec)
+		Normalize(normalized)
+		insertVec = normalized
+	}
+
+	idx := vs.graph.Insert(insertVec)
+	id := uint64(idx)
 	vs.ids[key] = id
 	vs.keys[id] = key
-
-	// Вставляем в Go граф с использованием calculateDistance
-	vs.graph.Insert(workerID, id, vec)
 
 	return nil
 }
 
 // Delete удаляет вектор по ключу.
-func (vs *VectorStore) Delete(workerID int, key string) bool {
+func (vs *VectorStore) Delete(key string) bool {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
@@ -169,8 +108,7 @@ func (vs *VectorStore) Delete(workerID int, key string) bool {
 		return false
 	}
 
-	// Удаляем из Go графа
-	vs.graph.Delete(workerID, id)
+	vs.graph.Delete(id)
 
 	delete(vs.ids, key)
 	delete(vs.keys, id)
@@ -178,14 +116,14 @@ func (vs *VectorStore) Delete(workerID int, key string) bool {
 	return true
 }
 
-// SearchResult — один результат поиска.
+// VSearchResult — один результат поиска.
 type VSearchResult struct {
 	Key      string
 	Distance float32
 }
 
 // Search находит K ближайших векторов к запросу.
-func (vs *VectorStore) Search(workerID int, query []float32, K int) ([]VSearchResult, error) {
+func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
@@ -196,13 +134,21 @@ func (vs *VectorStore) Search(workerID int, query []float32, K int) ([]VSearchRe
 		return nil, fmt.Errorf("query dimension mismatch: expected %d, got %d", vs.dim, len(query))
 	}
 
+	// Pre-normalization: нормализуем копию запроса.
+	searchQuery := query
+	if vs.autoNormalize {
+		normalized := make([]float32, len(query))
+		copy(normalized, query)
+		Normalize(normalized)
+		searchQuery = normalized
+	}
+
 	efSearch := K * 10
 	if efSearch < 100 {
 		efSearch = 100
 	}
 
-	// Поиск в Go HNSW графе (который вызовет calculateDistance)
-	results := vs.graph.Search(workerID, query, K, efSearch)
+	results := vs.graph.Search(searchQuery, K, efSearch)
 
 	out := make([]VSearchResult, len(results))
 	for i, r := range results {
@@ -226,12 +172,10 @@ func (vs *VectorStore) ForEach(fn func(key string, vec []float32)) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
-	vs.graph.mu.RLock()
-	defer vs.graph.mu.RUnlock()
-
 	for id, key := range vs.keys {
-		if node, ok := vs.graph.nodes[id]; ok {
-			fn(key, node.Vector)
+		node := &vs.graph.nodes[id]
+		if node.Alive {
+			fn(key, vs.graph.arena.Get(node.VectorOffset))
 		}
 	}
 }

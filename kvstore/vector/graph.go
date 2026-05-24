@@ -3,7 +3,7 @@ package vector
 import (
 	"math"
 	"math/rand"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -30,10 +30,22 @@ import (
 //
 // Только здесь мы пулим не слайс, а целый набор буферов.
 type searchState struct {
-	visited    map[uint64]bool // множество посещённых нод
-	candidates minHeap         // очередь кандидатов (minHeap)
-	results    maxHeap         // лучшие результаты (maxHeap)
-	collected  []item          // буфер для сбора финальных результатов
+	visited    []uint64 // bitset: 1 бит на ноду (вместо map[uint64]bool)
+	candidates minHeap  // очередь кандидатов (minHeap)
+	results    maxHeap  // лучшие результаты (maxHeap)
+	collected  []item   // буфер для сбора финальных результатов
+}
+
+// isVisited проверяет, была ли нода посещена.
+// Одна инструкция AND — вместо hash + bucket lookup в map.
+func (s *searchState) isVisited(id uint64) bool {
+	return s.visited[id/64]&(1<<(id%64)) != 0
+}
+
+// setVisited помечает ноду как посещённую.
+// Одна инструкция OR — вместо hash + bucket insert в map.
+func (s *searchState) setVisited(id uint64) {
+	s.visited[id/64] |= 1 << (id % 64)
 }
 
 // searchPool — пул переиспользуемых состояний поиска.
@@ -43,7 +55,7 @@ type searchState struct {
 var searchPool = sync.Pool{
 	New: func() any {
 		return &searchState{
-			visited:    make(map[uint64]bool, 256), // pre-alloc на 256 записей
+			visited:    make([]uint64, 0, 256), // вырастет при первом acquire
 			candidates: make(minHeap, 0, 256),
 			results:    make(maxHeap, 0, 256),
 			collected:  make([]item, 0, 256),
@@ -53,33 +65,45 @@ var searchPool = sync.Pool{
 
 // acquire берёт состояние из пула и СБРАСЫВАЕТ все буферы.
 //
-// clear(map) — встроенная функция Go 1.21+, которая очищает map
-// БЕЗ освобождения внутренних bucket'ов. То есть map остаётся
-// того же размера, но пустая. Ноль аллокаций при следующем заполнении
-// (пока не превысим старый размер).
-func (s *searchState) acquire() {
-	clear(s.visited)                // очищаем map, сохраняя capacity
+// nodeSlots — количество ячеек в []Node (включая дыры от Delete).
+// Bitset растёт по мере роста графа, но никогда не уменьшается
+// (чтобы не делать лишних аллокаций).
+//
+// Обнуление bitset через for-range: Go компилятор распознаёт этот паттерн
+// и генерирует runtime.memclrNoHeapPointers — наносекунды для 1-2 КБ.
+func (s *searchState) acquire(nodeSlots int) {
+	needed := (nodeSlots + 63) / 64 // ceil(nodeSlots / 64)
+	if cap(s.visited) < needed {
+		s.visited = make([]uint64, needed)
+	} else {
+		s.visited = s.visited[:needed]
+		for i := range s.visited {
+			s.visited[i] = 0 // memclr intrinsic
+		}
+	}
 	s.candidates = s.candidates[:0] // обнуляем длину, capacity остаётся
 	s.results = s.results[:0]       // то же
 	s.collected = s.collected[:0]   // то же
 }
 
 type Node struct {
-	ID        uint64
-	Vector    []float32
-	Level     int        // максимальный слой, на котором нода присутствует
-	Neighbors [][]uint64 // Neighbors[i] = ID соседей на слое i
+	ID              uint64
+	VectorOffset    uint32
+	NeighborsOffset uint32 // смещение в NeighborsArena
+	Level           int    // максимальный слой, на котором нода присутствует
+	Alive           bool   // маркер «живая ли нода» (tombstone при Delete)
 }
 
 // Graph — HNSW-граф.
 //
 // Это «карта городов» с несколькими слоями масштаба.
 type Graph struct {
-	mu sync.RWMutex
-
-	// Хранилище всех нод. map[id] → нода.
-	// Позже мы это заменим на арену — но сначала нужно понять алгоритм.
-	nodes map[uint64]*Node
+	// Хранилище всех нод — плоский массив (арена).
+	// Индекс в слайсе = внутренний ID ноды. Прямой доступ O(1) без хэширования.
+	// GC видит один объект вместо тысяч отдельных *Node.
+	nodes     []Node    // плоский массив, индекс = ID ноды
+	nodeCount int       // количество живых нод (без дыр/tombstone)
+	freeIDs   []uint32  // стек свободных индексов (от Delete)
 
 	// Точка входа — нода на самом верхнем уровне.
 	// Поиск ВСЕГДА начинается с неё (как «вылет из Москвы»).
@@ -114,6 +138,17 @@ type Graph struct {
 	// Функция расстояния (Euclidean или Cosine).
 	// Тот же паттерн, что Handler в server.go — функция как параметр.
 	Distance DistanceFunc
+
+	arena          *VectorArena
+	neighborsArena *NeighborsArena
+
+	// ─── Переиспользуемые буферы (zero-alloc pruning/insert) ───
+	// Безопасны без мьютекса: Insert и Delete вызываются только под
+	// эксклюзивным mu.Lock() в VectorStore.
+	pruneBufItems   []item   // буфер для pruneNeighbors (capacity = M0)
+	pruneBufIDs     []uint64 // буфер для ID после pruning (capacity = M0)
+	insertBuf       []uint64 // буфер для обратных связей в Insert (capacity = M0+1)
+	searchResultBuf []item   // буфер для результатов searchLayer
 }
 
 // NewGraph создаёт пустой HNSW-граф с параметрами по умолчанию.
@@ -124,13 +159,20 @@ type Graph struct {
 //	M=16, efConstruction=200 — хороший баланс скорость/качество.
 func NewGraph(distance DistanceFunc) *Graph {
 	m := 16
+	m0 := 2 * m
 	return &Graph{
-		nodes:          make(map[uint64]*Node),
-		M:              m,
-		M0:             2 * m, // слой 0 в 2 раза плотнее (из оригинальной статьи)
-		Ml:             1.0 / math.Log(float64(m)),
-		EfConstruction: 200,
-		Distance:       distance,
+		nodes:           make([]Node, 0, 10000),
+		freeIDs:         make([]uint32, 0, 64),
+		M:               m,
+		M0:              m0, // слой 0 в 2 раза плотнее (из оригинальной статьи)
+		Ml:              1.0 / math.Log(float64(m)),
+		EfConstruction:  200,
+		Distance:        distance,
+		neighborsArena:  NewNeighborsArena(m, m0, 10000),
+		pruneBufItems:   make([]item, 0, m0+1),
+		pruneBufIDs:     make([]uint64, 0, m0+1),
+		insertBuf:       make([]uint64, 0, m0+1),
+		searchResultBuf: make([]item, 0, 256),
 	}
 }
 
@@ -179,113 +221,151 @@ func (g *Graph) maxNeighbors(level int) int {
 
 // searchLayer ищет ef ближайших нод к query на одном слое графа.
 //
-// Это жадный алгоритм: начинаем с entryID, смотрим его соседей,
-// если сосед ближе — идём к нему, смотрим ЕГО соседей, и так далее.
-//
-// Параметры:
-//
-//	query   — вектор, к которому ищем ближайших
-//	entryID — откуда начинаем поиск на этом слое
-//	ef      — сколько ближайших хотим найти (ширина поиска)
-//	level   — на каком слое ищем
-//
-// Возвращает: до ef ближайших нод, отсортированных по расстоянию (ближайшая первая).
-// searchLayer ищет ef ближайших нод к query на одном слое графа.
-//
 // ★ ZERO-ALLOC версия ★
 // Все буферы берутся из sync.Pool и возвращаются после использования.
-// На hot path (10K+ RPS) — ни одной аллокации.
-func (g *Graph) searchLayer(workerID int, query []float32, entryID uint64, ef int, level int) []item {
+// Результат записывается в переиспользуемый буфер dst (или searchResultBuf).
+func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) []item {
 
 	state := searchPool.Get().(*searchState)
-	state.acquire()
+	state.acquire(len(g.nodes))
 
-	entryNode := g.nodes[entryID]
-	entryDist := g.Distance(workerID, query, entryNode.Vector)
+	entryNode := &g.nodes[entryID]
+	entryDist := g.Distance(query, g.arena.Get(entryNode.VectorOffset))
 
-	state.visited[entryID] = true
+	state.setVisited(entryID)
 
 	entry := item{id: entryID, dist: entryDist}
-	state.candidates.push(entry) // ← typed, zero alloc
-	state.results.push(entry)    // ← typed, zero alloc
+	state.candidates.push(entry)
+	state.results.push(entry)
 
 	for state.candidates.Len() > 0 {
-		closest := state.candidates.pop()      // ← typed, zero alloc
-		farthestResult := state.results.peek() // ← typed peek, zero alloc
+		closest := state.candidates.pop()
+		farthestResult := state.results.peek()
 
 		if closest.dist > farthestResult.dist {
 			break
 		}
 
-		node := g.nodes[closest.id]
-		for _, neighborID := range node.Neighbors[level] {
-			if state.visited[neighborID] {
+		node := &g.nodes[closest.id]
+		for _, neighborID := range g.neighborsArena.GetNeighbors(node.NeighborsOffset, level) {
+			if state.isVisited(neighborID) {
 				continue
 			}
-			state.visited[neighborID] = true
+			state.setVisited(neighborID)
 
-			neighborNode := g.nodes[neighborID]
-			neighborDist := g.Distance(workerID, query, neighborNode.Vector)
+			neighborNode := &g.nodes[neighborID]
+			neighborDist := g.Distance(query, g.arena.Get(neighborNode.VectorOffset))
 
-			farthestResult = state.results.peek() // ← typed peek
+			farthestResult = state.results.peek()
 
 			if neighborDist < farthestResult.dist || state.results.Len() < ef {
 				newItem := item{id: neighborID, dist: neighborDist}
-				state.candidates.push(newItem) // ← typed
-				state.results.push(newItem)    // ← typed
+				state.candidates.push(newItem)
+				state.results.push(newItem)
 
 				if state.results.Len() > ef {
-					state.results.pop() // ← typed
+					state.results.pop()
 				}
 			}
 		}
 	}
 
+	// Собираем результаты из maxHeap в обратном порядке
 	for state.results.Len() > 0 {
-		state.collected = append(state.collected, state.results.pop()) // ← typed
+		state.collected = append(state.collected, state.results.pop())
 	}
-
 	for i, j := 0, len(state.collected)-1; i < j; i, j = i+1, j-1 {
 		state.collected[i], state.collected[j] = state.collected[j], state.collected[i]
 	}
 
-	result := make([]item, len(state.collected))
-	copy(result, state.collected)
+	// ★ Вместо make([]item) — переиспользуем буфер searchResultBuf.
+	// Безопасно: вызывающий код использует результат до следующего searchLayer.
+	g.searchResultBuf = g.searchResultBuf[:0]
+	g.searchResultBuf = append(g.searchResultBuf, state.collected...)
 
 	searchPool.Put(state)
-	return result
+	return g.searchResultBuf
+}
+
+// greedyClosest — специализированный поиск ближайшей ноды для ef=1.
+//
+// На верхних слоях HNSW мы ищем ровно одну ближайшую ноду (жадный спуск).
+// searchLayer для ef=1 избыточен: pool + map + heap ради одного числа.
+//
+// greedyClosest делает то же самое, но:
+//   - 0 аллокаций
+//   - Не использует sync.Pool, map, heap
+//   - Компилируется в тесный цикл с Distance-вызовами
+//
+// Не отслеживает visited — на верхних слоях граф разрежённый,
+// циклов практически не бывает. Даже если нода проверится дважды —
+// это один лишний Distance (~200ns), что дешевле pool+map (~500ns+).
+func (g *Graph) greedyClosest(query []float32, entryID uint64, level int) uint64 {
+	bestID := entryID
+	bestDist := g.Distance(query, g.arena.Get(g.nodes[entryID].VectorOffset))
+
+	improved := true
+	for improved {
+		improved = false
+		node := &g.nodes[bestID]
+		for _, neighborID := range g.neighborsArena.GetNeighbors(node.NeighborsOffset, level) {
+			dist := g.Distance(query, g.arena.Get(g.nodes[neighborID].VectorOffset))
+			if dist < bestDist {
+				bestID = neighborID
+				bestDist = dist
+				improved = true
+			}
+		}
+	}
+	return bestID
 }
 
 // Insert добавляет новый вектор в HNSW-граф.
+//
+// Возвращает внутренний индекс ноды в плоском массиве nodes.
+// VectorStore использует этот индекс для маппинга ключ ↔ нода.
 //
 // Это главная операция. Здесь происходит:
 //  1. Генерация случайного уровня для ноды
 //  2. Спуск по верхним слоям (навигация к нужному региону)
 //  3. Поиск и подключение соседей на каждом слое
-func (g *Graph) Insert(workerID int, id uint64, vec []float32) {
+func (g *Graph) Insert(vec []float32) uint32 {
 	// 1. Кидаем «кубик» — на скольких слоях будет жить нода
 	level := g.randomLevel()
 
-	// 2. Создаём ноду
-	newNode := &Node{
-		ID:        id,
-		Vector:    vec,
-		Level:     level,
-		Neighbors: make([][]uint64, level+1), // слои 0..level
+	if g.arena == nil {
+		g.arena = NewVectorArena(len(vec), 10000)
+	}
+	vecOffset := g.arena.Allocate(vec)
+	neighborsOffset := g.neighborsArena.Allocate(level)
+
+	// 2. Выделяем ячейку: из free list или append в конец
+	var idx uint32
+	if len(g.freeIDs) > 0 {
+		idx = g.freeIDs[len(g.freeIDs)-1]
+		g.freeIDs = g.freeIDs[:len(g.freeIDs)-1]
+	} else {
+		idx = uint32(len(g.nodes))
+		g.nodes = append(g.nodes, Node{})
 	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	// 3. Добавляем ноду в хранилище
-	g.nodes[id] = newNode
+	// 3. Записываем ноду по значению в плоский массив
+	g.nodes[idx] = Node{
+		ID:              uint64(idx),
+		VectorOffset:    vecOffset,
+		NeighborsOffset: neighborsOffset,
+		Level:           level,
+		Alive:           true,
+	}
+	g.nodeCount++
+	id := uint64(idx)
 
 	// 4. Первая нода в графе — особый случай
 	//    Она автоматически становится entry point. Соседей нет.
-	if len(g.nodes) == 1 {
+	if g.nodeCount == 1 {
 		g.entryPointID = id
 		g.maxLevel = level
-		return
+		return idx
 	}
 
 	ep := g.entryPointID // начинаем с текущего entry point
@@ -293,63 +373,47 @@ func (g *Graph) Insert(workerID int, id uint64, vec []float32) {
 	// ═══════════════════════════════════════════════════
 	// ФАЗА 1: Спуск по верхним слоям (выше level новой ноды)
 	// ═══════════════════════════════════════════════════
-	//
-	// На этих слоях новая нода НЕ будет присутствовать.
-	// Мы просто навигируемся ближе к месту вставки.
-	// ef=1 — нам нужен только 1 ближайший (чтобы знать, откуда продолжить).
-	//
-	// Аналогия: летим на самолёте. Не высаживаемся — просто выбираем
-	//           ближайший аэропорт для пересадки.
+	// ★ greedyClosest вместо searchLayer(ef=1) — без pool/map/heap.
 	for lc := g.maxLevel; lc > level; lc-- {
-		results := g.searchLayer(workerID, vec, ep, 1, lc)
-		if len(results) > 0 {
-			ep = results[0].id // спускаемся: entry point для следующего слоя
-		}
+		ep = g.greedyClosest(vec, ep, lc)
 	}
 
 	// ═══════════════════════════════════════════════════
 	// ФАЗА 2: Поиск соседей и подключение (от level до 0)
 	// ═══════════════════════════════════════════════════
-	//
-	// На этих слоях новая нода БУДЕТ жить.
-	// Для каждого слоя:
-	//   1. Ищем efConstruction ближайших
-	//   2. Выбираем M лучших как соседей
-	//   3. Строим двусторонние связи
 	for lc := min(level, g.maxLevel); lc >= 0; lc-- {
-		// Шаг 1: Ищем efConstruction ближайших нод на этом слое
-		results := g.searchLayer(workerID, vec, ep, g.EfConstruction, lc)
+		results := g.searchLayer(vec, ep, g.EfConstruction, lc)
 
-		// Шаг 2: Выбираем M лучших (results уже отсортированы — ближайший первый)
 		M := g.maxNeighbors(lc)
 		if len(results) > M {
 			results = results[:M]
 		}
 
-		// Шаг 3: Сохраняем ID выбранных соседей
-		neighborIDs := make([]uint64, len(results))
+		// Шаг 3: Сохраняем ID выбранных соседей через арену (★ zero-alloc через insertBuf)
+		neighborIDs := g.insertBuf[:len(results)]
 		for i, r := range results {
 			neighborIDs[i] = r.id
 		}
-		newNode.Neighbors[lc] = neighborIDs
+		g.neighborsArena.SetNeighbors(g.nodes[idx].NeighborsOffset, lc, neighborIDs)
 
-		// Шаг 4: Обратные связи — соседи тоже должны знать о новой ноде.
-		//
-		// Граф ДВУСТОРОННИЙ: если A — сосед B, то B — сосед A.
-		// Это важно для поиска: иначе мы бы не могли «прийти» к новой ноде.
+		// Шаг 4: Обратные связи через арену (★ zero-alloc через insertBuf)
 		for _, r := range results {
-			neighbor := g.nodes[r.id]
-			neighbor.Neighbors[lc] = append(neighbor.Neighbors[lc], id)
+			neighbor := &g.nodes[r.id]
+			existing := g.neighborsArena.GetNeighbors(neighbor.NeighborsOffset, lc)
 
-			// Если у соседа стало слишком много связей — обрезаем.
-			// Оставляем только M самых близких к нему.
-			if len(neighbor.Neighbors[lc]) > M {
-				g.pruneNeighbors(workerID, neighbor, lc, M)
+			// Переиспользуем insertBuf: [existing..., id]
+			updated := g.insertBuf[:len(existing)+1]
+			copy(updated, existing)
+			updated[len(existing)] = id
+
+			if len(updated) > M {
+				g.neighborsArena.SetNeighbors(neighbor.NeighborsOffset, lc, updated[:M])
+				g.pruneNeighborsFromList(neighbor, lc, M, updated)
+			} else {
+				g.neighborsArena.SetNeighbors(neighbor.NeighborsOffset, lc, updated)
 			}
 		}
 
-		// entry point для следующего (нижнего) слоя =
-		// ближайшая нода, найденная на текущем слое
 		if len(results) > 0 {
 			ep = results[0].id
 		}
@@ -358,49 +422,98 @@ func (g *Graph) Insert(workerID int, id uint64, vec []float32) {
 	// ═══════════════════════════════════════════════════
 	// Обновление entry point
 	// ═══════════════════════════════════════════════════
-	//
-	// Если новая нода «выбросила» уровень выше текущего максимума —
-	// она становится новым entry point.
-	// Логично: мы всегда начинаем поиск с самого верхнего слоя.
 	if level > g.maxLevel {
 		g.entryPointID = id
 		g.maxLevel = level
 	}
+
+	return idx
 }
 
 // pruneNeighbors обрезает список соседей до maxCount.
 //
-// Когда у ноды слишком много соседей (больше M), нужно оставить
-// только самых близких. Как в реальности: у города не бывает 100 автобанов,
-// содержать дорого — оставляем только дороги к ближайшим городам.
-func (g *Graph) pruneNeighbors(workerID int, node *Node, level int, maxCount int) {
-	// 1. Для каждого соседа считаем расстояние от НОДЫ (не от запроса!)
-	neighbors := node.Neighbors[level]
-	items := make([]item, len(neighbors))
+// ★ ZERO-ALLOC версия ★
+// Использует переиспользуемые буферы pruneBufItems/pruneBufIDs из Graph.
+// slices.SortFunc вместо sort.Slice — без рефлексии и аллокаций.
+func (g *Graph) pruneNeighbors(node *Node, level int, maxCount int) {
+	neighbors := g.neighborsArena.GetNeighbors(node.NeighborsOffset, level)
 
+	// 1. Переиспользуем буфер items (расширяем при необходимости)
+	if cap(g.pruneBufItems) < len(neighbors) {
+		g.pruneBufItems = make([]item, len(neighbors))
+	}
+	items := g.pruneBufItems[:len(neighbors)]
 	for i, nid := range neighbors {
 		items[i] = item{
 			id:   nid,
-			dist: g.Distance(workerID, node.Vector, g.nodes[nid].Vector),
+			dist: g.Distance(g.arena.Get(node.VectorOffset), g.arena.Get(g.nodes[nid].VectorOffset)),
 		}
 	}
 
-	// 2. Сортируем по расстоянию: ближайшие первые
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].dist < items[j].dist
+	// 2. slices.SortFunc — generics, без reflect.Swapper, 0 аллокаций
+	slices.SortFunc(items, func(a, b item) int {
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
+		return 0
 	})
 
-	// 3. Обрезаем: оставляем только maxCount ближайших
 	if len(items) > maxCount {
 		items = items[:maxCount]
 	}
 
-	// 4. Записываем обратно
-	pruned := make([]uint64, len(items))
+	// 3. Переиспользуем буфер pruned (расширяем при необходимости)
+	if cap(g.pruneBufIDs) < len(items) {
+		g.pruneBufIDs = make([]uint64, len(items))
+	}
+	pruned := g.pruneBufIDs[:len(items)]
 	for i, it := range items {
 		pruned[i] = it.id
 	}
-	node.Neighbors[level] = pruned
+	g.neighborsArena.SetNeighbors(node.NeighborsOffset, level, pruned)
+}
+
+// pruneNeighborsFromList — то же что pruneNeighbors, но принимает готовый список соседей.
+//
+// ★ ZERO-ALLOC версия ★
+func (g *Graph) pruneNeighborsFromList(node *Node, level int, maxCount int, neighbors []uint64) {
+	// Переиспользуем буфер items (расширяем при необходимости)
+	if cap(g.pruneBufItems) < len(neighbors) {
+		g.pruneBufItems = make([]item, len(neighbors))
+	}
+	items := g.pruneBufItems[:len(neighbors)]
+	for i, nid := range neighbors {
+		items[i] = item{
+			id:   nid,
+			dist: g.Distance(g.arena.Get(node.VectorOffset), g.arena.Get(g.nodes[nid].VectorOffset)),
+		}
+	}
+
+	slices.SortFunc(items, func(a, b item) int {
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
+		return 0
+	})
+
+	if len(items) > maxCount {
+		items = items[:maxCount]
+	}
+
+	if cap(g.pruneBufIDs) < len(items) {
+		g.pruneBufIDs = make([]uint64, len(items))
+	}
+	pruned := g.pruneBufIDs[:len(items)]
+	for i, it := range items {
+		pruned[i] = it.id
+	}
+	g.neighborsArena.SetNeighbors(node.NeighborsOffset, level, pruned)
 }
 
 // Delete удаляет ноду из HNSW-графа.
@@ -422,48 +535,50 @@ func (g *Graph) pruneNeighbors(workerID int, node *Node, level int, maxCount int
 // Аналогия: сносим город на карте. Все дороги, которые шли ЧЕРЕЗ этот город,
 // нужно перенаправить напрямую между оставшимися городами,
 // иначе часть страны окажется в изоляции.
-func (g *Graph) Delete(workerID int, id uint64) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	node, exists := g.nodes[id]
-	if !exists {
+func (g *Graph) Delete(id uint64) bool {
+	if id >= uint64(len(g.nodes)) || !g.nodes[id].Alive {
 		return false
 	}
+	node := &g.nodes[id]
+	g.arena.Free(node.VectorOffset)
 
 	// ═══════════════════════════════════════════════════
 	// ФАЗА 1: Ремонт связей на каждом слое
 	// ═══════════════════════════════════════════════════
 	for level := 0; level <= node.Level; level++ {
-		neighbors := node.Neighbors[level]
+		// Копируем соседей, т.к. будем модифицировать арену
+		origNeighbors := g.neighborsArena.GetNeighbors(node.NeighborsOffset, level)
+		neighbors := make([]uint64, len(origNeighbors))
+		copy(neighbors, origNeighbors)
+
 		M := g.maxNeighbors(level)
 
 		for _, neighborID := range neighbors {
-			neighbor := g.nodes[neighborID]
-			if neighbor == nil {
+			if neighborID >= uint64(len(g.nodes)) || !g.nodes[neighborID].Alive {
 				continue
 			}
+			neighbor := &g.nodes[neighborID]
 
 			// Шаг A: Убираем удалённую ноду из списка соседей
-			neighbor.Neighbors[level] = removeID(neighbor.Neighbors[level], id)
+			nNeighbors := g.neighborsArena.GetNeighbors(neighbor.NeighborsOffset, level)
+			cleaned := removeID(append([]uint64{}, nNeighbors...), id)
 
-			// Шаг B: Переподключаем — добавляем других соседей удаляемой ноды.
-			//
-			// Пример: если удаляем B, а граф был A—B—C,
-			// то A теряет связь с C. Нужно добавить A—C напрямую.
+			// Шаг B: Переподключаем — добавляем других соседей удаляемой ноды
 			for _, otherID := range neighbors {
 				if otherID == neighborID {
-					continue // не соединяем ноду саму с собой
+					continue
 				}
-				if containsID(neighbor.Neighbors[level], otherID) {
-					continue // связь уже есть
+				if containsID(cleaned, otherID) {
+					continue
 				}
-				neighbor.Neighbors[level] = append(neighbor.Neighbors[level], otherID)
+				cleaned = append(cleaned, otherID)
 			}
 
-			// Шаг C: Обрезаем если соседей стало слишком много
-			if len(neighbor.Neighbors[level]) > M {
-				g.pruneNeighbors(workerID, neighbor, level, M)
+			// Шаг C: Записываем, с прунингом если нужно
+			if len(cleaned) > M {
+				g.pruneNeighborsFromList(neighbor, level, M, cleaned)
+			} else {
+				g.neighborsArena.SetNeighbors(neighbor.NeighborsOffset, level, cleaned)
 			}
 		}
 	}
@@ -471,45 +586,46 @@ func (g *Graph) Delete(workerID int, id uint64) bool {
 	// ═══════════════════════════════════════════════════
 	// ФАЗА 2: Полная зачистка — убираем ВСЕ ссылки на удалённую ноду
 	// ═══════════════════════════════════════════════════
-	//
-	// Почему недостаточно Фазы 1?
-	// pruneNeighbors может создать асимметричные рёбра:
-	// если A → B существует, но B → A было обрезано при прунинге.
-	// Тогда B ссылается на A, но A не знает о B.
-	// Фаза 1 чистит только соседей A (из A.Neighbors).
-	// Фаза 2 проходит по ВСЕМ нодам и удаляет любые оставшиеся ссылки.
-	for _, n := range g.nodes {
-		if n.ID == id {
+	for i := range g.nodes {
+		n := &g.nodes[i]
+		if !n.Alive || n.ID == id {
 			continue
 		}
 		for level := 0; level <= n.Level; level++ {
-			n.Neighbors[level] = removeID(n.Neighbors[level], id)
+			nNeighbors := g.neighborsArena.GetNeighbors(n.NeighborsOffset, level)
+			cleaned := removeID(append([]uint64{}, nNeighbors...), id)
+			if len(cleaned) != len(nNeighbors) {
+				g.neighborsArena.SetNeighbors(n.NeighborsOffset, level, cleaned)
+			}
 		}
 	}
 
 	// ═══════════════════════════════════════════════════
-	// ФАЗА 3: Удаляем ноду из хранилища
+	// ФАЗА 3: Tombstone + free list
 	// ═══════════════════════════════════════════════════
-	delete(g.nodes, id)
+	g.neighborsArena.Free(node.NeighborsOffset, node.Level)
+	node.Alive = false
+	g.freeIDs = append(g.freeIDs, uint32(id))
+	g.nodeCount--
 
 	// ═══════════════════════════════════════════════════
 	// ФАЗА 4: Обновляем entry point (если удалили именно его)
 	// ═══════════════════════════════════════════════════
 	if id == g.entryPointID {
-		if len(g.nodes) == 0 {
-			// Граф стал пустым
+		if g.nodeCount == 0 {
 			g.entryPointID = 0
 			g.maxLevel = 0
 		} else {
-			// Ищем ноду с максимальным уровнем — она станет новым entry point.
-			// Entry point всегда должен быть на самом верхнем слое,
-			// иначе поиск не сможет начаться с верхних слоёв.
 			newMaxLevel := -1
 			var newEP uint64
-			for nid, n := range g.nodes {
+			for i := range g.nodes {
+				n := &g.nodes[i]
+				if !n.Alive {
+					continue
+				}
 				if n.Level > newMaxLevel {
 					newMaxLevel = n.Level
-					newEP = nid
+					newEP = uint64(i)
 				}
 			}
 			g.entryPointID = newEP
@@ -567,12 +683,9 @@ type SearchResult struct {
 //	K        = "скольких показать в ответе"
 //	Можно спросить 100 (efSearch=100), но показать только 10 (K=10).
 //	Чем больше спросишь — тем вероятнее найдёшь лучших.
-func (g *Graph) Search(workerID int, query []float32, K int, efSearch int) []SearchResult {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
+func (g *Graph) Search(query []float32, K int, efSearch int) []SearchResult {
 	// Пустой граф — пустой результат
-	if len(g.nodes) == 0 {
+	if g.nodeCount == 0 {
 		return nil
 	}
 
@@ -588,13 +701,10 @@ func (g *Graph) Search(workerID int, query []float32, K int, efSearch int) []Sea
 	// ФАЗА 1: Спуск по верхним слоям (слой maxLevel → слой 1)
 	// ═══════════════════════════════════════════════════
 	//
-	// Точно как в Insert: ef=1, жадная навигация.
+	// ★ greedyClosest вместо searchLayer(ef=1) — без pool/map/heap.
 	// Цель: найти хорошую «стартовую позицию» для слоя 0.
 	for lc := g.maxLevel; lc > 0; lc-- {
-		results := g.searchLayer(workerID, query, ep, 1, lc)
-		if len(results) > 0 {
-			ep = results[0].id
-		}
+		ep = g.greedyClosest(query, ep, lc)
 	}
 
 	// ═══════════════════════════════════════════════════
@@ -602,7 +712,7 @@ func (g *Graph) Search(workerID int, query []float32, K int, efSearch int) []Sea
 	// ═══════════════════════════════════════════════════
 	//
 	// Слой 0 содержит ВСЕ ноды. Здесь ищем efSearch ближайших.
-	results := g.searchLayer(workerID, query, ep, efSearch, 0)
+	results := g.searchLayer(query, ep, efSearch, 0)
 
 	// Обрезаем до K
 	if len(results) > K {
@@ -623,14 +733,10 @@ func (g *Graph) Search(workerID int, query []float32, K int, efSearch int) []Sea
 
 // Len возвращает количество нод в графе.
 func (g *Graph) Len() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return len(g.nodes)
+	return g.nodeCount
 }
 
 // MaxLevel возвращает текущий максимальный уровень графа.
 func (g *Graph) MaxLevel() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
 	return g.maxLevel
 }

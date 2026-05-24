@@ -45,6 +45,10 @@ type WorkerSlot struct {
 
 	// Стек для zero-allocation вызовов CallWithStack
 	Stack [8]uint64
+
+	// Pre-created context с workerID для host-функций.
+	// Создаётся один раз при createSlot — zero-alloc на hot path.
+	ctx context.Context
 }
 
 // WorkerLocalEngine управляет per-worker WASM-слотами.
@@ -157,6 +161,7 @@ func (wle *WorkerLocalEngine) createSlot(workerID int, name string, compiled waz
 		memoryBudget: budget,
 		compiled:     compiled,
 		moduleName:   name,
+		ctx:          context.WithValue(context.Background(), workerIDCtxKey{}, workerID),
 	}, nil
 }
 
@@ -189,7 +194,7 @@ func (wle *WorkerLocalEngine) Exec(workerID int, moduleName, funcName string, ke
 
 	slot.Stack[0] = uint64(InputOffset)
 	slot.Stack[1] = uint64(len(key))
-	err := fn.CallWithStack(context.Background(), slot.Stack[:2])
+	err := fn.CallWithStack(slot.ctx, slot.Stack[:2])
 	if err != nil {
 		return nil, fmt.Errorf("exec error: %w", err)
 	}
@@ -313,4 +318,21 @@ func (ws *WorkerSlot) Memory() api.Memory {
 	return ws.memory
 }
 
+// workerIDCtxKey — ключ контекста для передачи workerID в host-функции WASM.
+// Используется вместо парсинга workerID из имени инстанса.
+type workerIDCtxKey struct{}
+
+// WorkerIDFromContext извлекает workerID из контекста.
+// Возвращает 0 если workerID не установлен.
+func WorkerIDFromContext(ctx context.Context) int {
+	if id, ok := ctx.Value(workerIDCtxKey{}).(int); ok {
+		return id
+	}
+	return 0
+}
+
+// NumWorkers возвращает количество воркеров.
+func (wle *WorkerLocalEngine) NumWorkers() int {
+	return wle.numWorkers
+}
 

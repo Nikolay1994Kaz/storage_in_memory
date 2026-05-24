@@ -3,12 +3,9 @@ package vector
 import (
 	"fmt"
 	"math/rand"
-	"os"
-	"runtime"
 	"sync/atomic"
+	"runtime"
 	"testing"
-
-	"kvstore/kvstore/internal/compute"
 )
 
 // BenchmarkSearch_Full — полный HNSW Search на чистом Go графе.
@@ -32,7 +29,7 @@ func BenchmarkSearch_Full(b *testing.B) {
 		for j := range vec {
 			vec[j] = rng.Float32()*2 - 1
 		}
-		g.Insert(0, uint64(i), vec)
+		g.Insert(vec)
 	}
 
 	queries := make([][]float32, 100)
@@ -47,7 +44,83 @@ func BenchmarkSearch_Full(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		g.Search(0, queries[i%len(queries)], K, efSearch)
+		g.Search(queries[i%len(queries)], K, efSearch)
+	}
+}
+
+// BenchmarkSearch_Cosine — поиск с «сырым» CosineDistance.
+// 3 цикла + 2×sqrt + деление на каждый вызов distance.
+func BenchmarkSearch_Cosine(b *testing.B) {
+	const (
+		numVectors = 10000
+		dim        = 128
+		K          = 10
+		efSearch   = 100
+	)
+
+	rng := rand.New(rand.NewSource(42))
+
+	g := NewGraph(CosineDistance)
+	for i := 0; i < numVectors; i++ {
+		vec := make([]float32, dim)
+		for j := range vec {
+			vec[j] = rng.Float32()*2 - 1
+		}
+		g.Insert(vec)
+	}
+
+	queries := make([][]float32, 100)
+	for i := range queries {
+		q := make([]float32, dim)
+		for j := range q {
+			q[j] = rng.Float32()*2 - 1
+		}
+		queries[i] = q
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		g.Search(queries[i%len(queries)], K, efSearch)
+	}
+}
+
+// BenchmarkSearch_CosinePreNorm — поиск с pre-normalized DotProductDistance.
+// 1 цикл, 0 sqrt, 0 делений. Вектора нормализованы при вставке.
+func BenchmarkSearch_CosinePreNorm(b *testing.B) {
+	const (
+		numVectors = 10000
+		dim        = 128
+		K          = 10
+		efSearch   = 100
+	)
+
+	rng := rand.New(rand.NewSource(42))
+
+	g := NewGraph(DotProductDistance)
+	for i := 0; i < numVectors; i++ {
+		vec := make([]float32, dim)
+		for j := range vec {
+			vec[j] = rng.Float32()*2 - 1
+		}
+		Normalize(vec) // pre-normalize при вставке
+		g.Insert(vec)
+	}
+
+	queries := make([][]float32, 100)
+	for i := range queries {
+		q := make([]float32, dim)
+		for j := range q {
+			q[j] = rng.Float32()*2 - 1
+		}
+		Normalize(q) // pre-normalize запрос
+		queries[i] = q
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		g.Search(queries[i%len(queries)], K, efSearch)
 	}
 }
 
@@ -62,14 +135,13 @@ func BenchmarkSearch_Full_Go(b *testing.B) {
 	rng := rand.New(rand.NewSource(42))
 
 	vs := NewVectorStore(EuclideanDistance)
-	vs.SetEngine(0) // Чистый Go
 
 	for i := 0; i < numVectors; i++ {
 		vec := make([]float32, dim)
 		for j := range vec {
 			vec[j] = rng.Float32()*2 - 1
 		}
-		vs.Add(0, fmt.Sprintf("vec:%d", i), vec)
+		vs.Add(fmt.Sprintf("vec:%d", i), vec)
 	}
 
 	queries := make([][]float32, 100)
@@ -84,64 +156,11 @@ func BenchmarkSearch_Full_Go(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		vs.Search(0, queries[i%len(queries)], K)
+		vs.Search(queries[i%len(queries)], K)
 	}
 }
 
-// BenchmarkSearch_Full_Wasm — поиск через VectorStore с WASM SIMD ускорением расчёта расстояний.
-func BenchmarkSearch_Full_Wasm(b *testing.B) {
-	const (
-		numVectors = 10000
-		dim        = 128
-		K          = 10
-	)
-
-	rng := rand.New(rand.NewSource(42))
-
-	wasmBytes, err := os.ReadFile("../../rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm")
-	if err != nil {
-		b.Skip("skipping WASM benchmark because vector_math_wasm.wasm not found")
-	}
-
-	e := compute.NewEngine()
-	defer e.Close()
-
-	wle := compute.NewWorkerLocalEngine(e)
-	defer wle.Close()
-
-	if err := wle.WarmUpFromBytes("vector_math", wasmBytes, compute.TierPinned); err != nil {
-		b.Fatalf("failed to warm up WASM: %v", err)
-	}
-
-	vs := NewVectorStore(EuclideanDistance)
-	vs.SetWorkerLocalEngine(wle)
-	vs.SetEngine(1) // Включаем WASM SIMD ускорение
-
-	for i := 0; i < numVectors; i++ {
-		vec := make([]float32, dim)
-		for j := range vec {
-			vec[j] = rng.Float32()*2 - 1
-		}
-		vs.Add(0, fmt.Sprintf("vec:%d", i), vec)
-	}
-
-	queries := make([][]float32, 100)
-	for i := range queries {
-		q := make([]float32, dim)
-		for j := range q {
-			q[j] = rng.Float32()*2 - 1
-		}
-		queries[i] = q
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		vs.Search(0, queries[i%len(queries)], K)
-	}
-}
-
-// BenchmarkSearch_Full_Go_Parallel — параллельный поиск через VectorStore на чистом Go.
+// BenchmarkSearch_Full_Go_Parallel — параллельный поиск через VectorStore.
 func BenchmarkSearch_Full_Go_Parallel(b *testing.B) {
 	const (
 		numVectors = 10000
@@ -152,14 +171,13 @@ func BenchmarkSearch_Full_Go_Parallel(b *testing.B) {
 	rng := rand.New(rand.NewSource(42))
 
 	vs := NewVectorStore(EuclideanDistance)
-	vs.SetEngine(0) // Чистый Go
 
 	for i := 0; i < numVectors; i++ {
 		vec := make([]float32, dim)
 		for j := range vec {
 			vec[j] = rng.Float32()*2 - 1
 		}
-		vs.Add(0, fmt.Sprintf("vec:%d", i), vec)
+		vs.Add(fmt.Sprintf("vec:%d", i), vec)
 	}
 
 	queries := make([][]float32, 100)
@@ -174,74 +192,95 @@ func BenchmarkSearch_Full_Go_Parallel(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	var counter uint32
-	numWorkers := uint32(runtime.NumCPU())
+	_ = uint32(runtime.NumCPU())
 	b.RunParallel(func(pb *testing.PB) {
-		workerID := int(atomic.AddUint32(&counter, 1) % numWorkers)
+		atomic.AddUint32(&counter, 1)
 		i := 0
 		for pb.Next() {
-			vs.Search(workerID, queries[i%len(queries)], K)
+			vs.Search(queries[i%len(queries)], K)
 			i++
 		}
 	})
 }
 
-// BenchmarkSearch_Full_Wasm_Parallel — параллельный поиск через VectorStore с WASM SIMD в параллельном режиме.
-func BenchmarkSearch_Full_Wasm_Parallel(b *testing.B) {
-	const (
-		numVectors = 10000
-		dim        = 128
-		K          = 10
-	)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Бенчмарк: изолированный Go distance по размерностям.
+//
+//	go test ./kvstore/vector/ -bench 'BenchmarkDistance_' -benchtime=3s
+// ═══════════════════════════════════════════════════════════════════════════════
 
+func benchmarkDistanceGo(b *testing.B, dim int) {
 	rng := rand.New(rand.NewSource(42))
-
-	wasmBytes, err := os.ReadFile("../../rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm")
-	if err != nil {
-		b.Skip("skipping WASM benchmark because vector_math_wasm.wasm not found")
-	}
-
-	e := compute.NewEngine()
-	defer e.Close()
-
-	wle := compute.NewWorkerLocalEngine(e)
-	defer wle.Close()
-
-	if err := wle.WarmUpFromBytes("vector_math", wasmBytes, compute.TierPinned); err != nil {
-		b.Fatalf("failed to warm up WASM: %v", err)
-	}
-
-	vs := NewVectorStore(EuclideanDistance)
-	vs.SetWorkerLocalEngine(wle)
-	vs.SetEngine(1) // Включаем WASM SIMD ускорение
-
-	for i := 0; i < numVectors; i++ {
-		vec := make([]float32, dim)
-		for j := range vec {
-			vec[j] = rng.Float32()*2 - 1
-		}
-		vs.Add(0, fmt.Sprintf("vec:%d", i), vec)
-	}
-
-	queries := make([][]float32, 100)
-	for i := range queries {
-		q := make([]float32, dim)
-		for j := range q {
-			q[j] = rng.Float32()*2 - 1
-		}
-		queries[i] = q
+	a := make([]float32, dim)
+	bv := make([]float32, dim)
+	for j := range a {
+		a[j] = rng.Float32()*2 - 1
+		bv[j] = rng.Float32()*2 - 1
 	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	var counter uint32
-	numWorkers := uint32(runtime.NumCPU())
-	b.RunParallel(func(pb *testing.PB) {
-		workerID := int(atomic.AddUint32(&counter, 1) % numWorkers)
-		i := 0
-		for pb.Next() {
-			vs.Search(workerID, queries[i%len(queries)], K)
-			i++
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		EuclideanDistance(a, bv)
+	}
 }
 
+// dim=128 (Ollama nomic-embed-text по умолчанию)
+func BenchmarkDistance_Go_128(b *testing.B) { benchmarkDistanceGo(b, 128) }
+
+// dim=256
+func BenchmarkDistance_Go_256(b *testing.B) { benchmarkDistanceGo(b, 256) }
+
+// dim=512
+func BenchmarkDistance_Go_512(b *testing.B) { benchmarkDistanceGo(b, 512) }
+
+// dim=768 (BERT, nomic-embed-text, многие LLM)
+func BenchmarkDistance_Go_768(b *testing.B) { benchmarkDistanceGo(b, 768) }
+
+// dim=1024
+func BenchmarkDistance_Go_1024(b *testing.B) { benchmarkDistanceGo(b, 1024) }
+
+// dim=1536 (OpenAI text-embedding-ada-002)
+func BenchmarkDistance_Go_1536(b *testing.B) { benchmarkDistanceGo(b, 1536) }
+
+// dim=2048
+func BenchmarkDistance_Go_2048(b *testing.B) { benchmarkDistanceGo(b, 2048) }
+
+// dim=3072 (OpenAI text-embedding-3-large)
+func BenchmarkDistance_Go_3072(b *testing.B) { benchmarkDistanceGo(b, 3072) }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Сравнение: Euclidean vs Cosine vs DotProduct (dim=128)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func BenchmarkDistance_Cosine_128(b *testing.B) {
+	rng := rand.New(rand.NewSource(42))
+	a := make([]float32, 128)
+	bv := make([]float32, 128)
+	for j := range a {
+		a[j] = rng.Float32()*2 - 1
+		bv[j] = rng.Float32()*2 - 1
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		CosineDistance(a, bv)
+	}
+}
+
+func BenchmarkDistance_DotProduct_128(b *testing.B) {
+	rng := rand.New(rand.NewSource(42))
+	a := make([]float32, 128)
+	bv := make([]float32, 128)
+	for j := range a {
+		a[j] = rng.Float32()*2 - 1
+		bv[j] = rng.Float32()*2 - 1
+	}
+	Normalize(a)
+	Normalize(bv)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		DotProductDistance(a, bv)
+	}
+}

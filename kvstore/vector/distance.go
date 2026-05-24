@@ -13,7 +13,7 @@ import "math"
 // Если   dist(A,B) < dist(A,C)
 // то и dist²(A,B) < dist²(A,C)  — порядок сохраняется!
 // Поэтому корень не нужен. Это стандартная оптимизация во всех vector DB.
-func EuclideanDistance(workerID int, a, b []float32) float32 {
+func EuclideanDistance(a, b []float32) float32 {
 	var sum float32
 
 	// Проходим по каждой паре чисел и считаем (a[i] - b[i])²
@@ -47,7 +47,7 @@ func EuclideanDistance(workerID int, a, b []float32) float32 {
 //
 //	a·b    = a₁×b₁ + a₂×b₂ + ... + aₙ×bₙ  (скалярное произведение)
 //	|a|    = √(a₁² + a₂² + ... + aₙ²)       (длина вектора)
-func CosineDistance(workerID int, a, b []float32) float32 {
+func CosineDistance(a, b []float32) float32 {
 	var dot, normA, normB float32
 
 	for i := range a {
@@ -85,6 +85,26 @@ func Normalize(vec []float32) {
 	}
 }
 
+// DotProductDistance — сверхбыстрое расстояние для PRE-NORMALIZED векторов.
+//
+// Если все векторы нормализованы (|v| = 1.0), то:
+//
+//	CosineDistance(a, b) = 1 - dot(a, b) / (|a| × |b|)
+//	                     = 1 - dot(a, b) / (1.0 × 1.0)
+//	                     = 1 - dot(a, b)
+//
+// Один цикл, ноль sqrt, ноль делений. ×3 быстрее CosineDistance.
+//
+// ⚠️ Используй ТОЛЬКО через NewVectorStoreCosine, который автоматически
+// нормализует все вставляемые векторы и запросы.
+func DotProductDistance(a, b []float32) float32 {
+	var dot float32
+	for i := range a {
+		dot += a[i] * b[i]
+	}
+	return 1 - dot
+}
+
 // DistanceFunc — тип функции расстояния.
 // Позволяет пользователю выбрать метрику при создании индекса.
 //
@@ -96,4 +116,4 @@ func Normalize(vec []float32) {
 // В server.go — тот же приём. Вместо жёсткого вызова конкретной функции,
 // мы передаём функцию как параметр. Хочешь Euclidean — передай Euclidean.
 // Хочешь Cosine — передай Cosine.
-type DistanceFunc func(workerID int, a, b []float32) float32
+type DistanceFunc func(a, b []float32) float32

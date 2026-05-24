@@ -2,10 +2,8 @@ package compute
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math"
-	"strings"
 	"time"
 
 	"github.com/tetratelabs/wazero"
@@ -292,14 +290,8 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 				query[i] = math.Float32frombits(bits)
 			}
 
-			// 3. Вызываем поиск с извлечением workerID из имени инстанса
-			workerID := 0
-			name := m.Name()
-			if idx := strings.LastIndex(name, "_w"); idx != -1 {
-				if _, err := fmt.Sscanf(name[idx+2:], "%d", &workerID); err != nil {
-					workerID = 0
-				}
-			}
+			// 3. Вызываем поиск (workerID передаётся через context из WorkerSlot)
+			workerID := WorkerIDFromContext(ctx)
 			results := e.VSimSearch(workerID, query, int(k))
 
 			// 4. Записываем результаты в WASM-memory по offset 4096

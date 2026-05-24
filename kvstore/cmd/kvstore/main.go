@@ -96,13 +96,13 @@ func main() {
 			restored++
 		case wal.OpVSimAdd:
 			vec := vector.DeserializeVector(entry.Value)
-			if err := vecStore.Add(0, entry.Key, vec); err != nil {
+			if err := vecStore.Add(entry.Key, vec); err != nil {
 				log.Printf("WARNING: failed to restore vector %s: %v", entry.Key, err)
 			}
 			vecRestored++
 			restored++
 		case wal.OpVSimDel:
-			vecStore.Delete(0, entry.Key)
+			vecStore.Delete(entry.Key)
 			restored++
 		}
 	}
@@ -152,10 +152,10 @@ func main() {
 			s.ForEach(fn)
 		}
 		cl.Repl.VecStoreAdd = func(key string, vec []float32) {
-			vecStore.Add(0, key, vec)
+			vecStore.Add(key, vec)
 		}
 		cl.Repl.VecStoreDel = func(key string) {
-			vecStore.Delete(0, key)
+			vecStore.Delete(key)
 		}
 		cl.Repl.VecStoreForEach = func(fn func(key string, vec []float32)) {
 			vecStore.ForEach(fn)
@@ -202,7 +202,7 @@ func main() {
 		Key      string
 		Distance float32
 	} {
-		results, err := vecStore.Search(workerID, query, K)
+		results, err := vecStore.Search(query, K)
 		if err != nil {
 			return nil
 		}
@@ -233,18 +233,7 @@ func main() {
 	triggers := compute.NewTriggerManager(wasm)
 	compute.LoadAll(dataDir, wasm, triggers)
 
-	// Warm up vector_math wasm
-	wasmBytes, err := os.ReadFile("rust_src/target/wasm32-unknown-unknown/release/vector_math_wasm.wasm")
-	if err == nil {
-		if err := wasm.WorkerLocal.WarmUpFromBytes("vector_math", wasmBytes, compute.TierPinned); err == nil {
-			vecStore.SetWorkerLocalEngine(wasm.WorkerLocal)
-			log.Println("WASM Vector engine warmed up and loaded into vecStore successfully")
-		} else {
-			log.Printf("WARNING: failed to warm up vector_math WASM module: %v", err)
-		}
-	} else {
-		log.Printf("WARNING: failed to read vector_math_wasm.wasm: %v", err)
-	}
+
 
 	// === 8. AI Engine (Ollama) ===
 	var aiClient *ai.Client
@@ -268,7 +257,7 @@ func main() {
 		// Background Worker: асинхронный embedding с PubSub-нотификациями
 		aiWorker = ai.NewWorker(aiClient, 256)
 		aiWorker.VecStoreAdd = func(key string, vec []float32) error {
-			return vecStore.Add(0, key, vec)
+			return vecStore.Add(key, vec)
 		}
 		aiWorker.KVStoreSet = func(key string, value []byte) {
 			s.Set(0, key, value)
@@ -791,7 +780,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		walValue := vector.SerializeVector(vec)
 		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
-		if err := vecStore.Add(workerID, key, vec); err != nil {
+		if err := vecStore.Add(key, vec); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
@@ -814,7 +803,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		key := string(args[0])
-		if vecStore.Delete(workerID, key) {
+		if vecStore.Delete(key) {
 			bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: key})
 			if cl != nil && cl.Repl != nil {
 				cl.Repl.ForwardWrite("VSIM.DEL " + key)
@@ -843,7 +832,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 			query[i-1] = float32(f)
 		}
-		results, err := vecStore.Search(workerID, query, K)
+		results, err := vecStore.Search(query, K)
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
@@ -856,28 +845,9 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 
 	case "VSIM.INFO":
 		count, dim, maxLevel := vecStore.Info()
-		engineName := "go"
-		if vecStore.Engine() == 1 {
-			engineName = "rust_wasm"
-		}
-		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d engine:%s", count, dim, maxLevel, engineName)
+		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d", count, dim, maxLevel)
 		buf.WriteBulkString(info)
 
-	case "VSIM.SETENGINE":
-		if len(args) < 1 {
-			buf.WriteError("ERR usage: VSIM.SETENGINE <0|1>")
-			return
-		}
-		engine, err := strconv.Atoi(string(args[0]))
-		if err != nil || (engine != 0 && engine != 1) {
-			buf.WriteError("ERR invalid engine (must be 0 or 1)")
-			return
-		}
-		if err := vecStore.SetEngine(engine); err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		buf.WriteSimpleString("OK")
 
 	// === AI Commands ===
 	case "AI.EMBED":
@@ -922,7 +892,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError(fmt.Sprintf("ERR embed: %v", err))
 			return
 		}
-		results, err := vecStore.Search(workerID, embedding, K)
+		results, err := vecStore.Search(embedding, K)
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR search: %v", err))
 			return
@@ -954,7 +924,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 
 		// RAG Step 2: поиск похожих документов
-		results, err := vecStore.Search(workerID, embedding, 3)
+		results, err := vecStore.Search(embedding, 3)
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR search: %v", err))
 			return
