@@ -133,14 +133,25 @@ func (w *Worker) loop(id int) {
 func (w *Worker) processTask(workerID int, task Task) {
 	start := time.Now()
 
-	// 1. Генерируем embedding через Ollama
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	embedding, err := w.client.Embed(ctx, task.Text)
+	// 1. Генерируем embedding через Ollama (с 1 retry при транзиентных ошибках).
+	// Ollama может вернуть 503 при перегрузке — один retry с паузой 500ms
+	// достаточен для восстановления. Без retry задача терялась навсегда.
+	var embedding []float32
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		embedding, err = w.client.Embed(ctx, task.Text)
+		cancel()
+		if err == nil {
+			break
+		}
+		if attempt == 0 {
+			log.Printf("[ai] Worker %d: embed retry for key '%s': %v", workerID, task.Key, err)
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
 	if err != nil {
-		log.Printf("[ai] Worker %d: embed error for key '%s': %v", workerID, task.Key, err)
-		// Оповещаем об ошибке через PubSub
+		log.Printf("[ai] Worker %d: embed failed for key '%s': %v", workerID, task.Key, err)
 		if w.Publish != nil {
 			w.Publish("ai:errors", fmt.Sprintf("embed_failed:%s:%v", task.Key, err))
 		}

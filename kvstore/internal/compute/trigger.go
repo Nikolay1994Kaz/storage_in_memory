@@ -95,6 +95,13 @@ func (tm *TriggerManager) ListTriggers() []*Trigger {
 //   - Command-модуль (legacy):       ExecFunctionWithKey() — ~14ms, 53K allocs
 func (tm *TriggerManager) Fire(event TriggerEvent, key string, workerID int) {
 	tm.mu.RLock()
+	// Fast path: если триггеров нет — выходим без аллокаций.
+	// Типичный случай: Fire() вызывается на КАЖДЫЙ SET/DEL,
+	// но триггеры настроены только у 1% пользователей.
+	if len(tm.triggers) == 0 {
+		tm.mu.RUnlock()
+		return
+	}
 	triggers := make([]*Trigger, len(tm.triggers))
 	copy(triggers, tm.triggers)
 	tm.mu.RUnlock()
@@ -108,9 +115,6 @@ func (tm *TriggerManager) Fire(event TriggerEvent, key string, workerID int) {
 		if err != nil || !matched {
 			continue
 		}
-
-		log.Printf("[wasm] Trigger %s fired: %s on key '%s' → %s.%s",
-			t.ID, event, key, t.ModuleName, t.FuncName)
 
 		// Быстрый путь: Reactor-модуль через worker-local инстанс
 		if tm.engine.WorkerLocal != nil && tm.engine.WorkerLocal.HasModule(t.ModuleName) {

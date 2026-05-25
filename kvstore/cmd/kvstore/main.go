@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -43,6 +44,9 @@ func main() {
 	clusterSlotStart := flag.Int("slot-start", 0, "начало диапазона слотов")
 	clusterSlotEnd := flag.Int("slot-end", 16383, "конец диапазона слотов")
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "URL Ollama API")
+	requirePass := flag.String("requirepass", "", "пароль для AUTH (пусто = без аутентификации)")
+	tlsCert := flag.String("tls-cert", "", "путь к TLS сертификату (PEM)")
+	tlsKey := flag.String("tls-key", "", "путь к TLS ключу (PEM)")
 	flag.Parse()
 
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
@@ -257,6 +261,11 @@ func main() {
 		// Background Worker: асинхронный embedding с PubSub-нотификациями
 		aiWorker = ai.NewWorker(aiClient, 256)
 		aiWorker.VecStoreAdd = func(key string, vec []float32) error {
+			// WAL: без этого AI-проиндексированные векторы терялись при рестарте.
+			// Записываем сериализованный вектор — при восстановлении OpVSimAdd
+			// вставит его обратно в HNSW без повторного вызова Ollama.
+			walValue := vector.SerializeVector(vec)
+			bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 			return vecStore.Add(key, vec)
 		}
 		aiWorker.KVStoreSet = func(key string, value []byte) {
@@ -281,6 +290,29 @@ func main() {
 
 		cmd := strings.ToUpper(string(args[0]))
 		cmdArgs := args[1:]
+
+		// ─── AUTH ───────────────────────────────────────────
+		// Если --requirepass задан, клиент должен пройти AUTH
+		// перед выполнением любых команд (кроме AUTH и PING).
+		if *requirePass != "" {
+			if cmd == "AUTH" {
+				if len(cmdArgs) != 1 {
+					cs.Buf.WriteError("ERR wrong number of arguments for 'AUTH' command")
+					return
+				}
+				if string(cmdArgs[0]) == *requirePass {
+					cs.Authenticated = true
+					cs.Buf.WriteSimpleString("OK")
+				} else {
+					cs.Buf.WriteError("ERR invalid password")
+				}
+				return
+			}
+			if !cs.Authenticated && cmd != "PING" {
+				cs.Buf.WriteError("NOAUTH Authentication required")
+				return
+			}
+		}
 
 		// Транзакции
 		switch cmd {
@@ -332,6 +364,17 @@ func main() {
 	// === 8. Сервер ===
 	listenAddr := fmt.Sprintf(":%d", *port)
 	srv := server.NewServer(listenAddr, handler)
+
+	// TLS: если указаны сертификат и ключ — включаем шифрование.
+	if *tlsCert != "" && *tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load TLS cert/key: %v\n", err)
+			os.Exit(1)
+		}
+		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	}
+
 	if err := srv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start: %v\n", err)
 		os.Exit(1)

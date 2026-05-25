@@ -88,7 +88,7 @@ func NewEngine() *Engine {
 	e := &Engine{
 		runtime:     r,
 		modules:     make(map[string]*CompiledModule),
-		ExecTimeout: 10 * time.Millisecond, // Phase 0: max 10ms на вызов
+		ExecTimeout: 100 * time.Millisecond, // 100ms: Command-модули тратят ~14ms на instantiation
 	}
 
 	// Host-функции регистрируются один раз (до WASI)

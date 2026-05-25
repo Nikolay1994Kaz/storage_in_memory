@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -21,11 +22,12 @@ const (
 // Buf — per-connection ring buffer (заменяет bufio.Reader + bufio.Writer).
 // WorkerID — идентификатор epoll-воркера для TCMallocStore MCache.
 type ConnState struct {
-	Conn     net.Conn
-	Buf      *ConnBuf // ← заменяет Reader + Writer
-	WorkerID int
-	InTx     bool
-	TxQueue  [][][]byte // ← was [][]protocol.Value
+	Conn          net.Conn
+	Buf           *ConnBuf // ← заменяет Reader + Writer
+	WorkerID      int
+	InTx          bool
+	TxQueue       [][][]byte // ← was [][]protocol.Value
+	Authenticated bool       // true после успешной AUTH команды
 }
 
 // Handler — функция обработки RESP-команды.
@@ -48,11 +50,12 @@ type worker struct {
 
 // Server — TCP-сервер на базе per-worker epoll.
 type Server struct {
-	addr     string
-	handler  Handler
-	listener net.Listener
-	workers  []*worker
-	next     atomic.Uint64
+	addr      string
+	handler   Handler
+	listener  net.Listener
+	workers   []*worker
+	next      atomic.Uint64
+	TLSConfig *tls.Config // nil = plain TCP, not-nil = TLS
 }
 
 func NewServer(addr string, handler Handler) *Server {
@@ -69,6 +72,14 @@ func (s *Server) Start() error {
 	s.listener, err = net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.addr, err)
+	}
+
+	// TLS: оборачиваем listener, если TLSConfig задан.
+	// Весь остальной код (epoll, ConnBuf) работает без изменений —
+	// TLS прозрачно шифрует на уровне listener, conn.Read/Write те же.
+	if s.TLSConfig != nil {
+		s.listener = tls.NewListener(s.listener, s.TLSConfig)
+		log.Println("TLS enabled")
 	}
 
 	numWorkers := runtime.NumCPU()
