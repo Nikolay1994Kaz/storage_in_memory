@@ -682,3 +682,79 @@ func TestDelete_RecallAfterMassDelete(t *testing.T) {
 		t.Errorf("recall too low after mass delete: %.0f%%", recall*100)
 	}
 }
+
+// Тест: Проверка работы searchState (bitset: isVisited, setVisited и сброс/аллокация в acquire)
+// ──────────────────────────────────────────────────────────────────────────────────────────
+func TestSearchState_VisitedAndAcquire(t *testing.T) {
+	// 1. Тестируем базовые функции isVisited и setVisited для разных ID
+	state := &searchState{
+		visited: make([]uint64, 4), // 4 * 64 = 256 бит
+	}
+
+	testIDs := []uint64{0, 5, 63, 64, 127, 128, 255}
+	for _, id := range testIDs {
+		if state.isVisited(id) {
+			t.Errorf("node ID=%d is visited initially, expected false", id)
+		}
+		state.setVisited(id)
+		if !state.isVisited(id) {
+			t.Errorf("node ID=%d is not visited after setVisited, expected true", id)
+		}
+	}
+
+	// Убедимся, что соседние невыбранные ноды остались ложными
+	unvisitedIDs := []uint64{1, 4, 62, 65, 126, 129, 254}
+	for _, id := range unvisitedIDs {
+		if state.isVisited(id) {
+			t.Errorf("node ID=%d is visited, expected false (should not be affected by neighbor set)", id)
+		}
+	}
+
+	// 2. Тестируем acquire — сброс и сохранение емкости
+	// Настроим state с какими-то данными в кучах и буферах
+	state.candidates = append(state.candidates, item{id: 10, dist: 1.5})
+	state.results = append(state.results, item{id: 20, dist: 2.5})
+	state.collected = append(state.collected, item{id: 30, dist: 3.5})
+
+	// Вызываем acquire для маленького размера графа (nodeSlots = 100 -> needed = 2 uint64)
+	// Должно занулиться visited, но capacity остаться >= 2
+	state.acquire(100)
+
+	// Проверяем, что все ранее установленные биты занулились (только для ID < 100, так как длина visited теперь 2 uint64, то есть 128 бит)
+	for _, id := range testIDs {
+		if id < 100 {
+			if state.isVisited(id) {
+				t.Errorf("node ID=%d is still visited after acquire, expected reset", id)
+			}
+		}
+	}
+
+	// Проверяем сброс длин куч и буферов при сохранении capacity
+	if len(state.candidates) != 0 || cap(state.candidates) < 1 {
+		t.Errorf("candidates heap length not reset to 0 or capacity lost")
+	}
+	if len(state.results) != 0 || cap(state.results) < 1 {
+		t.Errorf("results heap length not reset to 0 or capacity lost")
+	}
+	if len(state.collected) != 0 || cap(state.collected) < 1 {
+		t.Errorf("collected slice length not reset to 0 or capacity lost")
+	}
+
+	// 3. Тестируем автоматическое расширение (grow) в acquire при большом nodeSlots
+	largeNodeSlots := 20000 // needed = (20000+63)/64 = 313 uint64
+	state.acquire(largeNodeSlots)
+
+	// Проверяем, что длина visited увеличилась до необходимой
+	expectedNeeded := (largeNodeSlots + 63) / 64
+	if len(state.visited) != expectedNeeded {
+		t.Errorf("expected visited slice length %d, got %d", expectedNeeded, len(state.visited))
+	}
+
+	// Проверяем, что все биты в новом расширенном массиве равны 0
+	for i := uint64(0); i < uint64(largeNodeSlots); i += 100 {
+		if state.isVisited(i) {
+			t.Errorf("node ID=%d is visited in freshly allocated visited slice, expected false", i)
+		}
+	}
+}
+
