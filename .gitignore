@@ -1,11 +1,13 @@
 # Binaries
 kvstore-server
 kvstore/kvstore
-store.test
 *.test
+*_bin
 
 # Profiling
 *.prof
+*.out
+*.svg
 
 # WAL data files
 *.wal
@@ -23,8 +25,10 @@ data.wal
 # Runtime data
 data/
 data_backup/
+data_old_backup/
 *.log
-*.txt
-*_bin
-tinygo/
+node*/
 
+# Build tools (install separately, not part of source)
+tinygo/
+rust_src/

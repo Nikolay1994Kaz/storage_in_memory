@@ -1,0 +1,63 @@
+services:
+  # ─── KVStore ──────────────────────────────────────
+  # Основной сервер. Ждёт, пока Ollama будет готова.
+  kvstore:
+    build: .
+    container_name: kvstore
+    ports:
+      - "6380:6380"
+    volumes:
+      - kvstore-data:/app/data
+    command:
+      - "--port=6380"
+      - "--ollama-url=http://ollama:11434"
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ─── Ollama ───────────────────────────────────────
+  # Нейросеть в отдельном контейнере. GPU пробрасывается
+  # автоматически, если доступен (deploy.resources).
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    # Раскомментируйте блок ниже, если у вас NVIDIA GPU и установлен Nvidia Container Toolkit
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+  # ─── Ollama Init ──────────────────────────────────
+  # Одноразовый контейнер: скачивает модель эмбеддингов
+  # при первом запуске. При повторных — модель уже в volume,
+  # pull завершается мгновенно.
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: |
+      sh -c "
+        echo 'Waiting for Ollama to start...'
+        until ollama list > /dev/null 2>&1; do
+          sleep 1
+        done
+        echo 'Pulling embedding model...'
+        ollama pull nomic-embed-text
+        echo 'Model ready!'
+      "
+
+volumes:
+  kvstore-data:
+  ollama-models:

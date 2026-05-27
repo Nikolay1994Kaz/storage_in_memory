@@ -292,7 +292,7 @@ func (c *Cluster) pingRandomNode() {
 	target := candidates[rand.Intn(len(candidates))]
 
 	// Подключаемся к gossip-порту
-	addr := fmt.Sprintf("%s:%d", extractHost(target.Addr), target.GossipPort)
+	addr := net.JoinHostPort(extractHost(target.Addr), fmt.Sprintf("%d", target.GossipPort))
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		// Нода не отвечает — ничего не делаем.
