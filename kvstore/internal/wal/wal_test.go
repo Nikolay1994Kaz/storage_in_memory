@@ -367,7 +367,7 @@ func TestSyncer_Fsync(t *testing.T) {
 	path := filepath.Join(dir, "wal_0001.log")
 
 	// iterate-заглушка (для Syncer'а)
-	iterate := func(fn func(string, []byte)) {}
+	iterate := func(fn func(byte, string, []byte)) {}
 
 	syncer := NewSyncer(w, 10*time.Millisecond, dir, iterate)
 
@@ -409,7 +409,7 @@ func TestSyncer_CompactTrigger(t *testing.T) {
 	compactCalled.Add(1)
 	compactDone := false
 
-	iterate := func(fn func(string, []byte)) {
+	iterate := func(fn func(byte, string, []byte)) {
 		if !compactDone {
 			compactDone = true
 			compactCalled.Done()
@@ -448,7 +448,7 @@ func TestSyncer_CompactTrigger(t *testing.T) {
 // TestSyncer_Stop — Stop дожидается последнего Sync и завершает горутину.
 func TestSyncer_Stop(t *testing.T) {
 	w, _ := tempWAL(t)
-	iterate := func(fn func(string, []byte)) {}
+	iterate := func(fn func(byte, string, []byte)) {}
 
 	syncer := NewSyncer(w, 10*time.Millisecond, "", iterate)
 
@@ -475,9 +475,9 @@ func TestSnapshot_WriteAndRead(t *testing.T) {
 		testData[fmt.Sprintf("key:%d", i)] = fmt.Sprintf("val:%d", i)
 	}
 
-	iterate := func(fn func(string, []byte)) {
+	iterate := func(fn func(byte, string, []byte)) {
 		for k, v := range testData {
-			fn(k, []byte(v))
+			fn(OpSet, k, []byte(v))
 		}
 	}
 
@@ -519,8 +519,8 @@ func TestSnapshot_AtomicRename(t *testing.T) {
 	dir := t.TempDir()
 	sw := NewSnapshotWriter(dir)
 
-	iterate := func(fn func(string, []byte)) {
-		fn("only-key", []byte("only-value"))
+	iterate := func(fn func(byte, string, []byte)) {
+		fn(OpSet, "only-key", []byte("only-value"))
 	}
 
 	sw.WriteSnapshot(iterate)
@@ -549,8 +549,8 @@ func TestSnapshot_ErrorCleansUp(t *testing.T) {
 	os.MkdirAll(readOnlyDir, 0555)
 
 	sw := NewSnapshotWriter(readOnlyDir)
-	iterate := func(fn func(string, []byte)) {
-		fn("k", []byte("v"))
+	iterate := func(fn func(byte, string, []byte)) {
+		fn(OpSet, "k", []byte("v"))
 	}
 
 	err := sw.WriteSnapshot(iterate)

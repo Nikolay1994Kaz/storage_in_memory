@@ -28,7 +28,7 @@ func NewSnapshotWriter(dir string) *SnapshotWriter {
 // Оптимизация: пишет напрямую в файл через bufio (256KB буфер)
 // с pre-allocated encode buffer. Без промежуточного WAL.Write() —
 // нет mutex lock и аллокаций на каждый ключ.
-func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value []byte))) error {
+func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(op byte, key string, value []byte))) error {
 	tmpPath := filepath.Join(sw.dir, "snapshot.wal.tmp")
 	finalPath := filepath.Join(sw.dir, "snapshot.wal")
 
@@ -43,7 +43,7 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value [
 
 	count := 0
 	var writeErr error
-	iterate(func(key string, value []byte) {
+	iterate(func(op byte, key string, value []byte) {
 		if writeErr != nil {
 			return // предыдущая запись упала — пропускаем остальные
 		}
@@ -60,7 +60,7 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value [
 
 		// Заполняем payload: [Op 1B][KeyLen 4B][Key][Value]
 		off := 8
-		encodeBuf[off] = OpSet
+		encodeBuf[off] = op
 		off++
 
 		binary.LittleEndian.PutUint32(encodeBuf[off:], uint32(len(key)))
@@ -122,7 +122,7 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(key string, value [
 // 1. Rotate WAL (мгновенно)
 // 2. Записать snapshot (фон)
 // 3. Удалить старые WAL (ТОЛЬКО после успешного snapshot!)
-func BackgroundCompact(w *WAL, dir string, iterate func(fn func(key string, value []byte))) {
+func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key string, value []byte))) {
 	// 1. Ротация — переключаем WAL на новый файл.
 	// Наносекундная точность в имени предотвращает коллизии при быстрой ротации.
 	now := time.Now()

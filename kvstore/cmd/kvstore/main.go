@@ -126,7 +126,20 @@ func main() {
 	defer bw.Close()
 
 	// === 4. Syncer ===
-	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, s.ForEach)
+	// iterateAll — объединённый обход KV + Vectors для snapshot.
+	// Snapshot должен содержать ОБА типа данных, иначе после компактизации
+	// (CleanupOldWALs) вектора из удалённых WAL-файлов будут потеряны.
+	iterateAll := func(fn func(op byte, key string, value []byte)) {
+		// KV данные → OpSet
+		s.ForEach(func(key string, value []byte) {
+			fn(wal.OpSet, key, value)
+		})
+		// Вектора → OpVSimAdd
+		vecStore.ForEach(func(key string, vec []float32) {
+			fn(wal.OpVSimAdd, key, vector.SerializeVector(vec))
+		})
+	}
+	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, iterateAll)
 	defer syncer.Stop()
 
 	// === 5. Pub/Sub Hub ===
@@ -339,7 +352,7 @@ func main() {
 			for _, queuedArgs := range cs.TxQueue {
 				qCmd := strings.ToUpper(string(queuedArgs[0]))
 				qCmdArgs := queuedArgs[1:]
-				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, cs, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, cs, qCmd, qCmdArgs)
 			}
 			globalTxMu.Unlock()
 			cs.InTx = false
@@ -358,7 +371,7 @@ func main() {
 			return
 		}
 
-		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, cs, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, cs, cmd, cmdArgs)
 	}
 
 	// === 8. Сервер ===
@@ -429,6 +442,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine,
 	triggers *compute.TriggerManager, vecStore *vector.VectorStore,
 	aiClient *ai.Client, aiWorker *ai.Worker,
+	iterateAll func(fn func(op byte, key string, value []byte)),
 	cs *server.ConnState, cmd string, args [][]byte) {
 
 	buf := cs.Buf
@@ -684,7 +698,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		buf.WriteInt(s.Len())
 
 	case "COMPACT":
-		wal.BackgroundCompact(bw.RawWAL(), dataDir, s.ForEach)
+		wal.BackgroundCompact(bw.RawWAL(), dataDir, iterateAll)
 		buf.WriteSimpleString("OK compaction started")
 
 	// === WASM ===

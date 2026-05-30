@@ -23,12 +23,12 @@ type Syncer struct {
 	stop       chan struct{}
 	done       chan struct{} // закрывается когда run() завершается
 	dir        string
-	iterate    func(fn func(key string, value []byte))
+	iterate    func(fn func(op byte, key string, value []byte))
 	compacting atomic.Bool
 	wg         sync.WaitGroup
 }
 
-func NewSyncer(w *WAL, interval time.Duration, dir string, iterate func(fn func(key string, value []byte))) *Syncer {
+func NewSyncer(w *WAL, interval time.Duration, dir string, iterate func(fn func(op byte, key string, value []byte))) *Syncer {
 	s := &Syncer{
 		wal:      w,
 		interval: interval,
