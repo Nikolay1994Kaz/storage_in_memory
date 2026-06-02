@@ -369,7 +369,7 @@ func TestSyncer_Fsync(t *testing.T) {
 	// iterate-заглушка (для Syncer'а)
 	iterate := func(fn func(byte, string, []byte)) {}
 
-	syncer := NewSyncer(w, 10*time.Millisecond, dir, iterate)
+	syncer := NewSyncer(w, 10*time.Millisecond, dir, iterate, func() error { return nil })
 
 	// Пишем entry (через WAL напрямую, без Sync)
 	w.Write(Entry{Op: OpSet, Key: "synced", Value: []byte("yes")})
@@ -418,7 +418,7 @@ func TestSyncer_CompactTrigger(t *testing.T) {
 	}
 
 	// Syncer с коротким интервалом — чтобы sizeCheck сработал быстро
-	syncer := NewSyncer(w, 1*time.Millisecond, dir, iterate)
+	syncer := NewSyncer(w, 1*time.Millisecond, dir, iterate, func() error { return nil })
 
 	// Ждём срабатывания compact (sizeCheckEvery=50, interval=1ms → ~50ms)
 	done := make(chan struct{})
@@ -450,7 +450,7 @@ func TestSyncer_Stop(t *testing.T) {
 	w, _ := tempWAL(t)
 	iterate := func(fn func(byte, string, []byte)) {}
 
-	syncer := NewSyncer(w, 10*time.Millisecond, "", iterate)
+	syncer := NewSyncer(w, 10*time.Millisecond, "", iterate, func() error { return nil })
 
 	// Stop не должен зависнуть и не паниковать
 	syncer.Stop()

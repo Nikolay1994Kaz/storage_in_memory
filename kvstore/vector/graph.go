@@ -34,6 +34,11 @@ type searchState struct {
 	candidates minHeap  // очередь кандидатов (minHeap)
 	results    maxHeap  // лучшие результаты (maxHeap)
 	collected  []item   // буфер для сбора финальных результатов
+
+	// Используются в searchLayer для сбора соседей в батч.
+	batchOffsets []uint32  // offset-ы непосещённых соседей
+	batchIDs     []uint64  // ID непосещённых соседей (параллельно offsets)
+	batchDists   []float32 // результаты distance (параллельно offsets)
 }
 
 // isVisited проверяет, была ли нода посещена.
@@ -55,10 +60,13 @@ func (s *searchState) setVisited(id uint64) {
 var searchPool = sync.Pool{
 	New: func() any {
 		return &searchState{
-			visited:    make([]uint64, 0, 256), // вырастет при первом acquire
-			candidates: make(minHeap, 0, 256),
-			results:    make(maxHeap, 0, 256),
-			collected:  make([]item, 0, 256),
+			visited:      make([]uint64, 0, 256),
+			candidates:   make(minHeap, 0, 256),
+			results:      make(maxHeap, 0, 256),
+			collected:    make([]item, 0, 256),
+			batchOffsets: make([]uint32, 0, 32),
+			batchIDs:     make([]uint64, 0, 32),
+			batchDists:   make([]float32, 0, 32),
 		}
 	},
 }
@@ -81,9 +89,12 @@ func (s *searchState) acquire(nodeSlots int) {
 			s.visited[i] = 0 // memclr intrinsic
 		}
 	}
-	s.candidates = s.candidates[:0] // обнуляем длину, capacity остаётся
-	s.results = s.results[:0]       // то же
-	s.collected = s.collected[:0]   // то же
+	s.candidates = s.candidates[:0]    // обнуляем длину, capacity остаётся
+	s.results = s.results[:0]          // то же
+	s.collected = s.collected[:0]      // то же
+	s.batchOffsets = s.batchOffsets[:0] // batch буферы тоже сбрасываем
+	s.batchIDs = s.batchIDs[:0]
+	s.batchDists = s.batchDists[:0]
 }
 
 type Node struct {
@@ -101,9 +112,9 @@ type Graph struct {
 	// Хранилище всех нод — плоский массив (арена).
 	// Индекс в слайсе = внутренний ID ноды. Прямой доступ O(1) без хэширования.
 	// GC видит один объект вместо тысяч отдельных *Node.
-	nodes     []Node    // плоский массив, индекс = ID ноды
-	nodeCount int       // количество живых нод (без дыр/tombstone)
-	freeIDs   []uint32  // стек свободных индексов (от Delete)
+	nodes     []Node   // плоский массив, индекс = ID ноды
+	nodeCount int      // количество живых нод (без дыр/tombstone)
+	freeIDs   []uint32 // стек свободных индексов (от Delete)
 
 	// Точка входа — нода на самом верхнем уровне.
 	// Поиск ВСЕГДА начинается с неё (как «вылет из Москвы»).
@@ -149,6 +160,7 @@ type Graph struct {
 	pruneBufIDs     []uint64 // буфер для ID после pruning (capacity = M0)
 	insertBuf       []uint64 // буфер для обратных связей в Insert (capacity = M0+1)
 	searchResultBuf []item   // буфер для результатов searchLayer
+
 }
 
 // NewGraph создаёт пустой HNSW-граф с параметрами по умолчанию.
@@ -246,25 +258,49 @@ func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) 
 			break
 		}
 
+		// НОВЫЙ КОД (batch):
 		node := &g.nodes[closest.id]
-		for _, neighborID := range g.neighborsArena.GetNeighbors(node.NeighborsOffset, level) {
+		neighbors := g.neighborsArena.GetNeighbors(node.NeighborsOffset, level)
+
+		// Фаза 1: собрать offset-ы НЕПОСЕЩЁННЫХ соседей
+		state.batchOffsets = state.batchOffsets[:0]
+		state.batchIDs = state.batchIDs[:0]
+
+		for _, neighborID := range neighbors {
 			if state.isVisited(neighborID) {
 				continue
 			}
 			state.setVisited(neighborID)
 
 			neighborNode := &g.nodes[neighborID]
-			neighborDist := g.Distance(query, g.arena.Get(neighborNode.VectorOffset))
+			state.batchOffsets = append(state.batchOffsets, neighborNode.VectorOffset)
+			state.batchIDs = append(state.batchIDs, neighborID)
+		}
 
+		// Фаза 2: batch distance — один «вызов» на все offset-ы
+		if len(state.batchOffsets) > 0 {
+			// Убедиться что буфер результатов достаточного размера
+			if cap(state.batchDists) < len(state.batchOffsets) {
+				state.batchDists = make([]float32, len(state.batchOffsets))
+			}
+			state.batchDists = state.batchDists[:len(state.batchOffsets)]
+
+			g.batchDistance(query, state.batchOffsets, state.batchDists)
+
+			// Фаза 3: разобрать результаты
 			farthestResult = state.results.peek()
+			for i, neighborID := range state.batchIDs {
+				neighborDist := state.batchDists[i]
 
-			if neighborDist < farthestResult.dist || state.results.Len() < ef {
-				newItem := item{id: neighborID, dist: neighborDist}
-				state.candidates.push(newItem)
-				state.results.push(newItem)
+				if neighborDist < farthestResult.dist || state.results.Len() < ef {
+					newItem := item{id: neighborID, dist: neighborDist}
+					state.candidates.push(newItem)
+					state.results.push(newItem)
 
-				if state.results.Len() > ef {
-					state.results.pop()
+					if state.results.Len() > ef {
+						state.results.pop()
+					}
+					farthestResult = state.results.peek()
 				}
 			}
 		}
@@ -739,4 +775,22 @@ func (g *Graph) Len() int {
 // MaxLevel возвращает текущий максимальный уровень графа.
 func (g *Graph) MaxLevel() int {
 	return g.maxLevel
+}
+
+// batchDistance считает расстояние от query до каждого вектора по offset-ам.
+//
+// Зачем batch, а не по одному?
+// Cache locality: offsets собраны подряд в буфере searchState,
+// CPU prefetcher эффективнее загружает данные.
+//
+// query    — поисковый вектор
+// offsets  — массив VectorOffset-ов из Node-ов
+// results  — куда записать расстояния (len >= len(offsets))
+//
+// Все массивы — переиспользуемые буферы из searchState, 0 аллокаций.
+func (g *Graph) batchDistance(query []float32, offsets []uint32, results []float32) {
+	for i, off := range offsets {
+		vec := g.arena.Get(off)
+		results[i] = g.Distance(query, vec)
+	}
 }

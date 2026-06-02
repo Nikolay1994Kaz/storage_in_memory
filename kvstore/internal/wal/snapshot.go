@@ -121,8 +121,9 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(op byte, key string
 // BackgroundCompact выполняет полный цикл компактизации:
 // 1. Rotate WAL (мгновенно)
 // 2. Записать snapshot (фон)
-// 3. Удалить старые WAL (ТОЛЬКО после успешного snapshot!)
-func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key string, value []byte))) {
+// 3. Сохранить векторный граф (фон)
+// 4. Удалить старые WAL (ТОЛЬКО после успешного snapshot!)
+func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key string, value []byte)), saveVectors func() error) {
 	// 1. Ротация — переключаем WAL на новый файл.
 	// Наносекундная точность в имени предотвращает коллизии при быстрой ротации.
 	now := time.Now()
@@ -144,6 +145,14 @@ func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key str
 			// НЕ удаляем старые WAL — snapshot не прошёл,
 			// старые WAL нужны для recovery!
 			return
+		}
+
+		// Записываем бинарный снапшот векторов
+		if saveVectors != nil {
+			if err := saveVectors(); err != nil {
+				log.Printf("Vector snapshot failed: %v", err)
+				return
+			}
 		}
 
 		// 3. Удаляем старые WAL-файлы ТОЛЬКО после успешного snapshot.

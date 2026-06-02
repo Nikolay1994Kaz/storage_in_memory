@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,17 +66,37 @@ func main() {
 	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
 	defer ttl.Stop()
 
-	// === 2. Восстановление ===
-	entries, err := wal.ReadAllWALs(dataDir)
-	if err != nil {
-		log.Fatalf("Failed to read WALs: %v", err)
+	// === 2. Инициализация хранилища векторов и загрузка бинарного снапшота ===
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
+	graphPath := filepath.Join(dataDir, "graph.bin")
+	graphLoaded := false
+
+	if _, err := os.Stat(graphPath); err == nil {
+		log.Printf("Loading HNSW graph from binary snapshot %s...", graphPath)
+		f, err := os.Open(graphPath)
+		if err == nil {
+			if err := vecStore.LoadBinary(f); err != nil {
+				log.Printf("WARNING: failed to load HNSW graph from binary snapshot: %v. Will rebuild from WAL.", err)
+			} else {
+				log.Printf("HNSW graph loaded successfully from binary snapshot!")
+				graphLoaded = true
+			}
+			f.Close()
+		}
 	}
 
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
-
+	// === 3. Восстановление состояния из WAL ===
 	restored := 0
 	vecRestored := 0
-	for _, entry := range entries {
+
+	// Шаг A: Сначала читаем и накатываем snapshot.wal (если есть)
+	snapshotPath := filepath.Join(dataDir, "snapshot.wal")
+	snapshotEntries, err := wal.ReadEntries(snapshotPath)
+	if err != nil {
+		log.Fatalf("Failed to read snapshot.wal: %v", err)
+	}
+
+	applyEntry := func(entry wal.Entry, isFromSnapshot bool) {
 		switch entry.Op {
 		case wal.OpSet:
 			s.Set(0, entry.Key, entry.Value)
@@ -99,6 +121,10 @@ func main() {
 			ttl.Remove(entry.Key)
 			restored++
 		case wal.OpVSimAdd:
+			// Если граф загружен из бинарного снапшота, мы пропускаем векторные операции из snapshot.wal
+			if isFromSnapshot && graphLoaded {
+				return
+			}
 			vec := vector.DeserializeVector(entry.Value)
 			if err := vecStore.Add(entry.Key, vec); err != nil {
 				log.Printf("WARNING: failed to restore vector %s: %v", entry.Key, err)
@@ -106,8 +132,29 @@ func main() {
 			vecRestored++
 			restored++
 		case wal.OpVSimDel:
+			if isFromSnapshot && graphLoaded {
+				return
+			}
 			vecStore.Delete(entry.Key)
 			restored++
+		}
+	}
+
+	for _, entry := range snapshotEntries {
+		applyEntry(entry, true)
+	}
+
+	// Шаг B: Потом читаем и накатываем все wal_*.log файлы в правильном порядке
+	matches, _ := filepath.Glob(filepath.Join(dataDir, "wal_*.log"))
+	sort.Strings(matches) // Сортируем по имени (по времени создания)
+
+	for _, path := range matches {
+		logEntries, err := wal.ReadEntries(path)
+		if err != nil {
+			log.Fatalf("Failed to read WAL log %s: %v", path, err)
+		}
+		for _, entry := range logEntries {
+			applyEntry(entry, false)
 		}
 	}
 
@@ -126,20 +173,42 @@ func main() {
 	defer bw.Close()
 
 	// === 4. Syncer ===
-	// iterateAll — объединённый обход KV + Vectors для snapshot.
-	// Snapshot должен содержать ОБА типа данных, иначе после компактизации
-	// (CleanupOldWALs) вектора из удалённых WAL-файлов будут потеряны.
+	// iterateAll — обход только KV данных для snapshot.wal (векторы хранятся отдельно)
 	iterateAll := func(fn func(op byte, key string, value []byte)) {
-		// KV данные → OpSet
 		s.ForEach(func(key string, value []byte) {
 			fn(wal.OpSet, key, value)
 		})
-		// Вектора → OpVSimAdd
-		vecStore.ForEach(func(key string, vec []float32) {
-			fn(wal.OpVSimAdd, key, vector.SerializeVector(vec))
-		})
 	}
-	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, iterateAll)
+
+	// saveVectors — сохраняет HNSW граф в graph.bin
+	saveVectors := func() error {
+		graphPath := filepath.Join(dataDir, "graph.bin")
+		tmpPath := graphPath + ".tmp"
+		f, err := os.Create(tmpPath)
+		if err != nil {
+			return err
+		}
+		writer := bufio.NewWriterSize(f, 256*1024)
+		if err := vecStore.SaveBinary(writer); err != nil {
+			f.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		if err := writer.Flush(); err != nil {
+			f.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		f.Close()
+		return os.Rename(tmpPath, graphPath)
+	}
+
+	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, iterateAll, saveVectors)
 	defer syncer.Stop()
 
 	// === 5. Pub/Sub Hub ===
@@ -352,7 +421,7 @@ func main() {
 			for _, queuedArgs := range cs.TxQueue {
 				qCmd := strings.ToUpper(string(queuedArgs[0]))
 				qCmdArgs := queuedArgs[1:]
-				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, cs, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
 			}
 			globalTxMu.Unlock()
 			cs.InTx = false
@@ -371,7 +440,7 @@ func main() {
 			return
 		}
 
-		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, cs, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
 	}
 
 	// === 8. Сервер ===
@@ -443,6 +512,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	triggers *compute.TriggerManager, vecStore *vector.VectorStore,
 	aiClient *ai.Client, aiWorker *ai.Worker,
 	iterateAll func(fn func(op byte, key string, value []byte)),
+	saveVectors func() error,
 	cs *server.ConnState, cmd string, args [][]byte) {
 
 	buf := cs.Buf
@@ -698,7 +768,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		buf.WriteInt(s.Len())
 
 	case "COMPACT":
-		wal.BackgroundCompact(bw.RawWAL(), dataDir, iterateAll)
+		wal.BackgroundCompact(bw.RawWAL(), dataDir, iterateAll, saveVectors)
 		buf.WriteSimpleString("OK compaction started")
 
 	// === WASM ===

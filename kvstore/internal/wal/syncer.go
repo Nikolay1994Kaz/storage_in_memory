@@ -18,24 +18,26 @@ const (
 )
 
 type Syncer struct {
-	wal        *WAL
-	interval   time.Duration
-	stop       chan struct{}
-	done       chan struct{} // закрывается когда run() завершается
-	dir        string
-	iterate    func(fn func(op byte, key string, value []byte))
-	compacting atomic.Bool
-	wg         sync.WaitGroup
+	wal         *WAL
+	interval    time.Duration
+	stop        chan struct{}
+	done        chan struct{} // закрывается когда run() завершается
+	dir         string
+	iterate     func(fn func(op byte, key string, value []byte))
+	saveVectors func() error
+	compacting  atomic.Bool
+	wg          sync.WaitGroup
 }
 
-func NewSyncer(w *WAL, interval time.Duration, dir string, iterate func(fn func(op byte, key string, value []byte))) *Syncer {
+func NewSyncer(w *WAL, interval time.Duration, dir string, iterate func(fn func(op byte, key string, value []byte)), saveVectors func() error) *Syncer {
 	s := &Syncer{
-		wal:      w,
-		interval: interval,
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
-		dir:      dir,
-		iterate:  iterate,
+		wal:         w,
+		interval:    interval,
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
+		dir:         dir,
+		iterate:     iterate,
+		saveVectors: saveVectors,
 	}
 	s.wg.Add(1)
 	go s.run()
@@ -96,7 +98,7 @@ func (s *Syncer) checkWALSize() {
 					log.Printf("WAL compact panic: %v", r)
 				}
 			}()
-			BackgroundCompact(s.wal, s.dir, s.iterate)
+			BackgroundCompact(s.wal, s.dir, s.iterate, s.saveVectors)
 		}()
 	}
 }

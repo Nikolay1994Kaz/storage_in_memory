@@ -63,6 +63,7 @@ func NewVectorStoreCosine() *VectorStore {
 	return vs
 }
 
+
 // Add добавляет вектор с указанным ключом.
 func (vs *VectorStore) Add(key string, vec []float32) error {
 	vs.mu.Lock()
