@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestSnapshotPerformance measures and prints precise execution times and memory allocations.
@@ -37,7 +39,7 @@ func TestSnapshotPerformance(t *testing.T) {
 	runtime.ReadMemStats(&memBefore)
 
 	startTime := time.Now()
-	storeOriginal := NewVectorStore(EuclideanDistance)
+	storeOriginal := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 	for i := 0; i < numVectors; i++ {
 		key := fmt.Sprintf("key_%d", i)
 		if err := storeOriginal.Add(key, vectors[i]); err != nil {
@@ -87,7 +89,7 @@ func TestSnapshotPerformance(t *testing.T) {
 	runtime.ReadMemStats(&memBefore)
 
 	startTime = time.Now()
-	storeRestored := NewVectorStore(EuclideanDistance)
+	storeRestored := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 	reader := bytes.NewReader(snapshotBytes)
 	if err := storeRestored.LoadBinary(reader); err != nil {
 		t.Fatalf("Failed to load binary snapshot: %v", err)

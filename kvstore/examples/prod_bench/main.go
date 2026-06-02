@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"kvstore/kvstore/internal/store/tcmalloc"
 	"kvstore/kvstore/vector"
 )
 
@@ -46,11 +47,12 @@ func runBenchmark(numVectors int, dim int, metricName string) {
 	var memBefore runtime.MemStats
 	runtime.ReadMemStats(&memBefore)
 
+	allocator := tcmalloc.NewTCMallocStore(runtime.NumCPU())
 	var store *vector.VectorStore
 	if metricName == "Cosine (Pre-Normalized)" {
-		store = vector.NewVectorStoreCosine()
+		store = vector.NewVectorStoreCosine(allocator)
 	} else {
-		store = vector.NewVectorStore(vector.EuclideanDistance)
+		store = vector.NewVectorStore(vector.EuclideanDistance, allocator)
 	}
 
 	startTime := time.Now()

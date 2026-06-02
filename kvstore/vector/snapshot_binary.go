@@ -42,9 +42,9 @@ func (vs *VectorStore) SaveBinary(w io.Writer) error {
 		return fmt.Errorf("vector arena write: %w", err)
 	}
 
-	// === SECTION 5: NeighborsArena (ID=5) ===
-	if err := writeSectionNeighborsArena(&buf, vs.graph.neighborsArena); err != nil {
-		return fmt.Errorf("neighbors arena write: %w", err)
+	// === SECTION 5: Neighbors (ID=5) ===
+	if err := writeSectionNeighbors(&buf, vs.graph); err != nil {
+		return fmt.Errorf("neighbors write: %w", err)
 	}
 
 	// === SECTION 6: KeyMap (ID=6) ===
@@ -129,6 +129,7 @@ func (vs *VectorStore) LoadBinary(r io.Reader) error {
 	vs.keys = make(map[uint64]string)
 	vs.ids = make(map[string]uint64)
 	vs.graph = &Graph{
+		allocator:       vs.allocator,
 		pruneBufItems:   make([]item, 0, 33),
 		pruneBufIDs:     make([]uint64, 0, 33),
 		insertBuf:       make([]uint64, 0, 33),
@@ -174,8 +175,8 @@ func (vs *VectorStore) LoadBinary(r io.Reader) error {
 				return fmt.Errorf("parse vector arena: %w", err)
 			}
 		case 5:
-			if err := readSectionNeighborsArena(secReader, vs.graph); err != nil {
-				return fmt.Errorf("parse neighbors arena: %w", err)
+			if err := readSectionNeighbors(secReader, vs.graph); err != nil {
+				return fmt.Errorf("parse neighbors: %w", err)
 			}
 		case 6:
 			if err := readSectionKeyMap(secReader, vs); err != nil {
@@ -337,28 +338,24 @@ func writeSectionVectorArena(w io.Writer, va *VectorArena) error {
 	return nil
 }
 
-func writeSectionNeighborsArena(w io.Writer, na *NeighborsArena) error {
-	if na == nil {
-		if _, err := w.Write([]byte{5}); err != nil {
-			return err
+func writeSectionNeighbors(w io.Writer, g *Graph) error {
+	count := uint32(len(g.nodes))
+	
+	// Сначала посчитаем размер секции
+	sectionSize := uint32(4) // count
+	for i := uint32(0); i < count; i++ {
+		node := &g.nodes[i]
+		sectionSize += 4 // level
+		if node.Alive {
+			for level := 0; level <= node.Level; level++ {
+				neighbors := g.getNeighbors(node.NeighborsHandle, level)
+				sectionSize += 4 + uint32(len(neighbors))*8
+			}
+		} else {
+			// Для неживых нод пишем 0 соседей
+			sectionSize += 4 // numNeighbors = 0
 		}
-		var lenBuf [4]byte
-		binary.LittleEndian.PutUint32(lenBuf[:], 8)
-		if _, err := w.Write(lenBuf[:]); err != nil {
-			return err
-		}
-		var zeroes [8]byte
-		_, err := w.Write(zeroes[:])
-		return err
 	}
-
-	dataLen := uint32(len(na.data))
-	freeLevels := uint32(len(na.freeOffsets))
-	freeMapSize := uint32(0)
-	for _, list := range na.freeOffsets {
-		freeMapSize += 4 + 4 + uint32(len(list))*4
-	}
-	sectionSize := 4 + dataLen*8 + 4 + freeMapSize
 
 	if _, err := w.Write([]byte{5}); err != nil {
 		return err
@@ -368,43 +365,49 @@ func writeSectionNeighborsArena(w io.Writer, na *NeighborsArena) error {
 	if _, err := w.Write(lenBuf[:]); err != nil {
 		return err
 	}
-	var dataLenBuf [4]byte
-	binary.LittleEndian.PutUint32(dataLenBuf[:], dataLen)
-	if _, err := w.Write(dataLenBuf[:]); err != nil {
+
+	var countBuf [4]byte
+	binary.LittleEndian.PutUint32(countBuf[:], count)
+	if _, err := w.Write(countBuf[:]); err != nil {
 		return err
 	}
-	if dataLen > 0 {
-		sizeInBytes := dataLen * 8
-		byteSlice := unsafe.Slice((*byte)(unsafe.Pointer(&na.data[0])), sizeInBytes)
-		if _, err := w.Write(byteSlice); err != nil {
-			return err
-		}
-	}
-	var freeLevelsBuf [4]byte
-	binary.LittleEndian.PutUint32(freeLevelsBuf[:], freeLevels)
-	if _, err := w.Write(freeLevelsBuf[:]); err != nil {
-		return err
-	}
-	for lvl, list := range na.freeOffsets {
+
+	for i := uint32(0); i < count; i++ {
+		node := &g.nodes[i]
 		var lvlBuf [4]byte
-		binary.LittleEndian.PutUint32(lvlBuf[:], uint32(lvl))
-		if _, err := w.Write(lvlBuf[:]); err != nil {
-			return err
-		}
-		count := uint32(len(list))
-		var countBuf [4]byte
-		binary.LittleEndian.PutUint32(countBuf[:], count)
-		if _, err := w.Write(countBuf[:]); err != nil {
-			return err
-		}
-		if count > 0 {
-			sizeInBytes := count * 4
-			byteSlice := unsafe.Slice((*byte)(unsafe.Pointer(&list[0])), sizeInBytes)
-			if _, err := w.Write(byteSlice); err != nil {
+		if node.Alive {
+			binary.LittleEndian.PutUint32(lvlBuf[:], uint32(node.Level))
+			if _, err := w.Write(lvlBuf[:]); err != nil {
+				return err
+			}
+			for level := 0; level <= node.Level; level++ {
+				neighbors := g.getNeighbors(node.NeighborsHandle, level)
+				var numBuf [4]byte
+				binary.LittleEndian.PutUint32(numBuf[:], uint32(len(neighbors)))
+				if _, err := w.Write(numBuf[:]); err != nil {
+					return err
+				}
+				if len(neighbors) > 0 {
+					sizeInBytes := uint32(len(neighbors)) * 8
+					byteSlice := unsafe.Slice((*byte)(unsafe.Pointer(&neighbors[0])), sizeInBytes)
+					if _, err := w.Write(byteSlice); err != nil {
+						return err
+					}
+				}
+			}
+		} else {
+			binary.LittleEndian.PutUint32(lvlBuf[:], 0)
+			if _, err := w.Write(lvlBuf[:]); err != nil {
+				return err
+			}
+			var numBuf [4]byte
+			binary.LittleEndian.PutUint32(numBuf[:], 0)
+			if _, err := w.Write(numBuf[:]); err != nil {
 				return err
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -566,57 +569,57 @@ func readSectionVectorArena(r io.Reader, g *Graph) error {
 	return nil
 }
 
-func readSectionNeighborsArena(r io.Reader, g *Graph) error {
-	var dataLenBuf [4]byte
-	if _, err := io.ReadFull(r, dataLenBuf[:]); err != nil {
+func readSectionNeighbors(r io.Reader, g *Graph) error {
+	var countBuf [4]byte
+	if _, err := io.ReadFull(r, countBuf[:]); err != nil {
 		return err
 	}
-	dataLen := binary.LittleEndian.Uint32(dataLenBuf[:])
+	count := binary.LittleEndian.Uint32(countBuf[:])
 
-	na := &NeighborsArena{
-		M:           g.M,
-		M0:          g.M0,
-		freeOffsets: make(map[int][]uint32),
-	}
-	g.neighborsArena = na
-
-	na.data = make([]uint64, dataLen)
-	if dataLen > 0 {
-		sizeInBytes := dataLen * 8
-		byteSlice := unsafe.Slice((*byte)(unsafe.Pointer(&na.data[0])), sizeInBytes)
-		if _, err := io.ReadFull(r, byteSlice); err != nil {
-			return err
-		}
+	if count != uint32(len(g.nodes)) {
+		return fmt.Errorf("neighbors node count mismatch: nodes section has %d, neighbors section has %d", len(g.nodes), count)
 	}
 
-	var freeLevelsBuf [4]byte
-	if _, err := io.ReadFull(r, freeLevelsBuf[:]); err != nil {
-		return err
-	}
-	freeLevels := binary.LittleEndian.Uint32(freeLevelsBuf[:])
-
-	for i := uint32(0); i < freeLevels; i++ {
+	for i := uint32(0); i < count; i++ {
+		node := &g.nodes[i]
 		var lvlBuf [4]byte
 		if _, err := io.ReadFull(r, lvlBuf[:]); err != nil {
 			return err
 		}
-		lvl := int(binary.LittleEndian.Uint32(lvlBuf[:]))
+		level := int(binary.LittleEndian.Uint32(lvlBuf[:]))
 
-		var countBuf [4]byte
-		if _, err := io.ReadFull(r, countBuf[:]); err != nil {
-			return err
-		}
-		count := binary.LittleEndian.Uint32(countBuf[:])
-
-		offsets := make([]uint32, count)
-		if count > 0 {
-			sizeInBytes := count * 4
-			byteSlice := unsafe.Slice((*byte)(unsafe.Pointer(&offsets[0])), sizeInBytes)
-			if _, err := io.ReadFull(r, byteSlice); err != nil {
+		if !node.Alive {
+			var numBuf [4]byte
+			if _, err := io.ReadFull(r, numBuf[:]); err != nil {
 				return err
 			}
+			node.NeighborsHandle = 0
+			continue
 		}
-		na.freeOffsets[lvl] = offsets
+
+		buf, handle := g.allocator.Alloc(0, g.neighborsBlockSize(level)*8)
+		for i := range buf {
+			buf[i] = 0
+		}
+		node.NeighborsHandle = handle
+
+		for lc := 0; lc <= level; lc++ {
+			var numBuf [4]byte
+			if _, err := io.ReadFull(r, numBuf[:]); err != nil {
+				return err
+			}
+			numNeighbors := binary.LittleEndian.Uint32(numBuf[:])
+
+			if numNeighbors > 0 {
+				neighbors := make([]uint64, numNeighbors)
+				sizeInBytes := numNeighbors * 8
+				byteSlice := unsafe.Slice((*byte)(unsafe.Pointer(&neighbors[0])), sizeInBytes)
+				if _, err := io.ReadFull(r, byteSlice); err != nil {
+					return err
+				}
+				g.setNeighbors(handle, lc, neighbors)
+			}
+		}
 	}
 
 	return nil

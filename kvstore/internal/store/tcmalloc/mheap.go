@@ -143,6 +143,7 @@ func NewMHeap() *MHeap {
 	}
 	h.chunks = append(h.chunks, make([]byte, chunkSize))
 	h.offset = 0
+	h.registry.append(nil) // Reserve spanID = 0 to avoid zero-value Handle collision
 	return h
 }
 

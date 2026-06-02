@@ -67,7 +67,7 @@ func main() {
 	defer ttl.Stop()
 
 	// === 2. Инициализация хранилища векторов и загрузка бинарного снапшота ===
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance, s)
 	graphPath := filepath.Join(dataDir, "graph.bin")
 	graphLoaded := false
 

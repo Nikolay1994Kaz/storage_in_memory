@@ -5,14 +5,11 @@ import (
 	"fmt"
 	"math"
 	"sync"
+
+	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // VectorStore — обёртка над HNSW-графом для интеграции с Molten.
-//
-// Обеспечивает:
-//   - Маппинг строковых ключей → внутренние uint64 ID
-//   - Потокобезопасность
-//   - Валидацию размерности
 type VectorStore struct {
 	graph *Graph
 
@@ -28,38 +25,31 @@ type VectorStore struct {
 	// вместо CosineDistance (×3 быстрее).
 	autoNormalize bool
 
-	// normBuf — буфер для нормализации запроса без аллокаций.
-	// Защищён mu.RLock (Search берёт RLock, но normBuf пишется — нужен Lock).
-	// Поэтому в Search создаём копию запроса на стеке.
+	allocator *tcmalloc.TCMallocStore // Ссылка на менеджер памяти
 
 	mu sync.RWMutex
 }
 
 // NewVectorStore создаёт хранилище векторов с произвольной метрикой.
-func NewVectorStore(distance DistanceFunc) *VectorStore {
+func NewVectorStore(distance DistanceFunc, allocator *tcmalloc.TCMallocStore) *VectorStore {
 	vs := &VectorStore{
-		keys: make(map[uint64]string),
-		ids:  make(map[string]uint64),
+		keys:      make(map[uint64]string),
+		ids:       make(map[string]uint64),
+		allocator: allocator,
 	}
-	vs.graph = NewGraph(distance)
+	vs.graph = NewGraph(distance, allocator)
 	return vs
 }
 
 // NewVectorStoreCosine создаёт хранилище для косинусного поиска.
-//
-// Под капотом: все вставляемые векторы автоматически нормализуются,
-// а вместо дорогого CosineDistance (3 цикла + 2×sqrt + деление)
-// используется DotProductDistance (1 цикл, 0 sqrt).
-//
-// Это стандартная оптимизация Milvus, Qdrant, Pinecone.
-// Пользователю не нужно знать детали — API тот же.
-func NewVectorStoreCosine() *VectorStore {
+func NewVectorStoreCosine(allocator *tcmalloc.TCMallocStore) *VectorStore {
 	vs := &VectorStore{
 		keys:          make(map[uint64]string),
 		ids:           make(map[string]uint64),
 		autoNormalize: true,
+		allocator:     allocator,
 	}
-	vs.graph = NewGraph(DotProductDistance)
+	vs.graph = NewGraph(DotProductDistance, allocator)
 	return vs
 }
 
@@ -186,7 +176,7 @@ func (vs *VectorStore) Clear() {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	vs.graph = NewGraph(vs.graph.Distance)
+	vs.graph = NewGraph(vs.graph.Distance, vs.allocator)
 	vs.keys = make(map[uint64]string)
 	vs.ids = make(map[string]uint64)
 	vs.dim = 0

@@ -412,3 +412,18 @@ func (s *TCMallocStore) Clear() {
 		s.shards[i].mu.Unlock()
 	}
 }
+
+// Alloc выделяет сырой блок памяти через per-worker mcache
+func (s *TCMallocStore) Alloc(workerID int, size int) ([]byte, Handle) {
+	return s.caches[workerID].Alloc(size)
+}
+
+// Free освобождает ранее выделенный Handle
+func (s *TCMallocStore) Free(workerID int, handle Handle) {
+	s.caches[workerID].Free(s.heap, handle)
+}
+
+// Resolve возвращает слайс байт, на который указывает Handle (zero-copy)
+func (s *TCMallocStore) Resolve(handle Handle) []byte {
+	return s.heap.Resolve(handle)
+}

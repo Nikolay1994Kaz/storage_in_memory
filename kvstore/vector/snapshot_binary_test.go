@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"strconv"
 	"testing"
+
+	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // generateRandomVector генерирует случайный вектор заданной размерности.
@@ -22,7 +24,7 @@ func TestVectorStore_BinarySnapshotRoundTrip(t *testing.T) {
 	numVectors := 500
 	rand.Seed(42) // Делаем генерацию детерминированной
 
-	vsSource := NewVectorStore(EuclideanDistance)
+	vsSource := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 
 	// 1. Наполняем базу случайными векторами
 	vectors := make(map[string][]float32)
@@ -68,7 +70,7 @@ func TestVectorStore_BinarySnapshotRoundTrip(t *testing.T) {
 		buf.Len(), float64(buf.Len())/1024, numVectors-len(deletedKeys))
 
 	// 5. Десериализуем в новое чистое хранилище
-	vsDest := NewVectorStore(EuclideanDistance)
+	vsDest := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 	if err := vsDest.LoadBinary(&buf); err != nil {
 		t.Fatalf("LoadBinary failed: %v", err)
 	}
@@ -112,7 +114,7 @@ func TestVectorStore_BinarySnapshotRoundTrip(t *testing.T) {
 
 func TestVectorStore_BinarySnapshotErrorHandling(t *testing.T) {
 	dim := 128
-	vs := NewVectorStore(EuclideanDistance)
+	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 	
 	// Вставляем пару векторов
 	_ = vs.Add("v1", generateRandomVector(dim))
@@ -126,7 +128,7 @@ func TestVectorStore_BinarySnapshotErrorHandling(t *testing.T) {
 
 	// 1. Тест на коррупцию Magic Header
 	corruptedMagic := append([]byte("WRONG"), snapshotBytes[5:]...)
-	vsDest := NewVectorStore(EuclideanDistance)
+	vsDest := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 	err := vsDest.LoadBinary(bytes.NewReader(corruptedMagic))
 	if err == nil {
 		t.Error("LoadBinary should fail on corrupted Magic Header, but got no error")
@@ -149,14 +151,14 @@ func TestVectorStore_BinarySnapshotErrorHandling(t *testing.T) {
 }
 
 func TestVectorStore_BinarySnapshotEmptyGraph(t *testing.T) {
-	vsSource := NewVectorStore(EuclideanDistance)
+	vsSource := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 	
 	var buf bytes.Buffer
 	if err := vsSource.SaveBinary(&buf); err != nil {
 		t.Fatalf("SaveBinary failed on empty store: %v", err)
 	}
 
-	vsDest := NewVectorStore(EuclideanDistance)
+	vsDest := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 	if err := vsDest.LoadBinary(&buf); err != nil {
 		t.Fatalf("LoadBinary failed on empty store: %v", err)
 	}

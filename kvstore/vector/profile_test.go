@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"runtime"
 	"testing"
+
+	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // BenchmarkSearch_Full — полный HNSW Search на чистом Go графе.
@@ -23,7 +25,7 @@ func BenchmarkSearch_Full(b *testing.B) {
 
 	rng := rand.New(rand.NewSource(42))
 
-	g := NewGraph(EuclideanDistance)
+	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 	for i := 0; i < numVectors; i++ {
 		vec := make([]float32, dim)
 		for j := range vec {
@@ -60,7 +62,7 @@ func BenchmarkSearch_Cosine(b *testing.B) {
 
 	rng := rand.New(rand.NewSource(42))
 
-	g := NewGraph(CosineDistance)
+	g := NewGraph(CosineDistance, tcmalloc.NewTCMallocStore(1))
 	for i := 0; i < numVectors; i++ {
 		vec := make([]float32, dim)
 		for j := range vec {
@@ -97,7 +99,7 @@ func BenchmarkSearch_CosinePreNorm(b *testing.B) {
 
 	rng := rand.New(rand.NewSource(42))
 
-	g := NewGraph(DotProductDistance)
+	g := NewGraph(DotProductDistance, tcmalloc.NewTCMallocStore(1))
 	for i := 0; i < numVectors; i++ {
 		vec := make([]float32, dim)
 		for j := range vec {
@@ -134,7 +136,7 @@ func BenchmarkSearch_Full_Go(b *testing.B) {
 
 	rng := rand.New(rand.NewSource(42))
 
-	vs := NewVectorStore(EuclideanDistance)
+	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 
 	for i := 0; i < numVectors; i++ {
 		vec := make([]float32, dim)
@@ -170,7 +172,7 @@ func BenchmarkSearch_Full_Go_Parallel(b *testing.B) {
 
 	rng := rand.New(rand.NewSource(42))
 
-	vs := NewVectorStore(EuclideanDistance)
+	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 
 	for i := 0; i < numVectors; i++ {
 		vec := make([]float32, dim)

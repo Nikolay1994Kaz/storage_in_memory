@@ -2,10 +2,12 @@ package vector
 
 import (
 	"testing"
+
+	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 func TestVectorStore_AddAndSearch(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance)
+	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 
 	vs.Add("cat", []float32{1, 0, 0})
 	vs.Add("dog", []float32{0.9, 0.1, 0})
@@ -32,7 +34,7 @@ func TestVectorStore_AddAndSearch(t *testing.T) {
 }
 
 func TestVectorStore_DimensionMismatch(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance)
+	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 
 	// Первый вектор — dim=3
 	err := vs.Add("a", []float32{1, 2, 3})
@@ -54,7 +56,7 @@ func TestVectorStore_DimensionMismatch(t *testing.T) {
 }
 
 func TestVectorStore_Upsert(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance)
+	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 
 	vs.Add("cat", []float32{1, 0, 0})
 	vs.Add("cat", []float32{0, 0, 1})
@@ -79,7 +81,7 @@ func TestVectorStore_Upsert(t *testing.T) {
 }
 
 func TestVectorStore_Delete(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance)
+	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 
 	vs.Add("a", []float32{1, 0})
 	vs.Add("b", []float32{0, 1})
@@ -119,7 +121,7 @@ func TestVectorStore_Delete(t *testing.T) {
 }
 
 func TestVectorStore_Info(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance)
+	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
 
 	// Пустой стор
 	count, dim, _ := vs.Info()
@@ -156,7 +158,7 @@ func TestVectorStore_Info(t *testing.T) {
 // 4. Игнорирует длину вектора (только направление важно)
 
 func TestVectorStore_CosinePreNormalization(t *testing.T) {
-	vs := NewVectorStoreCosine()
+	vs := NewVectorStoreCosine(tcmalloc.NewTCMallocStore(1))
 
 	// A и B — одно направление, но РАЗНЫЕ длины
 	// C — перпендикулярно
@@ -198,9 +200,9 @@ func TestVectorStore_CosinePreNormalization(t *testing.T) {
 
 func TestVectorStore_CosineVsDotProduct(t *testing.T) {
 	// Вариант 1: «классический» CosineDistance
-	vsCosine := NewVectorStore(CosineDistance)
+	vsCosine := NewVectorStore(CosineDistance, tcmalloc.NewTCMallocStore(1))
 	// Вариант 2: pre-normalized DotProduct
-	vsDot := NewVectorStoreCosine()
+	vsDot := NewVectorStoreCosine(tcmalloc.NewTCMallocStore(1))
 
 	vecs := []struct {
 		key string
