@@ -1,12 +1,19 @@
 package store
 
 import (
+	"encoding/binary"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/wal"
+	"kvstore/kvstore/vector"
 )
 
 // ─── Mock Evictor ──────────────────────────────────────────
@@ -502,3 +509,175 @@ func BenchmarkTTL_Set_Parallel(b *testing.B) {
 		}
 	})
 }
+
+// ─── Интеграционные тесты TTL + Вектор + WAL ─────────────────
+
+// compositeEvictor - тестовый клон структуры из main.go для проверки интеграции
+type compositeEvictor struct {
+	kv  *tcmalloc.TCMallocStore
+	vec *vector.VectorStore
+	wal *wal.BatchWAL
+}
+
+func (e *compositeEvictor) Del(key string) bool {
+	kvDeleted := e.kv.Del(0, key)
+	vecDeleted := e.vec.Delete(key)
+	if vecDeleted {
+		e.wal.Write(wal.Entry{Op: wal.OpVSimDel, Key: key})
+	}
+	return kvDeleted || vecDeleted
+}
+
+// TestCompositeEvictor_Integration проверяет совместную работу TTLManager и VectorStore
+func TestCompositeEvictor_Integration(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "kvstore_ttl_int_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	walPath := filepath.Join(tempDir, "wal_0.log")
+	rawWAL, err := wal.Open(walPath)
+	if err != nil {
+		t.Fatalf("failed to open WAL: %v", err)
+	}
+	bw := wal.NewBatchWAL(rawWAL)
+
+	// Инициализируем хранилища
+	s := tcmalloc.NewTCMallocStore(1)
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance, s)
+	ttl := NewTTLManager(tcmalloc.NewEvictor(s))
+	defer ttl.Stop()
+
+	// Подключаем наш гибридный evictor
+	ttl.SetEvictor(&compositeEvictor{kv: s, vec: vecStore, wal: bw})
+
+	// Добавляем значение и вектор
+	key := "test_key"
+	s.Set(0, key, []byte("val"))
+	err = vecStore.Add(key, []float32{1, 2, 3})
+	if err != nil {
+		t.Fatalf("failed to add vector: %v", err)
+	}
+
+	// Устанавливаем короткий TTL
+	ttl.Set(key, 10*time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+
+	// Вызываем ленивое удаление
+	ttl.IsExpired(key)
+
+	// Проверяем удаление из обоих хранилищ
+	if _, ok := s.Get(key); ok {
+		t.Fatal("key still exists in KV store after expiration")
+	}
+	info, err := vecStore.Search([]float32{1, 2, 3}, 1)
+	if err == nil && len(info) > 0 && info[0].Key == key {
+		t.Fatal("vector still exists in vector store after expiration")
+	}
+
+	// Закрываем WAL, чтобы сбросить записи на диск
+	bw.Close()
+
+	// Проверяем наличие записи OpVSimDel в WAL
+	entries, err := wal.ReadEntries(walPath)
+	if err != nil {
+		t.Fatalf("failed to read WAL: %v", err)
+	}
+
+	found := false
+	for _, entry := range entries {
+		if entry.Op == wal.OpVSimDel && entry.Key == key {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected OpVSimDel entry in WAL, but not found")
+	}
+}
+
+// TestWALReplay_ExpiredKeyAndDel проверяет корректность наката WAL операций
+// для удаления просроченных векторов в оффлайне (OpExpire) и удаления по DEL (OpDel).
+func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
+	s := tcmalloc.NewTCMallocStore(1)
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance, s)
+	ttl := NewTTLManager(tcmalloc.NewEvictor(s))
+	defer ttl.Stop()
+
+	// Логика-клон applyEntry для проверки реплея
+	applyEntry := func(entry wal.Entry) {
+		switch entry.Op {
+		case wal.OpSet:
+			s.Set(0, entry.Key, entry.Value)
+		case wal.OpDel:
+			s.Del(0, entry.Key)
+			vecStore.Delete(entry.Key)
+			ttl.OnDelete(entry.Key)
+		case wal.OpExpire:
+			if len(entry.Value) == 8 {
+				expiresAt := time.Unix(0, int64(binary.BigEndian.Uint64(entry.Value)))
+				remaining := time.Until(expiresAt)
+				if remaining > 0 {
+					ttl.Set(entry.Key, remaining)
+				} else {
+					s.Del(0, entry.Key)
+					vecStore.Delete(entry.Key) // Исправление утечки при оффлайн-истечении TTL
+					ttl.OnDelete(entry.Key)
+				}
+			}
+		}
+	}
+
+	// ─── Сценарий 1: Реплей OpExpire с датой в прошлом ───
+	keyExpired := "expired_offline_key"
+	s.Set(0, keyExpired, []byte("val"))
+	err := vecStore.Add(keyExpired, []float32{1, 2, 3})
+	if err != nil {
+		t.Fatalf("failed to add vector: %v", err)
+	}
+
+	expiredTime := time.Now().Add(-5 * time.Second).UnixNano()
+	valBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(valBuf, uint64(expiredTime))
+
+	expireEntry := wal.Entry{
+		Op:    wal.OpExpire,
+		Key:   keyExpired,
+		Value: valBuf,
+	}
+
+	applyEntry(expireEntry)
+
+	if _, ok := s.Get(keyExpired); ok {
+		t.Fatal("expired key not deleted")
+	}
+	info, err := vecStore.Search([]float32{1, 2, 3}, 1)
+	if err == nil && len(info) > 0 && info[0].Key == keyExpired {
+		t.Fatal("expired vector not deleted from vector store")
+	}
+
+	// ─── Сценарий 2: Реплей OpDel ───
+	keyDel := "deleted_manual_key"
+	s.Set(0, keyDel, []byte("val"))
+	err = vecStore.Add(keyDel, []float32{4, 5, 6})
+	if err != nil {
+		t.Fatalf("failed to add vector: %v", err)
+	}
+
+	delEntry := wal.Entry{
+		Op:  wal.OpDel,
+		Key: keyDel,
+	}
+
+	applyEntry(delEntry)
+
+	if _, ok := s.Get(keyDel); ok {
+		t.Fatal("deleted key still exists")
+	}
+	info, err = vecStore.Search([]float32{4, 5, 6}, 1)
+	if err == nil && len(info) > 0 && info[0].Key == keyDel {
+		t.Fatal("deleted vector still exists in vector store")
+	}
+}
+

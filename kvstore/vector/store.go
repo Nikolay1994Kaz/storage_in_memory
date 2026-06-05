@@ -151,6 +151,83 @@ func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 	return out, nil
 }
 
+// SearchFiltered находит K ближайших векторов с фильтрацией по ключу.
+//
+// filterFn принимает строковый ключ вектора и возвращает true,
+// если вектор должен попасть в результат.
+//
+// Пример использования:
+//
+//	vs.SearchFiltered(query, 10, func(key string) bool {
+//		val, ok := kvStore.Get("meta:" + key)
+//		return ok && string(val) == "electronics"
+//	})
+func (vs *VectorStore) SearchFiltered(query []float32, K int, filterFn func(string) bool) ([]VSearchResult, error) {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	if vs.dim == 0 {
+		return nil, nil
+	}
+	if len(query) != vs.dim {
+		return nil, fmt.Errorf("query dimension mismatch: expected %d, got %d", vs.dim, len(query))
+	}
+
+	// Pre-normalization
+	searchQuery := query
+	if vs.autoNormalize {
+		normalized := make([]float32, len(query))
+		copy(normalized, query)
+		Normalize(normalized)
+		searchQuery = normalized
+	}
+
+	efSearch := K * 10
+	if efSearch < 100 {
+		efSearch = 100
+	}
+
+	// Обёртка: переводим string-фильтр в uint64-фильтр (internal ID → user key).
+	internalFilter := func(nodeID uint64) bool {
+		key, ok := vs.keys[nodeID]
+		if !ok {
+			return false // нода без ключа = мёртвая/удалённая
+		}
+		return filterFn(key)
+	}
+
+	results := vs.graph.SearchFiltered(searchQuery, K, efSearch, internalFilter)
+
+	out := make([]VSearchResult, len(results))
+	for i, r := range results {
+		out[i] = VSearchResult{
+			Key:      vs.keys[r.ID],
+			Distance: r.Distance,
+		}
+	}
+	return out, nil
+}
+
+// Get возвращает копию вектора по его ключу.
+func (vs *VectorStore) Get(key string) ([]float32, bool) {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	id, exists := vs.ids[key]
+	if !exists {
+		return nil, false
+	}
+	node := &vs.graph.nodes[id]
+	if !node.Alive {
+		return nil, false
+	}
+
+	origVec := vs.graph.arena.Get(node.VectorOffset)
+	vecCopy := make([]float32, len(origVec))
+	copy(vecCopy, origVec)
+	return vecCopy, true
+}
+
 // Info возвращает статистику хранилища.
 func (vs *VectorStore) Info() (nodeCount int, dim int, maxLevel int) {
 	vs.mu.RLock()

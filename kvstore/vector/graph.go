@@ -261,6 +261,116 @@ func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) 
 	return g.searchResultBuf
 }
 
+// searchLayerFiltered — searchLayer с фильтрацией результатов.
+//
+// Отличие от searchLayer: нода, не прошедшая filterFn, добавляется
+// в candidates (чтобы продолжить обход графа), но НЕ в results.
+//
+// Это критически важно при высокой селективности фильтра:
+// если 99% нод не проходят фильтр, без добавления в candidates
+// поиск "застрянет" — не сможет найти путь через граф к подходящим нодам.
+//
+// filterFn принимает внутренний ID ноды и возвращает true, если нода
+// проходит фильтр. filterFn НЕ должен быть nil — для поиска без фильтра
+// используйте searchLayer.
+func (g *Graph) searchLayerFiltered(query []float32, entryID uint64, ef int, level int, filterFn func(uint64) bool) []item {
+
+	state := searchPool.Get().(*searchState)
+	state.acquire(len(g.nodes))
+
+	entryNode := &g.nodes[entryID]
+	entryDist := g.Distance(query, g.arena.Get(entryNode.VectorOffset))
+
+	state.setVisited(entryID)
+
+	entry := item{id: entryID, dist: entryDist}
+	state.candidates.push(entry)
+	// Точка входа добавляется в results только если проходит фильтр.
+	if filterFn(entryID) {
+		state.results.push(entry)
+	}
+
+	for state.candidates.Len() > 0 {
+		closest := state.candidates.pop()
+
+		// Условие остановки: если results непуст и closest дальше самого далёкого результата.
+		if state.results.Len() > 0 {
+			farthestResult := state.results.peek()
+			if closest.dist > farthestResult.dist && state.results.Len() >= ef {
+				break
+			}
+		}
+
+		node := &g.nodes[closest.id]
+		neighbors := g.getNeighbors(node.NeighborsHandle, level)
+
+		// Фаза 1: собрать offset-ы НЕПОСЕЩЁННЫХ соседей
+		state.batchOffsets = state.batchOffsets[:0]
+		state.batchIDs = state.batchIDs[:0]
+
+		for _, neighborID := range neighbors {
+			if state.isVisited(neighborID) {
+				continue
+			}
+			state.setVisited(neighborID)
+
+			neighborNode := &g.nodes[neighborID]
+			state.batchOffsets = append(state.batchOffsets, neighborNode.VectorOffset)
+			state.batchIDs = append(state.batchIDs, neighborID)
+		}
+
+		// Фаза 2: batch distance
+		if len(state.batchOffsets) > 0 {
+			if cap(state.batchDists) < len(state.batchOffsets) {
+				state.batchDists = make([]float32, len(state.batchOffsets))
+			}
+			state.batchDists = state.batchDists[:len(state.batchOffsets)]
+
+			g.batchDistance(query, state.batchOffsets, state.batchDists)
+
+			// Фаза 3: разобрать результаты с учётом фильтра
+			for i, neighborID := range state.batchIDs {
+				neighborDist := state.batchDists[i]
+
+				// В candidates добавляем ВСЕГДА — для продолжения обхода графа.
+				newItem := item{id: neighborID, dist: neighborDist}
+
+				farthestDist := float32(math.MaxFloat32)
+				if state.results.Len() > 0 {
+					farthestDist = state.results.peek().dist
+				}
+
+				if neighborDist < farthestDist || state.results.Len() < ef {
+					state.candidates.push(newItem)
+
+					// В results — только если проходит фильтр.
+					if filterFn(neighborID) {
+						state.results.push(newItem)
+
+						if state.results.Len() > ef {
+							state.results.pop()
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Собираем результаты из maxHeap в обратном порядке
+	for state.results.Len() > 0 {
+		state.collected = append(state.collected, state.results.pop())
+	}
+	for i, j := 0, len(state.collected)-1; i < j; i, j = i+1, j-1 {
+		state.collected[i], state.collected[j] = state.collected[j], state.collected[i]
+	}
+
+	g.searchResultBuf = g.searchResultBuf[:0]
+	g.searchResultBuf = append(g.searchResultBuf, state.collected...)
+
+	searchPool.Put(state)
+	return g.searchResultBuf
+}
+
 // greedyClosest — специализированный поиск ближайшей ноды для ef=1.
 //
 // На верхних слоях HNSW мы ищем ровно одну ближайшую ноду (жадный спуск).
@@ -698,6 +808,51 @@ func (g *Graph) Search(query []float32, K int, efSearch int) []SearchResult {
 	}
 
 	// Конвертируем внутренний item → экспортируемый SearchResult
+	out := make([]SearchResult, len(results))
+	for i, r := range results {
+		out[i] = SearchResult{
+			ID:       r.id,
+			Distance: r.dist,
+		}
+	}
+
+	return out
+}
+
+// SearchFiltered — поиск ближайших K векторов с фильтрацией.
+//
+// filterFn принимает внутренний ID ноды и возвращает true, если нода
+// должна попасть в результат. Используется для Single-Stage Filtering:
+// фильтрация происходит ВНУТРИ обхода графа, а не post-hoc.
+//
+// Пример: найти ближайшие 10 товаров из категории "электроника".
+func (g *Graph) SearchFiltered(query []float32, K int, efSearch int, filterFn func(uint64) bool) []SearchResult {
+	if g.nodeCount == 0 {
+		return nil
+	}
+
+	// При фильтрации увеличиваем efSearch — часть кандидатов будет отфильтрована.
+	// Множитель 3× даёт хороший баланс recall/performance для 10-50% selectivity.
+	filteredEf := efSearch * 3
+	if filteredEf < K*10 {
+		filteredEf = K * 10
+	}
+
+	ep := g.entryPointID
+
+	// ФАЗА 1: Спуск по верхним слоям (без фильтра — навигация)
+	for lc := g.maxLevel; lc > 0; lc-- {
+		ep = g.greedyClosest(query, ep, lc)
+	}
+
+	// ФАЗА 2: Фильтрованный поиск на слое 0
+	results := g.searchLayerFiltered(query, ep, filteredEf, 0, filterFn)
+
+	// Обрезаем до K
+	if len(results) > K {
+		results = results[:K]
+	}
+
 	out := make([]SearchResult, len(results))
 	for i, r := range results {
 		out[i] = SearchResult{

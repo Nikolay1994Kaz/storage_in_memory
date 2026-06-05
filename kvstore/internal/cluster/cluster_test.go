@@ -972,6 +972,79 @@ func TestSlotMigration_FullCycle(t *testing.T) {
 	t.Log("slot migration full cycle: MIGRATING → IMPORTING → ASK → NODE ✓")
 }
 
+// TestSlotMigration_WithVector проверяет, что при миграции слота
+// переносятся как KV-данные, так и векторные данные, если они существуют.
+func TestSlotMigration_WithVector(t *testing.T) {
+	c := New("127.0.0.1:6380", 6381)
+	c.State.Self.ID = "aaa"
+	c.State.Nodes["aaa"] = c.State.Self
+	c.State.Self.AssignSlots(0, 8191)
+
+	// Мокаем хранилище данных
+	kvStore := map[string][]byte{
+		"my-key": []byte("some-metadata"),
+	}
+	vecStore := map[string][]float32{
+		"my-key": {0.1, 0.2, 0.3},
+	}
+
+	c.MigrateGetFunc = func(key string) ([]byte, bool) {
+		val, ok := kvStore[key]
+		return val, ok
+	}
+	c.MigrateGetVecFunc = func(key string) ([]float32, bool) {
+		vec, ok := vecStore[key]
+		return vec, ok
+	}
+
+	var remoteKVKey string
+	var remoteKVVal []byte
+	c.MigrateSetRemoteFunc = func(addr, key string, value []byte) error {
+		remoteKVKey = key
+		remoteKVVal = value
+		return nil
+	}
+
+	var remoteVecKey string
+	var remoteVecVal []float32
+	c.MigrateSetRemoteVecFunc = func(addr, key string, vec []float32) error {
+		remoteVecKey = key
+		remoteVecVal = vec
+		return nil
+	}
+
+	deletedLocal := false
+	c.MigrateDelFunc = func(key string) {
+		delete(kvStore, key)
+		delete(vecStore, key)
+		deletedLocal = true
+	}
+
+	// Запускаем миграцию
+	resp := c.MigrateKey("127.0.0.1", 6381, "my-key")
+	if resp.Typ != '+' || resp.Str != "OK" {
+		t.Fatalf("MigrateKey failed: %v", resp)
+	}
+
+	// 1. Проверяем, что KV улетело на удаленную ноду
+	if remoteKVKey != "my-key" || string(remoteKVVal) != "some-metadata" {
+		t.Fatalf("KV data not sent to remote node: key=%s val=%s", remoteKVKey, string(remoteKVVal))
+	}
+
+	// 2. Проверяем, что вектор улетел на удаленную ноду
+	if remoteVecKey != "my-key" || len(remoteVecVal) != 3 || remoteVecVal[0] != 0.1 {
+		t.Fatalf("Vector data not sent to remote node: key=%s vec=%v", remoteVecKey, remoteVecVal)
+	}
+
+	// 3. Проверяем, что локально все очистилось
+	if !deletedLocal {
+		t.Fatal("local delete function was not called")
+	}
+	if len(kvStore) != 0 || len(vecStore) != 0 {
+		t.Fatalf("local stores not cleared: kv=%v, vec=%v", kvStore, vecStore)
+	}
+}
+
 // TestSetSlot_Errors — валидация ошибок SETSLOT.
 func TestSetSlot_Errors(t *testing.T) {
 	c := New("127.0.0.1:6380", 6381)

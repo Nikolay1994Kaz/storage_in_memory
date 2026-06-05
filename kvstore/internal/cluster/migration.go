@@ -120,24 +120,42 @@ func (c *Cluster) clusterGetKeysInSlot(args []protocol.Value) protocol.Value {
 }
 
 // MigrateKey — переносит один ключ на другую ноду:
-//  1. Читаем значение из локального Store
-//  2. Отправляем SET на целевую ноду по TCP
-//  3. Удаляем ключ из локального Store
+//  1. Читаем значение (KV) и/или вектор из локальных хранилищ
+//  2. Отправляем их на целевую ноду по TCP
+//  3. Удаляем данные локально
 func (c *Cluster) MigrateKey(host string, port int, key string) protocol.Value {
 	if c.MigrateGetFunc == nil || c.MigrateDelFunc == nil || c.MigrateSetRemoteFunc == nil {
 		return protocol.Value{Typ: '-', Str: "ERR migration functions not configured"}
 	}
 
-	value, ok := c.MigrateGetFunc(key)
-	if !ok {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	migratedAnything := false
+
+	// 1. Проверяем и мигрируем KV-значение
+	value, hasKV := c.MigrateGetFunc(key)
+	if hasKV {
+		if err := c.MigrateSetRemoteFunc(addr, key, value); err != nil {
+			return protocol.Value{Typ: '-', Str: "ERR KV migration failed: " + err.Error()}
+		}
+		migratedAnything = true
+	}
+
+	// 2. Проверяем и мигрируем вектор
+	if c.MigrateGetVecFunc != nil && c.MigrateSetRemoteVecFunc != nil {
+		vec, hasVec := c.MigrateGetVecFunc(key)
+		if hasVec {
+			if err := c.MigrateSetRemoteVecFunc(addr, key, vec); err != nil {
+				return protocol.Value{Typ: '-', Str: "ERR Vector migration failed: " + err.Error()}
+			}
+			migratedAnything = true
+		}
+	}
+
+	if !migratedAnything {
 		return protocol.Value{Typ: '-', Str: "ERR key not found: " + key}
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
-	if err := c.MigrateSetRemoteFunc(addr, key, value); err != nil {
-		return protocol.Value{Typ: '-', Str: "ERR migration failed: " + err.Error()}
-	}
-
+	// 3. Удаляем локальные копии
 	c.MigrateDelFunc(key)
 
 	return protocol.Value{Typ: '+', Str: "OK"}

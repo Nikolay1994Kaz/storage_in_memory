@@ -39,6 +39,8 @@ type Cluster struct {
 	MigrateGetFunc       func(key string) ([]byte, bool)
 	MigrateDelFunc       func(key string)
 	MigrateSetRemoteFunc func(addr, key string, value []byte) error
+	MigrateGetVecFunc       func(key string) ([]float32, bool)
+	MigrateSetRemoteVecFunc func(addr, key string, vec []float32) error
 	Repl                 *ReplicationManager
 }
 

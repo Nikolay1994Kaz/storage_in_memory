@@ -282,3 +282,15 @@ func (m *TTLManager) Stop() {
 		close(m.stop)
 	})
 }
+
+// SetEvictor заменяет evictor на лету.
+//
+// Используется для перехода с простого KV-evictor (нужен при WAL replay)
+// на CompositeEvictor (KV + VectorStore + WAL запись) после полной инициализации.
+//
+// Безопасно: activeExpiry вызывает store.Del() под WLock шарда,
+// а SetEvictor вызывается один раз при старте сервера до начала
+// обработки клиентских запросов.
+func (m *TTLManager) SetEvictor(e Evictor) {
+	m.store = e
+}

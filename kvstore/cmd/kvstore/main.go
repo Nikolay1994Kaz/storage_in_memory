@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -63,6 +64,9 @@ func main() {
 	os.MkdirAll(dataDir, 0755)
 
 	// === 1. TTL Manager ===
+	// Инициализация перенесена после WAL (строка ниже), потому что
+	// CompositeEvictor при TTL-expire записывает OpVSimDel в WAL.
+	// Для фазы WAL replay используем временный KV-only evictor.
 	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
 	defer ttl.Stop()
 
@@ -103,6 +107,7 @@ func main() {
 			restored++
 		case wal.OpDel:
 			s.Del(0, entry.Key)
+			vecStore.Delete(entry.Key) // Также удаляем вектор при реплее DEL
 			ttl.OnDelete(entry.Key)
 			restored++
 		case wal.OpExpire:
@@ -113,6 +118,7 @@ func main() {
 					ttl.Set(entry.Key, remaining)
 				} else {
 					s.Del(0, entry.Key)
+					vecStore.Delete(entry.Key) // Также удаляем вектор, если ключ просрочен в оффлайне
 					ttl.OnDelete(entry.Key)
 				}
 			}
@@ -171,6 +177,14 @@ func main() {
 
 	bw := wal.NewBatchWAL(rawWAL)
 	defer bw.Close()
+
+	// === TTL: подключаем CompositeEvictor ===
+	// Теперь при истечении TTL ключа TTLManager автоматически:
+	//   1. Удаляет значение из KV Store (как раньше)
+	//   2. Удаляет вектор из HNSW графа (если ключ есть в VectorStore)
+	//   3. Записывает OpVSimDel в WAL (чтобы удаление пережило рестарт)
+	ttl.SetEvictor(&compositeEvictor{kv: s, vec: vecStore, wal: bw})
+
 
 	// === 4. Syncer ===
 	// iterateAll — обход только KV данных для snapshot.wal (векторы хранятся отдельно)
@@ -231,7 +245,14 @@ func main() {
 		}
 		cl.MigrateDelFunc = func(key string) {
 			s.Del(0, key)
+			vecStore.Delete(key) // Очищаем вектор
 			ttl.OnDelete(key)
+		}
+		cl.MigrateGetVecFunc = func(key string) ([]float32, bool) {
+			return vecStore.Get(key)
+		}
+		cl.MigrateSetRemoteVecFunc = func(addr, key string, vec []float32) error {
+			return SendVectorToNode(addr, key, vec)
 		}
 
 		cl.Repl.StoreForEach = func(fn func(key string, value []byte)) {
@@ -653,6 +674,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		bw.Write(wal.Entry{Op: wal.OpDel, Key: key})
 		ok := s.Del(workerID, key)
+		vecStore.Delete(key) // Также удаляем вектор при ручном DEL
 		ttl.OnDelete(key)
 		if cl != nil && cl.Repl != nil {
 			cl.Repl.ForwardWrite(fmt.Sprintf("DEL %s", key))
@@ -896,6 +918,12 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		key := string(args[0])
+		if cl != nil {
+			if moved := cl.CheckKey(key); moved != nil {
+				writeValue(buf, *moved)
+				return
+			}
+		}
 		vec := make([]float32, len(args)-1)
 		for i := 1; i < len(args); i++ {
 			f, err := strconv.ParseFloat(string(args[i]), 32)
@@ -930,6 +958,12 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		key := string(args[0])
+		if cl != nil {
+			if moved := cl.CheckKey(key); moved != nil {
+				writeValue(buf, *moved)
+				return
+			}
+		}
 		if vecStore.Delete(key) {
 			bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: key})
 			if cl != nil && cl.Repl != nil {
@@ -974,6 +1008,84 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		count, dim, maxLevel := vecStore.Info()
 		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d", count, dim, maxLevel)
 		buf.WriteBulkString(info)
+
+	// VSIM.SEARCHFILTER — поиск ближайших векторов с фильтрацией по метаданным.
+	//
+	// Формат:  VSIM.SEARCHFILTER <K> <filter_field> <filter_value> <v1> <v2> ... <vN>
+	//
+	// Для каждого вектора с ключом X проверяется:
+	//   GET "filter_field:X" == filter_value
+	//
+	// Пример: если вектор имеет ключ "product:123", а метаданные хранятся как
+	//   SET "category:product:123" "electronics"
+	// то команда:
+	//   VSIM.SEARCHFILTER 10 category electronics 0.1 0.2 0.3 ...
+	// найдёт 10 ближайших векторов только из категории "electronics".
+	//
+	// Альтернативный режим с PREFIX:
+	//   VSIM.SEARCHFILTER <K> PREFIX <prefix> <v1> <v2> ... <vN>
+	// Фильтрует по префиксу ключа вектора. Например:
+	//   VSIM.SEARCHFILTER 10 PREFIX product: 0.1 0.2 0.3 ...
+	// найдёт только векторы, чей ключ начинается с "product:".
+	case "VSIM.SEARCHFILTER":
+		if len(args) < 4 {
+			buf.WriteError("ERR usage: VSIM.SEARCHFILTER <K> <filter_field> <filter_value> <v1> <v2> ... <vN>  or  VSIM.SEARCHFILTER <K> PREFIX <prefix> <v1> <v2> ... <vN>")
+			return
+		}
+		K, err := strconv.Atoi(string(args[0]))
+		if err != nil || K <= 0 {
+			buf.WriteError("ERR invalid K (must be positive integer)")
+			return
+		}
+		filterField := string(args[1])
+		filterValue := string(args[2])
+		vecArgs := args[3:]
+
+		if len(vecArgs) == 0 {
+			buf.WriteError("ERR no vector components provided")
+			return
+		}
+
+		query := make([]float32, len(vecArgs))
+		for i, a := range vecArgs {
+			f, err := strconv.ParseFloat(string(a), 32)
+			if err != nil {
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i+3, string(a)))
+				return
+			}
+			query[i] = float32(f)
+		}
+
+		var filterFn func(string) bool
+
+		if strings.ToUpper(filterField) == "PREFIX" {
+			// Режим PREFIX: фильтрация по префиксу ключа вектора.
+			prefix := filterValue
+			filterFn = func(key string) bool {
+				return strings.HasPrefix(key, prefix)
+			}
+		} else {
+			// Режим KV: проверяем метаданные в KV Store.
+			// Для вектора с ключом X ищем: GET "field:X" == value
+			field := filterField
+			value := filterValue
+			filterFn = func(key string) bool {
+				metaKey := field + ":" + key
+				val, ok := s.Get(metaKey)
+				return ok && string(val) == value
+			}
+		}
+
+		results, err := vecStore.SearchFiltered(query, K, filterFn)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(results) * 2)
+		for _, r := range results {
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
+		}
 
 
 	// === AI Commands ===
@@ -1098,4 +1210,71 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	default:
 		buf.WriteError(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
+}
+
+// ═══════════════════════════════════════════════════
+// compositeEvictor — TTL-expire удаляет и KV, и вектор
+// ═══════════════════════════════════════════════════
+//
+// Когда TTLManager обнаруживает просроченный ключ, он вызывает Del(key).
+// compositeEvictor выполняет три действия:
+//
+//  1. Удаляет значение из KV Store (TCMalloc)
+//  2. Если ключ имеет ассоциированный вектор в HNSW графе — удаляет его,
+//     освобождая память в VectorArena и TCMalloc (neighbors блок)
+//  3. Записывает OpVSimDel в WAL, чтобы удаление пережило рестарт
+//
+// Без этого векторы с TTL «утекали» — KV-ключ удалялся,
+// а вектор оставался навечно в графе HNSW, занимая RAM.
+type compositeEvictor struct {
+	kv  *tcmalloc.TCMallocStore
+	vec *vector.VectorStore
+	wal *wal.BatchWAL
+}
+
+func (e *compositeEvictor) Del(key string) bool {
+	kvDeleted := e.kv.Del(0, key)
+
+	vecDeleted := e.vec.Delete(key)
+	if vecDeleted {
+		e.wal.Write(wal.Entry{Op: wal.OpVSimDel, Key: key})
+	}
+
+	return kvDeleted || vecDeleted
+}
+
+// SendVectorToNode отправляет VSIM.ADD key v1 v2 ... vN на удалённую ноду через TCP.
+func SendVectorToNode(addr, key string, vec []float32) error {
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect to %s: %w", addr, err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	// Формируем массив RESP аргументов для команды VSIM.ADD
+	var sb strings.Builder
+	// Число аргументов: 2 (VSIM.ADD + key) + len(vec)
+	fmt.Fprintf(&sb, "*%d\r\n$8\r\nVSIM.ADD\r\n$%d\r\n%s\r\n", 2+len(vec), len(key), key)
+	for _, v := range vec {
+		vStr := strconv.FormatFloat(float64(v), 'f', -1, 32)
+		fmt.Fprintf(&sb, "$%d\r\n%s\r\n", len(vStr), vStr)
+	}
+
+	if _, err := conn.Write([]byte(sb.String())); err != nil {
+		return fmt.Errorf("write to %s: %w", addr, err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("read from %s: %w", addr, err)
+	}
+
+	resp := string(buf[:n])
+	if !strings.HasPrefix(resp, "+OK") {
+		return fmt.Errorf("remote VSIM.ADD failed: %s", strings.TrimSpace(resp))
+	}
+
+	return nil
 }
