@@ -318,21 +318,21 @@ func TestEngine_CallbacksWiring(t *testing.T) {
 		v, ok := store[key]
 		return v, ok
 	}
-	e.StoreSet = func(key string, value []byte) {
+	e.StoreSet = func(workerID int, key string, value []byte) {
 		store[key] = value
 	}
-	e.StoreDel = func(key string) {
+	e.StoreDel = func(workerID int, key string) {
 		delete(store, key)
 	}
 
 	// Прямой вызов callback'ов (без WASM)
-	e.StoreSet("hello", []byte("world"))
+	e.StoreSet(0, "hello", []byte("world"))
 	val, ok := e.StoreGet("hello")
 	if !ok || string(val) != "world" {
 		t.Fatalf("StoreGet = %q/%v, want world/true", val, ok)
 	}
 
-	e.StoreDel("hello")
+	e.StoreDel(0, "hello")
 	_, ok = e.StoreGet("hello")
 	if ok {
 		t.Fatal("key should be deleted")

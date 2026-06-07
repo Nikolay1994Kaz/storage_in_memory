@@ -25,6 +25,11 @@ type VectorStore struct {
 	// вместо CosineDistance (×3 быстрее).
 	autoNormalize bool
 
+	// LSH-индекс для предварительной фильтрации при поиске.
+	// Плоский массив хэшей + POPCNT brute-force. 0 аллокаций на поиск.
+	// Создаётся лениво при первой вставке (когда dim известен).
+	lsh *LSHIndex
+
 	allocator *tcmalloc.TCMallocStore // Ссылка на менеджер памяти
 
 	mu sync.RWMutex
@@ -62,6 +67,12 @@ func (vs *VectorStore) Add(key string, vec []float32) error {
 	// Валидация размерности
 	if vs.dim == 0 {
 		vs.dim = len(vec)
+		// Ленивая инициализация LSH-индекса при первой вставке,
+		// только для высокоразмерных векторов (dim >= 256).
+		if vs.dim >= 256 {
+			// seed=42 — детерминированные проекции для воспроизводимости.
+			vs.lsh = NewLSHIndex(vs.dim, 42)
+		}
 	} else if len(vec) != vs.dim {
 		return fmt.Errorf("dimension mismatch: expected %d, got %d", vs.dim, len(vec))
 	}
@@ -86,6 +97,11 @@ func (vs *VectorStore) Add(key string, vec []float32) error {
 	vs.ids[key] = id
 	vs.keys[id] = key
 
+	// LSH: вычисляем хэш и записываем в плоский массив
+	if vs.lsh != nil {
+		vs.lsh.Insert(idx, insertVec)
+	}
+
 	return nil
 }
 
@@ -100,6 +116,11 @@ func (vs *VectorStore) Delete(key string) bool {
 	}
 
 	vs.graph.Delete(id)
+
+	// LSH: помечаем sentinel (Hamming=64 → не пройдёт threshold)
+	if vs.lsh != nil {
+		vs.lsh.Delete(uint32(id))
+	}
 
 	delete(vs.ids, key)
 	delete(vs.keys, id)
@@ -125,30 +146,12 @@ func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 		return nil, fmt.Errorf("query dimension mismatch: expected %d, got %d", vs.dim, len(query))
 	}
 
-	// Pre-normalization: нормализуем копию запроса.
-	searchQuery := query
-	if vs.autoNormalize {
-		normalized := make([]float32, len(query))
-		copy(normalized, query)
-		Normalize(normalized)
-		searchQuery = normalized
+	// Если размерность высокая (>= 256) и LSH инициализирован, используем LSH
+	if vs.dim >= 256 && vs.lsh != nil {
+		return vs.searchWithLSHNoLock(query, K, 14)
 	}
 
-	efSearch := K * 10
-	if efSearch < 100 {
-		efSearch = 100
-	}
-
-	results := vs.graph.Search(searchQuery, K, efSearch)
-
-	out := make([]VSearchResult, len(results))
-	for i, r := range results {
-		out[i] = VSearchResult{
-			Key:      vs.keys[r.ID],
-			Distance: r.Distance,
-		}
-	}
-	return out, nil
+	return vs.searchNoLSH(query, K)
 }
 
 // SearchFiltered находит K ближайших векторов с фильтрацией по ключу.
@@ -257,6 +260,7 @@ func (vs *VectorStore) Clear() {
 	vs.keys = make(map[uint64]string)
 	vs.ids = make(map[string]uint64)
 	vs.dim = 0
+	vs.lsh = nil
 }
 
 func SerializeVector(vec []float32) []byte {

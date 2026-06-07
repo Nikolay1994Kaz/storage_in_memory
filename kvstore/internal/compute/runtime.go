@@ -53,13 +53,13 @@ type Engine struct {
 	// Callback-мостики к основному движку.
 	// StoreGet/StoreSet/StoreDel — прямые операции (без WAL).
 	StoreGet func(key string) ([]byte, bool)
-	StoreSet func(key string, value []byte)
-	StoreDel func(key string)
+	StoreSet func(workerID int, key string, value []byte)
+	StoreDel func(workerID int, key string)
 
 	// StoreSetWithWAL/StoreDelWithWAL — операции с WAL (для durability).
 	// Используются из host-функций, чтобы данные из WASM переживали рестарт.
-	StoreSetWithWAL func(key string, value []byte) error
-	StoreDelWithWAL func(key string) error
+	StoreSetWithWAL func(workerID int, key string, value []byte) error
+	StoreDelWithWAL func(workerID int, key string) error
 
 	// Publish — отправка сообщения в Pub/Sub канал.
 	Publish    func(channel, message string)

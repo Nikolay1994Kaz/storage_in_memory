@@ -1,0 +1,487 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "Active Connections",
+      "type": "stat",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "kvstore_network_active_connections",
+          "legendFormat": "Active Connections",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 500
+              },
+              {
+                "color": "red",
+                "value": 1500
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "title": "OOM Events",
+      "type": "stat",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "kvstore_oom_events_total",
+          "legendFormat": "OOM Events",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 3,
+      "title": "TCMalloc Memory Usage",
+      "type": "gauge",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "kvstore_memory_used_bytes",
+          "legendFormat": "Memory Used",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "neutralHeaderColor": true
+          },
+          "mappings": [],
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 104857600
+              },
+              {
+                "color": "red",
+                "value": 524288000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      }
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 4,
+      "title": "Request Rate (RPS)",
+      "type": "timeseries",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "sum(rate(kvstore_commands_total[10s])) by (command)",
+          "legendFormat": "{{command}} RPS",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10
+          },
+          "unit": "requests/sec"
+        }
+      }
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 5,
+      "title": "Command Latency (p99 / p50)",
+      "type": "timeseries",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum(rate(kvstore_command_duration_seconds_bucket[1m])) by (le, command))",
+          "legendFormat": "{{command}} p99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum(rate(kvstore_command_duration_seconds_bucket[1m])) by (le, command))",
+          "legendFormat": "{{command}} p50",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth"
+          },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 6,
+      "title": "WASM Reactor Executions",
+      "type": "timeseries",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "sum(rate(kvstore_wasm_executions_total[10s])) by (module, function)",
+          "legendFormat": "{{module}}.{{function}} RPS",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "requests/sec"
+        }
+      }
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 7,
+      "title": "WASM Execution Latency (Avg in Microseconds)",
+      "type": "timeseries",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "(sum(rate(kvstore_wasm_execution_duration_seconds_sum[1m])) by (module, function) / sum(rate(kvstore_wasm_executions_total[1m])) by (module, function)) * 1000000",
+          "legendFormat": "{{module}}.{{function}} latency",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth"
+          },
+          "unit": "µs"
+        }
+      }
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 8,
+      "title": "Epoll Greedy Drain Efficiency",
+      "type": "timeseries",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "(sum(rate(kvstore_network_greedy_hits_total[1m])) / sum(rate(kvstore_network_greedy_reads_total[1m]))) * 100",
+          "legendFormat": "Pipelining Efficiency",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5
+          },
+          "unit": "percent",
+          "max": 100,
+          "min": 0
+        }
+      }
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 9,
+      "title": "WAL Sync Latency (p99)",
+      "type": "timeseries",
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "datasource": "VictoriaMetrics",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum(rate(kvstore_wal_write_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "fsync p99",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line"
+          },
+          "unit": "s"
+        }
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [
+    "kvstore"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "KVStore Engine Monitor",
+  "uid": "kvstore-monitor",
+  "version": 1,
+  "weekStart": ""
+}

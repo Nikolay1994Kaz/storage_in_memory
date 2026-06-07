@@ -1,0 +1,3 @@
+[submodule "molten-go-sdk"]
+	path = molten-go-sdk
+	url = git@github.com:Nikolay1994Kaz/molten-go-sdk.git

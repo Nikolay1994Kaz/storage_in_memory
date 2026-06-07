@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"time"
+
+	"kvstore/kvstore/internal/monitoring"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -194,10 +197,13 @@ func (wle *WorkerLocalEngine) Exec(workerID int, moduleName, funcName string, ke
 
 	slot.Stack[0] = uint64(InputOffset)
 	slot.Stack[1] = uint64(len(key))
+	start := time.Now()
 	err := fn.CallWithStack(slot.ctx, slot.Stack[:2])
+	duration := time.Since(start)
 	if err != nil {
 		return nil, fmt.Errorf("exec error: %w", err)
 	}
+	monitoring.RecordWasm(moduleName, funcName, duration)
 
 	// 3. Читаем результат из OUTPUT_REGION
 	resultLen := uint32(slot.Stack[0])
@@ -229,6 +235,7 @@ func (wle *WorkerLocalEngine) Exec(workerID int, moduleName, funcName string, ke
 // Вызывается ТОЛЬКО при превышении memory budget (Tier 1).
 // Это редкое событие — раз на ~100K вызовов для sloppy-модулей.
 func (wle *WorkerLocalEngine) recycleSlot(slot *WorkerSlot) error {
+	monitoring.WasmRecycles.Inc()
 	ctx := context.Background()
 	slot.instance.Close(ctx)
 

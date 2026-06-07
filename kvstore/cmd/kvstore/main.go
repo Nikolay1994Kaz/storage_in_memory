@@ -23,6 +23,7 @@ import (
 	"kvstore/kvstore/internal/ai"
 	"kvstore/kvstore/internal/cluster"
 	"kvstore/kvstore/internal/compute"
+	"kvstore/kvstore/internal/monitoring"
 	"kvstore/kvstore/internal/protocol"
 	"kvstore/kvstore/internal/pubsub"
 	"kvstore/kvstore/internal/server"
@@ -50,10 +51,25 @@ func main() {
 	requirePass := flag.String("requirepass", "", "пароль для AUTH (пусто = без аутентификации)")
 	tlsCert := flag.String("tls-cert", "", "путь к TLS сертификату (PEM)")
 	tlsKey := flag.String("tls-key", "", "путь к TLS ключу (PEM)")
+	metricsPort := flag.Int("metrics-port", 9090, "порт для HTTP сервера метрик VictoriaMetrics (0 = отключен)")
 	flag.Parse()
 
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
 	s := tcmalloc.NewTCMallocStore(runtime.NumCPU())
+
+	// Инициализация метрик памяти TCMalloc
+	monitoring.InitMemoryMetrics(
+		func() float64 { return float64(s.UsedMemory()) },
+		func() float64 {
+			numChunks, _, _, _ := s.HeapStats()
+			return float64(numChunks)
+		},
+		func() float64 {
+			_, _, _, numSpans := s.HeapStats()
+			return float64(numSpans)
+		},
+		func() float64 { return float64(s.MaxMemory()) },
+	)
 
 	// Лимит памяти
 	if *maxMemoryMB > 0 {
@@ -296,11 +312,11 @@ func main() {
 	wasm.StoreGet = func(key string) ([]byte, bool) {
 		return s.Get(key)
 	}
-	wasm.StoreSet = func(key string, value []byte) {
-		s.Set(0, key, value)
+	wasm.StoreSet = func(workerID int, key string, value []byte) {
+		s.Set(workerID, key, value)
 	}
-	wasm.StoreDel = func(key string) {
-		s.Del(0, key)
+	wasm.StoreDel = func(workerID int, key string) {
+		s.Del(workerID, key)
 	}
 	wasm.Publish = func(channel, message string) {
 		hub.Publish(channel, message)
@@ -324,14 +340,14 @@ func main() {
 		return out
 	}
 
-	wasm.StoreSetWithWAL = func(key string, value []byte) error {
+	wasm.StoreSetWithWAL = func(workerID int, key string, value []byte) error {
 		bw.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value})
-		s.Set(0, key, value)
+		s.Set(workerID, key, value)
 		return nil
 	}
-	wasm.StoreDelWithWAL = func(key string) error {
+	wasm.StoreDelWithWAL = func(workerID int, key string) error {
 		bw.Write(wal.Entry{Op: wal.OpDel, Key: key})
-		s.Del(0, key)
+		s.Del(workerID, key)
 		ttl.OnDelete(key)
 		return nil
 	}
@@ -420,21 +436,28 @@ func main() {
 		// Транзакции
 		switch cmd {
 		case "MULTI":
+			start := time.Now()
 			cs.InTx = true
 			cs.Buf.WriteSimpleString("OK")
+			monitoring.RecordCommand(cmd, time.Since(start))
 			return
 		case "DISCARD":
+			start := time.Now()
 			if !cs.InTx {
 				cs.Buf.WriteError("ERR DISCARD without MULTI")
+				monitoring.RecordCommand(cmd, time.Since(start))
 				return
 			}
 			cs.InTx = false
 			cs.TxQueue = nil
 			cs.Buf.WriteSimpleString("OK")
+			monitoring.RecordCommand(cmd, time.Since(start))
 			return
 		case "EXEC":
+			startEXEC := time.Now()
 			if !cs.InTx {
 				cs.Buf.WriteError("ERR EXEC without MULTI")
+				monitoring.RecordCommand(cmd, time.Since(startEXEC))
 				return
 			}
 			globalTxMu.Lock()
@@ -442,11 +465,14 @@ func main() {
 			for _, queuedArgs := range cs.TxQueue {
 				qCmd := strings.ToUpper(string(queuedArgs[0]))
 				qCmdArgs := queuedArgs[1:]
+				startCmd := time.Now()
 				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
+				monitoring.RecordCommand(qCmd, time.Since(startCmd))
 			}
 			globalTxMu.Unlock()
 			cs.InTx = false
 			cs.TxQueue = nil
+			monitoring.RecordCommand(cmd, time.Since(startEXEC))
 			return
 		}
 
@@ -461,7 +487,14 @@ func main() {
 			return
 		}
 
+		start := time.Now()
 		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
+		monitoring.RecordCommand(cmd, time.Since(start))
+	}
+
+	// Запуск HTTP-сервера метрик VictoriaMetrics
+	if *metricsPort > 0 {
+		monitoring.StartHttpServer(*metricsPort)
 	}
 
 	// === 8. Сервер ===
@@ -600,6 +633,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		// Проверка лимита памяти (OOM protection)
 		if s.IsOOM() {
+			monitoring.OomEvents.Inc()
 			buf.WriteError("OOM command not allowed when used memory > 'maxmemory'")
 			return
 		}

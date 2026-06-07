@@ -5,6 +5,8 @@ import (
 	"net"
 	"strconv"
 	"syscall"
+
+	"kvstore/kvstore/internal/monitoring"
 )
 
 const (
@@ -73,6 +75,9 @@ func (cb *ConnBuf) ReadFromConn() (int, error) {
 		cb.rbuf = newBuf
 	}
 	n, err := cb.conn.Read(cb.rbuf[cb.rend:])
+	if n > 0 {
+		monitoring.BytesRead.Add(n)
+	}
 	cb.rend += n
 	return n, err
 }
@@ -88,6 +93,7 @@ func (cb *ConnBuf) ReadFromConn() (int, error) {
 //
 // Если EAGAIN — данных нет, возвращаем 0.
 func (cb *ConnBuf) TryRead() int {
+	monitoring.GreedyReads.Inc()
 	if cb.rawConn == nil {
 		return 0
 	}
@@ -104,6 +110,8 @@ func (cb *ConnBuf) TryRead() int {
 		if n > 0 {
 			nRead = n
 			cb.rend += n
+			monitoring.BytesRead.Add(n)
+			monitoring.GreedyHits.Inc()
 		}
 		// Всегда true: не ждём данных, просто проверяем
 		_ = err
@@ -356,7 +364,10 @@ func (cb *ConnBuf) Flush() error {
 	if len(cb.wbuf) == 0 {
 		return nil
 	}
-	_, err := cb.conn.Write(cb.wbuf)
+	n, err := cb.conn.Write(cb.wbuf)
+	if n > 0 {
+		monitoring.BytesWritten.Add(n)
+	}
 	cb.wbuf = cb.wbuf[:0]
 	return err
 }

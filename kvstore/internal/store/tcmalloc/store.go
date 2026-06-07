@@ -56,7 +56,7 @@ func hashStoreKey(key string) uint64 {
 // С padding: каждый шард = своя cache line → нет false sharing.
 type indexShard struct {
 	_     [64]byte                  // ── padding: начало cache line
-	mu    sync.Mutex                // защищает ТОЛЬКО writers (Set, Del, Resize)
+	mu    sync.RWMutex              // защищает writers (Lock) и readers (RLock)
 	table atomic.Pointer[HashTable] // lock-free для readers (Get)
 	_     [64]byte                  // ── padding: конец cache line
 }
@@ -160,17 +160,29 @@ func encodeInto(buf []byte, key string, value []byte) {
 }
 
 func decodeFrom(buf []byte) (string, []byte) {
+	if len(buf) < 4 {
+		return "", nil
+	}
 	offset := 0
 
 	keyLen := binary.LittleEndian.Uint32(buf[offset:])
 	offset += 4
 
+	if int(keyLen) < 0 || offset+int(keyLen) > len(buf) {
+		return "", nil
+	}
 	key := string(buf[offset : offset+int(keyLen)])
 	offset += int(keyLen)
 
+	if offset+4 > len(buf) {
+		return "", nil
+	}
 	valLen := binary.LittleEndian.Uint32(buf[offset:])
 	offset += 4
 
+	if int(valLen) < 0 || offset+int(valLen) > len(buf) {
+		return "", nil
+	}
 	value := make([]byte, valLen)
 	copy(value, buf[offset:offset+int(valLen)])
 
@@ -244,7 +256,9 @@ func (s *TCMallocStore) Get(key string) ([]byte, bool) {
 	hash := hashStoreKey(key)
 	sh := &s.shards[hash%numStoreShards]
 
-	// LOCK-FREE: просто atomic Load, никакого mutex.
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
 	t := sh.table.Load()
 	rawHandle, ok := t.Get(hash)
 	if !ok {
@@ -311,16 +325,21 @@ func (s *TCMallocStore) Len() int {
 // Используется для snapshot/compaction — не на горячем пути.
 func (s *TCMallocStore) ForEach(fn func(key string, value []byte)) {
 	for i := 0; i < numStoreShards; i++ {
-		t := s.shards[i].table.Load()
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		t := sh.table.Load()
 		for j := uint64(0); j < t.size; j++ {
 			h := t.slots[j].hash.Load()
 			if h != emptyHash && h != tombstoneHash {
 				rawHandle := t.slots[j].handle.Load()
 				buf := s.heap.Resolve(Handle(rawHandle))
 				key, value := decodeFrom(buf)
-				fn(key, value)
+				if key != "" {
+					fn(key, value)
+				}
 			}
 		}
+		sh.mu.RUnlock()
 	}
 }
 
@@ -426,4 +445,14 @@ func (s *TCMallocStore) Free(workerID int, handle Handle) {
 // Resolve возвращает слайс байт, на который указывает Handle (zero-copy)
 func (s *TCMallocStore) Resolve(handle Handle) []byte {
 	return s.heap.Resolve(handle)
+}
+
+// HeapStats возвращает статистику аллокатора кучи.
+func (s *TCMallocStore) HeapStats() (numChunks int, totalBytes int, usedBytes int, numSpans int) {
+	return s.heap.Stats()
+}
+
+// MaxMemory возвращает лимит памяти в байтах.
+func (s *TCMallocStore) MaxMemory() int64 {
+	return s.heap.MaxMemory()
 }

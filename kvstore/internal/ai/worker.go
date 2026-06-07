@@ -6,6 +6,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"kvstore/kvstore/internal/monitoring"
 )
 
 // Worker — фоновый процессор AI-задач.
@@ -84,6 +86,7 @@ func (w *Worker) Start(concurrency int) {
 func (w *Worker) Submit(key, text string) error {
 	select {
 	case w.tasks <- Task{Key: key, Text: text}:
+		monitoring.AiQueueLen.Set(uint64(len(w.tasks)))
 		return nil
 	default:
 		return fmt.Errorf("ai worker queue full (%d/%d)", len(w.tasks), cap(w.tasks))
@@ -114,6 +117,7 @@ func (w *Worker) loop(id int) {
 	for {
 		select {
 		case task := <-w.tasks:
+			monitoring.AiQueueLen.Set(uint64(len(w.tasks)))
 			w.processTask(id, task)
 		case <-w.stop:
 			return

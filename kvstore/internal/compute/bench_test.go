@@ -39,9 +39,9 @@ func loadFraudScorer(b *testing.B) (*Engine, []byte) {
 		v, ok := store[key]
 		return v, ok
 	}
-	e.StoreSet = func(key string, value []byte) {}
-	e.StoreDel = func(key string) {}
-	e.StoreSetWithWAL = func(key string, value []byte) error { return nil }
+	e.StoreSet = func(workerID int, key string, value []byte) {}
+	e.StoreDel = func(workerID int, key string) {}
+	e.StoreSetWithWAL = func(workerID int, key string, value []byte) error { return nil }
 	e.Publish = func(channel, message string) {}
 
 	if err := e.LoadModule("fraud_scorer", wasmBytes); err != nil {
@@ -272,9 +272,9 @@ func loadReactorFraudScorer(b *testing.B) (*Engine, []byte) {
 		v, ok := store[key]
 		return v, ok
 	}
-	e.StoreSet = func(key string, value []byte) {}
-	e.StoreDel = func(key string) {}
-	e.StoreSetWithWAL = func(key string, value []byte) error { return nil }
+	e.StoreSet = func(workerID int, key string, value []byte) {}
+	e.StoreDel = func(workerID int, key string) {}
+	e.StoreSetWithWAL = func(workerID int, key string, value []byte) error { return nil }
 	e.Publish = func(channel, message string) {}
 
 	if err := e.LoadModule("fraud_scorer", wasmBytes); err != nil {

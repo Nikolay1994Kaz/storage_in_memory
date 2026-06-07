@@ -564,14 +564,14 @@ ROADMAP.md (Уровни 0-9):
   Уровень 6: TTL ─────────────── ✅ Готово
   Уровень 7: Pub/Sub ─────────── ✅ Готово
   Уровень 8: Кластеризация ──── ✅ Готово
-  Уровень 9: Tunable Guarantees  ⬜ В планах
+  Уровень 9: Tunable Guarantees  ✅ Готово
 
 VISION.md (следующие уровни — продуктовые):
-  Уровень 10: WASM Compute ──── 🔜 Phase 0    ← ВОТ ТУТ МЫ
-  Уровень 11: Arena Compaction ─ 🔜 Phase 2
-  Уровень 12: Persisted Streams  🔜 Phase 2
-  Уровень 13: Observability ──── 🔜 Phase 3
-  Уровень 14: OSS Launch ─────── 🔜 Phase 4
+  Уровень 10: WASM Compute ──── ✅ Готово
+  Уровень 11: Arena Compaction ─ ✅ Готово (Auto-Compact)
+  Уровень 12: Persisted Streams  ✅ Готово
+  Уровень 13: Observability ──── ✅ Готово (VictoriaMetrics + Grafana)
+  Уровень 14: OSS Launch ─────── 🔜 Phase 4    ← ВОТ ТУТ МЫ
   Уровень 15: Enterprise/SaaS ── 🔜 Phase 5
 ```
 

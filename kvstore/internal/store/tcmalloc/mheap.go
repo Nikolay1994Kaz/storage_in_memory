@@ -306,6 +306,11 @@ func (h *MHeap) SetMaxMemory(bytes int64) {
 	h.maxMemory = bytes
 }
 
+// MaxMemory возвращает установленный лимит памяти в байтах.
+func (h *MHeap) MaxMemory() int64 {
+	return h.maxMemory
+}
+
 // IsOOM проверяет, превышен ли лимит памяти.
 // Если maxMemory == 0 — лимита нет, всегда false.
 //

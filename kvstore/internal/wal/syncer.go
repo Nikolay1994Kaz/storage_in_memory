@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"kvstore/kvstore/internal/monitoring"
 )
 
 const (
@@ -56,7 +58,10 @@ func (s *Syncer) run() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := s.wal.Sync(); err != nil {
+			start := time.Now()
+			err := s.wal.Sync()
+			monitoring.WalWriteDuration.Update(time.Since(start).Seconds())
+			if err != nil {
 				log.Printf("WAL sync error: %v", err)
 			}
 
@@ -70,7 +75,9 @@ func (s *Syncer) run() {
 			}
 
 		case <-s.stop:
+			start := time.Now()
 			s.wal.Sync()
+			monitoring.WalWriteDuration.Update(time.Since(start).Seconds())
 			return
 		}
 	}

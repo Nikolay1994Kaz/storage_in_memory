@@ -6,11 +6,13 @@ services:
     container_name: kvstore
     ports:
       - "6380:6380"
+      - "9090:9090"
     volumes:
       - kvstore-data:/app/data
     command:
       - "--port=6380"
       - "--ollama-url=http://ollama:11434"
+      - "--metrics-port=9090"
     depends_on:
       ollama-init:
         condition: service_completed_successfully
@@ -23,23 +25,14 @@ services:
     image: ollama/ollama:latest
     container_name: ollama
     ports:
-      - "11434:11434"
+      - "11435:11434"
     volumes:
       - ollama-models:/root/.ollama
-    # Раскомментируйте блок ниже, если у вас NVIDIA GPU и установлен Nvidia Container Toolkit
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
     restart: unless-stopped
 
   # ─── Ollama Init ──────────────────────────────────
   # Одноразовый контейнер: скачивает модель эмбеддингов
-  # при первом запуске. При повторных — модель уже в volume,
-  # pull завершается мгновенно.
+  # при первом запуске.
   ollama-init:
     image: ollama/ollama:latest
     container_name: ollama-init
@@ -58,6 +51,42 @@ services:
         echo 'Model ready!'
       "
 
+  # ─── VictoriaMetrics ──────────────────────────────
+  # Time Series Database для сбора и хранения метрик
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.101.0
+    container_name: victoriametrics
+    ports:
+      - "8428:8428"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - vm-data:/victoria-metrics-data
+    command:
+      - "-promscrape.config=/etc/prometheus/prometheus.yml"
+    restart: unless-stopped
+
+  # ─── Grafana ──────────────────────────────────────
+  # Визуализация метрик и дашборд
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning/datasources/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
+      - ./monitoring/grafana/provisioning/dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+      - ./monitoring/grafana/provisioning/dashboards/kvstore_dashboard.json:/etc/grafana/provisioning/dashboards/kvstore_dashboard.json
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    depends_on:
+      - victoriametrics
+    restart: unless-stopped
+
 volumes:
   kvstore-data:
   ollama-models:
+  vm-data:
+  grafana-data:

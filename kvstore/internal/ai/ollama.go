@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"kvstore/kvstore/internal/monitoring"
 )
 
 // Client — HTTP-клиент к Ollama API.
@@ -93,6 +95,11 @@ type chatResponse struct {
 // Тот же паттерн, что в WASM Engine (ExecFunction):
 // позволяет вызывающему коду отменить запрос по таймауту.
 func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
+	start := time.Now()
+	defer func() {
+		monitoring.AiEmbedDuration.Update(time.Since(start).Seconds())
+	}()
+
 	// 1. Формируем JSON-запрос
 	reqBody := embedRequest{
 		Model: c.embedModel,
@@ -146,6 +153,10 @@ func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
 // В будущем можно добавить streaming через PubSub
 // (каждый токен → PUBLISH ai:stream:requestID token).
 func (c *Client) Chat(ctx context.Context, prompt string) (string, error) {
+	start := time.Now()
+	defer func() {
+		monitoring.AiChatDuration.Update(time.Since(start).Seconds())
+	}()
 	reqBody := chatRequest{
 		Model: c.chatModel,
 		Messages: []chatMessage{

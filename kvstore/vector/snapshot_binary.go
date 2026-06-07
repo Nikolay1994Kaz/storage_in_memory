@@ -190,6 +190,24 @@ func (vs *VectorStore) LoadBinary(r io.Reader) error {
 		vs.graph.arena.dim = vs.dim
 	}
 
+	// Перестраиваем LSH индекс, если размерность высокая (dim >= 256)
+	if vs.dim >= 256 {
+		vs.lsh = NewLSHIndex(vs.dim, 42)
+		// Пре-аллоцируем hashes до размера len(vs.graph.nodes)
+		vs.lsh.hashes = make([]uint64, len(vs.graph.nodes))
+		for i := range vs.lsh.hashes {
+			vs.lsh.hashes[i] = lshSentinel
+		}
+		for id, node := range vs.graph.nodes {
+			if node.Alive {
+				vec := vs.graph.arena.Get(node.VectorOffset)
+				vs.lsh.Insert(uint32(id), vec)
+			}
+		}
+	} else {
+		vs.lsh = nil
+	}
+
 	return nil
 }
 

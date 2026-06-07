@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'kvstore'
+    static_configs:
+      - targets: ['kvstore:9090']

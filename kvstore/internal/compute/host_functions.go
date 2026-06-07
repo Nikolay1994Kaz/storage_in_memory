@@ -95,13 +95,14 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			// BUG FIX: Используем StoreSetWithWAL для durability.
 			// Раньше данные из WASM терялись при рестарте.
 			tx, ok := ctx.Value(execTxKey{}).(*WasmTxCtx)
+			workerID := WorkerIDFromContext(ctx)
 			writeFunc := func() {
 				if e.StoreSetWithWAL != nil {
-					if err := e.StoreSetWithWAL(string(keyCopy), valCopy); err != nil {
+					if err := e.StoreSetWithWAL(workerID, string(keyCopy), valCopy); err != nil {
 						log.Printf("[wasm] kv_set WAL error: %v", err)
 					}
 				} else {
-					e.StoreSet(string(keyCopy), valCopy)
+					e.StoreSet(workerID, string(keyCopy), valCopy)
 				}
 			}
 			if ok && tx.InTx {
@@ -127,15 +128,16 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 				return
 			}
 
+			workerID := WorkerIDFromContext(ctx)
 			// BUG FIX: Используем StoreDelWithWAL для durability.
 			if e.StoreDelWithWAL != nil {
-				if err := e.StoreDelWithWAL(string(key)); err != nil {
+				if err := e.StoreDelWithWAL(workerID, string(key)); err != nil {
 					log.Printf("[wasm] kv_del WAL error: %v", err)
 					stack[0] = 0
 					return
 				}
 			} else {
-				e.StoreDel(string(key))
+				e.StoreDel(workerID, string(key))
 			}
 			stack[0] = 1
 		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).

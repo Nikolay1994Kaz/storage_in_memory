@@ -5,6 +5,8 @@ import (
 	"net"
 	"sync"
 	"syscall"
+
+	"kvstore/kvstore/internal/monitoring"
 )
 
 // Epoll оборачивает Linux epoll для неблокирующего I/O.
@@ -49,6 +51,8 @@ func (e *Epoll) Add(cs *ConnState) error {
 	e.connections[fd] = cs
 	e.mu.Unlock()
 
+	monitoring.ActiveConnections.Inc()
+
 	return nil
 }
 
@@ -64,6 +68,8 @@ func (e *Epoll) Remove(cs *ConnState) error {
 	e.mu.Lock()
 	delete(e.connections, fd)
 	e.mu.Unlock()
+
+	monitoring.ActiveConnections.Dec()
 
 	return cs.Conn.Close()
 }
