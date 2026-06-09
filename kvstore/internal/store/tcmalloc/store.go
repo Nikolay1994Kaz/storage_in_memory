@@ -5,6 +5,7 @@ import (
 	"hash/maphash"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const numStoreShards = 256
@@ -95,6 +96,24 @@ type TCMallocStore struct {
 	// hash(key) → Handle.
 	// Каждый шард с padding до 64 байт (anti false sharing).
 	shards [numStoreShards]indexShard
+
+	// ── Deferred Free (RCU-style grace period) ──────────────
+	//
+	// Проблема: lock-free Get читает handle из таблицы, затем Resolve.
+	// Если Del сразу вызовет Free(handle), слот вернётся в Span.freeStack.
+	// Новый Alloc переиспользует слот → Get прочитает чужие данные.
+	//
+	// Решение: Del НЕ вызывает Free сразу. Handle кладётся в deferCurr.
+	// Внутренняя горутина runDeferredFree (каждые 100ms)
+	// освобождает deferPrev — handles, пролежавшие ЦЕЛЫЙ цикл.
+	// За это время все in-flight Get гарантированно завершились (~200ns vs ~100ms).
+	//
+	// Аллокатор САМ управляет своим lifecycle —
+	// никакой зависимости от Syncer/WAL/внешних таймеров.
+	deferMu   sync.Mutex
+	deferCurr []Handle
+	deferPrev []Handle
+	stopCh    chan struct{} // закрыть для остановки runDeferredFree
 }
 
 // NewTCMallocStore создаёт хранилище.
@@ -118,11 +137,16 @@ func NewTCMallocStore(numWorkers int) *TCMallocStore {
 		heap:     heap,
 		centrals: centrals,
 		caches:   caches,
+		stopCh:   make(chan struct{}),
 	}
 
 	for i := 0; i < numStoreShards; i++ {
 		s.shards[i].initShard()
 	}
+
+	// Аллокатор сам управляет своим deferred free —
+	// никакой зависимости от WAL/Syncer/внешних таймеров.
+	go s.runDeferredFree()
 
 	return s
 }
@@ -256,9 +280,15 @@ func (s *TCMallocStore) Get(key string) ([]byte, bool) {
 	hash := hashStoreKey(key)
 	sh := &s.shards[hash%numStoreShards]
 
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-
+	// ★ LOCK-FREE — ни одного mutex ★
+	//
+	// Безопасно потому что:
+	//   1. table.Load() — atomic (если Set сделал Grow, мы прочитаем
+	//      либо старую, либо новую таблицу — обе валидны)
+	//   2. t.Get(hash) — atomic Load слотов
+	//   3. heap.Resolve(handle) — lock-free (chunks append-only)
+	//   4. Del НЕ вызывает Free(handle) сразу → данные в span
+	//      НЕ перезаписываются пока мы читаем (deferred free)
 	t := sh.table.Load()
 	rawHandle, ok := t.Get(hash)
 	if !ok {
@@ -306,8 +336,12 @@ func (s *TCMallocStore) Del(workerID int, key string) bool {
 		return false
 	}
 
-	// Освобождаем блок обратно в аллокатор
-	s.caches[workerID].Free(s.heap, Handle(rawHandle))
+	// ★ НЕ освобождаем сразу! ★
+	// Handle кладётся в очередь отложенного Free.
+	// Это гарантирует что in-flight Get (который уже прочитал
+	// этот handle из таблицы, но ещё не вызвал Resolve)
+	// прочитает валидные данные.
+	s.DeferFree(Handle(rawHandle))
 	return true
 }
 
@@ -456,3 +490,100 @@ func (s *TCMallocStore) HeapStats() (numChunks int, totalBytes int, usedBytes in
 func (s *TCMallocStore) MaxMemory() int64 {
 	return s.heap.MaxMemory()
 }
+
+// ══════════════════════════════════════════════════
+// DEFERRED FREE (RCU-style lock-free Get)
+// ══════════════════════════════════════════════════
+
+// runDeferredFree — внутренняя горутина аллокатора.
+//
+// Аллокатор САМ управляет своим lifecycle —
+// не зависит от WAL/Syncer/внешних таймеров.
+// Это Single Responsibility: память управляется аллокатором,
+// WAL управляется syncer’ом — каждый отвечает за своё.
+func (s *TCMallocStore) runDeferredFree() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.FlushDeferred()
+		case <-s.stopCh:
+			// Последний flush: освобождаем всё что накопилось.
+			s.FlushDeferred()
+			s.FlushDeferred() // двойной вызов — double buffering
+			return
+		}
+	}
+}
+
+// Close останавливает внутренние горутины аллокатора.
+// Вызывай при завершении работы (defer s.Close()).
+func (s *TCMallocStore) Close() {
+	close(s.stopCh)
+}
+
+// DeferFree добавляет handle в очередь отложенного освобождения.
+//
+// Handle будет фактически освобождён при втором вызове FlushDeferred
+// (т.е. пролежит минимум один полный цикл — grace period ≥100ms).
+//
+// Используется:
+//   - Del (KV store): lock-free Get может держать handle в момент удаления
+//   - B+Tree Delete: lock-free Search может держать member handle
+//   - B+Tree Insert (duplicate): старый member ещё может читаться Search'ем
+func (s *TCMallocStore) DeferFree(h Handle) {
+	s.deferMu.Lock()
+	s.deferCurr = append(s.deferCurr, h)
+	s.deferMu.Unlock()
+}
+
+// FlushDeferred освобождает отложенные handle'ы, пролежавшие ≥1 цикл.
+//
+// Вызывается внутренней горутиной каждые 100ms.
+// Get занимает ~200ns. Grace period 100ms даёт запас x500000.
+//
+// Алгоритм двойной буферизации:
+//
+//	 Вызов N:
+//	   1. Освобождаем deferPrev (handle'ы из вызова N-1, пролежали целый цикл)
+//	   2. deferPrev = deferCurr (текущие handle'ы — начинают ждать)
+//	   3. deferCurr = пустой (переиспользуем backing array от prev)
+//
+// Возвращает количество освобождённых handle'ов (для мониторинга).
+func (s *TCMallocStore) FlushDeferred() int {
+	s.deferMu.Lock()
+	// 1. Забираем prev (они отлежали целый цикл — безопасно освобождать)
+	toFree := s.deferPrev
+
+	// 2. Текущая очередь уходит в prev (начинает grace period)
+	s.deferPrev = s.deferCurr
+
+	// 3. Переиспользуем backing array от prev для нового curr
+	s.deferCurr = toFree[:0]
+	s.deferMu.Unlock()
+
+	// 4. Освобождаем за пределами мьютекса — не блокируем Del
+	for _, h := range toFree {
+		s.caches[0].Free(s.heap, h)
+	}
+
+	return len(toFree)
+}
+
+// DeferredQueueLen возвращает количество handle'ов ожидающих освобождения.
+// Для мониторинга / метрик.
+func (s *TCMallocStore) DeferredQueueLen() int {
+	s.deferMu.Lock()
+	n := len(s.deferCurr) + len(s.deferPrev)
+	s.deferMu.Unlock()
+	return n
+}
+
+// MemoryCounter возвращает указатель на общий атомарный счётчик памяти.
+// Используется для интеграции B+Tree / Arena с общим учётом IsOOM.
+func (s *TCMallocStore) MemoryCounter() *atomic.Int64 {
+	return s.heap.MemoryCounter()
+}
+

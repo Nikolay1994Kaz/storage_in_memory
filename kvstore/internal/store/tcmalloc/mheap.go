@@ -335,3 +335,13 @@ func (h *MHeap) Stats() (numChunks int, totalBytes int, usedBytes int, numSpans 
 	numSpans = h.registry.len()
 	return
 }
+
+// MemoryCounter возвращает указатель на общий атомарный счётчик памяти.
+//
+// Используется для интеграции внешних структур данных (B+Tree, Arena)
+// с общим учётом потребления. Любое atomic.Add на этот счётчик
+// автоматически учитывается в IsOOM() и UsedMemory().
+func (h *MHeap) MemoryCounter() *atomic.Int64 {
+	return &h.usedBytes
+}
+

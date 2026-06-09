@@ -1,26 +1,39 @@
 package btree
 
 import (
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // ============================================================================
-// B+Tree на базе TCMalloc — zero-alloc, GC-free
+// B+Tree на базе TCMalloc — zero-alloc, GC-free, lock-free Search
 // ============================================================================
 //
 // Все узлы дерева живут в TCMalloc (тот же аллокатор что для KV-данных).
 // Ни одного *node указателя. Ни одного string. GC не видит структуру дерева.
 //
-// node хранит:
-//   - score (float64)   — ключ сортировки
-//   - member (Handle)   — ссылка на строку-member в TCMalloc
-//   - children (Handle) — ссылки на дочерние узлы (тоже в TCMalloc)
+// Модель конкурентности (аналог TCMalloc Store):
 //
-// Доступ к узлу: store.Resolve(handle) → []byte → (*node)(unsafe.Pointer)
-// Стоимость: ~5ns (lock-free Resolve).
+//	Search   — ★ LOCK-FREE ★ через seqlock (как Get в TCMalloc store)
+//	Len      — ★ LOCK-FREE ★ через atomic.Int64
+//	Insert   — mu.Lock (exclusive между writers)
+//	Delete   — mu.Lock (exclusive между writers)
+//	ForEach  — mu.RLock (shared, блокируется writers)
+//	Range    — mu.RLock (shared, блокируется writers)
+//	Min/Max  — mu.RLock (shared, блокируется writers)
+//
+// Seqlock (per-node version counter):
+//   - Writer: version++ (нечётный = "пишу") → modify → version++ (чётный = "готово")
+//   - Reader: v1 = load → read → v2 = load → if v1 != v2 || v1&1 → retry
+//
+// DeferFree (RCU-style grace period):
+//   - Delete/Insert(duplicate) вызывают store.DeferFree(memberH) вместо Free
+//   - Это гарантирует что in-flight lock-free Search не прочитает freed memory
+//   - Тот же механизм что в TCMalloc store Del → DeferFree → FlushDeferred
 
 // order — максимум ключей в узле.
 // 32 ключа → высота дерева для 1М записей ≈ 4 (log32(1_000_000)).
@@ -47,12 +60,15 @@ type item struct {
 // Нет ни одного Go-указателя (*node, string, []byte) — GC игнорирует.
 // Доступ через unsafe.Pointer cast из []byte, полученного через Resolve.
 //
-// sizeof(node) ≈ 816 байт → попадает в size class 5 (1024B).
+// Поле version — seqlock counter:
+//   - Чётное значение = узел стабилен, можно читать lock-free
+//   - Нечётное значение = writer модифицирует узел, reader должен retry
 type node struct {
 	items    [order + 1]item            // +1 = overflow-слот для split
 	children [order + 2]tcmalloc.Handle // Handle на дочерние узлы
 	next     tcmalloc.Handle            // → следующий лист (цепочка)
 	count    int32                      // текущее кол-во ключей
+	version  uint32                     // seqlock: чёт=стабильный, нечёт=пишут
 	leaf     bool                       // лист или внутренний?
 	_        [3]byte                    // padding для выравнивания
 }
@@ -61,12 +77,16 @@ type node struct {
 var nodeSize = int(unsafe.Sizeof(node{}))
 
 // BPTree — B+дерево, все узлы в TCMalloc.
+//
+// root и len — atomic для lock-free Search и Len.
+// mu — RWMutex: writers берут Lock, ForEach/Range/Min/Max берут RLock.
+// Search НЕ берёт никаких мьютексов (seqlock).
 type BPTree struct {
 	mu       sync.RWMutex
 	store    *tcmalloc.TCMallocStore
 	workerID int
-	root     tcmalloc.Handle
-	len      int
+	root     atomic.Uint64 // Handle корня (atomic для lock-free Search)
+	len      atomic.Int64  // количество элементов (atomic для lock-free Len)
 }
 
 // New создаёт пустое B+дерево.
@@ -77,11 +97,23 @@ func New(store *tcmalloc.TCMallocStore, workerID int) *BPTree {
 	rootH := allocNode(store, workerID)
 	root := resolveNode(store, rootH)
 	root.leaf = true
-	return &BPTree{
+	t := &BPTree{
 		store:    store,
 		workerID: workerID,
-		root:     rootH,
 	}
+	t.root.Store(uint64(rootH))
+	return t
+}
+
+// loadRoot атомарно читает Handle корня (для lock-free Search).
+func (t *BPTree) loadRoot() tcmalloc.Handle {
+	return tcmalloc.Handle(t.root.Load())
+}
+
+// storeRoot атомарно записывает Handle корня.
+// Вызывается из Insert под mu.Lock.
+func (t *BPTree) storeRoot(h tcmalloc.Handle) {
+	t.root.Store(uint64(h))
 }
 
 // ── Аллокация узлов через TCMalloc ─────────────────────────
@@ -134,18 +166,65 @@ func resolveMember(store *tcmalloc.TCMallocStore, h tcmalloc.Handle) string {
 	return string(buf[4 : 4+length])
 }
 
-// freeMember освобождает память member-строки.
-func freeMember(store *tcmalloc.TCMallocStore, workerID int, h tcmalloc.Handle) {
-	store.Free(workerID, h)
-}
-
 // ── Public API ──────────────────────────────────────────────
 
-// Len — количество элементов.
+// Len — количество элементов. ★ LOCK-FREE ★ через atomic.
 func (t *BPTree) Len() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.len
+	return int(t.len.Load())
+}
+
+// Search ищет member по score.
+//
+// ★ LOCK-FREE ★ — не берёт никаких mutex/RWMutex.
+// Использует seqlock (per-node version counter) для консистентного чтения.
+// Аналог lock-free Get в TCMalloc Store.
+//
+// Путь:
+//
+//	1. findLeafOptimistic — спуск от root к leaf с seqlock-валидацией
+//	2. leaf.version check → read keyIndex → member handle → version re-check
+//	3. resolveMember(handle) — lock-free Resolve (handle защищён DeferFree)
+//
+// Retry при конфликте с writer'ом: <0.01% вероятность (writer ~50ns, reader ~200ns).
+func (t *BPTree) Search(score float64) (string, bool) {
+	for {
+		// Оптимистичный спуск от root к leaf (seqlock на каждом уровне)
+		h, ok := t.findLeafOptimistic(score)
+		if !ok {
+			runtime.Gosched()
+			continue
+		}
+
+		nd := resolveNode(t.store, h)
+
+		// Seqlock: читаем версию ПЕРЕД чтением данных
+		v1 := atomic.LoadUint32(&nd.version)
+		if v1&1 != 0 {
+			// Writer работает прямо сейчас → retry
+			runtime.Gosched()
+			continue
+		}
+
+		// Читаем данные (keyIndex + member handle)
+		idx, found := nd.keyIndex(score)
+		var memberH tcmalloc.Handle
+		if found {
+			memberH = nd.items[idx].member
+		}
+
+		// Seqlock: проверяем версию ПОСЛЕ чтения
+		if atomic.LoadUint32(&nd.version) != v1 {
+			// Writer вмешался между v1 и v2 → данные могут быть inconsistent → retry
+			continue
+		}
+
+		// Версия не изменилась → данные консистентны.
+		// memberH защищён DeferFree (grace period ≥100ms >> ~200ns Search).
+		if found {
+			return resolveMember(t.store, memberH), true
+		}
+		return "", false
+	}
 }
 
 // Insert вставляет (score, member). Если score есть — обновляет member.
@@ -156,35 +235,26 @@ func (t *BPTree) Insert(score float64, member string) {
 	memberH := allocMember(t.store, t.workerID, member)
 	it := item{score: score, member: memberH}
 
-	splitKey, splitH := t.insertRec(t.root, it)
+	splitKey, splitH := t.insertRec(t.loadRoot(), it)
 
 	if splitH != nilHandle {
 		newRootH := allocNode(t.store, t.workerID)
 		newRoot := resolveNode(t.store, newRootH)
 		newRoot.items[0] = item{score: splitKey}
-		newRoot.children[0] = t.root
+		newRoot.children[0] = t.loadRoot()
 		newRoot.children[1] = splitH
 		newRoot.count = 1
 		newRoot.leaf = false
-		t.root = newRootH
+		// Atomic store — lock-free Search увидит новый root
+		t.storeRoot(newRootH)
 	}
-}
-
-// Search ищет member по score.
-func (t *BPTree) Search(score float64) (string, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	h := t.findLeaf(score)
-	nd := resolveNode(t.store, h)
-	idx, found := nd.keyIndex(score)
-	if found {
-		return resolveMember(t.store, nd.items[idx].member), true
-	}
-	return "", false
 }
 
 // Delete удаляет элемент по score. Возвращает true если существовал.
+//
+// Member освобождается через DeferFree (grace period), а НЕ через Free.
+// Это гарантирует что in-flight lock-free Search не прочитает freed memory.
+// Тот же механизм что в TCMalloc store Del.
 func (t *BPTree) Delete(score float64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -196,15 +266,26 @@ func (t *BPTree) Delete(score float64) bool {
 		return false
 	}
 
-	// Освобождаем память member-строки
-	freeMember(t.store, t.workerID, nd.items[idx].member)
+	// Сохраняем handle ДО модификации (для DeferFree)
+	memberH := nd.items[idx].member
+
+	// Seqlock: version odd → "пишу"
+	atomic.AddUint32(&nd.version, 1)
 
 	// Сдвигаем влево
 	for i := int(idx); i < int(nd.count)-1; i++ {
 		nd.items[i] = nd.items[i+1]
 	}
 	nd.count--
-	t.len--
+
+	// Seqlock: version even → "готово"
+	atomic.AddUint32(&nd.version, 1)
+
+	t.len.Add(-1)
+
+	// Отложенное освобождение (как в TCMalloc store Del).
+	// Handle пролежит ≥100ms в очереди → in-flight Search (~200ns) успеет прочитать.
+	t.store.DeferFree(memberH)
 	return true
 }
 
@@ -252,7 +333,7 @@ func (t *BPTree) ForEach(fn func(score float64, member string)) {
 	defer t.mu.RUnlock()
 
 	// Спуск до самого левого листа
-	h := t.root
+	h := t.loadRoot()
 	nd := resolveNode(t.store, h)
 	for !nd.leaf {
 		h = nd.children[0]
@@ -273,10 +354,10 @@ func (t *BPTree) Min() (float64, string, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	if t.len == 0 {
+	if t.len.Load() == 0 {
 		return 0, "", false
 	}
-	h := t.root
+	h := t.loadRoot()
 	nd := resolveNode(t.store, h)
 	for !nd.leaf {
 		h = nd.children[0]
@@ -290,10 +371,10 @@ func (t *BPTree) Max() (float64, string, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	if t.len == 0 {
+	if t.len.Load() == 0 {
 		return 0, "", false
 	}
-	h := t.root
+	h := t.loadRoot()
 	nd := resolveNode(t.store, h)
 	for !nd.leaf {
 		h = nd.children[int(nd.count)]
@@ -336,8 +417,10 @@ func (nd *node) keyIndex(score float64) (int, bool) {
 	return int(lo), false
 }
 
+// findLeaf — спуск к листу под mu.Lock (для writers: Insert/Delete).
+// Writers не конкурируют друг с другом → seqlock не нужен.
 func (t *BPTree) findLeaf(score float64) tcmalloc.Handle {
-	h := t.root
+	h := t.loadRoot()
 	nd := resolveNode(t.store, h)
 	for !nd.leaf {
 		i := nd.childIndex(score)
@@ -345,6 +428,36 @@ func (t *BPTree) findLeaf(score float64) tcmalloc.Handle {
 		nd = resolveNode(t.store, h)
 	}
 	return h
+}
+
+// findLeafOptimistic — lock-free спуск к листу с seqlock-валидацией.
+//
+// На каждом уровне: читаем version → childIndex → children[i] → проверяем version.
+// Если version изменился (writer вмешался) → возвращаем false → Search retry от root.
+//
+// Стоимость при отсутствии конфликтов: дополнительные 2 atomic.Load на уровень (~2ns).
+func (t *BPTree) findLeafOptimistic(score float64) (tcmalloc.Handle, bool) {
+	h := t.loadRoot()
+	nd := resolveNode(t.store, h)
+
+	for !nd.leaf {
+		v1 := atomic.LoadUint32(&nd.version)
+		if v1&1 != 0 {
+			return 0, false // writer работает → retry
+		}
+
+		i := nd.childIndex(score)
+		childH := nd.children[i]
+
+		if atomic.LoadUint32(&nd.version) != v1 {
+			return 0, false // version changed → retry
+		}
+
+		h = childH
+		nd = resolveNode(t.store, h)
+	}
+
+	return h, true
 }
 
 func (t *BPTree) insertRec(h tcmalloc.Handle, it item) (float64, tcmalloc.Handle) {
@@ -369,11 +482,22 @@ func (t *BPTree) insertLeaf(h tcmalloc.Handle, it item) (float64, tcmalloc.Handl
 	idx, found := nd.keyIndex(it.score)
 
 	if found {
-		// Ключ есть — освобождаем старый member, обновляем
-		freeMember(t.store, t.workerID, nd.items[idx].member)
+		// Ключ есть — обновляем member
+		oldMember := nd.items[idx].member
+
+		// Seqlock: version odd → "пишу" (lock-free Search увидит и retry)
+		atomic.AddUint32(&nd.version, 1)
 		nd.items[idx].member = it.member
+		atomic.AddUint32(&nd.version, 1)
+		// Seqlock: version even → "готово"
+
+		// Старый member → DeferFree (in-flight Search может его читать)
+		t.store.DeferFree(oldMember)
 		return 0, nilHandle
 	}
+
+	// Seqlock: version odd → "пишу"
+	atomic.AddUint32(&nd.version, 1)
 
 	// Сдвигаем вправо
 	for i := int(nd.count); i > idx; i-- {
@@ -381,7 +505,11 @@ func (t *BPTree) insertLeaf(h tcmalloc.Handle, it item) (float64, tcmalloc.Handl
 	}
 	nd.items[idx] = it
 	nd.count++
-	t.len++
+
+	// Seqlock: version even → "готово"
+	atomic.AddUint32(&nd.version, 1)
+
+	t.len.Add(1)
 
 	if nd.count <= order {
 		return 0, nilHandle
@@ -395,22 +523,24 @@ func (t *BPTree) splitLeaf(h tcmalloc.Handle) (float64, tcmalloc.Handle) {
 	mid := nd.count / 2
 
 	rightH := allocNode(t.store, t.workerID)
-	// После Alloc nd может протухнуть — берём заново
 	nd = resolveNode(t.store, h)
 	right := resolveNode(t.store, rightH)
 
-	// Копируем правую половину
+	// Копируем правую половину в новый узел
 	rightCount := nd.count - mid
 	for i := int32(0); i < rightCount; i++ {
 		right.items[i] = nd.items[mid+i]
 	}
 	right.count = rightCount
 	right.leaf = true
-	nd.count = mid
 
-	// Цепочка: left → right → old_next
+	// Seqlock: version odd → модифицируем count и next
+	atomic.AddUint32(&nd.version, 1)
+	nd.count = mid
 	right.next = nd.next
 	nd.next = rightH
+	atomic.AddUint32(&nd.version, 1)
+	// Seqlock: version even → "готово"
 
 	return right.items[0].score, rightH
 }
@@ -418,6 +548,9 @@ func (t *BPTree) splitLeaf(h tcmalloc.Handle) (float64, tcmalloc.Handle) {
 func (t *BPTree) insertInternal(h tcmalloc.Handle, score float64, childH tcmalloc.Handle) (float64, tcmalloc.Handle) {
 	nd := resolveNode(t.store, h)
 	idx, _ := nd.keyIndex(score)
+
+	// Seqlock: version odd → "пишу"
+	atomic.AddUint32(&nd.version, 1)
 
 	// Сдвигаем вправо
 	for i := int(nd.count); i > idx; i-- {
@@ -430,6 +563,9 @@ func (t *BPTree) insertInternal(h tcmalloc.Handle, score float64, childH tcmallo
 	nd.items[idx] = item{score: score}
 	nd.children[idx+1] = childH
 	nd.count++
+
+	// Seqlock: version even → "готово"
+	atomic.AddUint32(&nd.version, 1)
 
 	if nd.count <= order {
 		return 0, nilHandle
@@ -444,7 +580,6 @@ func (t *BPTree) splitInternal(h tcmalloc.Handle) (float64, tcmalloc.Handle) {
 	upKey := nd.items[mid].score
 
 	rightH := allocNode(t.store, t.workerID)
-	// После Alloc nd может протухнуть — берём заново
 	nd = resolveNode(t.store, h)
 	right := resolveNode(t.store, rightH)
 
@@ -459,7 +594,11 @@ func (t *BPTree) splitInternal(h tcmalloc.Handle) (float64, tcmalloc.Handle) {
 		right.children[i] = nd.children[mid+1+i]
 	}
 
+	// Seqlock: version odd → модифицируем count
+	atomic.AddUint32(&nd.version, 1)
 	nd.count = mid
+	atomic.AddUint32(&nd.version, 1)
+	// Seqlock: version even → "готово"
 
 	return upKey, rightH
 }

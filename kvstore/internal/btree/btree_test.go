@@ -319,3 +319,61 @@ func BenchmarkRangeSearch(b *testing.B) {
 		tree.RangeSearch(float64(i%99000), float64(i%99000+100))
 	}
 }
+
+// ── Concurrent Benchmarks (seqlock) ─────────────────────────
+
+// BenchmarkSearchParallel — параллельные lock-free Search'ы.
+// С RWMutex: reader'ы конкурируют через RLock atomic counter.
+// С seqlock: reader'ы полностью независимы, zero contention.
+func BenchmarkSearchParallel(b *testing.B) {
+	tree, _ := newTestTree()
+	for i := 0; i < 100000; i++ {
+		tree.Insert(float64(i), "v")
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			tree.Search(float64(i % 100000))
+			i++
+		}
+	})
+}
+
+// BenchmarkSearchParallelWithWrites — 90% read / 10% write mix.
+// Показывает эффект lock-free Search при конкурентных Insert/Delete.
+// Writer'ы берут mu.Lock, но reader'ы (Search) НЕ блокируются.
+func BenchmarkSearchParallelWithWrites(b *testing.B) {
+	tree, _ := newTestTree()
+	for i := 0; i < 100000; i++ {
+		tree.Insert(float64(i), "v")
+	}
+
+	// Фоновый writer: Insert + Delete в цикле
+	stopCh := make(chan struct{})
+	go func() {
+		j := 200000
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+				tree.Insert(float64(j), "w")
+				tree.Delete(float64(j))
+				j++
+			}
+		}
+	}()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			tree.Search(float64(i % 100000))
+			i++
+		}
+	})
+	b.StopTimer()
+	close(stopCh)
+}
+

@@ -56,6 +56,7 @@ func main() {
 
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
 	s := tcmalloc.NewTCMallocStore(runtime.NumCPU())
+	defer s.Close() // останавливает внутреннюю горутину deferred free
 
 	// Инициализация метрик памяти TCMalloc
 	monitoring.InitMemoryMetrics(

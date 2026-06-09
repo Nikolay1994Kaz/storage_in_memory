@@ -672,12 +672,28 @@ func TestStore_LargeObject_MemoryAccounting(t *testing.T) {
 
 	store.Del(0, "big")
 
+	// С deferred free память НЕ освобождается сразу — handle в очереди.
 	memAfterDel := store.UsedMemory()
-	if memAfterDel >= memAfterSet {
-		t.Fatalf("memory didn't decrease after Del: set=%d, del=%d (leak!)",
-			memAfterSet, memAfterDel)
+	if memAfterDel < memAfterSet {
+		t.Fatal("memory decreased immediately after Del (should be deferred)")
 	}
 
-	t.Logf("memory: before=%d, afterSet=%d, afterDel=%d (freed %d bytes)",
-		memBefore, memAfterSet, memAfterDel, memAfterSet-memAfterDel)
+	// Двойная буферизация: нужно ДВА вызова FlushDeferred.
+	// Вызов 1: deferPrev=empty(free nothing), deferCurr→deferPrev
+	store.FlushDeferred()
+	// Вызов 2: deferPrev=handles(free them), deferCurr→deferPrev
+	freed := store.FlushDeferred()
+
+	if freed == 0 {
+		t.Fatal("FlushDeferred should have freed at least 1 handle")
+	}
+
+	memAfterFlush := store.UsedMemory()
+	if memAfterFlush >= memAfterSet {
+		t.Fatalf("memory didn't decrease after FlushDeferred: set=%d, flush=%d (leak!)",
+			memAfterSet, memAfterFlush)
+	}
+
+	t.Logf("memory: before=%d, afterSet=%d, afterFlush=%d (freed %d bytes, %d handles)",
+		memBefore, memAfterSet, memAfterFlush, memAfterSet-memAfterFlush, freed)
 }
