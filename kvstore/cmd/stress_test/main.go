@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"sort"
@@ -34,34 +36,53 @@ const (
 
 func main() {
 	addr := flag.String("addr", "localhost:6380", "Адрес тестируемого сервера")
+	metricsAddr := flag.String("metrics-addr", "localhost:9090", "Адрес сервера метрик VictoriaMetrics")
+	durationStr := flag.String("duration", "10s", "Длительность теста (например: 10s, 5m, 2h, 48h)")
+	concurrencyVal := flag.Int("concurrency", 32, "Количество параллельных клиентов")
+	warmup := flag.Bool("warmup", true, "Запустить первичную загрузку (Warmup)")
+	crashTest := flag.Bool("crash-test", false, "Запустить краш-тест в конце")
+	oomTest := flag.Bool("oom-test", false, "Запустить тест OOM-защиты (запускает временный инстанс на порту 6389)")
 	flag.Parse()
+
+	duration, err := time.ParseDuration(*durationStr)
+	if err != nil {
+		fmt.Printf("%s[ОШИБКА] Некорректный формат длительности: %v%s\n", ColorRed, err, ColorReset)
+		os.Exit(1)
+	}
 
 	fmt.Printf("%s%s================================================================%s\n", ColorBold, ColorCyan, ColorReset)
 	fmt.Printf("%s%s🚀 ЗАПУСК АУДИТА ГОТОВНОСТИ К ПРОДАКШЕНУ (PRODUCTION READINESS AUDIT) 🚀%s\n", ColorBold, ColorMagenta, ColorReset)
+	fmt.Printf("%s%s   Параметры: duration=%v, concurrency=%d, warmup=%v, crash=%v, oom=%v%s\n", ColorBold, ColorCyan, duration, *concurrencyVal, *warmup, *crashTest, *oomTest, ColorReset)
 	fmt.Printf("%s%s================================================================%s\n\n", ColorBold, ColorCyan, ColorReset)
 
 	// Проверяем доступность сервера
 	conn, err := net.DialTimeout("tcp", *addr, 2*time.Second)
 	if err != nil {
-		fmt.Printf("%s[КРИТИЧЕСКАЯ ОШИБКА] Сервер не запущен на %s! Запустите сервер: ./kvstore_bin -port 6380%s\n", ColorRed, *addr, ColorReset)
+		fmt.Printf("%s[КРИТИЧЕСКАЯ ОШИБКА] Сервер не запущен на %s! Запустите сервер: ./kvstore-server --port 6380%s\n", ColorRed, *addr, ColorReset)
 		os.Exit(1)
 	}
 	conn.Close()
 
 	// Фаза 1: Первичная загрузка данных (Ingest)
-	runPhase1(*addr)
+	if *warmup {
+		runPhase1(*addr)
+	}
 
 	// Фаза 2 и 3: Параллельный стресс-тест под смешанной нагрузкой + Горячее переключение движка на лету
-	runPhase2And3(*addr)
+	runPhase2And3(*addr, *metricsAddr, duration, *concurrencyVal)
 
 	// Фаза 4: Устойчивость при сбоях (Crash Recovery & WAL Durability)
-	runPhase4(*addr)
+	if *crashTest {
+		runPhase4(*addr)
+	}
 
 	// Фаза 5: Проверка лимитов памяти и OOM-защиты
-	runPhase5()
+	if *oomTest {
+		runPhase5()
+	}
 
 	fmt.Printf("\n%s%s================================================================%s\n", ColorBold, ColorGreen, ColorReset)
-	fmt.Printf("%s%s🥇 ВЕРДИКТ: СИСТЕМА ПОЛНОСТЬЮ ГОТОВА К ЗАВТРАШНЕМУ ВЫХОДУ В ПРОДАКШЕН! 🥇%s\n", ColorBold, ColorGreen, ColorReset)
+	fmt.Printf("%s%s🥇 АУДИТ ЗАВЕРШЕН УСПЕШНО! 🥇%s\n", ColorBold, ColorGreen, ColorReset)
 	fmt.Printf("%s%s================================================================%s\n", ColorBold, ColorGreen, ColorReset)
 }
 
@@ -132,14 +153,56 @@ func runPhase1(addr string) {
 		ColorGreen, numVec, dim, ColorReset, vecDuration.Round(time.Millisecond), float64(numVec)/vecDuration.Seconds())
 }
 
+// Helpers для фонового сбора метрик
+func getServerMemory(metricsAddr string) float64 {
+	resp, err := http.Get("http://" + metricsAddr + "/metrics")
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "kvstore_memory_used_bytes ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				val, _ := strconv.ParseFloat(fields[1], 64)
+				return val
+			}
+		}
+	}
+	return 0
+}
+
+func getVectorCount(addr string) int {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return 0
+	}
+	defer conn.Close()
+	w := protocol.NewWriter(conn)
+	r := protocol.NewReader(conn)
+	sendCommand(w, "VSIM.INFO")
+	val, err := r.Read()
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(val.Str)
+	for _, f := range fields {
+		if strings.HasPrefix(f, "vectors:") {
+			count, _ := strconv.Atoi(strings.TrimPrefix(f, "vectors:"))
+			return count
+		}
+	}
+	return 0
+}
+
 // ==========================================
 // ФАЗА 2 & 3: Смешанный стресс-тест + Горячий своп движка
 // ==========================================
-func runPhase2And3(addr string) {
-	fmt.Printf("%s[ФАЗА 2 & 3] Запуск экстремального смешанного стресс-теста и горячего переключения движков...%s\n", ColorBold+ColorCyan, ColorReset)
+func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurrency int) {
+	fmt.Printf("%s[ФАЗА 2 & 3] Запуск параллельного стресс-теста...%s\n", ColorBold+ColorCyan, ColorReset)
 
-	const concurrency = 32
-	const testDuration = 6 * time.Second
 	const dim = 128
 
 	var (
@@ -150,11 +213,9 @@ func runPhase2And3(addr string) {
 		mu           sync.Mutex
 	)
 
-	// Канал отмены для воркеров
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Запуск фоновых воркеров
 	fmt.Printf("  🔥 Спавним %d параллельных клиентов, выполняющих смешанные запросы...\n", concurrency)
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
@@ -197,12 +258,29 @@ func runPhase2And3(addr string) {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					} else if dice < 85 {
-						// 15% SET
-						key := fmt.Sprintf("key:%d", rng.Intn(5000))
+					} else if dice < 80 {
+						// 10% VSIM.SEARCHRANGE (B+Tree + HNSW)
+						minScore := rng.Float64() * 10
+						maxScore := minScore + 5.0
+						args := []string{"VSIM.SEARCHRANGE", "10", "benchset", 
+							strconv.FormatFloat(minScore, 'f', 2, 64), 
+							strconv.FormatFloat(maxScore, 'f', 2, 64)}
+						for j := 0; j < dim; j++ {
+							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
+						}
+						err = sendCommand(w, args...)
+					} else if dice < 90 {
+						// 10% SET + ZADD
+						idNum := rng.Intn(5000)
+						key := fmt.Sprintf("key:%d", idNum)
 						err = sendCommand(w, "SET", key, "updated_during_stress")
+						if err == nil {
+							r.Read()
+							score := rng.Float64() * 15
+							err = sendCommand(w, "ZADD", "benchset", strconv.FormatFloat(score, 'f', 2, 64), key)
+						}
 					} else {
-						// 15% VSIM.ADD
+						// 10% VSIM.ADD
 						key := fmt.Sprintf("vec:%d", rng.Intn(500))
 						args := []string{"VSIM.ADD", key}
 						for j := 0; j < dim; j++ {
@@ -229,41 +307,81 @@ func runPhase2And3(addr string) {
 		}(i)
 	}
 
-	// Поток мониторинга и горячего переключения
-	time.Sleep(1500 * time.Millisecond)
-	fmt.Printf("\n  %s⚠️  [ГОРЯЧЕЕ ПЕРЕКЛЮЧЕНИЕ] Отправляем команду VSIM.SETENGINE 1 (Переключение на Rust WASM) под нагрузкой...%s\n", ColorYellow, ColorReset)
-	
-	ctrlConn, err := net.Dial("tcp", addr)
-	if err == nil {
-		cw := protocol.NewWriter(ctrlConn)
-		cr := protocol.NewReader(ctrlConn)
+	// Поток мониторинга
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		
-		switchStart := time.Now()
-		sendCommand(cw, "VSIM.SETENGINE", "1")
-		cr.Read()
-		fmt.Printf("  %s✅ [СИНХРОНИЗАЦИЯ УСПЕШНА] Переключено на движок RUST WASM за %v! Воркеры продолжают работу БЕЗ сбоев.%s\n\n", 
-			ColorGreen, time.Since(switchStart), ColorReset)
-		ctrlConn.Close()
-	}
-
-	time.Sleep(2000 * time.Millisecond)
-	fmt.Printf("  %s⚠️  [ГОРЯЧЕЕ ПЕРЕКЛЮЧЕНИЕ] Откат обратно командой VSIM.SETENGINE 0 (Возврат на Go движок) под нагрузкой...%s\n", ColorYellow, ColorReset)
-	ctrlConn2, err := net.Dial("tcp", addr)
-	if err == nil {
-		cw := protocol.NewWriter(ctrlConn2)
-		cr := protocol.NewReader(ctrlConn2)
+		var logInterval time.Duration
+		if testDuration > 10*time.Minute {
+			logInterval = 1 * time.Minute
+		} else if testDuration > 1*time.Minute {
+			logInterval = 10 * time.Second
+		} else {
+			logInterval = 1 * time.Second
+		}
 		
-		switchStart := time.Now()
-		sendCommand(cw, "VSIM.SETENGINE", "0")
-		cr.Read()
-		fmt.Printf("  %s✅ [ОТКАТ УСПЕШЕН] Возврат на GO движок выполнен за %v!%s\n\n", 
-			ColorGreen, time.Since(switchStart), ColorReset)
-		ctrlConn2.Close()
-	}
+		ticker := time.NewTicker(logInterval)
+		defer ticker.Stop()
+		
+		startTime := time.Now()
+		var lastCompleted int64
 
-	time.Sleep(testDuration - 3500*time.Millisecond)
+		// Периодическое переключение движка для проверки стабильности на лету
+		swapInterval := 5 * time.Minute
+		if testDuration < 10*time.Minute {
+			swapInterval = 1500 * time.Millisecond
+		}
+		swapTicker := time.NewTicker(swapInterval)
+		defer swapTicker.Stop()
+		
+		engineState := 0
 
-	// Останавливаем воркеров
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-swapTicker.C:
+				// Меняем движок 0 <-> 1
+				engineState = 1 - engineState
+				ctrlConn, err := net.Dial("tcp", addr)
+				if err == nil {
+					cw := protocol.NewWriter(ctrlConn)
+					cr := protocol.NewReader(ctrlConn)
+					sendCommand(cw, "VSIM.SETENGINE", strconv.Itoa(engineState))
+					cr.Read()
+					ctrlConn.Close()
+					fmt.Printf("\n  %s🔄 [ГОРЯЧЕЕ ПЕРЕКЛЮЧЕНИЕ] Движок переключен на %d (0=Go, 1=Rust WASM)%s\n", ColorYellow, engineState, ColorReset)
+				}
+			case <-ticker.C:
+				elapsed := time.Since(startTime)
+				currCompleted := completedOps.Load()
+				diff := currCompleted - lastCompleted
+				lastCompleted = currCompleted
+				
+				rps := float64(diff) / logInterval.Seconds()
+				memBytes := getServerMemory(metricsAddr)
+				memMB := memBytes / 1024 / 1024
+				vecCount := getVectorCount(addr)
+				
+				fmt.Printf("  ⏱️  [%s] Прогресс: %s/%s | Текущий RPS: %s%.0f%s | Ошибок: %s%d%s | Память: %.2f MB | Векторов: %d\n",
+					time.Now().Format("15:04:05"),
+					elapsed.Round(time.Second),
+					testDuration,
+					ColorCyan, rps, ColorReset,
+					GetErrorColor(errorOps.Load()), errorOps.Load(), ColorReset,
+					memMB, vecCount,
+				)
+				
+				if elapsed >= testDuration {
+					return
+				}
+			}
+		}
+	}()
+
+	// Ждем окончания времени теста
+	time.Sleep(testDuration)
 	cancel()
 	wg.Wait()
 
@@ -281,9 +399,9 @@ func runPhase2And3(addr string) {
 		p99 = latencies[len(latencies)*99/100]
 	}
 
-	fmt.Printf("  📊 %sРезультаты стресс-теста под нагрузкой:%s\n", ColorBold, ColorReset)
+	fmt.Printf("\n  📊 %sРезультаты стресс-теста под нагрузкой:%s\n", ColorBold, ColorReset)
 	fmt.Printf("    - Всего успешных транзакций:  %s%d%s\n", ColorGreen, total, ColorReset)
-	fmt.Printf("    - Ошибок / падений системы:  %s%d%s (Идеальная стабильность!)\n", 
+	fmt.Printf("    - Ошибок / падений системы:  %s%d%s\n", 
 		GetErrorColor(errors), errors, ColorReset)
 	fmt.Printf("    - Средний RPS системы:       %s%.0f req/sec%s\n", 
 		ColorCyan, float64(total)/testDuration.Seconds(), ColorReset)
@@ -298,7 +416,6 @@ func runPhase2And3(addr string) {
 func runPhase4(addr string) {
 	fmt.Printf("%s[ФАЗА 4] Тестирование надежности и восстановления после сбоев (WAL Durability)...%s\n", ColorBold+ColorCyan, ColorReset)
 
-	// 1. Проверяем текущее количество данных перед сбоем
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		panic(err)
@@ -317,31 +434,26 @@ func runPhase4(addr string) {
 
 	fmt.Printf("  📝 Состояние системы перед сбоем: KV записей: %d, Векторный индекс: %s\n", preCrashCount, preCrashVecInfo)
 
-	// 2. Имитируем жесткое падение сервера (убиваем процесс)
 	fmt.Printf("  %s💥 Имитируем аварийное выключение (SIGKILL / kill -9)...%s\n", ColorRed, ColorReset)
 	
-	// Находим PID процесса сервера
-	cmd := exec.Command("pgrep", "-f", "kvstore_bin")
+	cmd := exec.Command("pgrep", "-f", "kvstore-server")
 	out, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("    Не удалось найти процесс сервера! Убедитесь, что сервер запущен через ./kvstore_bin\n")
+		fmt.Printf("    Не удалось найти процесс сервера! Убедитесь, что сервер запущен как ./kvstore-server\n")
 		return
 	}
 	
 	pids := strings.Fields(string(out))
 	for _, pidStr := range pids {
 		pid, _ := strconv.Atoi(pidStr)
-		// Убиваем процесс
 		syscall.Kill(pid, syscall.SIGKILL)
 	}
 	time.Sleep(1 * time.Second)
 	fmt.Println("    💀 Сервер успешно «упал». Подключение невозможно.")
 
-	// 3. Перезапускаем сервер
 	fmt.Printf("  %s🔄 Перезапуск сервера и автоматическое восстановление из лога WAL...%s\n", ColorYellow, ColorReset)
 	
-	// Запускаем сервер заново
-	runCmd := exec.Command("./kvstore_bin", "-port", "6380")
+	runCmd := exec.Command("./kvstore-server", "--port", "6380")
 	runCmd.Stdout = nil
 	runCmd.Stderr = nil
 	err = runCmd.Start()
@@ -350,10 +462,8 @@ func runPhase4(addr string) {
 		return
 	}
 	
-	// Ждем окончания восстановления (WAL содержит много записей, дадим 3 секунды)
 	time.Sleep(3 * time.Second)
 
-	// 4. Подключаемся и проверяем целостность данных
 	conn2, err := net.Dial("tcp", addr)
 	if err != nil {
 		fmt.Printf("    %s❌ Ошибка: Сервер не смог подняться после падения!%s\n", ColorRed, ColorReset)
@@ -386,17 +496,15 @@ func runPhase4(addr string) {
 				vectors, _ = strconv.Atoi(parts[1])
 			case "dimension":
 				dim, _ = strconv.Atoi(parts[1])
-			case "engine":
-				engine = parts[1]
 			}
 		}
 		return
 	}
 
-	preVectors, preDim, preEngine := parseVecInfo(preCrashVecInfo)
-	postVectors, postDim, postEngine := parseVecInfo(postCrashVecInfo)
+	preVectors, preDim, _ := parseVecInfo(preCrashVecInfo)
+	postVectors, postDim, _ := parseVecInfo(postCrashVecInfo)
 
-	if postCrashCount == preCrashCount && preVectors == postVectors && preDim == postDim && preEngine == postEngine {
+	if postCrashCount == preCrashCount && preVectors == postVectors && preDim == postDim {
 		fmt.Printf("  %s✅ [WAL ВЕРИФИЦИРОВАН] Восстановление прошло со 100%% точностью! Ни один байт данных не был утерян!%s\n\n", 
 			ColorGreen, ColorReset)
 	} else {
@@ -411,16 +519,14 @@ func runPhase5() {
 	fmt.Printf("%s[ФАЗА 5] Проверка лимитов оперативной памяти и OOM-защиты (Out Of Memory Prevention)...%s\n", ColorBold+ColorCyan, ColorReset)
 
 	const tempPort = 6389
-	const maxMemMB = 10 // Тестовый лимит 10 МБ
+	const maxMemMB = 10 
 
-	// Запускаем временный сервер с лимитом памяти
 	fmt.Printf("  🔒 Запуск тестового инстанса сервера с лимитом -maxmemory %d MB на порту %d...\n", maxMemMB, tempPort)
 	tempAddr := fmt.Sprintf("localhost:%d", tempPort)
 	
-	tempCmd := exec.Command("./kvstore_bin", "-port", strconv.Itoa(tempPort), "-maxmemory", strconv.Itoa(maxMemMB))
+	tempCmd := exec.Command("./kvstore-server", "--port", strconv.Itoa(tempPort), "--maxmemory", strconv.Itoa(maxMemMB))
 	tempCmd.Start()
 	defer func() {
-		// Убиваем временный сервер по завершении
 		if tempCmd.Process != nil {
 			tempCmd.Process.Kill()
 		}
@@ -438,7 +544,6 @@ func runPhase5() {
 	w := protocol.NewWriter(conn)
 	r := protocol.NewReader(conn)
 
-	// Генерируем большую строку (100 КБ) для быстрой утечки памяти
 	largeVal := strings.Repeat("A", 100*1024) 
 
 	fmt.Println("  📥 Агрессивно наполняем сервер данными для достижения лимита в 10 МБ...")

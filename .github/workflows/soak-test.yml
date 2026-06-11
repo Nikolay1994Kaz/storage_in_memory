@@ -1,0 +1,66 @@
+name: Soak Test (Load & Memory Leak Audit)
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Duration of the stress test (e.g., 10m, 1h, 5h)'
+        required: true
+        default: '5h'
+      concurrency:
+        description: 'Number of parallel clients'
+        required: true
+        default: '32'
+
+jobs:
+  soak-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+
+    - name: Build Server
+      run: |
+        go build -o kvstore-server ./kvstore/cmd/kvstore/
+
+    - name: Build Stress Test Client
+      run: |
+        go build -o kvstore-stress ./kvstore/cmd/stress_test/
+
+    - name: Start KVStore Server
+      run: |
+        ./kvstore-server --port 6380 --metrics-port 9090 > server.log 2>&1 &
+        echo "Waiting for server to spin up..."
+        sleep 3
+        # Check if server is running
+        curl -s http://localhost:9090/metrics > /dev/null && echo "Server is healthy and metrics port is open!" || (echo "Server failed to start" && exit 1)
+
+    - name: Run Soak Stress Test
+      run: |
+        duration="${{ github.event.inputs.duration || '5h' }}"
+        concurrency="${{ github.event.inputs.concurrency || '32' }}"
+        echo "Starting stress test with duration=$duration and concurrency=$concurrency..."
+        ./kvstore-stress -duration "$duration" -concurrency "$concurrency" -addr localhost:6380 -metrics-addr localhost:9090 2>&1 | tee stress.log
+
+    - name: Stop Server
+      if: always()
+      run: |
+        killall kvstore-server || true
+
+    - name: Upload Logs Artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: soak-test-logs
+        path: |
+          server.log
+          stress.log
