@@ -20,8 +20,10 @@ const (
 	OpDel     byte = 2
 	OpExpire  byte = 3 // TTL: Value = 8 байт unix nano (абсолютное время смерти)
 	OpPersist byte = 4 // Убрать TTL: Value пустой
-	OpVSimAdd byte = 5 // вектор добавлен в HNSW
-	OpVSimDel byte = 6 // вектор удалён из HNSW
+	OpVSimAdd byte = 5  // вектор добавлен в HNSW
+	OpVSimDel byte = 6  // вектор удалён из HNSW
+	OpZAdd    byte = 16 // sorted set: Key = setName, Value = [8B score LE float64][member string]
+	OpZRem    byte = 17 // sorted set: Key = setName, Value = [member string]
 )
 
 // maxEntrySize — защита от мусорных данных при recovery.

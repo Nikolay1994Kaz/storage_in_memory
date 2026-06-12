@@ -143,7 +143,7 @@ func (t *HashTable) Get(hash uint64) (uint64, bool) {
 //
 // Atomic Store нужен даже под mutex: чтобы lock-free Get()
 // в другой goroutine увидел данные через memory barrier.
-func (t *HashTable) Put(hash, handle uint64) {
+func (t *HashTable) Put(hash, handle uint64) (uint64, bool) {
 	hash = sanitizeHash(hash)
 	idx := hash & t.mask
 
@@ -157,7 +157,7 @@ func (t *HashTable) Put(hash, handle uint64) {
 			t.slots[idx].handle.Store(handle)
 			t.slots[idx].hash.Store(hash)
 			t.count++
-			return
+			return 0, false
 
 		case tombstoneHash:
 			// Переиспользуем tombstone.
@@ -165,13 +165,14 @@ func (t *HashTable) Put(hash, handle uint64) {
 			t.slots[idx].hash.Store(hash)
 			t.count++
 			t.tombstones--
-			return
+			return 0, false
 
 		case hash:
 			// Обновление существующего ключа.
 			// hash уже записан и правильный → обновляем только handle.
+			oldHandle := t.slots[idx].handle.Load()
 			t.slots[idx].handle.Store(handle)
-			return
+			return oldHandle, true
 		}
 
 		idx = (idx + 1) & t.mask

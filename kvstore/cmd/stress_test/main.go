@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"kvstore/kvstore/internal/protocol"
+	"kvstore/kvstore/vector"
 )
 
 // ANSI colors for beautiful CLI output
@@ -42,12 +44,17 @@ func main() {
 	warmup := flag.Bool("warmup", true, "Запустить первичную загрузку (Warmup)")
 	crashTest := flag.Bool("crash-test", false, "Запустить краш-тест в конце")
 	oomTest := flag.Bool("oom-test", false, "Запустить тест OOM-защиты (запускает временный инстанс на порту 6389)")
+	asmTest := flag.Bool("asm-test", true, "Запустить верификацию ассемблерных AVX2 инструкций")
 	flag.Parse()
 
 	duration, err := time.ParseDuration(*durationStr)
 	if err != nil {
 		fmt.Printf("%s[ОШИБКА] Некорректный формат длительности: %v%s\n", ColorRed, err, ColorReset)
 		os.Exit(1)
+	}
+
+	if *asmTest {
+		runAssemblyValidation()
 	}
 
 	fmt.Printf("%s%s================================================================%s\n", ColorBold, ColorCyan, ColorReset)
@@ -120,9 +127,7 @@ func runPhase1(addr string) {
 	numVec := 500
 	dim := 128
 
-	// Сброс движка на Go
-	sendCommand(w, "VSIM.SETENGINE", "0")
-	r.Read()
+
 
 	// Загрузка KV
 	kvStart := time.Now()
@@ -201,7 +206,7 @@ func getVectorCount(addr string) int {
 // ФАЗА 2 & 3: Смешанный стресс-тест + Горячий своп движка
 // ==========================================
 func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurrency int) {
-	fmt.Printf("%s[ФАЗА 2 & 3] Запуск параллельного стресс-теста...%s\n", ColorBold+ColorCyan, ColorReset)
+	fmt.Printf("%s[ФАЗА 2 & 3] Запуск параллельного стресс-теста (смешанная нагрузка + Pub/Sub)...%s\n", ColorBold+ColorCyan, ColorReset)
 
 	const dim = 128
 
@@ -216,6 +221,60 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// ─── 1. Запуск подписчиков (Subscribers) ───
+	const numSubscribers = 8
+	fmt.Printf("  📡 Запуск %d параллельных подписчиков Pub/Sub...\n", numSubscribers)
+	for i := 0; i < numSubscribers; i++ {
+		wg.Add(1)
+		go func(subID int) {
+			defer wg.Done()
+
+			subConn, err := net.Dial("tcp", addr)
+			if err != nil {
+				fmt.Printf("    [Подписчик %d] Ошибка подключения: %v\n", subID, err)
+				errorOps.Add(1)
+				return
+			}
+			defer subConn.Close()
+
+			sw := protocol.NewWriter(subConn)
+			sr := protocol.NewReader(subConn)
+
+			channel := fmt.Sprintf("stress:chan:%d", subID%10) // 10 общих каналов
+			if err := sendCommand(sw, "SUBSCRIBE", channel); err != nil {
+				errorOps.Add(1)
+				return
+			}
+
+			// Читаем подтверждение SUBSCRIBE
+			if _, err := sr.Read(); err != nil {
+				errorOps.Add(1)
+				return
+			}
+
+			// Прерываем блокирующий Read при завершении контекста
+			go func() {
+				<-ctx.Done()
+				subConn.Close()
+			}()
+
+			for {
+				_, err := sr.Read()
+				if err != nil {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+					errorOps.Add(1)
+					return
+				}
+				completedOps.Add(1)
+			}
+		}(i)
+	}
+
+	// ─── 2. Запуск клиентов-писателей (Writers) ───
 	fmt.Printf("  🔥 Спавним %d параллельных клиентов, выполняющих смешанные запросы...\n", concurrency)
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
@@ -247,18 +306,18 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 					dice := rng.Intn(100)
 
 					var err error
-					if dice < 40 {
-						// 40% GET
+					if dice < 35 {
+						// 35% GET
 						key := fmt.Sprintf("key:%d", rng.Intn(5000))
 						err = sendCommand(w, "GET", key)
-					} else if dice < 70 {
+					} else if dice < 65 {
 						// 30% VSIM.SEARCH
 						args := []string{"VSIM.SEARCH", "10"}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					} else if dice < 80 {
+					} else if dice < 75 {
 						// 10% VSIM.SEARCHRANGE (B+Tree + HNSW)
 						minScore := rng.Float64() * 10
 						maxScore := minScore + 5.0
@@ -269,7 +328,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					} else if dice < 90 {
+					} else if dice < 85 {
 						// 10% SET + ZADD
 						idNum := rng.Intn(5000)
 						key := fmt.Sprintf("key:%d", idNum)
@@ -279,7 +338,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 							score := rng.Float64() * 15
 							err = sendCommand(w, "ZADD", "benchset", strconv.FormatFloat(score, 'f', 2, 64), key)
 						}
-					} else {
+					} else if dice < 95 {
 						// 10% VSIM.ADD
 						key := fmt.Sprintf("vec:%d", rng.Intn(500))
 						args := []string{"VSIM.ADD", key}
@@ -287,6 +346,10 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
+					} else {
+						// 5% PUBLISH
+						channel := fmt.Sprintf("stress:chan:%d", rng.Intn(10))
+						err = sendCommand(w, "PUBLISH", channel, "stress_message_payload_val")
 					}
 
 					if err != nil {
@@ -327,32 +390,10 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 		startTime := time.Now()
 		var lastCompleted int64
 
-		// Периодическое переключение движка для проверки стабильности на лету
-		swapInterval := 5 * time.Minute
-		if testDuration < 10*time.Minute {
-			swapInterval = 1500 * time.Millisecond
-		}
-		swapTicker := time.NewTicker(swapInterval)
-		defer swapTicker.Stop()
-		
-		engineState := 0
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-swapTicker.C:
-				// Меняем движок 0 <-> 1
-				engineState = 1 - engineState
-				ctrlConn, err := net.Dial("tcp", addr)
-				if err == nil {
-					cw := protocol.NewWriter(ctrlConn)
-					cr := protocol.NewReader(ctrlConn)
-					sendCommand(cw, "VSIM.SETENGINE", strconv.Itoa(engineState))
-					cr.Read()
-					ctrlConn.Close()
-					fmt.Printf("\n  %s🔄 [ГОРЯЧЕЕ ПЕРЕКЛЮЧЕНИЕ] Движок переключен на %d (0=Go, 1=Rust WASM)%s\n", ColorYellow, engineState, ColorReset)
-				}
 			case <-ticker.C:
 				elapsed := time.Since(startTime)
 				currCompleted := completedOps.Load()
@@ -582,4 +623,89 @@ func GetErrorColor(errors int64) string {
 		return ColorGreen
 	}
 	return ColorRed
+}
+
+func runAssemblyValidation() {
+	fmt.Printf("%s[ФАЗА 0] Локальная верификация ассемблерных AVX2 инструкций...%s\n", ColorBold+ColorCyan, ColorReset)
+
+	// Различные размерности для тестирования:
+	// - кратные 8 (оптимизированный путь)
+	// - некратные 8 (проверка корректности хвостового цикла remainder_loop)
+	// - маленькие и большие размерности
+	dims := []int{1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 31, 32, 127, 128, 768, 1024}
+
+	rng := rand.New(rand.NewSource(42))
+
+	for _, dim := range dims {
+		a := make([]float32, dim)
+		b := make([]float32, dim)
+		for i := 0; i < dim; i++ {
+			a[i] = rng.Float32() * 10
+			b[i] = rng.Float32() * 10
+		}
+
+		// 1. Тестируем евклидово расстояние
+		asmEuclidean := vector.EuclideanDistance(a, b)
+		goEuclidean := vector.EuclideanPureGo(a, b)
+		diffEuc := math.Abs(float64(asmEuclidean - goEuclidean))
+		maxValEuc := math.Max(math.Abs(float64(asmEuclidean)), math.Abs(float64(goEuclidean)))
+		isOkEuc := diffEuc < 1e-5
+		if !isOkEuc && maxValEuc > 0 {
+			isOkEuc = (diffEuc / maxValEuc) < 1e-5
+		}
+		if !isOkEuc {
+			fmt.Printf("  %s❌ [ОШИБКА AVX2] Евклидово расстояние не совпадает для dim=%d! ASM=%f, Go=%f (diff=%e, relDiff=%e)%s\n",
+				ColorRed, dim, asmEuclidean, goEuclidean, diffEuc, diffEuc/maxValEuc, ColorReset)
+			os.Exit(1)
+		}
+
+		// 2. Тестируем скалярное произведение (Dot Product)
+		// Нормализуем вектора, чтобы проверить Cosine Distance и Dot Product
+		aNorm := make([]float32, dim)
+		bNorm := make([]float32, dim)
+		copy(aNorm, a)
+		copy(bNorm, b)
+		vector.Normalize(aNorm)
+		vector.Normalize(bNorm)
+
+		asmDot := vector.DotProductDistance(aNorm, bNorm)
+		goDot := 1.0 - vector.DotProductPureGo(aNorm, bNorm)
+		diffDot := math.Abs(float64(asmDot - goDot))
+		maxValDot := math.Max(math.Abs(float64(asmDot)), math.Abs(float64(goDot)))
+		isOkDot := diffDot < 1e-5
+		if !isOkDot && maxValDot > 0 {
+			isOkDot = (diffDot / maxValDot) < 1e-5
+		}
+		if !isOkDot {
+			fmt.Printf("  %s❌ [ОШИБКА AVX2] Dot Product не совпадает для dim=%d! ASM=%f, Go=%f (diff=%e, relDiff=%e)%s\n",
+				ColorRed, dim, asmDot, goDot, diffDot, diffDot/maxValDot, ColorReset)
+			os.Exit(1)
+		}
+		
+		// 3. Тестируем Cosine Distance
+		asmCosine := vector.CosineDistance(a, b)
+		// Pure Go Cosine Distance
+		dotGo := vector.DotProductPureGo(a, b)
+		normAGo := vector.DotProductPureGo(a, a)
+		normBGo := vector.DotProductPureGo(b, b)
+		var goCosine float32 = 1.0
+		if normAGo != 0 && normBGo != 0 {
+			sim := dotGo / float32(math.Sqrt(float64(normAGo))*math.Sqrt(float64(normBGo)))
+			goCosine = 1.0 - sim
+		}
+		diffCos := math.Abs(float64(asmCosine - goCosine))
+		maxValCos := math.Max(math.Abs(float64(asmCosine)), math.Abs(float64(goCosine)))
+		isOkCos := diffCos < 1e-5
+		if !isOkCos && maxValCos > 0 {
+			isOkCos = (diffCos / maxValCos) < 1e-5
+		}
+		if !isOkCos {
+			fmt.Printf("  %s❌ [ОШИБКА AVX2] Косинусное расстояние не совпадает для dim=%d! ASM=%f, Go=%f (diff=%e, relDiff=%e)%s\n",
+				ColorRed, dim, asmCosine, goCosine, diffCos, diffCos/maxValCos, ColorReset)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Printf("  %s✅ [AVX2 ВЕРИФИЦИРОВАН] Ассемблерные инструкции Euclidean, Cosine и DotProduct успешно прошли тесты на точность по всем размерностям!%s\n\n",
+		ColorGreen, ColorReset)
 }

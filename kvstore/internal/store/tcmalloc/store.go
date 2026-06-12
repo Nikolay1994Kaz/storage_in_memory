@@ -260,9 +260,13 @@ func (s *TCMallocStore) Set(workerID int, key string, value []byte) {
 		sh.table.Store(t)
 	}
 
-	t.Put(hash, uint64(handle))
+	oldHandle, overwritten := t.Put(hash, uint64(handle))
 
 	sh.mu.Unlock()
+
+	if overwritten {
+		s.DeferFree(Handle(oldHandle))
+	}
 }
 
 // Get читает значение по ключу.

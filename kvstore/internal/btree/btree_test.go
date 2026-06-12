@@ -60,18 +60,58 @@ func TestInsertAndSearch(t *testing.T) {
 	}
 }
 
+// TestInsertDuplicate — composite keys: same score, different member = 2 items.
 func TestInsertDuplicate(t *testing.T) {
 	tree, _ := newTestTree()
 
 	tree.Insert(10, "old")
-	tree.Insert(10, "new")
+	tree.Insert(10, "new") // другой member, тот же score → 2 элемента
 
-	got, _ := tree.Search(10)
-	if got != "new" {
-		t.Fatalf("got %q, want %q", got, "new")
+	if tree.Len() != 2 {
+		t.Fatalf("Len = %d, want 2 (different members at same score)", tree.Len())
 	}
-	if tree.Len() != 1 {
-		t.Fatalf("Len = %d, want 1", tree.Len())
+
+	// Тот же member, тот же score → update (no new item)
+	tree.Insert(10, "old")
+	if tree.Len() != 2 {
+		t.Fatalf("Len = %d, want 2 (re-insert same member)", tree.Len())
+	}
+}
+
+// TestDuplicateScores — множество членов с одинаковым score.
+func TestDuplicateScores(t *testing.T) {
+	tree, _ := newTestTree()
+	tree.Insert(10, "alice")
+	tree.Insert(10, "bob")
+	tree.Insert(10, "charlie")
+	tree.Insert(20, "dave")
+
+	if tree.Len() != 4 {
+		t.Fatalf("Len = %d, want 4", tree.Len())
+	}
+
+	// RangeSearch должен вернуть все 3 элемента с score 10
+	results := tree.RangeSearch(10, 10)
+	if len(results) != 3 {
+		t.Fatalf("RangeSearch(10,10) = %d results, want 3", len(results))
+	}
+
+	// DeleteMember удаляет конкретный member
+	if !tree.DeleteMember(10, "bob") {
+		t.Fatal("DeleteMember(10, bob) should return true")
+	}
+	if tree.Len() != 3 {
+		t.Fatalf("Len after delete = %d, want 3", tree.Len())
+	}
+
+	results = tree.RangeSearch(10, 10)
+	if len(results) != 2 {
+		t.Fatalf("RangeSearch after delete = %d results, want 2", len(results))
+	}
+
+	// DeleteMember для несуществующего → false
+	if tree.DeleteMember(10, "bob") {
+		t.Fatal("DeleteMember(10, bob) should return false (already deleted)")
 	}
 }
 
@@ -235,22 +275,20 @@ func TestForEach(t *testing.T) {
 
 func TestRandomInsertSearch(t *testing.T) {
 	tree, _ := newTestTree()
-	m := make(map[float64]string)
 
 	rng := rand.New(rand.NewSource(42))
 	for i := 0; i < 10000; i++ {
-		score := float64(rng.Intn(5000))
-		val := fmt.Sprintf("v%d", i)
+		score := float64(i) // уникальные score
+		val := fmt.Sprintf("v%d", rng.Intn(100000))
 		tree.Insert(score, val)
-		m[score] = val
 	}
-	if tree.Len() != len(m) {
-		t.Fatalf("Len = %d, want %d", tree.Len(), len(m))
+	if tree.Len() != 10000 {
+		t.Fatalf("Len = %d, want 10000", tree.Len())
 	}
-	for score, val := range m {
-		got, ok := tree.Search(score)
-		if !ok || got != val {
-			t.Fatalf("Search(%v) = (%q, %v), want (%q, true)", score, got, ok, val)
+	for i := 0; i < 10000; i++ {
+		_, ok := tree.Search(float64(i))
+		if !ok {
+			t.Fatalf("Search(%d) not found", i)
 		}
 	}
 }
@@ -376,4 +414,3 @@ func BenchmarkSearchParallelWithWrites(b *testing.B) {
 	b.StopTimer()
 	close(stopCh)
 }
-

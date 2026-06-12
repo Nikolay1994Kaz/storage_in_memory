@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"kvstore/kvstore/internal/ai"
+	"kvstore/kvstore/internal/btree"
 	"kvstore/kvstore/internal/cluster"
 	"kvstore/kvstore/internal/compute"
 	"kvstore/kvstore/internal/monitoring"
@@ -29,6 +30,7 @@ import (
 	"kvstore/kvstore/internal/server"
 	"kvstore/kvstore/internal/store"
 	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/store/zset"
 	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
 )
@@ -89,6 +91,10 @@ func main() {
 
 	// === 2. Инициализация хранилища векторов и загрузка бинарного снапшота ===
 	vecStore := vector.NewVectorStore(vector.EuclideanDistance, s)
+
+	// === 2.5. Инициализация sorted sets (ZSet) ===
+	zsetReg := zset.New(s)
+
 	graphPath := filepath.Join(dataDir, "graph.bin")
 	graphLoaded := false
 
@@ -159,6 +165,16 @@ func main() {
 				return
 			}
 			vecStore.Delete(entry.Key)
+			restored++
+		case wal.OpZAdd:
+			if len(entry.Value) >= 8 {
+				score, member := zset.DecodeZAddValue(entry.Value)
+				zsetReg.ZAdd(0, entry.Key, score, member)
+				restored++
+			}
+		case wal.OpZRem:
+			member := string(entry.Value)
+			zsetReg.ZRem(0, entry.Key, member)
 			restored++
 		}
 	}
@@ -467,7 +483,7 @@ func main() {
 				qCmd := strings.ToUpper(string(queuedArgs[0]))
 				qCmdArgs := queuedArgs[1:]
 				startCmd := time.Now()
-				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
 				monitoring.RecordCommand(qCmd, time.Since(startCmd))
 			}
 			globalTxMu.Unlock()
@@ -489,7 +505,7 @@ func main() {
 		}
 
 		start := time.Now()
-		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
 		monitoring.RecordCommand(cmd, time.Since(start))
 	}
 
@@ -565,6 +581,7 @@ func arg(args [][]byte, i int) string {
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
 	hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine,
 	triggers *compute.TriggerManager, vecStore *vector.VectorStore,
+	zsetReg *zset.ZSetRegistry,
 	aiClient *ai.Client, aiWorker *ai.Worker,
 	iterateAll func(fn func(op byte, key string, value []byte)),
 	saveVectors func() error,
@@ -1112,6 +1129,173 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 
 		results, err := vecStore.SearchFiltered(query, K, filterFn)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(results) * 2)
+		for _, r := range results {
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
+		}
+
+
+	// === Sorted Sets (ZSET) ===
+	case "ZADD":
+		// ZADD <setName> <score> <member>
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: ZADD <key> <score> <member>")
+			return
+		}
+		setName := string(args[0])
+		score, err := strconv.ParseFloat(string(args[1]), 64)
+		if err != nil {
+			buf.WriteError("ERR invalid score (must be a float)")
+			return
+		}
+		member := string(args[2])
+		isNew := zsetReg.ZAdd(workerID, setName, score, member)
+		// WAL
+		bw.Write(wal.Entry{Op: wal.OpZAdd, Key: setName, Value: zset.EncodeZAddValue(score, member)})
+		if isNew {
+			buf.WriteInt(1)
+		} else {
+			buf.WriteInt(0)
+		}
+
+	case "ZSCORE":
+		// ZSCORE <setName> <member>
+		if len(args) < 2 {
+			buf.WriteError("ERR usage: ZSCORE <key> <member>")
+			return
+		}
+		setName := string(args[0])
+		member := string(args[1])
+		score, ok := zsetReg.ZScore(setName, member)
+		if !ok {
+			buf.WriteNull()
+		} else {
+			buf.WriteBulkString(strconv.FormatFloat(score, 'f', -1, 64))
+		}
+
+	case "ZREM":
+		// ZREM <setName> <member>
+		if len(args) < 2 {
+			buf.WriteError("ERR usage: ZREM <key> <member>")
+			return
+		}
+		setName := string(args[0])
+		member := string(args[1])
+		ok := zsetReg.ZRem(workerID, setName, member)
+		if ok {
+			bw.Write(wal.Entry{Op: wal.OpZRem, Key: setName, Value: []byte(member)})
+			buf.WriteInt(1)
+		} else {
+			buf.WriteInt(0)
+		}
+
+	case "ZRANGEBYSCORE":
+		// ZRANGEBYSCORE <setName> <min> <max> [WITHSCORES]
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: ZRANGEBYSCORE <key> <min> <max> [WITHSCORES]")
+			return
+		}
+		setName := string(args[0])
+		minScore, err := strconv.ParseFloat(string(args[1]), 64)
+		if err != nil {
+			buf.WriteError("ERR invalid min score")
+			return
+		}
+		maxScore, err := strconv.ParseFloat(string(args[2]), 64)
+		if err != nil {
+			buf.WriteError("ERR invalid max score")
+			return
+		}
+		withScores := len(args) >= 4 && strings.ToUpper(string(args[3])) == "WITHSCORES"
+
+		results := zsetReg.ZRangeByScore(setName, minScore, maxScore)
+		if withScores {
+			buf.WriteArrayHeader(len(results) * 2)
+			for _, r := range results {
+				buf.WriteBulkString(r.Member)
+				buf.WriteBulkString(strconv.FormatFloat(r.Score, 'f', -1, 64))
+			}
+		} else {
+			buf.WriteArrayHeader(len(results))
+			for _, r := range results {
+				buf.WriteBulkString(r.Member)
+			}
+		}
+
+	case "ZCARD":
+		// ZCARD <setName>
+		if len(args) < 1 {
+			buf.WriteError("ERR usage: ZCARD <key>")
+			return
+		}
+		setName := string(args[0])
+		buf.WriteInt(zsetReg.ZCard(setName))
+
+	// === VSIM.SEARCHRANGE — комбинированный поиск: вектор + score range ===
+	//
+	// VSIM.SEARCHRANGE <K> <setName> <minScore> <maxScore> <v1> <v2> ... <vN>
+	//
+	// Поток:
+	//   1. B+Tree RangeSearch → множество допустимых member'ов (O(log n + k))
+	//   2. HNSW SearchFiltered с filterFn = "member в множестве" → K лучших
+	//
+	// Без B+Tree пришлось бы делать N вызовов GET для каждого кандидата HNSW.
+	case "VSIM.SEARCHRANGE":
+		if len(args) < 5 {
+			buf.WriteError("ERR usage: VSIM.SEARCHRANGE <K> <setName> <minScore> <maxScore> <v1> <v2> ... <vN>")
+			return
+		}
+		K, err := strconv.Atoi(string(args[0]))
+		if err != nil || K <= 0 {
+			buf.WriteError("ERR invalid K (must be positive integer)")
+			return
+		}
+		setName := string(args[1])
+		minScore, err := strconv.ParseFloat(string(args[2]), 64)
+		if err != nil {
+			buf.WriteError("ERR invalid minScore")
+			return
+		}
+		maxScore, err := strconv.ParseFloat(string(args[3]), 64)
+		if err != nil {
+			buf.WriteError("ERR invalid maxScore")
+			return
+		}
+		vecArgs := args[4:]
+		if len(vecArgs) == 0 {
+			buf.WriteError("ERR no vector components provided")
+			return
+		}
+		query := make([]float32, len(vecArgs))
+		for i, a := range vecArgs {
+			f, err := strconv.ParseFloat(string(a), 32)
+			if err != nil {
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i+4, string(a)))
+				return
+			}
+			query[i] = float32(f)
+		}
+
+		// Шаг 1: B+Tree RangeCollectHashes → множество memberHash'ей (1 alloc)
+		// Оптимизация: вместо 113 allocs (resolveMember × N) — 1 alloc (map[uint64]).
+		allowed := zsetReg.MembersInRangeHashed(setName, minScore, maxScore)
+		if allowed == nil {
+			// Пустой sorted set или нет элементов в диапазоне
+			buf.WriteArrayHeader(0)
+			return
+		}
+
+		// Шаг 2: HNSW SearchFiltered с hash-фильтром
+		// HashMember(key) — inline FNV-1a (~15ns), zero-alloc.
+		results, err := vecStore.SearchFiltered(query, K, func(key string) bool {
+			_, ok := allowed[btree.HashMember(key)]
+			return ok
+		})
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return

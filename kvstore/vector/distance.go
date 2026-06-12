@@ -6,8 +6,8 @@ import "math"
 // На amd64-системах с поддержкой AVX2 они будут перезаписаны в init()
 // функциями из ассемблерного файла.
 var (
-	euclideanImpl  = euclideanPureGo
-	dotProductImpl = dotProductPureGo
+	euclideanImpl  = EuclideanPureGo
+	dotProductImpl = DotProductPureGo
 )
 
 // EuclideanDistance вычисляет квадрат евклидова расстояния между двумя векторами.
@@ -15,7 +15,7 @@ func EuclideanDistance(a, b []float32) float32 {
 	return euclideanImpl(a, b)
 }
 
-func euclideanPureGo(a, b []float32) float32 {
+func EuclideanPureGo(a, b []float32) float32 {
 	var sum float32
 	for i := range a {
 		diff := a[i] - b[i]
@@ -55,7 +55,7 @@ func DotProductDistance(a, b []float32) float32 {
 	return 1 - dotProductImpl(a, b)
 }
 
-func dotProductPureGo(a, b []float32) float32 {
+func DotProductPureGo(a, b []float32) float32 {
 	var dot float32
 	for i := range a {
 		dot += a[i] * b[i]
