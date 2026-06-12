@@ -1,43 +1,75 @@
 package pubsub
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"kvstore/kvstore/internal/protocol"
+	"kvstore/kvstore/vector"
 )
 
 const (
 	maxBuffer = 256
 )
 
-// Subscriber — один подписчик.
+// Subscriber — единый подписчик, поддерживающий оба типа маршрутизации.
+//
+// Один conn = один Subscriber = один writePump = один канал доставки.
+// Classic Publish и Semantic Publish оба пишут в тот же ch.
 type Subscriber struct {
-	ch       chan protocol.Value
-	conn     net.Conn
-	done     chan struct{}
-	channels map[string]struct{} // каналы этого подписчика — O(1) lookup
+	ch   chan protocol.Value
+	conn net.Conn
+	done chan struct{}
+
+	// Classic routing: набор строковых каналов
+	channels map[string]struct{}
+
+	// Semantic routing: вектор интересов в HNSW-индексе
+	vecKey    string  // ключ в HNSW ("" = нет семантической подписки)
+	threshold float32 // максимальная distance
 }
 
-// Hub — центральный диспетчер Pub/Sub.
+// Hub — единый диспетчер Pub/Sub с двумя типами маршрутизации:
+//   - Classic: точное совпадение имени канала (SUBSCRIBE/PUBLISH)
+//   - Semantic: K-NN поиск в HNSW + threshold (VSIM.SUBSCRIBE/VSIM.PUBLISH)
+//
+// Один conn может иметь ОБА типа подписок одновременно.
+// Все сообщения (classic и semantic) доставляются через единый канал и writePump.
 type Hub struct {
 	mu          sync.RWMutex
-	channels    map[string]map[*Subscriber]struct{}
 	subscribers map[net.Conn]*Subscriber
+
+	// Classic routing
+	channels map[string]map[*Subscriber]struct{}
+
+	// Semantic routing (опционально)
+	semIndex  *vector.VectorStore    // HNSW-индекс интересов подписчиков
+	semSubs   map[string]*Subscriber // HNSW key → subscriber
+	nextSemID atomic.Uint64
 }
 
-func NewHub() *Hub {
-	return &Hub{
-		channels:    make(map[string]map[*Subscriber]struct{}),
+// NewHub создаёт единый Hub.
+//
+// semIndex — VectorStore для семантической маршрутизации (nil = только classic).
+// Рекомендуется vector.NewVectorStoreCosine для семантической близости.
+func NewHub(semIndex *vector.VectorStore) *Hub {
+	h := &Hub{
 		subscribers: make(map[net.Conn]*Subscriber),
+		channels:    make(map[string]map[*Subscriber]struct{}),
 	}
+	if semIndex != nil {
+		h.semIndex = semIndex
+		h.semSubs = make(map[string]*Subscriber)
+	}
+	return h
 }
 
-// Subscribe подписывает соединение на каналы.
-func (h *Hub) Subscribe(conn net.Conn, channels []string) *Subscriber {
-	h.mu.Lock()
-
+// getOrCreateSub возвращает существующего подписчика или создаёт нового.
+// Вызывается под h.mu.Lock().
+func (h *Hub) getOrCreateSub(conn net.Conn) *Subscriber {
 	sub, exists := h.subscribers[conn]
 	if !exists {
 		sub = &Subscriber{
@@ -49,9 +81,20 @@ func (h *Hub) Subscribe(conn net.Conn, channels []string) *Subscriber {
 		h.subscribers[conn] = sub
 		go sub.writePump()
 	}
+	return sub
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Classic Pub/Sub
+// ═══════════════════════════════════════════════════════════════
+
+// Subscribe подписывает соединение на строковые каналы.
+func (h *Hub) Subscribe(conn net.Conn, channels []string) *Subscriber {
+	h.mu.Lock()
+
+	sub := h.getOrCreateSub(conn)
 
 	// Подготавливаем сообщения-подтверждения ДО снятия блокировки.
-	// len(sub.channels) читается безопасно под локом.
 	confirmations := make([]protocol.Value, 0, len(channels))
 
 	for _, channel := range channels {
@@ -61,8 +104,6 @@ func (h *Hub) Subscribe(conn net.Conn, channels []string) *Subscriber {
 		h.channels[channel][sub] = struct{}{}
 		sub.channels[channel] = struct{}{} // O(1) трекинг подписок
 
-		// Собираем ответ, пока мапа безопасно заблокирована.
-		// Инкремент счётчика корректен — как в настоящем Redis.
 		confirmations = append(confirmations, protocol.Value{
 			Typ: '*',
 			Array: []protocol.Value{
@@ -100,7 +141,7 @@ func (h *Hub) Unsubscribe(conn net.Conn, channels []string) {
 	}
 
 	if len(channels) == 0 {
-		// Отписка от всех — напрямую, без лишней аллокации слайса
+		// Отписка от всех classic каналов — напрямую, без лишней аллокации слайса
 		for channel := range sub.channels {
 			if subs, ok := h.channels[channel]; ok {
 				delete(subs, sub)
@@ -123,10 +164,9 @@ func (h *Hub) Unsubscribe(conn net.Conn, channels []string) {
 		}
 	}
 
-	// Если больше нет подписок — закрываем подписчика
-	if len(sub.channels) == 0 {
-		close(sub.done)
-		delete(h.subscribers, conn)
+	// Закрываем подписчика только если НЕТ ни classic, ни semantic подписок
+	if len(sub.channels) == 0 && sub.vecKey == "" {
+		h.closeSub(sub)
 	}
 }
 
@@ -188,12 +228,197 @@ func (h *Hub) Publish(channel string, message string) int {
 	return delivered
 }
 
-// RemoveConn вызывается при отключении клиента.
-func (h *Hub) RemoveConn(conn net.Conn) {
-	h.Unsubscribe(conn, nil)
+// ═══════════════════════════════════════════════════════════════
+// Semantic Pub/Sub (Vector-routed)
+// ═══════════════════════════════════════════════════════════════
+
+// SemanticSubscribe регистрирует вектор интересов для соединения.
+//
+// Если conn уже имеет classic подписки — они сохраняются.
+// Если conn уже имеет semantic подписку — она заменяется.
+func (h *Hub) SemanticSubscribe(conn net.Conn, vec []float32, threshold float32) (*Subscriber, error) {
+	if h.semIndex == nil {
+		return nil, fmt.Errorf("semantic pub/sub not configured")
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	sub := h.getOrCreateSub(conn)
+
+	// Удаляем старую semantic подписку если есть
+	if sub.vecKey != "" {
+		h.semIndex.Delete(sub.vecKey)
+		delete(h.semSubs, sub.vecKey)
+	}
+
+	id := h.nextSemID.Add(1)
+	key := fmt.Sprintf("__sem:%d", id)
+
+	if err := h.semIndex.Add(key, vec); err != nil {
+		return nil, err
+	}
+
+	sub.vecKey = key
+	sub.threshold = threshold
+	h.semSubs[key] = sub
+
+	// Подтверждение подписки
+	confirm := protocol.Value{
+		Typ: '*',
+		Array: []protocol.Value{
+			{Typ: '$', Str: "semantic-subscribe"},
+			{Typ: '$', Str: "OK"},
+			{Typ: ':', Num: 1},
+		},
+	}
+	select {
+	case sub.ch <- confirm:
+	default:
+	}
+
+	return sub, nil
 }
 
-// IsSubscriber проверяет, является ли соединение подписчиком.
+// SemanticUnsubscribe удаляет семантическую подписку.
+// Classic подписки сохраняются.
+func (h *Hub) SemanticUnsubscribe(conn net.Conn) bool {
+	if h.semIndex == nil {
+		return false
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	sub, exists := h.subscribers[conn]
+	if !exists || sub.vecKey == "" {
+		return false
+	}
+
+	h.semIndex.Delete(sub.vecKey)
+	delete(h.semSubs, sub.vecKey)
+	sub.vecKey = ""
+	sub.threshold = 0
+
+	// Закрываем подписчика если нет и classic подписок
+	if len(sub.channels) == 0 {
+		h.closeSub(sub)
+	}
+
+	return true
+}
+
+// SemanticPublish доставляет сообщение подписчикам по векторной близости.
+func (h *Hub) SemanticPublish(queryVec []float32, message string) int {
+	if h.semIndex == nil {
+		return 0
+	}
+
+	h.mu.RLock()
+	subCount := len(h.semSubs)
+	if subCount == 0 {
+		h.mu.RUnlock()
+		return 0
+	}
+
+	// HNSW search: найти ближайших подписчиков
+	results, err := h.semIndex.Search(queryVec, subCount)
+	if err != nil || len(results) == 0 {
+		h.mu.RUnlock()
+		return 0
+	}
+
+	// Собрать matching подписчиков под RLock
+	type target struct {
+		sub *Subscriber
+	}
+	targets := make([]target, 0, len(results))
+
+	for _, r := range results {
+		sub, exists := h.semSubs[r.Key]
+		if !exists {
+			continue
+		}
+		if r.Distance <= sub.threshold {
+			targets = append(targets, target{sub: sub})
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(targets) == 0 {
+		return 0
+	}
+
+	// Формируем RESP-сообщение ВНЕ лока
+	msg := protocol.Value{
+		Typ: '*',
+		Array: []protocol.Value{
+			{Typ: '$', Str: "semantic-message"},
+			{Typ: '$', Str: message},
+		},
+	}
+
+	// Доставка ВНЕ лока (аналогично Hub.Publish)
+	delivered := 0
+	for _, t := range targets {
+		select {
+		case t.sub.ch <- msg:
+			delivered++
+		default:
+			log.Printf("Semantic Pub/Sub: slow subscriber disconnected")
+			h.disconnectSlow(t.sub)
+		}
+	}
+
+	return delivered
+}
+
+// SemanticSubscriberCount возвращает количество семантических подписчиков.
+func (h *Hub) SemanticSubscriberCount() int {
+	if h.semIndex == nil {
+		return 0
+	}
+	h.mu.RLock()
+	n := len(h.semSubs)
+	h.mu.RUnlock()
+	return n
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Общие методы
+// ═══════════════════════════════════════════════════════════════
+
+// RemoveConn удаляет ВСЕ подписки соединения (classic + semantic).
+// Вызывается при отключении клиента.
+func (h *Hub) RemoveConn(conn net.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	sub, exists := h.subscribers[conn]
+	if !exists {
+		return
+	}
+
+	// Очистка classic каналов
+	for channel := range sub.channels {
+		if subs, ok := h.channels[channel]; ok {
+			delete(subs, sub)
+			if len(subs) == 0 {
+				delete(h.channels, channel)
+			}
+		}
+	}
+
+	// Очистка semantic подписки
+	if sub.vecKey != "" && h.semIndex != nil {
+		h.semIndex.Delete(sub.vecKey)
+		delete(h.semSubs, sub.vecKey)
+	}
+
+	h.closeSub(sub)
+}
+
+// IsSubscriber проверяет наличие любой подписки (classic или semantic).
 func (h *Hub) IsSubscriber(conn net.Conn) bool {
 	h.mu.RLock()
 	_, exists := h.subscribers[conn]
@@ -201,9 +426,19 @@ func (h *Hub) IsSubscriber(conn net.Conn) bool {
 	return exists
 }
 
-// --- Внутренние методы ---
+// ═══════════════════════════════════════════════════════════════
+// Внутренние методы
+// ═══════════════════════════════════════════════════════════════
 
-// writePump — горутина подписчика.
+// closeSub закрывает подписчика и удаляет из реестра.
+// Вызывается под h.mu.Lock().
+func (h *Hub) closeSub(sub *Subscriber) {
+	close(sub.done)
+	delete(h.subscribers, sub.conn)
+}
+
+// writePump — единственная горутина подписчика.
+// Отправляет ВСЕ сообщения (classic + semantic) в TCP.
 func (s *Subscriber) writePump() {
 	writer := protocol.NewWriter(s.conn)
 
@@ -220,7 +455,7 @@ func (s *Subscriber) writePump() {
 }
 
 // disconnectSlow отключает медленного подписчика.
-// Безопасен при вызове из нескольких горутин одновременно.
+// Очищает ОБА типа подписок. Безопасен при вызове из нескольких горутин.
 func (h *Hub) disconnectSlow(sub *Subscriber) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -230,7 +465,7 @@ func (h *Hub) disconnectSlow(sub *Subscriber) {
 		return // Уже отключен — выходим без паники
 	}
 
-	// Убираем из всех каналов
+	// Очистка classic
 	for channel := range sub.channels {
 		if subs, ok := h.channels[channel]; ok {
 			delete(subs, sub)
@@ -238,6 +473,12 @@ func (h *Hub) disconnectSlow(sub *Subscriber) {
 				delete(h.channels, channel)
 			}
 		}
+	}
+
+	// Очистка semantic
+	if sub.vecKey != "" && h.semIndex != nil {
+		h.semIndex.Delete(sub.vecKey)
+		delete(h.semSubs, sub.vecKey)
 	}
 
 	close(sub.done)

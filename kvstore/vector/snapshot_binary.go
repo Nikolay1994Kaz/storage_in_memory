@@ -129,11 +129,10 @@ func (vs *VectorStore) LoadBinary(r io.Reader) error {
 	vs.keys = make(map[uint64]string)
 	vs.ids = make(map[string]uint64)
 	vs.graph = &Graph{
-		allocator:       vs.allocator,
-		pruneBufItems:   make([]item, 0, 33),
-		pruneBufIDs:     make([]uint64, 0, 33),
-		insertBuf:       make([]uint64, 0, 33),
-		searchResultBuf: make([]item, 0, 256),
+		allocator:     vs.allocator,
+		pruneBufItems: make([]item, 0, 33),
+		pruneBufIDs:   make([]uint64, 0, 33),
+		insertBuf:     make([]uint64, 0, 33),
 	}
 
 	// 7. Посекционный парсинг из буфера в памяти

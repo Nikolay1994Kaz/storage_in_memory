@@ -49,10 +49,9 @@ type Graph struct {
 	allocator *tcmalloc.TCMallocStore // Менеджер памяти для neighbors блоков
 
 	// ─── Переиспользуемые буферы (zero-alloc pruning/insert) ───
-	pruneBufItems   []item   // буфер для pruneNeighbors (capacity = M0)
-	pruneBufIDs     []uint64 // буфер для ID после pruning (capacity = M0)
-	insertBuf       []uint64 // буфер для обратных связей в Insert (capacity = M0+1)
-	searchResultBuf []item   // буфер для результатов searchLayer
+	pruneBufItems []item   // буфер для pruneNeighbors (capacity = M0)
+	pruneBufIDs   []uint64 // буфер для ID после pruning (capacity = M0)
+	insertBuf     []uint64 // буфер для обратных связей в Insert (capacity = M0+1)
 }
 
 // NewGraph создаёт пустой HNSW-граф с параметрами по умолчанию.
@@ -60,18 +59,17 @@ func NewGraph(distance DistanceFunc, allocator *tcmalloc.TCMallocStore) *Graph {
 	m := 16
 	m0 := 2 * m
 	return &Graph{
-		nodes:           make([]Node, 0, 10000),
-		freeIDs:         make([]uint32, 0, 64),
-		M:               m,
-		M0:              m0, // слой 0 в 2 раза плотнее (из оригинальной статьи)
-		Ml:              1.0 / math.Log(float64(m)),
-		EfConstruction:  200,
-		Distance:        distance,
-		allocator:       allocator,
-		pruneBufItems:   make([]item, 0, m0+1),
-		pruneBufIDs:     make([]uint64, 0, m0+1),
-		insertBuf:       make([]uint64, 0, m0+1),
-		searchResultBuf: make([]item, 0, 256),
+		nodes:          make([]Node, 0, 10000),
+		freeIDs:        make([]uint32, 0, 64),
+		M:              m,
+		M0:             m0, // слой 0 в 2 раза плотнее (из оригинальной статьи)
+		Ml:             1.0 / math.Log(float64(m)),
+		EfConstruction: 200,
+		Distance:       distance,
+		allocator:      allocator,
+		pruneBufItems:  make([]item, 0, m0+1),
+		pruneBufIDs:    make([]uint64, 0, m0+1),
+		insertBuf:      make([]uint64, 0, m0+1),
 	}
 }
 
@@ -172,12 +170,8 @@ func (g *Graph) maxNeighbors(level int) int {
 // searchLayer ищет ef ближайших нод к query на одном слое графа.
 //
 // ★ ZERO-ALLOC версия ★
-// Все буферы берутся из sync.Pool и возвращаются после использования.
-// Результат записывается в переиспользуемый буфер dst (или searchResultBuf).
-func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) []item {
-
-	state := searchPool.Get().(*searchState)
-	state.acquire(len(g.nodes))
+// Использует переданный из пула state для безопасной параллельной работы.
+func (g *Graph) searchLayer(state *searchState, query []float32, entryID uint64, ef int, level int) []item {
 
 	entryNode := &g.nodes[entryID]
 	entryDist := g.Distance(query, g.arena.Get(entryNode.VectorOffset))
@@ -252,13 +246,7 @@ func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) 
 		state.collected[i], state.collected[j] = state.collected[j], state.collected[i]
 	}
 
-	// ★ Вместо make([]item) — переиспользуем буфер searchResultBuf.
-	// Безопасно: вызывающий код использует результат до следующего searchLayer.
-	g.searchResultBuf = g.searchResultBuf[:0]
-	g.searchResultBuf = append(g.searchResultBuf, state.collected...)
-
-	searchPool.Put(state)
-	return g.searchResultBuf
+	return state.collected
 }
 
 // searchLayerFiltered — searchLayer с фильтрацией результатов.
@@ -273,10 +261,7 @@ func (g *Graph) searchLayer(query []float32, entryID uint64, ef int, level int) 
 // filterFn принимает внутренний ID ноды и возвращает true, если нода
 // проходит фильтр. filterFn НЕ должен быть nil — для поиска без фильтра
 // используйте searchLayer.
-func (g *Graph) searchLayerFiltered(query []float32, entryID uint64, ef int, level int, filterFn func(uint64) bool) []item {
-
-	state := searchPool.Get().(*searchState)
-	state.acquire(len(g.nodes))
+func (g *Graph) searchLayerFiltered(state *searchState, query []float32, entryID uint64, ef int, level int, filterFn func(uint64) bool) []item {
 
 	entryNode := &g.nodes[entryID]
 	entryDist := g.Distance(query, g.arena.Get(entryNode.VectorOffset))
@@ -364,11 +349,7 @@ func (g *Graph) searchLayerFiltered(query []float32, entryID uint64, ef int, lev
 		state.collected[i], state.collected[j] = state.collected[j], state.collected[i]
 	}
 
-	g.searchResultBuf = g.searchResultBuf[:0]
-	g.searchResultBuf = append(g.searchResultBuf, state.collected...)
-
-	searchPool.Put(state)
-	return g.searchResultBuf
+	return state.collected
 }
 
 // greedyClosest — специализированный поиск ближайшей ноды для ef=1.
@@ -468,8 +449,12 @@ func (g *Graph) Insert(vec []float32) uint32 {
 	// ═══════════════════════════════════════════════════
 	// ФАЗА 2: Поиск соседей и подключение (от level до 0)
 	// ═══════════════════════════════════════════════════
+	state := searchPool.Get().(*searchState)
+	defer searchPool.Put(state)
+
 	for lc := min(level, g.maxLevel); lc >= 0; lc-- {
-		results := g.searchLayer(vec, ep, g.EfConstruction, lc)
+		state.acquire(len(g.nodes))
+		results := g.searchLayer(state, vec, ep, g.EfConstruction, lc)
 		
 
 		M := g.maxNeighbors(lc)
@@ -783,6 +768,10 @@ func (g *Graph) Search(query []float32, K int, efSearch int) []SearchResult {
 		efSearch = K
 	}
 
+	state := searchPool.Get().(*searchState)
+	state.acquire(len(g.nodes))
+	defer searchPool.Put(state)
+
 	ep := g.entryPointID
 
 	// ═══════════════════════════════════════════════════
@@ -800,7 +789,7 @@ func (g *Graph) Search(query []float32, K int, efSearch int) []SearchResult {
 	// ═══════════════════════════════════════════════════
 	//
 	// Слой 0 содержит ВСЕ ноды. Здесь ищем efSearch ближайших.
-	results := g.searchLayer(query, ep, efSearch, 0)
+	results := g.searchLayer(state, query, ep, efSearch, 0)
 
 	// Обрезаем до K
 	if len(results) > K {
@@ -838,6 +827,10 @@ func (g *Graph) SearchFiltered(query []float32, K int, efSearch int, filterFn fu
 		filteredEf = K * 10
 	}
 
+	state := searchPool.Get().(*searchState)
+	state.acquire(len(g.nodes))
+	defer searchPool.Put(state)
+
 	ep := g.entryPointID
 
 	// ФАЗА 1: Спуск по верхним слоям (без фильтра — навигация)
@@ -846,7 +839,7 @@ func (g *Graph) SearchFiltered(query []float32, K int, efSearch int, filterFn fu
 	}
 
 	// ФАЗА 2: Фильтрованный поиск на слое 0
-	results := g.searchLayerFiltered(query, ep, filteredEf, 0, filterFn)
+	results := g.searchLayerFiltered(state, query, ep, filteredEf, 0, filterFn)
 
 	// Обрезаем до K
 	if len(results) > K {
