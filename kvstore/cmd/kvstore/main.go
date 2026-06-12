@@ -261,6 +261,10 @@ func main() {
 	// === 5. Pub/Sub Hub ===
 	hub := pubsub.NewHub()
 
+	// === 5.1. Semantic Pub/Sub (Vector-routed) ===
+	semanticIndex := vector.NewVectorStoreCosine(s)
+	semHub := pubsub.NewSemanticHub(semanticIndex)
+
 	// === 6. Cluster (опционально) ===
 	var cl *cluster.Cluster
 	if *clusterEnabled {
@@ -483,7 +487,7 @@ func main() {
 				qCmd := strings.ToUpper(string(queuedArgs[0]))
 				qCmdArgs := queuedArgs[1:]
 				startCmd := time.Now()
-				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, semHub, cl, wasm, triggers, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
 				monitoring.RecordCommand(qCmd, time.Since(startCmd))
 			}
 			globalTxMu.Unlock()
@@ -505,7 +509,7 @@ func main() {
 		}
 
 		start := time.Now()
-		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, semHub, cl, wasm, triggers, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
 		monitoring.RecordCommand(cmd, time.Since(start))
 	}
 
@@ -579,7 +583,7 @@ func arg(args [][]byte, i int) string {
 }
 
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
-	hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine,
+	hub *pubsub.Hub, semHub *pubsub.SemanticHub, cl *cluster.Cluster, wasm *compute.Engine,
 	triggers *compute.TriggerManager, vecStore *vector.VectorStore,
 	zsetReg *zset.ZSetRegistry,
 	aiClient *ai.Client, aiWorker *ai.Worker,
@@ -1025,6 +1029,59 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		} else {
 			buf.WriteInt(0)
 		}
+
+	// === Semantic Pub/Sub (Vector-routed) ===
+	case "VSIM.SUBSCRIBE":
+		// Формат: VSIM.SUBSCRIBE <threshold> <v1> <v2> ... <vN>
+		if len(args) < 2 {
+			buf.WriteError("ERR usage: VSIM.SUBSCRIBE <threshold> <v1> <v2> ... <vN>")
+			return
+		}
+		threshold, err := strconv.ParseFloat(string(args[0]), 32)
+		if err != nil || threshold < 0 {
+			buf.WriteError("ERR invalid threshold (must be non-negative float)")
+			return
+		}
+		vec := make([]float32, len(args)-1)
+		for i := 1; i < len(args); i++ {
+			f, err := strconv.ParseFloat(string(args[i]), 32)
+			if err != nil {
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, string(args[i])))
+				return
+			}
+			vec[i-1] = float32(f)
+		}
+		if _, err := semHub.Subscribe(cs.Conn, vec, float32(threshold)); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		// writePump отправляет подтверждение, не пишем в buf
+
+	case "VSIM.UNSUBSCRIBE":
+		if semHub.Unsubscribe(cs.Conn) {
+			buf.WriteSimpleString("OK")
+		} else {
+			buf.WriteSimpleString("OK") // idempotent: OK даже если не был подписан
+		}
+
+	case "VSIM.PUBLISH":
+		// Формат: VSIM.PUBLISH <message> <v1> <v2> ... <vN>
+		if len(args) < 2 {
+			buf.WriteError("ERR usage: VSIM.PUBLISH <message> <v1> <v2> ... <vN>")
+			return
+		}
+		message := string(args[0])
+		vec := make([]float32, len(args)-1)
+		for i := 1; i < len(args); i++ {
+			f, err := strconv.ParseFloat(string(args[i]), 32)
+			if err != nil {
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, string(args[i])))
+				return
+			}
+			vec[i-1] = float32(f)
+		}
+		count := semHub.Publish(vec, message)
+		buf.WriteInt(count)
 
 	case "VSIM.SEARCH":
 		if len(args) < 2 {

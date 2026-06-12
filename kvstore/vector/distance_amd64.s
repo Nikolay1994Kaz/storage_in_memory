@@ -1,6 +1,10 @@
 #include "textflag.h"
 
 // func euclideanAVX2(a, b []float32) float32
+//
+// Квадрат евклидова расстояния: sum((a[i] - b[i])^2)
+// FMA: VSUBPS + VFMADD231PS заменяет VSUBPS + VMULPS + VADDPS
+// Все AVX2 CPU поддерживают FMA3 (Haswell 2013+).
 TEXT ·euclideanAVX2(SB), NOSPLIT, $0-52
     MOVQ a_base+0(FP), AX
     MOVQ a_len+8(FP), BX
@@ -19,9 +23,8 @@ loop8:
     VMOVUPS (AX)(SI*4), Y1
     VMOVUPS (CX)(SI*4), Y2
 
-    VSUBPS Y2, Y1, Y1
-    VMULPS Y1, Y1, Y1
-    VADDPS Y1, Y0, Y0
+    VSUBPS Y2, Y1, Y1          // Y1 = a - b
+    VFMADD231PS Y1, Y1, Y0     // Y0 += Y1 * Y1 = Y0 + (a-b)^2
 
     ADDQ $8, SI
     JMP loop8
@@ -39,8 +42,7 @@ remainder_loop:
     MOVSS (AX)(SI*4), X1
     MOVSS (CX)(SI*4), X2
     SUBSS X2, X1
-    MULSS X1, X1
-    ADDSS X1, X0
+    VFMADD231SS X1, X1, X0     // X0 += (a-b)^2
 
     INCQ SI
     JMP remainder_loop
@@ -51,6 +53,9 @@ done:
     RET
 
 // func dotProductAVX2(a, b []float32) float32
+//
+// Скалярное произведение: sum(a[i] * b[i])
+// FMA: VFMADD231PS заменяет VMULPS + VADDPS
 TEXT ·dotProductAVX2(SB), NOSPLIT, $0-52
     MOVQ a_base+0(FP), AX
     MOVQ a_len+8(FP), BX
@@ -69,8 +74,7 @@ loop8_dot:
     VMOVUPS (AX)(SI*4), Y1
     VMOVUPS (CX)(SI*4), Y2
 
-    VMULPS Y2, Y1, Y1
-    VADDPS Y1, Y0, Y0
+    VFMADD231PS Y2, Y1, Y0     // Y0 += Y1 * Y2
 
     ADDQ $8, SI
     JMP loop8_dot
@@ -87,8 +91,7 @@ remainder_loop_dot:
 
     MOVSS (AX)(SI*4), X1
     MOVSS (CX)(SI*4), X2
-    MULSS X2, X1
-    ADDSS X1, X0
+    VFMADD231SS X2, X1, X0     // X0 += X1 * X2
 
     INCQ SI
     JMP remainder_loop_dot

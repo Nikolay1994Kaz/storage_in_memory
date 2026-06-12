@@ -1,6 +1,7 @@
 # Binaries
 kvstore-server
 kvstore/kvstore
+kvstore-stress
 *.test
 *_bin
 
