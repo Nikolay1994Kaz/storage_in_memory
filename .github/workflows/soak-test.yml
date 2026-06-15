@@ -1,9 +1,6 @@
 name: Soak Test (Load & Memory Leak Audit)
 
 on:
-  push:
-    branches:
-      - master
   workflow_dispatch:
     inputs:
       duration:
