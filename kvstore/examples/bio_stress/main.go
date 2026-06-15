@@ -1,14 +1,19 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
 )
 
@@ -32,6 +37,46 @@ func main() {
 	rng := rand.New(rand.NewSource(42))
 	allocator := tcmalloc.NewTCMallocStore(runtime.NumCPU())
 	vs := vector.NewVectorStoreCosine(allocator) // Косинусная близость
+
+	// 0. Инициализация WAL (Write-Ahead Log) для обеспечения durability
+	walDir := "./wal_bio_data"
+	if err := os.MkdirAll(walDir, 0755); err != nil {
+		panic(fmt.Errorf("failed to create WAL directory: %w", err))
+	}
+	walPath := filepath.Join(walDir, "bio_stress.wal")
+	rawWAL, err := wal.Open(walPath)
+	if err != nil {
+		panic(fmt.Errorf("failed to open WAL: %w", err))
+	}
+	bw := wal.NewBatchWAL(rawWAL)
+	defer func() {
+		bw.Close()
+		os.RemoveAll(walDir) // Очищаем временную папку логов после закрытия
+	}()
+
+	// Счётчики операций
+	var searchCount uint64
+	var pubCount uint64
+	var writeCount uint64
+	var deliveredCount uint64
+	var walCount uint64 // Счётчик операций в WAL
+
+	// Helper-функция для кодирования вектора и записи в WAL
+	writeToWAL := func(op byte, key string, vec []float32) {
+		var valBytes []byte
+		if len(vec) > 0 {
+			valBytes = make([]byte, len(vec)*4)
+			for i, f := range vec {
+				binary.LittleEndian.PutUint32(valBytes[i*4:], math.Float32bits(f))
+			}
+		}
+		bw.Write(wal.Entry{
+			Op:    op,
+			Key:   key,
+			Value: valBytes,
+		})
+		atomic.AddUint64(&walCount, 1)
+	}
 
 	// 1. Генерируем центроиды семейств белков
 	const numFamilies = 50
@@ -65,6 +110,8 @@ func main() {
 		if err := vs.Add(key, vec); err != nil {
 			panic(err)
 		}
+		// Дублируем запись в WAL
+		writeToWAL(wal.OpVSimAdd, key, vec)
 	}
 	fmt.Println("✅ Base populated.")
 
@@ -87,6 +134,8 @@ func main() {
 		if err := subIndex.Add(key, interest); err != nil {
 			panic(err)
 		}
+		// Запись о подписчике также дублируется в WAL
+		writeToWAL(wal.OpVSimAdd, key, interest)
 	}
 
 	// Фоновые обработчики каналов подписчиков (вычищают сообщения, чтоб не было блока)
@@ -102,12 +151,6 @@ func main() {
 		}(subs[i])
 	}
 	fmt.Println("✅ Subscribers ready.")
-
-	// Счётчики операций
-	var searchCount uint64
-	var pubCount uint64
-	var writeCount uint64
-	var deliveredCount uint64
 
 	var stop uint32
 	var wg sync.WaitGroup
@@ -165,10 +208,12 @@ func main() {
 				delIdx := localRng.Intn(initSize)
 				delKey := fmt.Sprintf("protein:id:%d", delIdx)
 				vs.Delete(delKey)
+				writeToWAL(wal.OpVSimDel, delKey, nil)
 
 				// Вставляем новый с тем же ключом
 				newVec := genProtein(localRng)
 				vs.Add(delKey, newVec)
+				writeToWAL(wal.OpVSimAdd, delKey, newVec)
 			}
 
 			// Вставляем абсолютно новые белки
@@ -176,10 +221,12 @@ func main() {
 				newVec := genProtein(localRng)
 				newKey := fmt.Sprintf("protein:id:%d", insertID)
 				vs.Add(newKey, newVec)
+				writeToWAL(wal.OpVSimAdd, newKey, newVec)
 				
 				// И сразу удаляем самый старый из добавленных, сохраняя размер около 10k
 				oldKey := fmt.Sprintf("protein:id:%d", insertID-initSize)
 				vs.Delete(oldKey)
+				writeToWAL(wal.OpVSimDel, oldKey, nil)
 				
 				insertID++
 			}
@@ -208,6 +255,12 @@ func main() {
 			heapAlloc := float64(mem.Alloc) / (1024 * 1024)
 			sysMem := float64(mem.Sys) / (1024 * 1024)
 
+			// Собираем размер файла WAL
+			walSizeMB := float64(0)
+			if fi, err := os.Stat(walPath); err == nil {
+				walSizeMB = float64(fi.Size()) / (1024 * 1024)
+			}
+			
 			fmt.Printf("[%s] Elapsed: %s | Remaining: %s\n", 
 				time.Now().Format("15:04:05"), 
 				elapsed.Round(time.Second), 
@@ -217,9 +270,17 @@ func main() {
 				atomic.LoadUint64(&searchCount), 
 				float64(atomic.LoadUint64(&searchCount))/elapsed.Seconds(),
 			)
-			fmt.Printf("   - Events published:  %d\n", atomic.LoadUint64(&pubCount))
+			fmt.Printf("   - Events published:   %d\n", atomic.LoadUint64(&pubCount))
 			fmt.Printf("   - Messages delivered: %d\n", atomic.LoadUint64(&deliveredCount))
-			fmt.Printf("   - DB Mutations (ops): %d\n", atomic.LoadUint64(&writeCount))
+			fmt.Printf("   - DB Mutations (ops): %d (%.2f wps)\n", 
+				atomic.LoadUint64(&writeCount),
+				float64(atomic.LoadUint64(&writeCount))/elapsed.Seconds(),
+			)
+			fmt.Printf("   - WAL Entries Written:%d (%.2f ops/sec)\n", 
+				atomic.LoadUint64(&walCount),
+				float64(atomic.LoadUint64(&walCount))/elapsed.Seconds(),
+			)
+			fmt.Printf("   - WAL File Size:      %.2f MB\n", walSizeMB)
 			fmt.Printf("   - Go Heap Alloc:      %.2f MB\n", heapAlloc)
 			fmt.Printf("   - Go Sys (OS Virtual): %.2f MB\n", sysMem)
 			fmt.Println("   -------------------------------------------------")

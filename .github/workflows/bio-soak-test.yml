@@ -21,4 +21,12 @@ jobs:
 
     - name: Run Bio Stress Test
       run: |
-        go run ./kvstore/examples/bio_stress/main.go
+        go run ./kvstore/examples/bio_stress/main.go 2>&1 | tee bio_stress.log
+
+    - name: Upload Logs Artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bio-stress-logs
+        path: |
+          bio_stress.log
