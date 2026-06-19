@@ -33,3 +33,8 @@ node*/
 # Build tools (install separately, not part of source)
 tinygo/
 rust_src/
+
+# Python
+__pycache__/
+*.pyc
+

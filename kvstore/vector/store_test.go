@@ -402,3 +402,26 @@ func TestVectorStore_SearchFiltered_DimensionMismatch(t *testing.T) {
 		t.Fatal("expected dimension mismatch error, got nil")
 	}
 }
+
+func TestVectorStore_DeserializeVectorZeroCopy(t *testing.T) {
+	original := []float32{1.0, -2.5, 3.14, 0.0, 999.9}
+	data := SerializeVector(original)
+
+	// Verify that the zero-copy deserializer returns the exact same float values.
+	deserialized := DeserializeVectorZeroCopy(data)
+	if len(deserialized) != len(original) {
+		t.Fatalf("length mismatch: expected %d, got %d", len(original), len(deserialized))
+	}
+
+	for i := range original {
+		if deserialized[i] != original[i] {
+			t.Errorf("value mismatch at index %d: expected %f, got %f", i, original[i], deserialized[i])
+		}
+	}
+
+	// Verify empty slice behavior
+	if empty := DeserializeVectorZeroCopy(nil); empty != nil {
+		t.Errorf("expected nil for nil input, got %v", empty)
+	}
+}
+

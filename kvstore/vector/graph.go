@@ -13,7 +13,7 @@ import (
 // Node — одна точка в графе HNSW.
 type Node struct {
 	ID              uint64
-	VectorOffset    uint32
+	VectorOffset    uint64
 	NeighborsHandle tcmalloc.Handle // Дескриптор блока связей в TCMalloc
 	Level           int             // максимальный слой, на котором нода присутствует
 	Alive           bool            // маркер «живая ли нода» (tombstone при Delete)
@@ -878,7 +878,7 @@ func (g *Graph) MaxLevel() int {
 // results  — куда записать расстояния (len >= len(offsets))
 //
 // Все массивы — переиспользуемые буферы из searchState, 0 аллокаций.
-func (g *Graph) batchDistance(query []float32, offsets []uint32, results []float32) {
+func (g *Graph) batchDistance(query []float32, offsets []uint64, results []float32) {
 	for i, off := range offsets {
 		vec := g.arena.Get(off)
 		results[i] = g.Distance(query, vec)
@@ -890,7 +890,7 @@ type searchState struct {
 	candidates   minHeap
 	results      maxHeap
 	collected    []item
-	batchOffsets []uint32
+	batchOffsets []uint64
 	batchIDs     []uint64
 	batchDists   []float32
 }
@@ -925,7 +925,7 @@ var searchPool = sync.Pool{
 			candidates:   make(minHeap, 0, 128),
 			results:      make(maxHeap, 0, 128),
 			collected:    make([]item, 0, 128),
-			batchOffsets: make([]uint32, 0, 32),
+			batchOffsets: make([]uint64, 0, 32),
 			batchIDs:     make([]uint64, 0, 32),
 			batchDists:   make([]float32, 0, 32),
 		}

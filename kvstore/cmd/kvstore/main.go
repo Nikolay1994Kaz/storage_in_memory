@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"kvstore/kvstore/internal/ai"
 	"kvstore/kvstore/internal/btree"
@@ -42,6 +43,13 @@ const (
 
 var globalTxMu sync.Mutex
 
+func unsafeString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(&b[0], len(b))
+}
+
 func main() {
 	// CLI-флаги
 	port := flag.Int("port", 6380, "порт для клиентов")
@@ -54,6 +62,10 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "путь к TLS сертификату (PEM)")
 	tlsKey := flag.String("tls-key", "", "путь к TLS ключу (PEM)")
 	metricsPort := flag.Int("metrics-port", 9090, "порт для HTTP сервера метрик VictoriaMetrics (0 = отключен)")
+	hnswM := flag.Int("hnsw-m", 16, "HNSW M parameter (number of node connections)")
+	hnswEfConstruction := flag.Int("hnsw-ef-construction", 200, "HNSW efConstruction parameter")
+	hnswEfSearch := flag.Int("hnsw-ef-search", 100, "HNSW efSearch parameter (0 = auto)")
+	hnswUseLSH := flag.Bool("hnsw-use-lsh", false, "Enable LSH pre-filtering for high-dimensional vectors (dim >= 256)")
 	flag.Parse()
 
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
@@ -91,6 +103,8 @@ func main() {
 
 	// === 2. Инициализация хранилища векторов и загрузка бинарного снапшота ===
 	vecStore := vector.NewVectorStore(vector.EuclideanDistance, s)
+	vecStore.SetHNSWParams(*hnswM, *hnswEfConstruction, *hnswEfSearch)
+	vecStore.SetUseLSH(*hnswUseLSH)
 
 	// === 2.5. Инициализация sorted sets (ZSet) ===
 	zsetReg := zset.New(s)
@@ -260,6 +274,8 @@ func main() {
 
 	// === 5. Pub/Sub Hub (Classic + Semantic) ===
 	semanticIndex := vector.NewVectorStoreCosine(s)
+	semanticIndex.SetHNSWParams(*hnswM, *hnswEfConstruction, *hnswEfSearch)
+	semanticIndex.SetUseLSH(*hnswUseLSH)
 	hub := pubsub.NewHub(semanticIndex)
 
 	// === 6. Cluster (опционально) ===
@@ -965,6 +981,48 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 
 	// === Vector Search ===
+	case "VSIM.ADDBIN":
+		if len(args) != 2 {
+			buf.WriteError("ERR usage: VSIM.ADDBIN <key> <binary_vec_bytes>")
+			return
+		}
+		key := string(args[0])
+		if cl != nil {
+			if moved := cl.CheckKey(key); moved != nil {
+				writeValue(buf, *moved)
+				return
+			}
+		}
+		if len(args[1])%4 != 0 {
+			buf.WriteError("ERR invalid binary vector: byte length must be a multiple of 4")
+			return
+		}
+		// Copy bytes from ring buffer for asynchronous WAL logging
+		walValue := make([]byte, len(args[1]))
+		copy(walValue, args[1])
+
+		// Zero-copy cast to []float32
+		vec := vector.DeserializeVectorZeroCopy(walValue)
+
+		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
+		if err := vecStore.Add(key, vec); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if cl != nil && cl.Repl != nil {
+			// Forward replication command in text format to replica nodes
+			// to avoid breaking existing replica replication protocols.
+			var sb strings.Builder
+			sb.WriteString("VSIM.ADD ")
+			sb.WriteString(key)
+			for _, v := range vec {
+				sb.WriteByte(' ')
+				sb.WriteString(strconv.FormatFloat(float64(v), 'f', -1, 32))
+			}
+			cl.Repl.ForwardWrite(sb.String())
+		}
+		buf.WriteSimpleString("OK")
+
 	case "VSIM.ADD":
 		if len(args) < 2 {
 			buf.WriteError("ERR usage: VSIM.ADD <key> <v1> <v2> ... <vN>")
@@ -979,9 +1037,9 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		vec := make([]float32, len(args)-1)
 		for i := 1; i < len(args); i++ {
-			f, err := strconv.ParseFloat(string(args[i]), 32)
+			f, err := strconv.ParseFloat(unsafeString(args[i]), 32)
 			if err != nil {
-				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, string(args[i])))
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, unsafeString(args[i])))
 				return
 			}
 			vec[i-1] = float32(f)
@@ -1034,16 +1092,16 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError("ERR usage: VSIM.SUBSCRIBE <threshold> <v1> <v2> ... <vN>")
 			return
 		}
-		threshold, err := strconv.ParseFloat(string(args[0]), 32)
+		threshold, err := strconv.ParseFloat(unsafeString(args[0]), 32)
 		if err != nil || threshold < 0 {
 			buf.WriteError("ERR invalid threshold (must be non-negative float)")
 			return
 		}
 		vec := make([]float32, len(args)-1)
 		for i := 1; i < len(args); i++ {
-			f, err := strconv.ParseFloat(string(args[i]), 32)
+			f, err := strconv.ParseFloat(unsafeString(args[i]), 32)
 			if err != nil {
-				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, string(args[i])))
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, unsafeString(args[i])))
 				return
 			}
 			vec[i-1] = float32(f)
@@ -1070,9 +1128,9 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		message := string(args[0])
 		vec := make([]float32, len(args)-1)
 		for i := 1; i < len(args); i++ {
-			f, err := strconv.ParseFloat(string(args[i]), 32)
+			f, err := strconv.ParseFloat(unsafeString(args[i]), 32)
 			if err != nil {
-				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, string(args[i])))
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, unsafeString(args[i])))
 				return
 			}
 			vec[i-1] = float32(f)
@@ -1085,20 +1143,49 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError("ERR usage: VSIM.SEARCH <K> <v1> <v2> ... <vN>")
 			return
 		}
-		K, err := strconv.Atoi(string(args[0]))
+		K, err := strconv.Atoi(unsafeString(args[0]))
 		if err != nil || K <= 0 {
 			buf.WriteError("ERR invalid K (must be positive integer)")
 			return
 		}
 		query := make([]float32, len(args)-1)
 		for i := 1; i < len(args); i++ {
-			f, err := strconv.ParseFloat(string(args[i]), 32)
+			f, err := strconv.ParseFloat(unsafeString(args[i]), 32)
 			if err != nil {
-				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, string(args[i])))
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, unsafeString(args[i])))
 				return
 			}
 			query[i-1] = float32(f)
 		}
+		results, err := vecStore.Search(query, K)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(results) * 2)
+		for _, r := range results {
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
+		}
+
+	case "VSIM.SEARCHBIN":
+		if len(args) != 2 {
+			buf.WriteError("ERR usage: VSIM.SEARCHBIN <K> <binary_vec_bytes>")
+			return
+		}
+		K, err := strconv.Atoi(unsafeString(args[0]))
+		if err != nil || K <= 0 {
+			buf.WriteError("ERR invalid K (must be positive integer)")
+			return
+		}
+		if len(args[1])%4 != 0 {
+			buf.WriteError("ERR invalid binary vector: byte length must be a multiple of 4")
+			return
+		}
+
+		// Zero-copy cast directly from the read buffer
+		query := vector.DeserializeVectorZeroCopy(args[1])
+
 		results, err := vecStore.Search(query, K)
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
@@ -1138,7 +1225,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError("ERR usage: VSIM.SEARCHFILTER <K> <filter_field> <filter_value> <v1> <v2> ... <vN>  or  VSIM.SEARCHFILTER <K> PREFIX <prefix> <v1> <v2> ... <vN>")
 			return
 		}
-		K, err := strconv.Atoi(string(args[0]))
+		K, err := strconv.Atoi(unsafeString(args[0]))
 		if err != nil || K <= 0 {
 			buf.WriteError("ERR invalid K (must be positive integer)")
 			return
@@ -1154,9 +1241,9 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 
 		query := make([]float32, len(vecArgs))
 		for i, a := range vecArgs {
-			f, err := strconv.ParseFloat(string(a), 32)
+			f, err := strconv.ParseFloat(unsafeString(a), 32)
 			if err != nil {
-				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i+3, string(a)))
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i+3, unsafeString(a)))
 				return
 			}
 			query[i] = float32(f)
@@ -1202,7 +1289,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		setName := string(args[0])
-		score, err := strconv.ParseFloat(string(args[1]), 64)
+		score, err := strconv.ParseFloat(unsafeString(args[1]), 64)
 		if err != nil {
 			buf.WriteError("ERR invalid score (must be a float)")
 			return
@@ -1255,12 +1342,12 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		setName := string(args[0])
-		minScore, err := strconv.ParseFloat(string(args[1]), 64)
+		minScore, err := strconv.ParseFloat(unsafeString(args[1]), 64)
 		if err != nil {
 			buf.WriteError("ERR invalid min score")
 			return
 		}
-		maxScore, err := strconv.ParseFloat(string(args[2]), 64)
+		maxScore, err := strconv.ParseFloat(unsafeString(args[2]), 64)
 		if err != nil {
 			buf.WriteError("ERR invalid max score")
 			return
@@ -1304,18 +1391,18 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError("ERR usage: VSIM.SEARCHRANGE <K> <setName> <minScore> <maxScore> <v1> <v2> ... <vN>")
 			return
 		}
-		K, err := strconv.Atoi(string(args[0]))
+		K, err := strconv.Atoi(unsafeString(args[0]))
 		if err != nil || K <= 0 {
 			buf.WriteError("ERR invalid K (must be positive integer)")
 			return
 		}
 		setName := string(args[1])
-		minScore, err := strconv.ParseFloat(string(args[2]), 64)
+		minScore, err := strconv.ParseFloat(unsafeString(args[2]), 64)
 		if err != nil {
 			buf.WriteError("ERR invalid minScore")
 			return
 		}
-		maxScore, err := strconv.ParseFloat(string(args[3]), 64)
+		maxScore, err := strconv.ParseFloat(unsafeString(args[3]), 64)
 		if err != nil {
 			buf.WriteError("ERR invalid maxScore")
 			return
@@ -1327,9 +1414,9 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		query := make([]float32, len(vecArgs))
 		for i, a := range vecArgs {
-			f, err := strconv.ParseFloat(string(a), 32)
+			f, err := strconv.ParseFloat(unsafeString(a), 32)
 			if err != nil {
-				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i+4, string(a)))
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i+4, unsafeString(a)))
 				return
 			}
 			query[i] = float32(f)

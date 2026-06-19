@@ -281,9 +281,12 @@ func (vs *VectorStore) searchWithLSHNoLock(query []float32, K int, threshold int
 	// ═══════════════════════════════════════════════════
 	queryHash := vs.lsh.ComputeHash(searchQuery)
 
-	minCandidates := K * 10
-	if minCandidates < 100 {
-		minCandidates = 100
+	minCandidates := vs.EfSearch
+	if minCandidates <= 0 {
+		minCandidates = K * 10
+		if minCandidates < 100 {
+			minCandidates = 100
+		}
 	}
 
 	// Адаптивный threshold: если кандидатов мало — расширяем
@@ -381,9 +384,14 @@ func (vs *VectorStore) searchNoLSH(query []float32, K int) ([]VSearchResult, err
 		searchQuery = normalized
 	}
 
-	efSearch := K * 10
-	if efSearch < 100 {
-		efSearch = 100
+	efSearch := vs.EfSearch
+	if efSearch <= 0 {
+		efSearch = K * 10
+		if efSearch < 100 {
+			efSearch = 100
+		} else if efSearch > 300 {
+			efSearch = 300
+		}
 	}
 
 	results := vs.graph.Search(searchQuery, K, efSearch)

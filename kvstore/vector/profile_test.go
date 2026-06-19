@@ -3,8 +3,9 @@ package vector
 import (
 	"fmt"
 	"math/rand"
-	"sync/atomic"
 	"runtime"
+	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"kvstore/kvstore/internal/store/tcmalloc"
@@ -285,4 +286,75 @@ func BenchmarkDistance_DotProduct_128(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		DotProductDistance(a, bv)
 	}
+}
+
+// BenchmarkParseTextVsBinary сравнивает производительность парсинга текстового RESP
+// (массив строк, преобразуемых через strconv.ParseFloat с аллокацией string)
+// и бинарного RESP (один []byte с zero-copy приведением к []float32).
+func BenchmarkParseTextVsBinary(b *testing.B) {
+	const dim = 784
+
+	// Подготовка текстовых данных
+	rng := rand.New(rand.NewSource(42))
+	textArgs := make([][]byte, dim)
+	for i := 0; i < dim; i++ {
+		textArgs[i] = []byte(strconv.FormatFloat(float64(rng.Float32()), 'f', 6, 32))
+	}
+
+	// Подготовка бинарных данных
+	floatVec := make([]float32, dim)
+	for i := 0; i < dim; i++ {
+		floatVec[i] = rng.Float32()
+	}
+	binaryData := SerializeVector(floatVec)
+
+	b.Run("TextParsing_784dim", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			query := make([]float32, len(textArgs))
+			for j := 0; j < len(textArgs); j++ {
+				// Симулируем то, что происходит в VSIM.SEARCH:
+				// Каждому элементу делается string(args[j]) (аллокация) и strconv.ParseFloat
+				s := string(textArgs[j])
+				f, err := strconv.ParseFloat(s, 32)
+				if err != nil {
+					b.Fatal(err)
+				}
+				query[j] = float32(f)
+			}
+			// Избегаем оптимизации компилятором
+			if len(query) != dim {
+				b.Fail()
+			}
+		}
+	})
+
+	b.Run("BinaryZeroCopy_784dim", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			// Zero-copy десериализация
+			query := DeserializeVectorZeroCopy(binaryData)
+			// Избегаем оптимизации компилятором
+			if len(query) != dim {
+				b.Fail()
+			}
+		}
+	})
+
+	b.Run("BinaryWithCopy_784dim", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			// Если нам нужно скопировать срез для безопасности/сохранения
+			dest := make([]float32, len(binaryData)/4)
+			query := DeserializeVectorZeroCopy(binaryData)
+			copy(dest, query)
+			// Избегаем оптимизации компилятором
+			if len(dest) != dim {
+				b.Fail()
+			}
+		}
+	})
 }

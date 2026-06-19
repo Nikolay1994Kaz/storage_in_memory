@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,8 +21,57 @@ func main() {
 	numConns := flag.Int("c", 50, "количество параллельных соединений")
 	numRequests := flag.Int("n", 100000, "общее количество запросов")
 	addr := flag.String("addr", "localhost:6380", "адрес сервера")
-	valueSize := flag.Int("size", 100, "размер значения в байтах")
+	valueSize := flag.Int("size", 100, "размер значения в байтах (для kv режима)")
+	mode := flag.String("mode", "kv", "режим тестирования: kv или vector")
+	dim := flag.Int("dim", 768, "размерность векторов (для vector режима)")
 	flag.Parse()
+
+	if *mode == "vector" {
+		fmt.Printf("=== KVStore Vector Benchmark ===\n")
+		fmt.Printf("Connections: %d\n", *numConns)
+		fmt.Printf("Requests:    %d\n", *numRequests)
+		fmt.Printf("Dimension:   %d\n", *dim)
+		fmt.Printf("Server:      %s\n\n", *addr)
+
+		// 1. --- VSIM.ADD (Text Mode) ---
+		fmt.Println("--- VSIM.ADD (Text Mode Vector Insertion) ---")
+		runBenchmark(*addr, *numConns, *numRequests, func(r *protocol.Reader, w *protocol.Writer, id int) {
+			key := fmt.Sprintf("vec_key_text:%d", id)
+			vec := generateRandomVector(*dim)
+			sendVsimAdd(w, key, vec)
+			r.Read() // +OK
+		})
+
+		// 2. --- VSIM.ADDBIN (Binary Mode) ---
+		fmt.Println("--- VSIM.ADDBIN (Binary Mode Vector Insertion) ---")
+		runBenchmark(*addr, *numConns, *numRequests, func(r *protocol.Reader, w *protocol.Writer, id int) {
+			key := fmt.Sprintf("vec_key_bin:%d", id)
+			vec := generateRandomVector(*dim)
+			sendVsimAddBin(w, key, vec)
+			r.Read() // +OK
+		})
+
+		// 3. --- VSIM.SEARCH (Vector Search) ---
+		fmt.Println("--- VSIM.SEARCH (Vector Search) ---")
+		runBenchmark(*addr, *numConns, *numRequests, func(r *protocol.Reader, w *protocol.Writer, id int) {
+			vec := generateRandomVector(*dim)
+			sendVsimSearch(w, 10, vec)
+			r.Read() // array response
+		})
+
+		// 4. --- VSIM.SEARCHRANGE (Hybrid Search) ---
+		fmt.Println("--- VSIM.SEARCHRANGE (Hybrid Search) ---")
+		setName := "bench_price_set"
+		prepareZSetKeys(*addr, setName, *numRequests)
+		runBenchmark(*addr, *numConns, *numRequests, func(r *protocol.Reader, w *protocol.Writer, id int) {
+			vec := generateRandomVector(*dim)
+			minScore := float64(20 + rand.Intn(20))
+			maxScore := minScore + float64(20 + rand.Intn(20))
+			sendVsimSearchRange(w, 10, setName, minScore, maxScore, vec)
+			r.Read() // array response
+		})
+		return
+	}
 
 	fmt.Printf("=== KVStore Benchmark ===\n")
 	fmt.Printf("Connections: %d\n", *numConns)
@@ -61,8 +113,6 @@ func main() {
 	})
 
 	// --- Бенчмарк SET EX (TTL) ---
-	// SET key value EX 60 — каждый ключ живёт 60 секунд.
-	// Измеряем overhead добавления TTL по сравнению с обычным SET.
 	fmt.Println("--- SET EX (TTL) ---")
 	runBenchmark(*addr, *numConns, *numRequests, func(r *protocol.Reader, w *protocol.Writer, id int) {
 		key := fmt.Sprintf("ttl_key:%d", id)
@@ -71,8 +121,6 @@ func main() {
 	})
 
 	// --- Бенчмарк TTL command ---
-	// Предварительно создаём 1000 ключей с TTL, потом гоняем TTL-запросы.
-	// Это тестирует скорость чтения из expires map.
 	fmt.Println("--- TTL command ---")
 	prepareKeysWithTTL(*addr, 1000)
 	runBenchmark(*addr, *numConns, *numRequests, func(r *protocol.Reader, w *protocol.Writer, id int) {
@@ -82,7 +130,6 @@ func main() {
 	})
 
 	// --- Бенчмарк EXPIRE ---
-	// Устанавливаем TTL на существующие ключи (созданные в SET-бенчмарке).
 	fmt.Println("--- EXPIRE ---")
 	runBenchmark(*addr, *numConns, *numRequests, func(r *protocol.Reader, w *protocol.Writer, id int) {
 		key := fmt.Sprintf("key:%d", rand.Intn(*numRequests))
@@ -91,8 +138,6 @@ func main() {
 	})
 
 	// --- Бенчмарк Pub/Sub ---
-	// Отдельная функция — у Pub/Sub совсем другая модель:
-	// подписчики ПОЛУЧАЮТ данные, а не запрашивают.
 	fmt.Println("--- PUB/SUB (fan-out) ---")
 	runPubSubBenchmark(*addr, 10, *numRequests/10)
 }
@@ -111,7 +156,11 @@ func sendCommand(w *protocol.Writer, args ...string) error {
 	for i, a := range args {
 		arr[i] = protocol.Value{Typ: '$', Str: a}
 	}
-	return w.Write(protocol.Value{Typ: '*', Array: arr})
+	err := w.Write(protocol.Value{Typ: '*', Array: arr})
+	if err != nil {
+		return err
+	}
+	return w.Flush()
 }
 
 // ==========================================================================
@@ -355,3 +404,80 @@ func runPubSubBenchmark(addr string, numSubscribers, numMessages int) {
 	fmt.Printf("  Publish RPS:         %.0f msg/sec\n", rps)
 	fmt.Printf("  Fan-out RPS:         %.0f deliveries/sec\n\n", fanoutRPS)
 }
+
+func generateRandomVector(dim int) []float32 {
+	vec := make([]float32, dim)
+	for i := range vec {
+		vec[i] = rand.Float32()
+	}
+	return vec
+}
+
+func sendVsimAdd(w *protocol.Writer, key string, vec []float32) error {
+	args := make([]string, len(vec)+2)
+	args[0] = "VSIM.ADD"
+	args[1] = key
+	for i, v := range vec {
+		args[i+2] = strconv.FormatFloat(float64(v), 'f', -1, 32)
+	}
+	return sendCommand(w, args...)
+}
+
+func sendVsimAddBin(w *protocol.Writer, key string, vec []float32) error {
+	buf := make([]byte, len(vec)*4)
+	for i, v := range vec {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(v))
+	}
+	arr := []protocol.Value{
+		{Typ: '$', Str: "VSIM.ADDBIN"},
+		{Typ: '$', Str: key},
+		{Typ: '$', Str: string(buf)},
+	}
+	err := w.Write(protocol.Value{Typ: '*', Array: arr})
+	if err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
+func sendVsimSearch(w *protocol.Writer, k int, vec []float32) error {
+	args := make([]string, len(vec)+2)
+	args[0] = "VSIM.SEARCH"
+	args[1] = strconv.Itoa(k)
+	for i, v := range vec {
+		args[i+2] = strconv.FormatFloat(float64(v), 'f', -1, 32)
+	}
+	return sendCommand(w, args...)
+}
+
+func prepareZSetKeys(addr string, setName string, n int) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		fmt.Printf("Prepare ZSet keys failed: %v\n", err)
+		return
+	}
+	defer conn.Close()
+	w := protocol.NewWriter(conn)
+	r := protocol.NewReader(conn)
+
+	for i := 0; i < n; i++ {
+		score := float64(10 + rand.Intn(90))
+		sendCommand(w, "ZADD", setName, strconv.FormatFloat(score, 'f', -1, 64), fmt.Sprintf("vec_key_bin:%d", i))
+		r.Read()
+	}
+	fmt.Printf("  Prepared %d keys in ZSet '%s'\n", n, setName)
+}
+
+func sendVsimSearchRange(w *protocol.Writer, k int, setName string, minScore, maxScore float64, vec []float32) error {
+	args := make([]string, len(vec)+5)
+	args[0] = "VSIM.SEARCHRANGE"
+	args[1] = strconv.Itoa(k)
+	args[2] = setName
+	args[3] = strconv.FormatFloat(minScore, 'f', -1, 64)
+	args[4] = strconv.FormatFloat(maxScore, 'f', -1, 64)
+	for i, v := range vec {
+		args[i+5] = strconv.FormatFloat(float64(v), 'f', -1, 32)
+	}
+	return sendCommand(w, args...)
+}
+

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"unsafe"
 
 	"kvstore/kvstore/internal/store/tcmalloc"
 )
@@ -31,6 +32,8 @@ type VectorStore struct {
 	lsh *LSHIndex
 
 	allocator *tcmalloc.TCMallocStore // Ссылка на менеджер памяти
+	EfSearch  int                     // Явная ширина поиска HNSW (если <= 0, то K * 10)
+	UseLSH    bool                    // Включить LSH-фильтрацию для высокоразмерных векторов (по умолчанию false)
 
 	mu sync.RWMutex
 }
@@ -58,6 +61,34 @@ func NewVectorStoreCosine(allocator *tcmalloc.TCMallocStore) *VectorStore {
 	return vs
 }
 
+// SetHNSWParams настраивает параметры HNSW-графа.
+func (vs *VectorStore) SetHNSWParams(M, efConstruction, efSearch int) {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	if M > 0 {
+		vs.graph.M = M
+		vs.graph.M0 = 2 * M
+		vs.graph.Ml = 1.0 / math.Log(float64(M))
+		vs.graph.pruneBufItems = make([]item, 0, vs.graph.M0+1)
+		vs.graph.pruneBufIDs = make([]uint64, 0, vs.graph.M0+1)
+		vs.graph.insertBuf = make([]uint64, 0, vs.graph.M0+1)
+	}
+	if efConstruction > 0 {
+		vs.graph.EfConstruction = efConstruction
+	}
+	if efSearch > 0 {
+		vs.EfSearch = efSearch
+	}
+}
+
+// SetUseLSH включает или выключает использование LSH-индекса для поиска.
+func (vs *VectorStore) SetUseLSH(use bool) {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	vs.UseLSH = use
+}
+
 
 // Add добавляет вектор с указанным ключом.
 func (vs *VectorStore) Add(key string, vec []float32) error {
@@ -69,7 +100,7 @@ func (vs *VectorStore) Add(key string, vec []float32) error {
 		vs.dim = len(vec)
 		// Ленивая инициализация LSH-индекса при первой вставке,
 		// только для высокоразмерных векторов (dim >= 256).
-		if vs.dim >= 256 {
+		if vs.dim >= 256 && vs.UseLSH {
 			// seed=42 — детерминированные проекции для воспроизводимости.
 			vs.lsh = NewLSHIndex(vs.dim, 42)
 		}
@@ -185,9 +216,14 @@ func (vs *VectorStore) SearchFiltered(query []float32, K int, filterFn func(stri
 		searchQuery = normalized
 	}
 
-	efSearch := K * 10
-	if efSearch < 100 {
-		efSearch = 100
+	efSearch := vs.EfSearch
+	if efSearch <= 0 {
+		efSearch = K * 10
+		if efSearch < 100 {
+			efSearch = 100
+		} else if efSearch > 300 {
+			efSearch = 300
+		}
 	}
 
 	// Обёртка: переводим string-фильтр в uint64-фильтр (internal ID → user key).
@@ -280,3 +316,11 @@ func DeserializeVector(data []byte) []float32 {
 	}
 	return vec
 }
+
+func DeserializeVectorZeroCopy(data []byte) []float32 {
+	if len(data) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), len(data)/4)
+}
+

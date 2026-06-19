@@ -11,7 +11,7 @@ import (
 )
 
 // Magic header и версия для проверки валидности файла
-var magicHeader = []byte("HNSW\x00\x01\x00\x00")
+var magicHeader = []byte("HNSW\x00\x02\x00\x00") // v2: VectorOffset uint64
 
 // SaveBinary сериализует весь HNSW-граф в высокопроизводительный бинарный формат.
 // Использует unsafe.Slice для копирования сырых блоков памяти без лишних аллокаций.
@@ -189,8 +189,8 @@ func (vs *VectorStore) LoadBinary(r io.Reader) error {
 		vs.graph.arena.dim = vs.dim
 	}
 
-	// Перестраиваем LSH индекс, если размерность высокая (dim >= 256)
-	if vs.dim >= 256 {
+	// Перестраиваем LSH индекс, если размерность высокая (dim >= 256) и LSH включен
+	if vs.dim >= 256 && vs.UseLSH {
 		vs.lsh = NewLSHIndex(vs.dim, 42)
 		// Пре-аллоцируем hashes до размера len(vs.graph.nodes)
 		vs.lsh.hashes = make([]uint64, len(vs.graph.nodes))
@@ -318,7 +318,7 @@ func writeSectionVectorArena(w io.Writer, va *VectorArena) error {
 
 	dataLen := uint32(len(va.data))
 	freeCount := uint32(len(va.freeOffsets))
-	sectionSize := 4 + dataLen*4 + 4 + freeCount*4
+	sectionSize := 4 + dataLen*4 + 4 + freeCount*8 // freeOffsets are uint64 = 8 bytes each
 
 	if _, err := w.Write([]byte{4}); err != nil {
 		return err
@@ -346,7 +346,7 @@ func writeSectionVectorArena(w io.Writer, va *VectorArena) error {
 		return err
 	}
 	if freeCount > 0 {
-		sizeInBytes := freeCount * 4
+		sizeInBytes := freeCount * 8 // uint64 = 8 bytes
 		byteSlice := unsafe.Slice((*byte)(unsafe.Pointer(&va.freeOffsets[0])), sizeInBytes)
 		if _, err := w.Write(byteSlice); err != nil {
 			return err
@@ -574,9 +574,9 @@ func readSectionVectorArena(r io.Reader, g *Graph) error {
 	}
 	freeCount := binary.LittleEndian.Uint32(freeCountBuf[:])
 
-	va.freeOffsets = make([]uint32, freeCount)
+	va.freeOffsets = make([]uint64, freeCount)
 	if freeCount > 0 {
-		sizeInBytes := freeCount * 4
+		sizeInBytes := freeCount * 8 // uint64 = 8 bytes
 		byteSlice := unsafe.Slice((*byte)(unsafe.Pointer(&va.freeOffsets[0])), sizeInBytes)
 		if _, err := io.ReadFull(r, byteSlice); err != nil {
 			return err
