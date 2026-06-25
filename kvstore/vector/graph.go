@@ -42,6 +42,13 @@ type Graph struct {
 	// EfConstruction — ширина поиска при ВСТАВКЕ.
 	EfConstruction int
 
+	// HeuristicSelect — использовать HNSW select-neighbors heuristic (Алг.4
+	// Malkov&Yashunin) вместо простого top-M при выборе соседей. Кандидат
+	// принимается, только если он ближе к базовому узлу, чем к любому уже
+	// выбранному соседу → разнообразие рёбер → лучше навигируемость → recall↑
+	// при том же efSearch. Стоит немного дороже на build (доп. дистанции).
+	HeuristicSelect bool
+
 	// Функция расстояния (Euclidean или Cosine).
 	Distance DistanceFunc
 
@@ -63,17 +70,18 @@ func NewGraph(distance DistanceFunc, allocator *tcmalloc.TCMallocStore) *Graph {
 	m := 16
 	m0 := 2 * m
 	return &Graph{
-		nodes:          make([]Node, 0, 10000),
-		freeIDs:        make([]uint32, 0, 64),
-		M:              m,
-		M0:             m0, // слой 0 в 2 раза плотнее (из оригинальной статьи)
-		Ml:             1.0 / math.Log(float64(m)),
-		EfConstruction: 200,
-		Distance:       distance,
-		allocator:      allocator,
-		pruneBufItems:  make([]item, 0, m0+1),
-		pruneBufIDs:    make([]uint64, 0, m0+1),
-		insertBuf:      make([]uint64, 0, m0+1),
+		nodes:           make([]Node, 0, 10000),
+		freeIDs:         make([]uint32, 0, 64),
+		M:               m,
+		M0:              m0, // слой 0 в 2 раза плотнее (из оригинальной статьи)
+		Ml:              1.0 / math.Log(float64(m)),
+		EfConstruction:  200,
+		HeuristicSelect: true, // HNSW select-neighbors heuristic: +recall (2.66× QPS@equal-recall) и +insert. См. step_profit_test.go:TestStep4
+		Distance:        distance,
+		allocator:       allocator,
+		pruneBufItems:   make([]item, 0, m0+1),
+		pruneBufIDs:     make([]uint64, 0, m0+1),
+		insertBuf:       make([]uint64, 0, m0+1),
 	}
 }
 
@@ -459,11 +467,14 @@ func (g *Graph) Insert(vec []float32) uint32 {
 	for lc := min(level, g.maxLevel); lc >= 0; lc-- {
 		state.acquire(len(g.nodes))
 		results := g.searchLayer(state, vec, ep, g.EfConstruction, lc)
-		
 
 		M := g.maxNeighbors(lc)
 		if len(results) > M {
-			results = results[:M]
+			if g.HeuristicSelect {
+				results = g.selectNeighborsHeuristic(results, M)
+			} else {
+				results = results[:M]
+			}
 		}
 
 		// Шаг 3: Сохраняем ID выбранных соседей через арену (★ zero-alloc через insertBuf)
@@ -580,7 +591,11 @@ func (g *Graph) pruneNeighborsFromList(node *Node, level int, maxCount int, neig
 	})
 
 	if len(items) > maxCount {
-		items = items[:maxCount]
+		if g.HeuristicSelect {
+			items = g.selectNeighborsHeuristic(items, maxCount)
+		} else {
+			items = items[:maxCount]
+		}
 	}
 
 	if cap(g.pruneBufIDs) < len(items) {
@@ -591,6 +606,42 @@ func (g *Graph) pruneNeighborsFromList(node *Node, level int, maxCount int, neig
 		pruned[i] = it.id
 	}
 	g.setNeighbors(node.NeighborsHandle, level, pruned)
+}
+
+// selectNeighborsHeuristic — HNSW select-neighbors heuristic (Алгоритм 4 из
+// Malkov & Yashunin, "Efficient and robust ANN ... using HNSW").
+//
+// items должны быть отсортированы по dist (дистанция до базового узла) ПО
+// ВОЗРАСТАНИЮ. Кандидат e принимается в набор R только если он ближе к базовому
+// узлу (e.dist), чем к любому уже выбранному соседу r (dist(e,r)). Это отсекает
+// «избыточные» рёбра в одном направлении и сохраняет дальние мосты → граф лучше
+// навигируется → выше recall при том же efSearch.
+//
+// Работает in-place: переставляет выбранных в начало items и возвращает префикс.
+// Zero-alloc. Стоимость: до O(M·len(items)) доп. вычислений дистанции на build.
+func (g *Graph) selectNeighborsHeuristic(items []item, M int) []item {
+	if len(items) <= M {
+		return items
+	}
+	selected := 0
+	for i := 0; i < len(items) && selected < M; i++ {
+		e := items[i]
+		eVec := g.arena.Get(g.nodes[e.id].VectorOffset)
+		good := true
+		for j := 0; j < selected; j++ {
+			// dist(e, r) < dist(e, q)  ⇒  e «загорожен» уже выбранным r → отклонить.
+			dER := g.Distance(eVec, g.arena.Get(g.nodes[items[j].id].VectorOffset))
+			if dER < e.dist {
+				good = false
+				break
+			}
+		}
+		if good {
+			items[selected], items[i] = items[i], items[selected]
+			selected++
+		}
+	}
+	return items[:selected]
 }
 
 // Delete удаляет ноду из HNSW-графа.
@@ -935,4 +986,3 @@ var searchPool = sync.Pool{
 		}
 	},
 }
-
