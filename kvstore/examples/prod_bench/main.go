@@ -96,7 +96,7 @@ func runBenchmark(numVectors int, dim int, metricName string) {
 	startTime = time.Now()
 	for i := 0; i < queryCount; i++ {
 		qStart := time.Now()
-		_, _ = store.Search(queries[i], 10)
+		_, _ = store.Search(queries[i], 10, nil)
 		latencies[i] = time.Since(qStart)
 	}
 	totalSearchTime := time.Since(startTime)
@@ -142,7 +142,7 @@ func runBenchmark(numVectors int, dim int, metricName string) {
 				}
 
 				qStart := time.Now()
-				_, _ = store.Search(q, 10)
+				_, _ = store.Search(q, 10, nil)
 				duration := time.Since(qStart)
 
 				localLatencies = append(localLatencies, duration)

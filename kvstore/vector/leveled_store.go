@@ -1,10 +1,18 @@
 package vector
 
 import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unsafe"
 
+	"kvstore/kvstore/internal/monitoring"
 	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
@@ -13,22 +21,24 @@ import (
 //
 // Архитектура:
 //
-//   Write Path (все размерности):
-//     Add(key, vec) → DeltaSegment (O(1) append)
-//     Когда delta.Full() → trigger background compaction
+//	Write Path (все размерности):
+//	  Add(key, vec) → DeltaSegment (O(1) append)
+//	  Когда delta.Full() → trigger background compaction
 //
-//   Read Path:
-//     Search(q, K) → параллельно по delta + все сегменты уровней → merge top-K
+//	Read Path:
+//	  Search(q, K) → параллельно по delta + все сегменты уровней → merge top-K
 //
-//   Compaction (background, не блокирует reads):
-//     L0: buildHNSW(deltaMax vectors) → [CSR если dim≤256]
-//     L1: merge 4×L0 → buildHNSW(4*deltaMax) → [CSR если dim≤256]
-//     L2: merge 4×L1 → buildHNSW(16*deltaMax) → ...
+//	Compaction (background, не блокирует reads):
+//	  L0: buildHNSW(deltaMax vectors) → [CSR если dim≤256]
+//	  L1: merge 4×L0 → buildHNSW(4*deltaMax) → [CSR если dim≤256]
+//	  L2: merge 4×L1 → buildHNSW(16*deltaMax) → ...
 //
 // Параметры по умолчанию:
-//   deltaMax = min(10_000, 40MB / (dim * 4))
-//   fanout   = 4
-//   CSR threshold = dim ≤ 256
+//
+//	deltaMax = min(50_000, 100MB / (dim * 4))
+//	fanout   = 4
+//	CSR threshold = dim ≤ 256
+//
 // =============================================================================
 
 const (
@@ -41,23 +51,41 @@ const (
 
 	// maxLevels — максимальное число уровней LSM-иерархии.
 	maxLevels = 8
+
+	// Типы сегментов в бинарном снапшоте.
+	segTypeFrozen    byte = 0
+	segTypeHNSWFlat  byte = 1
+	segTypeFrozenSQ8 byte = 2 // SQ8-compressed frozen (uint8 codes)
 )
+
+// leveledMagic — магические байты заголовка бинарного снапшота LeveledVectorStore.
+var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 1, 0, 0}
 
 // =============================================================================
 // Segment interface — единица хранения (либо FrozenGraph, либо plain HNSW)
 // =============================================================================
 
+// segment — внутренний интерфейс. filterFn != nil → фильтровать результаты.
 type segment interface {
-	// Search выполняет поиск K ближайших с заданным efSearch.
-	Search(query []float32, K, efSearch int) []segResult
-	// Len возвращает число векторов в сегменте.
+	Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult
 	Len() int
+	// HasKey проверяет, содержит ли сегмент живой вектор с этим ключом.
+	// Используется Delete для подтверждения, что tombstone нужно поставить.
+	HasKey(key string) bool
 }
 
-// segResult — универсальный тип результата поиска по сегменту.
-type segResult struct {
-	Key  string
-	Dist float32
+type leveledSearchState struct {
+	workerBufs [][]FrozenResult // буфер результатов для каждой горутины-воркера
+	combined   []VSearchResult  // общий буфер для слияния (был []LeveledResult)
+}
+
+var leveledSearchPool = sync.Pool{
+	New: func() any {
+		return &leveledSearchState{
+			workerBufs: make([][]FrozenResult, 0, 8),
+			combined:   make([]VSearchResult, 0, 256),
+		}
+	},
 }
 
 // -----------------------------------------------------------------------------
@@ -70,13 +98,46 @@ type frozenSegment struct {
 
 func (s *frozenSegment) Len() int { return s.fg.Len() }
 
-func (s *frozenSegment) Search(query []float32, K, efSearch int) []segResult {
-	raw := s.fg.Search(query, K, efSearch)
-	out := make([]segResult, len(raw))
-	for i, r := range raw {
-		out[i] = segResult{Key: r.Key, Dist: r.Dist}
+// HasKey — O(N) линейный поиск по keys. Дорогая операция!
+// Вызывается только из Delete для редких ручных DEL / TTL-eviction.
+// Не на горячем пути Search (там обход графа, не lookup по ключу).
+func (s *frozenSegment) HasKey(key string) bool {
+	fg := s.fg
+	for i := 0; i < fg.n; i++ {
+		if fg.keys[i] == key {
+			return true
+		}
 	}
-	return out
+	return false
+}
+
+func (s *frozenSegment) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return s.fg.Search(query, K, efSearch, dst, filterFn)
+}
+
+// -----------------------------------------------------------------------------
+// frozenSQSegment — обёртка вокруг *FrozenGraphSQ (SQ8-compressed), реализует segment.
+// -----------------------------------------------------------------------------
+
+type frozenSQSegment struct {
+	fg *FrozenGraphSQ
+}
+
+func (s *frozenSQSegment) Len() int { return s.fg.Len() }
+
+// HasKey — O(N) линейный поиск по keys (аналог frozenSegment).
+func (s *frozenSQSegment) HasKey(key string) bool {
+	fg := s.fg
+	for i := 0; i < fg.n; i++ {
+		if fg.keys[i] == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *frozenSQSegment) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return s.fg.Search(query, K, efSearch, dst, filterFn)
 }
 
 // -----------------------------------------------------------------------------
@@ -86,7 +147,7 @@ func (s *frozenSegment) Search(query []float32, K, efSearch int) []segResult {
 type hnswSegment struct {
 	g    *Graph
 	keys map[uint64]string // internal_id → user_key
-	mu   sync.RWMutex      // защита от чтения пока graаф строится
+	mu   sync.RWMutex      // защита от чтения пока граф строится
 }
 
 func (s *hnswSegment) Len() int {
@@ -95,21 +156,59 @@ func (s *hnswSegment) Len() int {
 	return s.g.nodeCount
 }
 
-func (s *hnswSegment) Search(query []float32, K, efSearch int) []segResult {
+// HasKey — O(N) итерация по keys map. Редкий путь (Delete/TTL-eviction).
+func (s *hnswSegment) HasKey(key string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, k := range s.keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *hnswSegment) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	raw := s.g.Search(query, K, efSearch)
-	out := make([]segResult, 0, len(raw))
-	for _, r := range raw {
+	if filterFn != nil {
+		internalFilter := func(nodeID uint64) bool {
+			key, ok := s.keys[nodeID]
+			return ok && key != "" && filterFn(key)
+		}
+		rawSearch := s.g.SearchFiltered(query, K, efSearch, internalFilter)
+		if cap(dst) < len(rawSearch) {
+			dst = make([]FrozenResult, 0, len(rawSearch))
+		} else {
+			dst = dst[:0]
+		}
+		for _, r := range rawSearch {
+			key, ok := s.keys[r.ID]
+			if !ok || key == "" {
+				continue
+			}
+			dst = append(dst, FrozenResult{Key: key, Dist: r.Distance})
+		}
+		return dst
+	}
+
+	rawSearch := s.g.Search(query, K, efSearch)
+	if cap(dst) < len(rawSearch) {
+		dst = make([]FrozenResult, 0, len(rawSearch))
+	} else {
+		dst = dst[:0]
+	}
+	for _, r := range rawSearch {
 		key, ok := s.keys[r.ID]
 		if !ok || key == "" {
 			continue
 		}
-		out = append(out, segResult{Key: key, Dist: r.Distance})
+		dst = append(dst, FrozenResult{Key: key, Dist: r.Distance})
 	}
-	return out
+	return dst
 }
+
 
 // =============================================================================
 // LeveledVectorStore
@@ -124,6 +223,9 @@ type LeveledConfig struct {
 	// Fanout — кол-во сегментов одного уровня до merge в следующий.
 	Fanout int
 
+	// M — параметр M HNSW (число соседей). 0 = default из NewGraph.
+	M int
+
 	// EfConstruction — ширина поиска при построении HNSW.
 	EfConstruction int
 
@@ -135,6 +237,30 @@ type LeveledConfig struct {
 
 	// Allocator — менеджер памяти для HNSW.
 	Allocator *tcmalloc.TCMallocStore
+
+	// UseSQ — включить Scalar Quantization (int8) для frozen-сегментов (любая dim).
+	// Сжимает рабочий набор векторов 4× (float32→uint8), поднимает QPS за счёт
+	// cache-locality. Recall держится ≥96% (vs 97% float32) благодаря ADC+rerank.
+	// Применяется только к новым сегментам после buildSegment; существующие
+	// сегменты сохраняют свой формат (segType различает в сериализации).
+	UseSQ bool
+
+	// NumBuilders — число параллельных build workers для компакции.
+	// 0 = auto (NumCPU/2, clamped 2..8). Build Pool: пока один worker строит
+	// тяжёлый L2-сегмент (~100s), остальные параллельно флашат дельту и строят
+	// L0/L1 → вставка не блокируется при burst-write.
+	NumBuilders int
+}
+
+// compactionResult — результат build/merge goroutine, передаётся через resultChan.
+// Значение (не указатель) — channel receive создаёт happens-before для всех полей.
+type compactionResult struct {
+	kind      taskKind
+	sourceLvl int        // для merge: уровень источник
+	targetLvl int        // куда добавлен результат
+	epoch     uint64     // эпоха на момент GRAB
+	result    segment    // построенный сегмент (nil = failure)
+	oldSegs   []segment  // для merge: сегменты для удаления из sourceLvl
 }
 
 // LeveledVectorStore — основное хранилище с leveled compaction.
@@ -143,13 +269,23 @@ type LeveledVectorStore struct {
 
 	mu    sync.RWMutex
 	delta *DeltaSegment
-	dim   int // устанавливается при первой вставке
+	dim   int // устанавливается при первой вставке или LoadBinary
 
 	// levels[i] — слой i, содержит []segment, упорядоченных по времени создания.
 	// levels[0] — самые свежие малые сегменты (каждый ≈ deltaMax векторов).
 	levels [maxLevels][]segment
 
-	// compacting — атомарный флаг: идёт ли фоновая компакция.
+	// tombstones — COW-множество удалённых ключей (atomic.Pointer для lock-free чтения).
+	// nil = нет удалений (zero-overhead).
+	tombstones atomic.Pointer[map[string]struct{}]
+
+	// compactionEpoch — поколение данных. Bump'ится под write-lock в Clear.
+	// Compactor захватывает epoch перед долгой работой (build/merge вне lock) и
+	// проверяет под lock перед записью в levels — иначе остаётся TOCTOU-окно,
+	// в котором Clear() зануляет levels, а compactor публикует устаревший сегмент.
+	compactionEpoch atomic.Uint64
+
+	// compacting — атомарный флаг: идёт ли фоновая/синхронная компакция.
 	compacting atomic.Bool
 
 	// compactCh — сигнальный канал для запуска фоновой компакции.
@@ -157,9 +293,91 @@ type LeveledVectorStore struct {
 
 	// done — канал для остановки фонового воркера.
 	done chan struct{}
+
+	// ─── Build Pool (producer-consumer компакция) ───
+	//
+	// coordinateCompaction() = producer: GRAB (delta flush + overflow merges)
+	// под lvs.mu, кладёт tasks в buildQueue. Никаких тяжёлых BUILD внутри.
+	//
+	// buildWorker() × numBuilders = consumers: BUILD (buildSegment/mergeSegments
+	// вне lock) + PUBLISH (append в levels под lock + epoch check).
+	//
+	// Это устраняет блокировку вставки: пока один worker строит L2 (~100s),
+	// остальные флашат дельту и строят L0/L1 параллельно.
+
+	// buildQueue — очередь задач для build workers. Bounded (32) — backpressure:
+	// когда полна, coordinator блокируется → insert не опережает build (анти-OOM).
+	buildQueue chan *compactionTask
+
+	// buildWG — WaitGroup для graceful shutdown build workers.
+	buildWG sync.WaitGroup
+
+	// coordWG — WaitGroup для coordinator (compactWorker).
+	coordWG sync.WaitGroup
+
+	// numBuilders — фактическое число build workers (из cfg.NumBuilders, auto).
+	numBuilders int
+
+	// closeOnce — защита от двойного close(done) в Close().
+	closeOnce sync.Once
+
+	// flushCond + flushPending — механизм ожидания FlushDeltaSync.
+	// FlushDeltaSync ставит флаг и шлёт сигнал coordinator'у, затем ждёт cond.
+	// buildWorker после publish delta-segment сбрасывает флаг и будит cond.
+	flushCond    *sync.Cond
+	flushPending atomic.Bool
+
+	// buildWorkerIDCounter — раздаёт уникальные workerID для параллельных buildSegment.
+	// TCMallocStore.Alloc(workerID, ...) шардирует по workerID; конкурентный доступ
+	// к одному caches[workerID] — data race. Каждый buildWorker берёт свой ID при старте.
+	buildWorkerIDCounter atomic.Int32
+
+	// buildAllocators — pool per-worker аллокаторов. TCMallocStore НЕ потокобезопасен
+	// для конкурентных Alloc через общий MCentral/MHeap, поэтому каждый buildWorker
+	// использует свой изолированный аллокатор. Создаются один раз при старте.
+	buildAllocators []*tcmalloc.TCMallocStore
+
+	// mergeAllocator — изолированный аллокатор для merge goroutines.
+	// Может быть несколько параллельных merge (разные уровни) → нужен pool.
+	// mergeAllocatorsCounter раздаёт round-robin.
+	mergeAllocators         []*tcmalloc.TCMallocStore
+	mergeAllocatorsCounter  atomic.Int32
+
+	// inFlightBuilds — счётчик delta-flush задач в работе.
+	// Increment перед запуском горутины, decrement в applyResult после publish/drop.
+	inFlightBuilds atomic.Int32
+
+	// buildSem — семафор: не более numBuilders builds одновременно.
+	// Горутины ждут на семафоре; coordinator никогда не блокируется.
+	// Это обеспечивает изоляцию allocator (только numBuilders concurrent builds)
+	// и предотвращает TCMallocStore race без ограничения количества горутин.
+	buildSem chan struct{}
+
+	// ─── Event Loop Coordinator ───
+	//
+	// Coordinator — чистый select{} event loop. Никогда не строит сам.
+	//   compactCh   → grab delta → запустить goroutine build → продолжить
+	//   resultChan  → атомарно применить результат в levels[] → продолжить
+	//
+	// Старые сегменты НЕ убираются из levels[] пока merge не завершён (нет дыр для search).
+	// mergeInFlight[L] = true → merge уровня L в работе (новый не запускаем).
+
+	// resultChan — канал результатов от build/merge goroutines → coordinator.
+	// Передаёт значение (не указатель) — happens-before через channel receive.
+	resultChan chan compactionResult
+
+	// mergeInFlight — флаги "идёт merge на уровне" (по одному merge на уровень одновременно).
+	mergeInFlight [maxLevels]bool
+
+	// deltaFlushInFlight — true пока delta-flush goroutine не вернула результат.
+	// Только один delta-flush одновременно (один buildAllocators[0] → нет TCMalloc race).
+	deltaFlushInFlight bool
+
+	// snapshotTime — UnixNano момента последнего успешного LoadBinary (для диагностики).
+	snapshotTime int64
 }
 
-// NewLeveledVectorStore создаёт хранилище и запускает фоновый compactor.
+// NewLeveledVectorStore создаёт хранилище и запускает Build Pool.
 func NewLeveledVectorStore(cfg LeveledConfig) *LeveledVectorStore {
 	if cfg.Fanout <= 0 {
 		cfg.Fanout = defaultFanout
@@ -177,28 +395,76 @@ func NewLeveledVectorStore(cfg LeveledConfig) *LeveledVectorStore {
 		cfg.Allocator = tcmalloc.NewTCMallocStore(1)
 	}
 
-	lvs := &LeveledVectorStore{
-		cfg:       cfg,
-		compactCh: make(chan struct{}, 1),
-		done:      make(chan struct{}),
+	// NumBuilders: auto = NumCPU/2, clamped [2, 8].
+	numBuilders := cfg.NumBuilders
+	if numBuilders <= 0 {
+		numBuilders = runtime.NumCPU() / 2
+		if numBuilders < 2 {
+			numBuilders = 2
+		}
+		if numBuilders > 8 {
+			numBuilders = 8
+		}
 	}
 
-	// Фоновый compactor
-	go lvs.compactWorker()
+	lvs := &LeveledVectorStore{
+		cfg:         cfg,
+		compactCh:   make(chan struct{}, 1),
+		done:        make(chan struct{}),
+		buildQueue:  make(chan *compactionTask, 32),
+		resultChan:  make(chan compactionResult, 32),
+		numBuilders: numBuilders,
+		buildSem:    make(chan struct{}, numBuilders),
+	}
+	lvs.flushCond = sync.NewCond(&lvs.mu)
+
+	// Per-worker изолированные аллокаторы для параллельных buildSegment.
+	// TCMallocStore НЕ потокобезопасен через общий MCentral/MHeap — каждый
+	// buildWorker получает свой аллокатор (свой MHeap/MCentral/MCache).
+	lvs.buildAllocators = make([]*tcmalloc.TCMallocStore, numBuilders)
+	for i := range lvs.buildAllocators {
+		lvs.buildAllocators[i] = tcmalloc.NewTCMallocStore(1)
+	}
+	// Изолированный аллокатор для coordinator-driven merge (не пересекается с build workers).
+	lvs.mergeAllocators = make([]*tcmalloc.TCMallocStore, maxLevels)
+	for i := range lvs.mergeAllocators {
+		lvs.mergeAllocators[i] = tcmalloc.NewTCMallocStore(1)
+	}
+
+	// Coordinator: 1 горутина, GRAB-only, кладёт tasks в buildQueue.
+	lvs.coordWG.Add(1)
+	go func() {
+		defer lvs.coordWG.Done()
+		lvs.compactWorker()
+	}()
+
+	// Build workers: N горутин, BUILD + PUBLISH параллельно.
+	for i := 0; i < numBuilders; i++ {
+		lvs.buildWG.Add(1)
+		go func() {
+			defer lvs.buildWG.Done()
+			lvs.buildWorker()
+		}()
+	}
 
 	return lvs
 }
 
 // deltaMax вычисляет максимальный размер дельты для заданной размерности.
-// min(10_000, 40MB / (dim * 4 bytes))
+// min(50_000, 100MB / (dim * 4 bytes)).
+//
+// 50 000 выбрано как баланс:
+// - 500k векторов → всего 10 L0 сегментов (быстрый merge, быстрый search).
+// - L1 merge = 4×50k = 200k (остаётся frozen: uint32 neighbor IDs, потолка нет).
+// - Delta flush занимает ~5-10s (build HNSW на 50k при M=32/efC=400).
 func deltaMax(dim, cfgMax int) int {
 	if cfgMax > 0 {
 		return cfgMax
 	}
-	const maxBytes = 40 * 1024 * 1024
+	const maxBytes = 100 * 1024 * 1024 // 100MB лимит на дельту
 	bySize := maxBytes / (dim * 4)
-	if bySize > 10_000 {
-		return 10_000
+	if bySize > 50_000 {
+		return 50_000
 	}
 	return bySize
 }
@@ -213,15 +479,22 @@ func (lvs *LeveledVectorStore) Add(key string, vec []float32) error {
 	if lvs.dim == 0 {
 		lvs.dim = len(vec)
 		max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
-		lvs.delta = NewDeltaSegment(lvs.dim, max)
+		lvs.delta = NewDeltaSegment(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction)
 	} else if len(vec) != lvs.dim {
 		return &dimMismatchError{expected: lvs.dim, got: len(vec)}
 	}
 
 	lvs.delta.Append(key, vec)
 
-	// Если дельта заполнена — сигнализируем фоновому воркеру
-	if lvs.delta.Full() {
+	// Если ключ ранее был удалён (есть в tombstones) — снимаем tombstone,
+	// иначе Delete(key) после Add(key,...) вновь удалит живой вектор.
+	deleteTombstone(&lvs.tombstones, key)
+
+	// Если дельта ТОЛЬКО ЧТО переполнилась — сигнализируем coordinator.
+	// НЕ шлём сигнал каждый Add после переполнения (busy-loop): проверяем ==maxSize,
+	// а не >=. Coordinator swap'нет delta при первой возможности (deltaFlushInFlight=false).
+	// Пока flush занят — delta копится, но сигналов не генерим.
+	if len(lvs.delta.keys) == lvs.delta.maxSize {
 		lvs.triggerCompact()
 	}
 
@@ -232,13 +505,104 @@ func (lvs *LeveledVectorStore) Add(key string, vec []float32) error {
 func (lvs *LeveledVectorStore) Delete(key string) bool {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
-	if lvs.delta == nil {
+
+	// Если в дельте — hard delete (вектор физически исчезает).
+	if lvs.delta != nil && lvs.delta.Delete(key) {
+		deleteTombstone(&lvs.tombstones, key) // снять, если был ранее
+		return true
+	}
+
+	// В дельте нет. Проверяем, есть ли ключ в каком-либо сегменте.
+	if !lvs.keyExistsInSegmentsLocked(key) {
 		return false
 	}
-	return lvs.delta.Delete(key)
+
+	// Ключ жив в сегменте. Помечаем tombstone (сегмент иммутабелен).
+	addTombstone(&lvs.tombstones, key)
+	monitoring.VectorTombstoneTotal.Inc()
+	return true
 }
 
-// FlushDelta принудительно флашит дельту (для тестов и graceful shutdown).
+// keyExistsInSegmentsLocked проверяет, жив ли ключ в каком-либо сегменте.
+// Вызывается под lvs.mu (read). Учитывает tombstones.
+func (lvs *LeveledVectorStore) keyExistsInSegmentsLocked(key string) bool {
+	if t := lvs.tombstones.Load(); t != nil {
+		if _, ok := (*t)[key]; ok {
+			return false // уже tombstoned
+		}
+	}
+	for _, level := range lvs.levels {
+		for _, seg := range level {
+			if seg.HasKey(key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// addTombstone: COW-добавление ключа. Вызывать под lvs.mu (write).
+// Дедуп: если ключ уже есть — no-op (без аллокации).
+func addTombstone(p *atomic.Pointer[map[string]struct{}], key string) {
+	old := p.Load()
+	if old != nil {
+		if _, exists := (*old)[key]; exists {
+			return
+		}
+		nw := make(map[string]struct{}, len(*old)+1)
+		for k, v := range *old {
+			nw[k] = v
+		}
+		nw[key] = struct{}{}
+		p.Store(&nw)
+		return
+	}
+	nw := map[string]struct{}{key: {}}
+	p.Store(&nw)
+}
+
+// deleteTombstone: COW-удаление ключа. Вызывать под lvs.mu (write).
+// Когда множество пустеет — Store(nil), возвращая zero-overhead-состояние.
+func deleteTombstone(p *atomic.Pointer[map[string]struct{}], key string) {
+	cur := p.Load()
+	if cur == nil {
+		return
+	}
+	if _, ok := (*cur)[key]; !ok {
+		return
+	}
+	if len(*cur) == 1 {
+		p.Store(nil)
+		return
+	}
+	nw := make(map[string]struct{}, len(*cur)-1)
+	for k, v := range *cur {
+		if k != key {
+			nw[k] = v
+		}
+	}
+	p.Store(&nw)
+}
+
+// Clear сбрасывает всё хранилище в пустое состояние.
+func (lvs *LeveledVectorStore) Clear() {
+	lvs.mu.Lock()
+	defer lvs.mu.Unlock()
+
+	// Bump эпохи ПОД локом: инвариант «epoch сменился ⇒ levels уже занулён».
+	// Compactor, державший старую эпоху в долгом merge вне lock, увидит новый
+	// epoch при последующем Lock и выбросит устаревший сегмент.
+	lvs.compactionEpoch.Add(1)
+
+	lvs.delta = nil
+	lvs.dim = 0
+	for i := range lvs.levels {
+		lvs.levels[i] = nil
+	}
+	lvs.tombstones.Store(nil)
+}
+
+// FlushDelta принудительно флашит дельту (async — для graceful shutdown).
 func (lvs *LeveledVectorStore) FlushDelta() {
 	lvs.mu.Lock()
 	if lvs.delta == nil || lvs.delta.Len() == 0 {
@@ -249,14 +613,34 @@ func (lvs *LeveledVectorStore) FlushDelta() {
 	lvs.mu.Unlock()
 }
 
-// Search выполняет поиск по delta + всем сегментам уровней.
+// FlushDeltaSync — см. реализацию ниже (Build Pool версия с cond-ожиданием).
+
+// =============================================================================
+// Поиск
+// =============================================================================
+
+// Search выполняет поиск K ближайших. dst — неиспользуется (для совместимости с VectorIndex).
+func (lvs *LeveledVectorStore) Search(query []float32, K int, dst []VSearchResult) ([]VSearchResult, error) {
+	return lvs.search(query, K, nil)
+}
+
+// SearchFiltered выполняет поиск K ближайших с фильтром по ключу. dst — неиспользуется.
+func (lvs *LeveledVectorStore) SearchFiltered(query []float32, K int, filterFn func(string) bool, dst []VSearchResult) ([]VSearchResult, error) {
+	return lvs.search(query, K, filterFn)
+}
+
+// search — внутренняя реализация с опциональным filterFn.
 //
 // Быстрые пути (0 горутин):
 //   - Только delta: прямой BruteForce, без merge
 //   - Один сегмент (+ пустая delta): прямой Search, без merge
 //
-// Параллельный путь: N сегментов + delta, горутины только при N > goroutineThreshold.
-func (lvs *LeveledVectorStore) Search(query []float32, K int) ([]LeveledResult, error) {
+// Параллельный путь: N сегментов + delta, горутины только при N > 3.
+//
+// Tombstones: snapshot захватывается ПОД lock вместе с указателями сегментов
+// и компонуется с filterFn в composedFilter. Если tombstones==nil (нет удалений)
+// — ни одной аллокации, overhead нулевой.
+func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(string) bool) ([]VSearchResult, error) {
 	lvs.mu.RLock()
 
 	if lvs.dim == 0 {
@@ -272,14 +656,21 @@ func (lvs *LeveledVectorStore) Search(query []float32, K int) ([]LeveledResult, 
 	if efSearch < K {
 		efSearch = K
 	}
+	// При фильтрации расширяем окно поиска ×4 для компенсации recall-потерь.
+	if filterFn != nil {
+		if efSearch*4 <= 2000 {
+			efSearch *= 4
+		} else {
+			efSearch = 2000
+		}
+	}
 
-	// Считаем сегменты и delta под блокировкой
+	// Считаем сегменты и delta ПОД lock
 	nSegs := 0
 	for i := range lvs.levels {
 		nSegs += len(lvs.levels[i])
 	}
-	delta := lvs.delta
-	hasDelta := delta != nil && delta.Len() > 0
+	hasDelta := lvs.delta != nil && lvs.delta.Len() > 0
 
 	// Fast path 1: ничего нет — возвращаем nil
 	if !hasDelta && nSegs == 0 {
@@ -287,15 +678,53 @@ func (lvs *LeveledVectorStore) Search(query []float32, K int) ([]LeveledResult, 
 		return nil, nil
 	}
 
-	// Fast path 2: только delta, нет сегментов — BruteForce без горутин and merge
-	if nSegs == 0 && hasDelta {
-		lvs.mu.RUnlock()
-		raw := delta.BruteForce(query, K, lvs.cfg.Distance)
-		out := make([]LeveledResult, len(raw))
-		for i, r := range raw {
-			out[i] = LeveledResult{Key: r.key, Dist: r.dist}
+	// Захватываем snapshot tombstones ПОД lock — атомарно вместе с указателями
+	// сегментов. После RUnlock compaction может сбросить tombstones, но наш
+	// snapshot останется консистентным: мы фильтруем по «не менее» актуальному
+	// множеству (старые tombstones ⊆ актуальных → не покажем лишнего).
+	tombSnap := lvs.tombstones.Load()
+
+	// composedFilter = tombstone-check ∘ filterFn.
+	// Передаётся во все сегменты и дельту. Если tombstones==nil и filterFn==nil
+	// — composedFilter==nil → zero overhead на всех путях.
+	var composedFilter func(string) bool
+	if tombSnap != nil {
+		ts := *tombSnap // immutable snapshot (COW-гарантия)
+		if filterFn != nil {
+			composedFilter = func(key string) bool {
+				_, deleted := ts[key]
+				return !deleted && filterFn(key)
+			}
+		} else {
+			composedFilter = func(key string) bool {
+				_, deleted := ts[key]
+				return !deleted
+			}
 		}
-		return out, nil
+	} else {
+		composedFilter = filterFn // nil или caller-provided, без обёртки
+	}
+
+	// Активная delta — MUTABLE (Add делает append/copy в неё). Все обращения
+	// к delta ниже идут ПОД lvs.mu.RLock(), иначе data race с параллельным Add.
+	// BruteForce по ~10k векторов ~200μs — RLock на это время блокирует Add,
+	// что приемлемо (delta bounded, flush регулярно освобождает lock).
+	delta := lvs.delta
+
+	// Fast path 2: только delta, нет сегментов — BruteForce под RLock.
+	// 1 alloc/op (выходной heap). BruteForce по ~10k векторов ~200μs — RLock на
+	// это время блокирует Add, что приемлемо (delta bounded).
+	if nSegs == 0 && hasDelta {
+		raw := delta.Search(query, K, efSearch, composedFilter)
+		lvs.mu.RUnlock()
+		if len(raw) == 0 {
+			return nil, nil
+		}
+		result := make([]VSearchResult, len(raw))
+		for i, r := range raw {
+			result[i] = VSearchResult{Key: r.key, Distance: r.dist}
+		}
+		return result, nil
 	}
 
 	// Fast path 3: один сегмент, delta пуста — прямой Search без merge
@@ -308,90 +737,388 @@ func (lvs *LeveledVectorStore) Search(query []float32, K int) ([]LeveledResult, 
 			}
 		}
 		lvs.mu.RUnlock()
-		raw := seg.Search(query, K, efSearch) // K кандидатов — достаточно для single-segment
+		raw := seg.Search(query, K, efSearch, nil, composedFilter)
 		if len(raw) > K {
 			raw = raw[:K]
 		}
-		out := make([]LeveledResult, len(raw))
-		for i, r := range raw {
-			out[i] = LeveledResult{Key: r.Key, Dist: r.Dist}
+		if len(raw) == 0 {
+			return nil, nil
 		}
-		return out, nil
+		result := make([]VSearchResult, len(raw))
+		for i, r := range raw {
+			result[i] = VSearchResult{Key: r.Key, Distance: r.Dist}
+		}
+		return result, nil
 	}
 
 	// General path: N сегментов + delta.
-	// Копируем указатели сегментов (дешёво: только указатели, ~8 байт на сегмент)
+	//
+	// Корректность concurrency:
+	//   - Сегменты immutable после публикации → поиск по ним идёт БЕЗ lvs.mu.
+	//   - Delta MUTABLE (Add делает append/copy в неё) → BruteForce по ней
+	//     обязан идти ПОД lvs.mu.RLock(), иначе data race с параллельным Add.
+	//     Поэтому delta обрабатываем синхронно под lock (~200μs при 10k векторов),
+	//     затем отпускаем lock и параллельно обходим immutable-сегменты.
+	//
+	// 1 alloc/op для delta (выходной heap), сегменты — через sync.Pool.
+	var deltaRes []deltaResult
+	if hasDelta {
+		deltaRes = delta.Search(query, K, efSearch, composedFilter)
+	}
+
+	// Копируем указатели сегментов (дешёво: ~8 байт на сегмент).
 	segs := make([]segment, 0, nSegs)
 	for i := range lvs.levels {
 		segs = append(segs, lvs.levels[i]...)
 	}
 	lvs.mu.RUnlock()
 
-	// Параллельный поиск: горутина на каждый источник
 	nWorkers := nSegs
 	if hasDelta {
 		nWorkers++
 	}
 
-	// Плоский буфер результатов — без 2D среза
-	type workerOut struct {
-		res []segResult
-	}
-	outs := make([]workerOut, nWorkers)
-	var wg sync.WaitGroup
-	wg.Add(nWorkers)
+	st := leveledSearchPool.Get().(*leveledSearchState)
+	defer leveledSearchPool.Put(st)
 
+	if cap(st.workerBufs) < nWorkers {
+		st.workerBufs = make([][]FrozenResult, nWorkers)
+	} else {
+		st.workerBufs = st.workerBufs[:nWorkers]
+	}
+	for i := range st.workerBufs {
+		if cap(st.workerBufs[i]) < efSearch {
+			st.workerBufs[i] = make([]FrozenResult, 0, efSearch)
+		} else {
+			st.workerBufs[i] = st.workerBufs[i][:0]
+		}
+	}
+
+	// delta-результат вычислен под RLock в виде []deltaResult. Копируем в
+	// workerBufs[0] как FrozenResult (struct conversion — zero alloc, копирование
+	// string-header + float32 по значению).
 	idx := 0
 	if hasDelta {
-		capturedIdx := idx
-		go func() {
-			defer wg.Done()
-			raw := delta.BruteForce(query, K, lvs.cfg.Distance)
-			out := make([]segResult, len(raw))
-			for i, r := range raw {
-				out[i] = segResult{Key: r.key, Dist: r.dist}
-			}
-			outs[capturedIdx].res = out
-		}()
-		idx++
+		for _, r := range deltaRes {
+			st.workerBufs[0] = append(st.workerBufs[0], FrozenResult{Key: r.key, Dist: r.dist})
+		}
+		idx = 1
 	}
-	for _, seg := range segs {
-		capturedIdx, seg := idx, seg
-		go func() {
-			defer wg.Done()
-			// Запрашиваем efSearch кандидатов — не K!
-			// Merge из N сегментов требует достаточно вариантов для global top-K.
-			outs[capturedIdx].res = seg.Search(query, efSearch, efSearch)
-		}()
-		idx++
+
+	// Сегменты — immutable, можно параллельно без lvs.mu.
+	remainSegs := segs
+	// Запускаем параллельный обход через фиксированный Worker Pool (Milvus-style).
+	// Ранее здесь запускалась goroutine на КАЖДЫЙ сегмент (до 35 штук), что вызывало
+	// огромный overhead на планировщик Go и context-switches на 12 ядрах.
+	// Теперь Worker Pool распределяет сегменты на горутины равномерно, без аллокаций.
+	if len(remainSegs) > 1 {
+		lvs.searchSegmentsParallel(query, efSearch, st, remainSegs, idx, composedFilter)
+	} else {
+		// Fast-path: всего 1 сегмент, работаем в текущей горутине (0 overhead).
+		for _, seg := range remainSegs {
+			st.workerBufs[idx] = seg.Search(query, efSearch, efSearch, st.workerBufs[idx], composedFilter)
+			idx++
+		}
 	}
-	wg.Wait()
 
 	// Flat merge: собираем всё в один срез и берём top-K
 	total := 0
-	for i := range outs {
-		total += len(outs[i].res)
+	for i := range st.workerBufs {
+		total += len(st.workerBufs[i])
 	}
-	combined := make([]LeveledResult, 0, total)
-	for i := range outs {
-		for _, r := range outs[i].res {
-			combined = append(combined, LeveledResult{Key: r.Key, Dist: r.Dist})
+
+	if cap(st.combined) < total {
+		st.combined = make([]VSearchResult, 0, total)
+	} else {
+		st.combined = st.combined[:0]
+	}
+
+	for i := range st.workerBufs {
+		for _, r := range st.workerBufs[i] {
+			st.combined = append(st.combined, VSearchResult{Key: r.Key, Distance: r.Dist})
 		}
 	}
-	slices.SortFunc(combined, func(a, b LeveledResult) int {
-		if a.Dist < b.Dist {
+
+	slices.SortFunc(st.combined, func(a, b VSearchResult) int {
+		if a.Distance < b.Distance {
 			return -1
 		}
-		if a.Dist > b.Dist {
+		if a.Distance > b.Distance {
 			return 1
 		}
 		return 0
 	})
-	if len(combined) > K {
-		combined = combined[:K]
+
+	if len(st.combined) > K {
+		st.combined = st.combined[:K]
 	}
-	return combined, nil
+
+	result := make([]VSearchResult, len(st.combined))
+	copy(result, st.combined)
+	return result, nil
 }
+
+// searchSegmentsParallel запускает горутину на каждый сегмент.
+// searchSegmentsParallel распределяет обход сегментов между воркерами (горутинами).
+// Вместо 1 горутины на сегмент (до 35+ горутин на запрос), мы создаём ровно
+// `numWorkers` горутин. Каждая горутина последовательно обходит свою пачку сегментов.
+// Это убирает overhead планировщика Go и максимально утилизирует L1/L2 кэши CPU.
+//
+// Только immutable-сегменты — вызывается ПОСЛЕ lvs.mu.RUnlock().
+// startIdx — начальный индекс в st.workerBufs (0 если delta пуста, иначе 1,
+// т.к. delta-результат уже в workerBufs[0]).
+func (lvs *LeveledVectorStore) searchSegmentsParallel(query []float32, efSearch int, st *leveledSearchState, segs []segment, startIdx int, filterFn func(string) bool) {
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(segs) {
+		numWorkers = len(segs)
+	}
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	// Если воркер всего один — нет смысла использовать горутины, делаем последовательно.
+	if numWorkers == 1 {
+		idx := startIdx
+		for _, seg := range segs {
+			st.workerBufs[idx] = seg.Search(query, efSearch, efSearch, st.workerBufs[idx], filterFn)
+			idx++
+		}
+		return
+	}
+
+	segsPerWorker := (len(segs) + numWorkers - 1) / numWorkers
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		// Разбиваем срез сегментов на пачки [w * segsPerWorker : ...].
+		start := w * segsPerWorker
+		end := start + segsPerWorker
+		if start > len(segs) {
+			start = len(segs)
+		}
+		if end > len(segs) {
+			end = len(segs)
+		}
+		if start >= end {
+			wg.Done() // нет работы для этого воркера (остаток меньше numWorkers)
+			continue
+		}
+
+		// Копируем срез сегментов и начальный индекс для безопасной записи в workerBufs.
+		workerSegs := segs[start:end]
+		bufStartIdx := startIdx + start
+
+		go func(workerBufs [][]FrozenResult) {
+			defer wg.Done()
+			idx := bufStartIdx
+			for _, seg := range workerSegs {
+				workerBufs[idx] = seg.Search(query, efSearch, efSearch, workerBufs[idx], filterFn)
+				idx++
+			}
+		}(st.workerBufs)
+	}
+
+	wg.Wait()
+}
+
+// =============================================================================
+// Дополнительные методы VectorIndex
+// =============================================================================
+
+// ForEach итерирует по всем живым векторам (delta + все сегменты).
+// Tombstoned ключи пропускаются. fn вызывается без блокировки lvs.mu.
+func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
+	lvs.mu.RLock()
+	defer lvs.mu.RUnlock()
+
+	// Snapshot tombstones под локом
+	var ts map[string]struct{}
+	if t := lvs.tombstones.Load(); t != nil {
+		ts = *t
+	}
+
+	// Delta (tombstones дельты — пустая строка ключа)
+	if lvs.delta != nil {
+		dim := lvs.dim
+		for i, key := range lvs.delta.keys {
+			if key == "" {
+				continue
+			}
+			fn(key, lvs.delta.data[i*dim:(i+1)*dim])
+		}
+	}
+
+	// Segments: пропускаем tombstoned ключи
+	for _, level := range lvs.levels {
+		for _, seg := range level {
+			switch s := seg.(type) {
+			case *frozenSegment:
+				fg := s.fg
+				for i := 0; i < fg.n; i++ {
+					if fg.keys[i] == "" {
+						continue
+					}
+					if ts != nil {
+						if _, deleted := ts[fg.keys[i]]; deleted {
+							continue
+						}
+					}
+					fn(fg.keys[i], fg.data[i*fg.dim:(i+1)*fg.dim])
+				}
+			case *frozenSQSegment:
+				fg := s.fg
+				dim := fg.dim
+				vecBuf := make([]float32, dim)
+				for i := 0; i < fg.n; i++ {
+					if fg.keys[i] == "" {
+						continue
+					}
+					if ts != nil {
+						if _, deleted := ts[fg.keys[i]]; deleted {
+							continue
+						}
+					}
+					// Деквантование int8 → float32
+					base := i * dim
+					for d := 0; d < dim; d++ {
+						vecBuf[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
+					}
+					fn(fg.keys[i], vecBuf)
+				}
+			case *hnswSegment:
+				s.mu.RLock()
+				for id, key := range s.keys {
+					if key == "" {
+						continue
+					}
+					if ts != nil {
+						if _, deleted := ts[key]; deleted {
+							continue
+						}
+					}
+					node := &s.g.nodes[id]
+					if node.Alive {
+						fn(key, s.g.arena.Get(node.VectorOffset))
+					}
+				}
+				s.mu.RUnlock()
+			}
+		}
+	}
+}
+
+// Get возвращает копию вектора по ключу.
+// Сначала ищет в дельте (O(1)), затем проверяет tombstones, затем сканирует сегменты.
+func (lvs *LeveledVectorStore) Get(key string) ([]float32, bool) {
+	lvs.mu.RLock()
+	defer lvs.mu.RUnlock()
+
+	// Дельта: O(1) через keyIdx map — tombstones дельты обработаны внутри
+	if lvs.delta != nil {
+		if idx, ok := lvs.delta.keyIdx[key]; ok {
+			if lvs.delta.keys[idx] != "" { // не tombstone дельты
+				vec := lvs.delta.data[idx*lvs.dim : (idx+1)*lvs.dim]
+				out := make([]float32, lvs.dim)
+				copy(out, vec)
+				return out, true
+			}
+			return nil, false // ключ удалён в дельте
+		}
+	}
+
+	// Tombstone check: ключ мог быть удалён из сегмента после последнего merge.
+	if t := lvs.tombstones.Load(); t != nil {
+		if _, deleted := (*t)[key]; deleted {
+			return nil, false
+		}
+	}
+
+	// Сканирование сегментов
+	for _, level := range lvs.levels {
+		for _, seg := range level {
+			switch s := seg.(type) {
+			case *frozenSegment:
+				fg := s.fg
+				for i := 0; i < fg.n; i++ {
+					if fg.keys[i] == key {
+						out := make([]float32, fg.dim)
+						copy(out, fg.data[i*fg.dim:(i+1)*fg.dim])
+						return out, true
+					}
+				}
+			case *frozenSQSegment:
+				fg := s.fg
+				dim := fg.dim
+				for i := 0; i < fg.n; i++ {
+					if fg.keys[i] == key {
+						out := make([]float32, dim)
+						base := i * dim
+						for d := 0; d < dim; d++ {
+							out[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
+						}
+						return out, true
+					}
+				}
+			case *hnswSegment:
+				s.mu.RLock()
+				for id, k := range s.keys {
+					if k == key {
+						node := &s.g.nodes[id]
+						if node.Alive {
+							raw := s.g.arena.Get(node.VectorOffset)
+							out := make([]float32, len(raw))
+							copy(out, raw)
+							s.mu.RUnlock()
+							return out, true
+						}
+					}
+				}
+				s.mu.RUnlock()
+			}
+		}
+	}
+	return nil, false
+}
+
+// Info возвращает общее кол-во векторов, размерность и номер максимального заполненного уровня.
+func (lvs *LeveledVectorStore) Info() (count, dim, maxLevel int) {
+	lvs.mu.RLock()
+	defer lvs.mu.RUnlock()
+
+	count = 0
+	if lvs.delta != nil {
+		count += lvs.delta.Len()
+	}
+	maxLevel = 0
+	for i, level := range lvs.levels {
+		for _, seg := range level {
+			count += seg.Len()
+			if i > maxLevel {
+				maxLevel = i
+			}
+		}
+	}
+	return count, lvs.dim, maxLevel
+}
+
+// SetHNSWParams обновляет параметры HNSW — применяются к следующим buildSegment.
+func (lvs *LeveledVectorStore) SetHNSWParams(M, efConstruction, efSearch int) {
+	lvs.mu.Lock()
+	defer lvs.mu.Unlock()
+	if M > 0 {
+		lvs.cfg.M = M
+	}
+	if efConstruction > 0 {
+		lvs.cfg.EfConstruction = efConstruction
+	}
+	if efSearch > 0 {
+		lvs.cfg.EfSearch = efSearch
+	}
+}
+
+// SetUseLSH — no-op для LeveledVectorStore (LSH не используется в LSM-архитектуре).
+func (lvs *LeveledVectorStore) SetUseLSH(_ bool) {}
 
 // Len возвращает общее число векторов (delta + все сегменты).
 func (lvs *LeveledVectorStore) Len() int {
@@ -410,14 +1137,323 @@ func (lvs *LeveledVectorStore) Len() int {
 	return total
 }
 
-// Close останавливает фоновый воркер.
+// SnapshotTime возвращает UnixNano времени последнего успешного LoadBinary (для диагностики).
+func (lvs *LeveledVectorStore) SnapshotTime() int64 { return lvs.snapshotTime }
+
+// Close останавливает coordinator и build workers, дожидаясь завершения.
+// Idempotent (sync.Once) — безопасен для многократного вызова.
 func (lvs *LeveledVectorStore) Close() {
-	close(lvs.done)
+	lvs.closeOnce.Do(func() {
+		close(lvs.done)
+		close(lvs.buildQueue) // build workers дорабатывают in-flight tasks и выходят
+		lvs.coordWG.Wait()   // coordinator вышел
+		lvs.buildWG.Wait()    // все build workers вышли
+
+		// Пробудить зависший в FlushDeltaSync cond.Wait, если он ждёт.
+		lvs.mu.Lock()
+		lvs.flushCond.Broadcast()
+		lvs.mu.Unlock()
+
+		// Останавливаем фоновые горутины runDeferredFree в per-worker аллокаторах.
+		for _, a := range lvs.buildAllocators {
+			a.Close()
+		}
+		for _, a := range lvs.mergeAllocators {
+			a.Close()
+		}
+	})
+}
+
+// =============================================================================
+// Persistence: SaveBinary / LoadBinary
+//
+// Формат (little-endian):
+//   [8B magic]
+//   [8B snapshotTime int64 UnixNano]
+//   [4B dim uint32]
+//   [1B maxLevels uint8 — всегда 8]
+//   для каждого уровня [0..maxLevels-1]:
+//     [4B nSegs uint32]
+//     для каждого сегмента:
+//       [1B segType: 0=FROZEN, 1=HNSW_FLAT]
+//       if FROZEN: fg.WriteTo(w)
+//       if HNSW_FLAT:
+//         [4B nVecs uint32]
+//         для каждого вектора:
+//           [2B keyLen uint16][keyLen B key][dim*4 B vec float32]
+//
+// Delta НЕ сохраняется (она пуста после FlushDeltaSync).
+// Новые Add() после FlushDeltaSync попадают в WAL и восстанавливаются при старте.
+// =============================================================================
+
+// SaveBinary сохраняет все скомпакченные сегменты.
+// ВАЖНО: вызывать после FlushDeltaSync() для гарантии полного снапшота.
+func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
+	// Снапшотируем указатели сегментов под RLock (дёшево — только указатели).
+	// Сами данные сегментов иммутабельны (frozenSegment) или защищены своим мьютексом (hnswSegment).
+	lvs.mu.RLock()
+	dim := lvs.dim
+	var snapLevels [maxLevels][]segment
+	for i, level := range lvs.levels {
+		if len(level) > 0 {
+			snapLevels[i] = make([]segment, len(level))
+			copy(snapLevels[i], level)
+		}
+	}
+	lvs.mu.RUnlock()
+
+	// Пишем без блокировки (frozenSegment иммутабелен, hnswSegment использует свой мьютекс)
+	if _, err := w.Write(leveledMagic[:]); err != nil {
+		return fmt.Errorf("leveled: write magic: %w", err)
+	}
+
+	var u8 [8]byte
+	binary.LittleEndian.PutUint64(u8[:], uint64(time.Now().UnixNano()))
+	if _, err := w.Write(u8[:]); err != nil {
+		return fmt.Errorf("leveled: write snapshotTime: %w", err)
+	}
+
+	var u4 [4]byte
+	binary.LittleEndian.PutUint32(u4[:], uint32(dim))
+	if _, err := w.Write(u4[:]); err != nil {
+		return fmt.Errorf("leveled: write dim: %w", err)
+	}
+
+	if _, err := w.Write([]byte{maxLevels}); err != nil {
+		return fmt.Errorf("leveled: write nLevels: %w", err)
+	}
+
+	for lyr, level := range snapLevels {
+		binary.LittleEndian.PutUint32(u4[:], uint32(len(level)))
+		if _, err := w.Write(u4[:]); err != nil {
+			return fmt.Errorf("leveled: write nSegs[%d]: %w", lyr, err)
+		}
+		for si, seg := range level {
+			switch s := seg.(type) {
+			case *frozenSegment:
+				if _, err := w.Write([]byte{segTypeFrozen}); err != nil {
+					return fmt.Errorf("leveled: write segType[%d][%d]: %w", lyr, si, err)
+				}
+				if err := s.fg.WriteGraphTo(w); err != nil {
+					return fmt.Errorf("leveled: write frozen[%d][%d]: %w", lyr, si, err)
+				}
+
+			case *frozenSQSegment:
+				if _, err := w.Write([]byte{segTypeFrozenSQ8}); err != nil {
+					return fmt.Errorf("leveled: write segType[%d][%d]: %w", lyr, si, err)
+				}
+				if err := s.fg.WriteGraphToSQ(w); err != nil {
+					return fmt.Errorf("leveled: write frozenSQ[%d][%d]: %w", lyr, si, err)
+				}
+
+			case *hnswSegment:
+				if _, err := w.Write([]byte{segTypeHNSWFlat}); err != nil {
+					return fmt.Errorf("leveled: write segType[%d][%d]: %w", lyr, si, err)
+				}
+				s.mu.RLock()
+				// Считаем живые векторы
+				nVecs := 0
+				for id, key := range s.keys {
+					if key != "" && s.g.nodes[id].Alive {
+						nVecs++
+					}
+				}
+				binary.LittleEndian.PutUint32(u4[:], uint32(nVecs))
+				if _, err := w.Write(u4[:]); err != nil {
+					s.mu.RUnlock()
+					return fmt.Errorf("leveled: write nVecs[%d][%d]: %w", lyr, si, err)
+				}
+				var klen [2]byte
+				var writeErr error
+				for id, key := range s.keys {
+					if key == "" || !s.g.nodes[id].Alive {
+						continue
+					}
+					binary.LittleEndian.PutUint16(klen[:], uint16(len(key)))
+					if _, err := w.Write(klen[:]); err != nil {
+						writeErr = err
+						break
+					}
+					if _, err := io.WriteString(w, key); err != nil {
+						writeErr = err
+						break
+					}
+					vec := s.g.arena.Get(s.g.nodes[id].VectorOffset)
+					if len(vec) > 0 {
+						b := unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), len(vec)*4)
+						if _, err := w.Write(b); err != nil {
+							writeErr = err
+							break
+						}
+					}
+				}
+				s.mu.RUnlock()
+				if writeErr != nil {
+					return fmt.Errorf("leveled: write hnswFlat[%d][%d]: %w", lyr, si, writeErr)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// LoadBinary восстанавливает состояние из ридера.
+// После загрузки delta пуста — новые Add() идут туда, WAL replay добавит недостающие.
+func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
+	lvs.mu.Lock()
+	defer lvs.mu.Unlock()
+
+	// Проверяем магию
+	var magic [8]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
+		return fmt.Errorf("leveled: read magic: %w", err)
+	}
+	if magic != leveledMagic {
+		return fmt.Errorf("leveled: invalid magic header (not a graph_leveled.bin?)")
+	}
+
+	// Читаем snapshotTime
+	var u8 [8]byte
+	if _, err := io.ReadFull(r, u8[:]); err != nil {
+		return fmt.Errorf("leveled: read snapshotTime: %w", err)
+	}
+	lvs.snapshotTime = int64(binary.LittleEndian.Uint64(u8[:]))
+
+	// Читаем dim
+	var u4 [4]byte
+	if _, err := io.ReadFull(r, u4[:]); err != nil {
+		return fmt.Errorf("leveled: read dim: %w", err)
+	}
+	lvs.dim = int(binary.LittleEndian.Uint32(u4[:]))
+
+	// Читаем nLevels
+	var nLevelsBuf [1]byte
+	if _, err := io.ReadFull(r, nLevelsBuf[:]); err != nil {
+		return fmt.Errorf("leveled: read nLevels: %w", err)
+	}
+	nLevels := int(nLevelsBuf[0])
+
+	// Сбрасываем текущие уровни
+	for i := range lvs.levels {
+		lvs.levels[i] = nil
+	}
+
+	// Восстанавливаем каждый уровень
+	for lyr := 0; lyr < nLevels; lyr++ {
+		if _, err := io.ReadFull(r, u4[:]); err != nil {
+			return fmt.Errorf("leveled: read nSegs[%d]: %w", lyr, err)
+		}
+		nSegs := int(binary.LittleEndian.Uint32(u4[:]))
+		if nSegs == 0 {
+			continue
+		}
+		lvs.levels[lyr] = make([]segment, 0, nSegs)
+
+		for si := 0; si < nSegs; si++ {
+			var stBuf [1]byte
+			if _, err := io.ReadFull(r, stBuf[:]); err != nil {
+				return fmt.Errorf("leveled: read segType[%d][%d]: %w", lyr, si, err)
+			}
+			segType := stBuf[0]
+
+			switch segType {
+			case segTypeFrozen:
+				fg, err := ReadFrozenGraph(r, lvs.cfg.Distance)
+				if err != nil {
+					return fmt.Errorf("leveled: read frozen[%d][%d]: %w", lyr, si, err)
+				}
+				lvs.levels[lyr] = append(lvs.levels[lyr], &frozenSegment{fg: fg})
+
+			case segTypeFrozenSQ8:
+				fg, err := ReadFrozenGraphSQ(r, lvs.cfg.Distance)
+				if err != nil {
+					return fmt.Errorf("leveled: read frozenSQ[%d][%d]: %w", lyr, si, err)
+				}
+				lvs.levels[lyr] = append(lvs.levels[lyr], &frozenSQSegment{fg: fg})
+
+			case segTypeHNSWFlat:
+				if _, err := io.ReadFull(r, u4[:]); err != nil {
+					return fmt.Errorf("leveled: read nVecs[%d][%d]: %w", lyr, si, err)
+				}
+				nVecs := int(binary.LittleEndian.Uint32(u4[:]))
+
+				entries := make([]DeltaEntry, 0, nVecs)
+				var klen [2]byte
+				for vi := 0; vi < nVecs; vi++ {
+					if _, err := io.ReadFull(r, klen[:]); err != nil {
+						return fmt.Errorf("leveled: read keyLen[%d][%d][%d]: %w", lyr, si, vi, err)
+					}
+					kl := int(binary.LittleEndian.Uint16(klen[:]))
+					key := ""
+					if kl > 0 {
+						kb := make([]byte, kl)
+						if _, err := io.ReadFull(r, kb); err != nil {
+							return fmt.Errorf("leveled: read key[%d][%d][%d]: %w", lyr, si, vi, err)
+						}
+						key = string(kb)
+					}
+					vec := make([]float32, lvs.dim)
+					if lvs.dim > 0 {
+						vb := unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), lvs.dim*4)
+						if _, err := io.ReadFull(r, vb); err != nil {
+							return fmt.Errorf("leveled: read vec[%d][%d][%d]: %w", lyr, si, vi, err)
+						}
+					}
+					entries = append(entries, DeltaEntry{Key: key, Vec: vec})
+				}
+
+				if len(entries) > 0 {
+					seg := lvs.buildSegment(entries, lvs.dim, 0)
+					if seg != nil {
+						lvs.levels[lyr] = append(lvs.levels[lyr], seg)
+					}
+				}
+
+			default:
+				return fmt.Errorf("leveled: unknown segType=%d at [%d][%d]", segType, lyr, si)
+			}
+		}
+	}
+
+	// Инициализируем пустую дельту (новые Add() пойдут сюда)
+	if lvs.delta != nil {
+		lvs.delta.Close() // освободить аллокатор старой дельты
+	}
+	if lvs.dim > 0 {
+		max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
+		lvs.delta = NewDeltaSegment(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction)
+	}
+
+	return nil
 }
 
 // =============================================================================
 // Внутренние методы
 // =============================================================================
+
+// ─── Build Pool: producer-consumer типы ───────────────────────────────────────
+
+// taskKind — тип задачи компакции.
+type taskKind int
+
+const (
+	taskFlushDelta taskKind = iota // flush delta → новый L0 сегмент
+	taskMergeLevel                 // merge N сегментов уровня L → сегмент уровня L+1
+)
+
+// compactionTask — единица работы. Создаётся coordinator'ом (GRAB под lock),
+// обрабатывается build/merge goroutine (BUILD вне lock), результат возвращается
+// через resultChan → coordinator атомарно применяет (PUBLISH под lock).
+type compactionTask struct {
+	kind      taskKind
+	entries   []DeltaEntry // для taskFlushDelta: векторы из дельты
+	segs      []segment    // для taskMergeLevel: сегменты для слияния (oldSegs для замены)
+	targetLvl int          // куда публиковать результат (0 для flush, L+1 для merge)
+	sourceLvl int          // для merge: уровень источника (L) — для cleanup oldSegs
+	epoch     uint64       // эпоха на момент GRAB (для PUBLISH-time check)
+	// result — заполнается goroutine после BUILD, читается coordinator при PUBLISH.
+	result segment
+}
 
 // collectSegments возвращает flat срез всех активных сегментов (под RLock).
 func (lvs *LeveledVectorStore) collectSegments() []segment {
@@ -437,123 +1473,615 @@ func (lvs *LeveledVectorStore) triggerCompact() {
 	}
 }
 
-// compactWorker — фоновая горутина, слушает compactCh и выполняет compaction.
+// compactWorker (coordinator) — ЧИСТЫЙ event loop. Никогда не строит сам.
+//
+//	select {
+//	  compactCh  → grab delta → запустить goroutine build → продолжить
+//	  resultChan → атомарно применить результат в levels[] → продолжить
+//	}
+//
+// Старые сегменты НЕ убираются из levels[] пока merge не завершён (нет дыр для search).
+// mergeInFlight[L] = true → merge уровня L в работе (новый не запускаем).
 func (lvs *LeveledVectorStore) compactWorker() {
 	for {
 		select {
 		case <-lvs.done:
 			return
+
 		case <-lvs.compactCh:
-			if lvs.compacting.CompareAndSwap(false, true) {
-				lvs.runCompaction()
-				lvs.compacting.Store(false)
+			// Сигнал: возможно нужно что-то сделать (delta fill или merge overflow).
+			lvs.handleCompactSignal()
+
+		case r := <-lvs.resultChan:
+			// Результат от build/merge goroutine → атомарно применить.
+			lvs.applyResult(r)
+		}
+	}
+}
+
+// handleCompactSignal — обработка сигнала compactCh.
+// GRAB delta → запустить goroutine build → проверить merges.
+func (lvs *LeveledVectorStore) handleCompactSignal() {
+	monitoring.VectorCompactionTotal.Inc()
+	epoch := lvs.compactionEpoch.Load()
+
+	// GRAB delta: атомарный swap под write-lock (микросекунды).
+	lvs.mu.Lock()
+	if lvs.delta == nil || lvs.delta.Len() == 0 {
+		lvs.mu.Unlock()
+		lvs.maybeScheduleMerges(epoch)
+		return
+	}
+	oldDelta := lvs.delta
+	max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
+	lvs.delta = NewDeltaSegment(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction)
+	lvs.mu.Unlock()
+
+	monitoring.VectorFlushDeltaTotal.Inc()
+	if oldDelta.Len() > 0 {
+		if lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold {
+			// Freeze-on-flush: граф дельты УЖЕ построен инкрементально при Add —
+			// замораживаем его напрямую (SQ8 при UseSQ — любой dim; иначе CSR float32),
+			// без повторной сборки HNSW (нет double-build). Close аллокатора — внутри
+			// горутины ПОСЛЕ freeze (freeze копирует в Go-память).
+			lvs.startFreezeDeltaGoroutine(oldDelta, epoch)
+		} else {
+			// dim > порога: frozen-CSR не применим → rebuild в hnswSegment из slab.
+			// entries ссылаются на slab oldDelta (не на граф) → Close после ExtractAll безопасен.
+			entries := oldDelta.ExtractAll()
+			oldDelta.Close()
+			lvs.startBuildGoroutine(&compactionTask{
+				kind:      taskFlushDelta,
+				entries:   entries,
+				targetLvl: 0,
+				epoch:     epoch,
+			})
+		}
+	} else {
+		oldDelta.Close()
+		// entries пуст — пробудим FlushDeltaSync если ожидает.
+		lvs.mu.Lock()
+		if lvs.flushPending.Load() && lvs.inFlightBuilds.Load() == 0 {
+			deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
+			if deltaEmpty {
+				lvs.flushPending.Store(false)
+				lvs.flushCond.Broadcast()
+			}
+		}
+		lvs.mu.Unlock()
+	}
+
+	// Проверить: нужно ли запустить merge (без блокировки coordinator).
+	lvs.maybeScheduleMerges(epoch)
+}
+
+// startBuildGoroutine запускает goroutine для BUILD delta-flush сегмента.
+// inFlightBuilds.Add(1) выполняется СИНХРОННО до запуска горутины —
+// FlushDeltaSync никогда не увидит ложный 0.
+//
+// Архитектура:
+//   - buildSem семафор ограничивает CPU-нагрузку: ≤ numBuilders горутин одновременно.
+//   - Каждая горутина создаёт СВОЙ свежий TCMallocStore → нет TCMalloc race (корень бага).
+//   - FrozenGraph копирует всё в Go memory → alloc можно закрыть после build.
+//   - defer alloc.Close() останавливает внутреннюю goroutine runDeferredFree (нет утечек).
+func (lvs *LeveledVectorStore) startBuildGoroutine(task *compactionTask) {
+	// Синхронный инкремент ДО запуска горутины — критично для FlushDeltaSync.
+	lvs.inFlightBuilds.Add(1)
+	epoch := task.epoch
+	go func() {
+		// Ожидаем свободный слот (семафор). Горутина блокируется, coordinator — нет.
+		select {
+		case lvs.buildSem <- struct{}{}:
+			defer func() { <-lvs.buildSem }()
+		case <-lvs.done:
+			// Shutdown: сигнализируем coordinator'у через resultChan.
+			res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: nil}
+			select {
+			case lvs.resultChan <- res:
+			default:
+				lvs.inFlightBuilds.Add(-1)
+			}
+			return
+		}
+
+		// Свежий аллокатор на каждый build: нет shared state, нет TCMalloc race.
+		// FrozenGraph не держит ссылку на аллокатор → можно закрыть после build.
+		alloc := tcmalloc.NewTCMallocStore(1)
+		defer alloc.Close() // остановить runDeferredFree goroutine
+
+		var seg segment
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					seg = nil // паника → rollback
+				}
+			}()
+			seg = lvs.buildSegmentWithAllocator(task.entries, lvs.dim, alloc)
+		}()
+
+		res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: seg}
+		select {
+		case lvs.resultChan <- res:
+		case <-lvs.done:
+			lvs.inFlightBuilds.Add(-1)
+		}
+	}()
+}
+
+// startFreezeDeltaGoroutine замораживает УЖЕ построенный граф дельты напрямую
+// в frozen-CSR (без rebuild HNSW). Применяется при dim ≤ csrDimThreshold.
+// inFlightBuilds.Add(1) синхронно ДО запуска горутины (как startBuildGoroutine).
+func (lvs *LeveledVectorStore) startFreezeDeltaGoroutine(oldDelta *DeltaSegment, epoch uint64) {
+	lvs.inFlightBuilds.Add(1)
+	go func() {
+		select {
+		case lvs.buildSem <- struct{}{}:
+			defer func() { <-lvs.buildSem }()
+		case <-lvs.done:
+			oldDelta.Close()
+			res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: nil}
+			select {
+			case lvs.resultChan <- res:
+			default:
+				lvs.inFlightBuilds.Add(-1)
+			}
+			return
+		}
+
+		var seg segment
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					seg = nil // паника → rollback
+				}
+			}()
+			keys := oldDelta.FreezeKeys()
+			g := oldDelta.Graph()
+			if lvs.cfg.UseSQ {
+				if fg := FreezeGraphSQ(g, lvs.cfg.Distance, keys); fg != nil {
+					seg = &frozenSQSegment{fg: fg}
+				}
+			} else {
+				if fg := FreezeGraph(g, lvs.cfg.Distance, keys); fg != nil {
+					seg = &frozenSegment{fg: fg}
+				}
+			}
+		}()
+		// freeze скопировал данные в Go-память → аллокатор графа дельты можно закрыть.
+		oldDelta.Close()
+
+		res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: seg}
+		select {
+		case lvs.resultChan <- res:
+		case <-lvs.done:
+			lvs.inFlightBuilds.Add(-1)
+		}
+	}()
+}
+
+// startMergeGoroutine запускает goroutine для BUILD merge-сегмента.
+// Результат возвращается через resultChan. Сегменты НЕ удаляются из levels
+// до получения результата (applyResult).
+func (lvs *LeveledVectorStore) startMergeGoroutine(task *compactionTask) {
+	sourceLvl := task.sourceLvl
+	targetLvl := task.targetLvl
+	epoch := task.epoch
+	segs := task.segs
+	go func() {
+		mergeStart := time.Now()
+		seg := lvs.mergeSegmentsWithAllocator(segs, lvs.pickMergeAllocator(sourceLvl))
+		monitoring.VectorMergeDuration.Update(time.Since(mergeStart).Seconds())
+		res := compactionResult{
+			kind:      taskMergeLevel,
+			sourceLvl: sourceLvl,
+			targetLvl: targetLvl,
+			epoch:     epoch,
+			result:    seg,
+			oldSegs:   segs,
+		}
+		select {
+		case lvs.resultChan <- res:
+		case <-lvs.done:
+		}
+	}()
+}
+
+// maybeScheduleMerges проверяет переполненные уровни и запускает merge goroutines.
+// По одному merge на уровень одновременно (mergeInFlight[L]). Сегменты НЕ убираются
+// из levels[] — старые остаются видимы для search до замены.
+func (lvs *LeveledVectorStore) maybeScheduleMerges(epoch uint64) {
+	fanout := lvs.cfg.Fanout
+	lvs.mu.Lock()
+	defer lvs.mu.Unlock()
+
+	for lyr := 0; lyr < maxLevels-1; lyr++ {
+		if lvs.mergeInFlight[lyr] {
+			continue // merge этого уровня уже в работе
+		}
+		if len(lvs.levels[lyr]) < fanout {
+			continue // уровень не переполнен — продолжаем проверять выше (L1 может быть переполнен без L0)
+		}
+		if lvs.compactionEpoch.Load() != epoch {
+			break // Clear() — стоп
+		}
+		// Берём ПЕРВЫЕ fanout сегментов для merge (copy slice header — не удаляем из levels).
+		// Старые сегменты останутся в levels[lyr] до applyResult.
+		toMerge := make([]segment, fanout)
+		copy(toMerge, lvs.levels[lyr][:fanout])
+
+		lvs.mergeInFlight[lyr] = true
+		sourceLvl := lyr
+		targetLvl := lyr + 1
+		taskEpoch := epoch
+		// Запускаем merge goroutine (coordinator не блокируется).
+		go func(segs []segment, srcLvl, tgtLvl int, e uint64) {
+			mergeStart := time.Now()
+			var seg segment
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						seg = nil
+					}
+				}()
+				seg = lvs.mergeSegmentsWithAllocator(segs, lvs.pickMergeAllocator(srcLvl))
+			}()
+			monitoring.VectorMergeDuration.Update(time.Since(mergeStart).Seconds())
+			res := compactionResult{
+				kind:      taskMergeLevel,
+				sourceLvl: srcLvl,
+				targetLvl: tgtLvl,
+				epoch:     e,
+				result:    seg,
+				oldSegs:   segs,
+			}
+			select {
+			case lvs.resultChan <- res:
+			case <-lvs.done:
+			}
+		}(toMerge, sourceLvl, targetLvl, taskEpoch)
+	}
+}
+
+// applyResult — атомарное применение результата build/merge под write lock.
+// Для flushDelta: просто append в levels[0].
+// Для mergeLevel: убрать oldSegs из levels[source], добавить newSeg в levels[target].
+// После применения: сброс mergeInFlight, re-check overflow, signal FlushDeltaSync.
+func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
+	lvs.mu.Lock()
+	defer lvs.mu.Unlock()
+
+	// Epoch check: если Clear() сработал во время build — результат устарел.
+	if lvs.compactionEpoch.Load() != r.epoch {
+		monitoring.VectorCompactionEpochMismatchTotal.Inc()
+		if r.kind == taskFlushDelta {
+			remaining := lvs.inFlightBuilds.Add(-1)
+			// Broadcast только когда последний build завершился и delta пуста.
+			if lvs.flushPending.Load() && remaining == 0 {
+				deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
+				if deltaEmpty {
+					lvs.flushPending.Store(false)
+					lvs.flushCond.Broadcast()
+				}
+			}
+		} else {
+			lvs.mergeInFlight[r.sourceLvl] = false
+		}
+		return
+	}
+
+
+	switch r.kind {
+	case taskFlushDelta:
+		// remaining — кол-во delta-build горутин ПОСЛЕ декремента.
+		remaining := lvs.inFlightBuilds.Add(-1)
+		if r.result != nil {
+			lvs.levels[0] = append(lvs.levels[0], r.result)
+		} else {
+			monitoring.VectorCompactionRollbackTotal.Inc()
+		}
+		// Broadcast только когда ЭТО последний build И delta пуста.
+		// Без этой проверки: первый же completed build сбрасывает flushPending=false,
+		// последующие 49 builds не будут broadcastить → FlushDeltaSync висит вечно.
+		if lvs.flushPending.Load() && remaining == 0 {
+			deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
+			if deltaEmpty {
+				lvs.flushPending.Store(false)
+				lvs.flushCond.Broadcast()
+			}
+		}
+
+	case taskMergeLevel:
+		lvs.mergeInFlight[r.sourceLvl] = false
+		if r.result == nil {
+			// Merge не удался — сегменты остаются в levels (не трогаем), просто выходим.
+			monitoring.VectorCompactionRollbackTotal.Inc()
+			return
+		}
+		// Убираем oldSegs из levels[source] — они заменены новым сегментом.
+		lvs.removeSegments(r.sourceLvl, r.oldSegs)
+		// Добавляем новый сегмент в levels[target].
+		lvs.levels[r.targetLvl] = append(lvs.levels[r.targetLvl], r.result)
+	}
+
+	// Re-check: триггерим coordinator ТОЛЬКО если есть переполнение или delta.
+	// Безусловный triggerCompact → busy-loop.
+	needsWork := false
+	if r.kind == taskMergeLevel {
+		// После merge target-уровень мог переполниться → каскад.
+		needsWork = len(lvs.levels[r.targetLvl]) >= lvs.cfg.Fanout
+	}
+	// Delta не пуста → нужен новый flush (применимо к обоим видам задач).
+	// БАГ если пропустить: когда последний build (remaining=0) завершается
+	// при non-empty delta, нет ни broadcast ни triggerCompact → FlushDeltaSync висит.
+	if !needsWork {
+		// Re-flush дельты ТОЛЬКО если она полна (обычный режим; safety на случай
+		// пропущенного Add-триггера) ИЛИ ждёт sync-flush (FlushDeltaSync).
+		// Иначе под нагрузкой (фоновый build + непрерывная запись) applyResult
+		// флашил бы остаток дельты после каждого build → дельта дробится на сотни
+		// крошечных сегментов и QPS падает из-за фан-аута.
+		deltaNonEmpty := lvs.delta != nil && lvs.delta.Len() > 0
+		deltaFull := lvs.delta != nil && lvs.delta.Full()
+		needsWork = deltaFull || (lvs.flushPending.Load() && deltaNonEmpty)
+	}
+	if needsWork {
+		lvs.triggerCompact()
+	}
+}
+
+// removeSegments удаляет указанные сегменты из levels[lyr].
+// O(N) но N маленькое (fanout сегментов на уровне).
+func (lvs *LeveledVectorStore) removeSegments(lyr int, toRemove []segment) {
+	if len(toRemove) == 0 {
+		return
+	}
+	// Build set of pointers to remove (identity comparison).
+	level := lvs.levels[lyr]
+	kept := level[:0] // in-place filter
+	for _, s := range level {
+		found := false
+		for _, r := range toRemove {
+			if s == r { // pointer identity
+				found = true
+				break
+			}
+		}
+		if !found {
+			kept = append(kept, s)
+		}
+	}
+	lvs.levels[lyr] = kept
+}
+
+// pickBuildWorkerID — round-robin по buildAllocators.
+// Каждый вызов возвращает следующий ID (atomic). Обеспечивает изоляцию
+// TCMallocStore при параллельных delta-flush goroutines (каждый — свой аллокатор).
+func (lvs *LeveledVectorStore) pickBuildWorkerID() int {
+	n := len(lvs.buildAllocators)
+	if n == 0 {
+		return 0
+	}
+	return int(lvs.buildWorkerIDCounter.Add(1)-1) % n
+}
+
+// pickMergeAllocator возвращает изолированный аллокатор для merge уровня sourceLvl.
+// Каждый уровень имеет свой allocator → параллельные merge разных уровней
+// не конкурируют. mergeAllocators имеет maxLevels элементов.
+func (lvs *LeveledVectorStore) pickMergeAllocator(sourceLvl int) *tcmalloc.TCMallocStore {
+	if sourceLvl >= 0 && sourceLvl < len(lvs.mergeAllocators) {
+		return lvs.mergeAllocators[sourceLvl]
+	}
+	return lvs.mergeAllocators[0]
+}
+
+// enqueueTask кладёт task в buildQueue, уважая shutdown.
+// Может блокироваться при полном буфере (backpressure).
+// Increment inFlightBuilds — buildWorker декремтит после publish.
+func (lvs *LeveledVectorStore) enqueueTask(task *compactionTask) {
+	lvs.inFlightBuilds.Add(1)
+	select {
+	case lvs.buildQueue <- task:
+	case <-lvs.done:
+		lvs.inFlightBuilds.Add(-1)
+	}
+}
+
+// buildWorker — пуловый воркер delta-flush задач. Получает задачу из buildQueue,
+// строит сегмент, применяет результат напрямую в levels[0].
+// Каждый buildWorker имеет свой дедикированный allocator — без TCMalloc race.
+func (lvs *LeveledVectorStore) buildWorker() {
+	workerID := int(lvs.buildWorkerIDCounter.Add(1)-1) % len(lvs.buildAllocators)
+	for {
+		select {
+		case <-lvs.done:
+			return
+		case task, ok := <-lvs.buildQueue:
+			if !ok {
+				return
+			}
+			// Build: паника перехватывается, seg=nil = rollback.
+			var seg segment
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						seg = nil
+					}
+				}()
+				seg = lvs.buildSegment(task.entries, lvs.dim, workerID)
+			}()
+
+			// Применяем результат под write-lock и декрементируем счётчик DOPO применения.
+			// Важно: декремент DOPO применения, чтобы FlushDeltaSync не вернулся раньше записи данных.
+			lvs.mu.Lock()
+			if lvs.compactionEpoch.Load() == task.epoch && seg != nil {
+				lvs.levels[0] = append(lvs.levels[0], seg)
+			} else if seg == nil {
+				monitoring.VectorCompactionRollbackTotal.Inc()
+			}
+			// Декремент счётчика DOPO применения результата.
+			remaining := lvs.inFlightBuilds.Add(-1)
+			// Broadcast только когда ЭТО последний build И delta пуста.
+			if lvs.flushPending.Load() && remaining == 0 {
+				deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
+				if deltaEmpty {
+					lvs.flushPending.Store(false)
+					lvs.flushCond.Broadcast()
+				}
+			}
+			overflow := len(lvs.levels[0]) >= lvs.cfg.Fanout
+			// Delta накопилась пока шли builds — запускаем следующий flush.
+			needsFlush := !overflow && lvs.delta != nil && lvs.delta.Len() > 0
+			lvs.mu.Unlock()
+			if overflow || needsFlush {
+				lvs.triggerCompact()
 			}
 		}
 	}
 }
 
-// runCompaction выполняет один полный цикл compaction:
-//  1. Flush delta → новый L0 сегмент
-//  2. Если L0 переполнен → merge L0 → L1
-//  3. Если L1 переполнен → merge L1 → L2
-//  4. ...и т.д. по уровням
-func (lvs *LeveledVectorStore) runCompaction() {
-	// 1. Flush delta
-	newSeg := lvs.flushDeltaToSegment()
-	if newSeg == nil {
-		return
-	}
+// FlushDeltaSync ждёт пока delta пуста И нет активного delta-flush build.
+//
+// Гарантия: после возврата все векторы, добавленные до вызова FlushDeltaSync,
+// находятся в опубликованных сегментах (levels[]). Merge goroutines (L1→L2 и т.д.)
+// НЕ ждём — они продолжают работать в фоне.
+//
+// Реализация: cond-based (sync.Cond), НЕ spin-loop.
+// Spin-loop создавал busy-loop coordinator'а: triggerCompact() заполнял compactCh
+// быстрее, чем coordinator обрабатывал resultChan → applyResult() не вызывался →
+// deltaFlushInFlight никогда не сбрасывался → livelock.
+//
+// flushCond.Broadcast() вызывается из applyResult() при завершении delta-flush build
+// и из Close() при graceful shutdown. FlushDeltaSync пробуждается и перепроверяет.
+func (lvs *LeveledVectorStore) FlushDeltaSync() {
+	// Один начальный сигнал — достаточно для запуска delta-flush goroutine.
+	lvs.triggerCompact()
 
-	// 2. Добавляем сегмент в L0
 	lvs.mu.Lock()
-	lvs.levels[0] = append(lvs.levels[0], newSeg)
-	lvs.mu.Unlock()
+	defer lvs.mu.Unlock()
 
-	// 3. Каскадное слияние уровней
-	fanout := lvs.cfg.Fanout
-	for lyr := 0; lyr < maxLevels-1; lyr++ {
-		lvs.mu.RLock()
-		nSegs := len(lvs.levels[lyr])
-		lvs.mu.RUnlock()
-
-		if nSegs < fanout {
-			break // этот уровень ещё не переполнен
+	for {
+		// Shutdown: coordinator уже вышел, ждать некому.
+		select {
+		case <-lvs.done:
+			return
+		default:
 		}
 
-		// Забираем все сегменты с уровня lyr
-		lvs.mu.Lock()
-		toMerge := lvs.levels[lyr]
-		lvs.levels[lyr] = nil
-		lvs.mu.Unlock()
-
-		// Строим merge-сегмент (вне lock!)
-		merged := lvs.mergeSegments(toMerge)
-		if merged == nil {
-			continue
+		deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
+		// Ждём пока: delta пуста И нет in-flight delta-flush builds.
+		if deltaEmpty && lvs.inFlightBuilds.Load() == 0 {
+			// Все векторы в сегментах. Сбрасываем flushPending: иначе applyResult
+			// продолжит eager-флашить дельту после следующих Add (фрагментация).
+			lvs.flushPending.Store(false)
+			// Триггерим merges (L0→L1→L2 cascade).
+			lvs.triggerCompact()
+			return
 		}
 
-		// Ставим на следующий уровень
-		lvs.mu.Lock()
-		lvs.levels[lyr+1] = append(lvs.levels[lyr+1], merged)
-		lvs.mu.Unlock()
+		// Пометить: мы ждём. applyResult() увидит флаг и сделает Broadcast.
+		lvs.flushPending.Store(true)
+		lvs.triggerCompact()
+		lvs.flushCond.Wait()
 	}
 }
 
-// flushDeltaToSegment атомарно забирает текущую дельту и строит из неё сегмент.
-// Дельта заменяется пустой — запись продолжается без блокировки.
-func (lvs *LeveledVectorStore) flushDeltaToSegment() segment {
+// anyMergeInFlight проверяет, есть ли активный merge на любом уровне.
+func (lvs *LeveledVectorStore) anyMergeInFlight() bool {
 	lvs.mu.Lock()
-	if lvs.delta == nil || lvs.delta.Len() == 0 {
-		lvs.mu.Unlock()
-		return nil
+	defer lvs.mu.Unlock()
+	for i := 0; i < maxLevels; i++ {
+		if lvs.mergeInFlight[i] {
+			return true
+		}
 	}
-	// Атомарная замена: старая дельта уходит на compaction, новая пустая
-	oldDelta := lvs.delta
-	max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
-	lvs.delta = NewDeltaSegment(lvs.dim, max)
-	dim := lvs.dim
-	lvs.mu.Unlock()
-
-	// Всё дальше — вне lock. Запись идёт в новую дельту.
-	entries := oldDelta.ExtractAll()
-	if len(entries) == 0 {
-		return nil
-	}
-
-	return lvs.buildSegment(entries, dim)
+	return false
 }
+
+// waitForBuildCompletion — не используется, оставлен для совместимости.
+func (lvs *LeveledVectorStore) waitForBuildCompletion() {
+	for lvs.inFlightBuilds.Load() > 0 {
+		select {
+		case <-lvs.done:
+			return
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
+
+// flushDeltaToSegment удалён — логика delta-flush интегрирована в coordinateCompaction
+// (Build Pool). Coordinator забирает delta и создаёт task{taskFlushDelta}, buildWorker
+// строит сегмент через buildSegment.
 
 // mergeSegments сливает несколько сегментов в один новый.
-// Извлекает векторы из каждого сегмента и строит новый HNSW с нуля.
-func (lvs *LeveledVectorStore) mergeSegments(segs []segment) segment {
-	dim := 0
+// Ключи из tombstone-слоя физически пропускаются — это единственный момент,
+// когда tombstones «применяются» и после merge перестают быть нужны.
+func (lvs *LeveledVectorStore) mergeSegments(segs []segment, workerID int) segment {
+	return lvs.mergeSegmentsWithAllocator(segs, lvs.buildAllocators[workerID%len(lvs.buildAllocators)])
+}
+
+// mergeSegmentsWithAllocator — merge с явным аллокатором (для coordinator-driven merge,
+// использует lvs.mergeAllocator, изолированный от build workers).
+func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, allocator *tcmalloc.TCMallocStore) segment {
 	lvs.mu.RLock()
-	dim = lvs.dim
+	dim := lvs.dim
+	// Snapshot tombstones под RLock — tombstones актуальны на момент начала merge.
+	// Ключи, удалённые до merge, не попадают в новый сегмент.
+	// Ключи, удалённые после snapshot, останутся в новом сегменте — они будут
+	// в tombstones и отфильтруются при следующем Search/Get. Корректно.
+	var ts map[string]struct{}
+	if t := lvs.tombstones.Load(); t != nil {
+		ts = *t
+	}
 	lvs.mu.RUnlock()
 
 	if dim == 0 {
 		return nil
 	}
 
-	// Извлекаем все векторы из всех сегментов
+	// Извлекаем векторы, пропуская tombstoned ключи
 	var entries []DeltaEntry
 	for _, seg := range segs {
 		switch s := seg.(type) {
 		case *frozenSegment:
-			// Извлекаем из CSR data-слайса
 			fg := s.fg
 			for i := 0; i < fg.n; i++ {
 				if fg.keys[i] == "" {
 					continue
 				}
+				if ts != nil {
+					if _, deleted := ts[fg.keys[i]]; deleted {
+						continue // tombstone — физически удаляем
+					}
+				}
 				vec := fg.data[i*fg.dim : (i+1)*fg.dim]
-				// Копируем — fg.data может уйти из памяти после merge
 				vecCopy := make([]float32, dim)
 				copy(vecCopy, vec)
 				entries = append(entries, DeltaEntry{Key: fg.keys[i], Vec: vecCopy})
 			}
+		case *frozenSQSegment:
+			// Деквантуем SQ8-векторы обратно в float32 для rebuild.
+			// Это единственная операция, теряющая точность: деквантованный вектор
+			// ≈ исходный с точностью SQ8 (error ≤ scale/2 per dimension).
+			// При rebuild новый сегмент квантуется заново — накопления ошибки нет.
+			fg := s.fg
+			for i := 0; i < fg.n; i++ {
+				if fg.keys[i] == "" {
+					continue
+				}
+				if ts != nil {
+					if _, deleted := ts[fg.keys[i]]; deleted {
+						continue
+					}
+				}
+				vecCopy := make([]float32, dim)
+				base := i * dim
+				for d := 0; d < dim; d++ {
+					vecCopy[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
+				}
+				entries = append(entries, DeltaEntry{Key: fg.keys[i], Vec: vecCopy})
+			}
 		case *hnswSegment:
-			// Извлекаем из arena
 			s.mu.RLock()
 			g := s.g
 			for i := range g.nodes {
@@ -563,6 +2091,11 @@ func (lvs *LeveledVectorStore) mergeSegments(segs []segment) segment {
 				key, ok := s.keys[uint64(i)]
 				if !ok || key == "" {
 					continue
+				}
+				if ts != nil {
+					if _, deleted := ts[key]; deleted {
+						continue // tombstone — физически удаляем
+					}
 				}
 				raw := g.arena.Get(g.nodes[i].VectorOffset)
 				vecCopy := make([]float32, dim)
@@ -577,31 +2110,86 @@ func (lvs *LeveledVectorStore) mergeSegments(segs []segment) segment {
 		return nil
 	}
 
-	return lvs.buildSegment(entries, dim)
+	newSeg := lvs.buildSegmentWithAllocator(entries, dim, allocator)
+
+	// Если merge успешен — сбрасываем tombstones, которые были применены.
+	// COW: только ключи из snapshot ts удаляются; новые tombstones, добавленные
+	// за время merge, остаются нетронутыми.
+	if newSeg != nil && ts != nil {
+		lvs.mu.Lock()
+		for key := range ts {
+			deleteTombstone(&lvs.tombstones, key)
+		}
+		lvs.mu.Unlock()
+	}
+
+	return newSeg
 }
 
 // buildSegment строит сегмент из набора (key, vec) записей.
 // Dim-adaptive: dim ≤ csrDimThreshold → FrozenGraph, иначе → hnswSegment.
-func (lvs *LeveledVectorStore) buildSegment(entries []DeltaEntry, dim int) segment {
+func (lvs *LeveledVectorStore) buildSegment(entries []DeltaEntry, dim, workerID int) segment {
+	n := len(entries)
+	if n == 0 {
+		return nil
+	}
+	// Выбираем per-worker изолированный аллокатор.
+	allocator := lvs.cfg.Allocator
+	if workerID >= 0 && workerID < len(lvs.buildAllocators) {
+		allocator = lvs.buildAllocators[workerID]
+	}
+	if allocator == nil {
+		allocator = tcmalloc.NewTCMallocStore(1)
+	}
+	return lvs.buildSegmentWithAllocator(entries, dim, allocator)
+}
+
+// buildSegmentWithAllocator — ядро построения сегмента с явным аллокатором.
+// Используется build workers (per-worker allocators) и coordinator-merge (mergeAllocator).
+func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, dim int, allocator *tcmalloc.TCMallocStore) segment {
 	n := len(entries)
 	if n == 0 {
 		return nil
 	}
 
+	buildStart := time.Now()
+	defer func() {
+		monitoring.VectorSegmentBuildDuration.Update(time.Since(buildStart).Seconds())
+	}()
+
 	// Строим HNSW из всех векторов.
-	// Используем общий аллокатор из конфига — НЕ создаём новый per-segment,
-	// иначе каждый NewTCMallocStore запускает фоновую горутину runDeferredFree.
-	g := NewGraph(lvs.cfg.Distance, lvs.cfg.Allocator)
+	g := NewGraph(lvs.cfg.Distance, allocator)
+	g.workerID = 0 // изолированный allocator: всегда shard 0
 	g.EfConstruction = lvs.cfg.EfConstruction
 
-	keys := make(map[uint64]string, n)
-	for i, e := range entries {
-		idx := g.Insert(e.Vec)
-		keys[uint64(idx)] = e.Key
-		_ = i
+	// Применяем параметр M если задан
+	if lvs.cfg.M > 0 {
+		g.M = lvs.cfg.M
+		g.M0 = 2 * lvs.cfg.M
+		g.Ml = 1.0 / math.Log(float64(lvs.cfg.M))
+		g.pruneBufItems = make([]item, 0, g.M0+1)
+		g.pruneBufIDs = make([]uint64, 0, g.M0+1)
+		g.insertBuf = make([]uint64, 0, g.M0+1)
 	}
 
-	// Dim-adaptive: freeze в CSR или оставить как HNSW
+	keys := make(map[uint64]string, n)
+	for _, e := range entries {
+		idx := g.Insert(e.Vec)
+		keys[uint64(idx)] = e.Key
+	}
+
+	// Выбор формата сегмента (frozen uint32 neighbor IDs — потолка n нет):
+	//   UseSQ=true → SQ8-frozen для ЛЮБОЙ размерности. На dim>256 это и есть решение
+	//     памяти для 768 (4× сжатие: 3072→768 B/vec). SQ-гейт по ПОЛЬЗЕ, не по dim.
+	//   UseSQ=false → float32-frozen только при dim ≤ csrDimThreshold (там CSR даёт
+	//     +QPS за счёт cache-locality); иначе обычный hnswSegment.
+	if lvs.cfg.UseSQ {
+		fg := FreezeGraphSQ(g, lvs.cfg.Distance, keys)
+		if fg == nil {
+			return nil
+		}
+		return &frozenSQSegment{fg: fg}
+	}
 	if dim <= csrDimThreshold {
 		fg := FreezeGraph(g, lvs.cfg.Distance, keys)
 		if fg == nil {
@@ -614,42 +2202,88 @@ func (lvs *LeveledVectorStore) buildSegment(entries []DeltaEntry, dim int) segme
 }
 
 // =============================================================================
-// Merge результатов
-// =============================================================================
-
-// LeveledResult — результат поиска из LeveledVectorStore.
-type LeveledResult struct {
-	Key  string
-	Dist float32
-}
-
-// mergeTopK сливает K результатов из нескольких источников (используется только в general пати).
-func mergeTopK(src []segResult, K int) []LeveledResult {
-	if len(src) == 0 {
-		return nil
-	}
-	slices.SortFunc(src, func(a, b segResult) int {
-		if a.Dist < b.Dist {
-			return -1
-		}
-		if a.Dist > b.Dist {
-			return 1
-		}
-		return 0
-	})
-	if len(src) > K {
-		src = src[:K]
-	}
-	out := make([]LeveledResult, len(src))
-	for i, r := range src {
-		out[i] = LeveledResult{Key: r.Key, Dist: r.Dist}
-	}
-	return out
-}
-
-// =============================================================================
 // Утилиты
 // =============================================================================
+
+// LeveledStats — снимок состояния LeveledVectorStore для метрик/диагностики.
+// Возвращается методом Stats(). Не зависит от пакета monitoring (нет import cycle).
+type LeveledStats struct {
+	TotalVectors    int   // живых векторов (delta + все сегменты)
+	DeltaLen        int   // векторов в активной дельте
+	DeltaMax        int   // ёмкость дельты до flush
+	Dim             int   // размерность векторов (0 если пусто)
+	MaxLevel        int   // максимальный заполненный уровень LSM (0-based)
+	SegmentsByLevel []int // [maxLevels] — число сегментов на каждом уровне
+	Tombstones      int   // активных tombstones (не применённых merge'ем)
+	AllocatorBytes  int64 // память под neighbors-блоки (tcmalloc)
+	DataBytes       int64 // память под векторы (frozen.data + hnsw arena)
+}
+
+// Stats возвращает snapshot состояния для метрик.
+// Потокобезопасен: берёт RLock на короткое время. Не делает аллокаций вне
+// возвращаемого среза SegmentsByLevel (фиксированной длины maxLevels).
+func (lvs *LeveledVectorStore) Stats() LeveledStats {
+	lvs.mu.RLock()
+	defer lvs.mu.RUnlock()
+
+	segsByLevel := make([]int, maxLevels)
+	totalVectors := 0
+	maxLevel := 0
+	var dataBytes int64
+	for i, level := range lvs.levels {
+		segsByLevel[i] = len(level)
+		if len(level) > 0 && i > maxLevel {
+			maxLevel = i
+		}
+		for _, seg := range level {
+			totalVectors += seg.Len()
+			dataBytes += segMemoryBytes(seg)
+		}
+	}
+
+	deltaLen := 0
+	deltaMax := 0
+	if lvs.delta != nil {
+		deltaLen = lvs.delta.Len()
+		deltaMax = lvs.delta.maxSize
+		totalVectors += deltaLen
+	}
+
+	tombstones := 0
+	if t := lvs.tombstones.Load(); t != nil {
+		tombstones = len(*t)
+	}
+
+	return LeveledStats{
+		TotalVectors:    totalVectors,
+		DeltaLen:        deltaLen,
+		DeltaMax:        deltaMax,
+		Dim:             lvs.dim,
+		MaxLevel:        maxLevel,
+		SegmentsByLevel: segsByLevel,
+		Tombstones:      tombstones,
+		DataBytes:       dataBytes,
+	}
+}
+
+// segMemoryBytes возвращает приближённый размер данных векторов в сегменте.
+// Не учитывает overhead структуры (keys []string, метаданные) — только payload.
+func segMemoryBytes(seg segment) int64 {
+	switch s := seg.(type) {
+	case *frozenSegment:
+		// data slab (n*dim*4) + CSR layers
+		return int64(s.fg.MemoryBytes())
+	case *frozenSQSegment:
+		// codes (n*dim*1) + sqMin/sqScale + CSR layers
+		return int64(s.fg.MemoryBytes())
+	case *hnswSegment:
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		// arena.data (float32) + tcmalloc neighbors (через allocator, не здесь)
+		return int64(len(s.g.arena.data)) * 4
+	}
+	return 0
+}
 
 type dimMismatchError struct {
 	expected, got int

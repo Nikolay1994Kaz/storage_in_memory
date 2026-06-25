@@ -54,7 +54,7 @@ func TestVectorStore_BinarySnapshotRoundTrip(t *testing.T) {
 
 			for i := 0; i < numQueries; i++ {
 				queryVectors[i] = generateRandomVector(dim)
-				res, err := vsSource.Search(queryVectors[i], K)
+				res, err := vsSource.Search(queryVectors[i], K, nil)
 				if err != nil {
 					t.Fatalf("Search failed during baseline: %v", err)
 				}
@@ -90,7 +90,7 @@ func TestVectorStore_BinarySnapshotRoundTrip(t *testing.T) {
 
 			// 7. Сверяем результаты поиска (они должны совпадать абсолютно бит-в-бит)
 			for i := 0; i < numQueries; i++ {
-				actualRes, err := vsDest.Search(queryVectors[i], K)
+				actualRes, err := vsDest.Search(queryVectors[i], K, nil)
 				if err != nil {
 					t.Fatalf("Search failed on restored graph: %v", err)
 				}

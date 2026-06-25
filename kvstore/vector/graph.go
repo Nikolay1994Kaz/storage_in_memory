@@ -48,6 +48,10 @@ type Graph struct {
 	arena     *VectorArena
 	allocator *tcmalloc.TCMallocStore // Менеджер памяти для neighbors блоков
 
+	// workerID — shard для TCMallocStore.Alloc. Разные buildWorker'ы используют
+	// разные workerID → нет data race на caches[]. По умолчанию 0 (совместимость).
+	workerID int
+
 	// ─── Переиспользуемые буферы (zero-alloc pruning/insert) ───
 	pruneBufItems []item   // буфер для pruneNeighbors (capacity = M0)
 	pruneBufIDs   []uint64 // буфер для ID после pruning (capacity = M0)
@@ -402,7 +406,7 @@ func (g *Graph) Insert(vec []float32) uint32 {
 		g.arena = NewVectorArena(len(vec), 10000)
 	}
 	vecOffset := g.arena.Allocate(vec)
-	buf, handle := g.allocator.Alloc(0, g.neighborsBlockSize(level)*8)
+	buf, handle := g.allocator.Alloc(g.workerID, g.neighborsBlockSize(level)*8)
 	for i := range buf {
 		buf[i] = 0
 	}

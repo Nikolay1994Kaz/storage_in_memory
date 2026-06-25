@@ -62,10 +62,12 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "путь к TLS сертификату (PEM)")
 	tlsKey := flag.String("tls-key", "", "путь к TLS ключу (PEM)")
 	metricsPort := flag.Int("metrics-port", 9090, "порт для HTTP сервера метрик VictoriaMetrics (0 = отключен)")
-	hnswM := flag.Int("hnsw-m", 16, "HNSW M parameter (number of node connections)")
-	hnswEfConstruction := flag.Int("hnsw-ef-construction", 200, "HNSW efConstruction parameter")
-	hnswEfSearch := flag.Int("hnsw-ef-search", 100, "HNSW efSearch parameter (0 = auto)")
+	hnswM := flag.Int("hnsw-m", 32, "HNSW M parameter (number of node connections)")
+	hnswEfConstruction := flag.Int("hnsw-ef-construction", 400, "HNSW efConstruction parameter")
+	hnswEfSearch := flag.Int("hnsw-ef-search", 200, "HNSW efSearch parameter (0 = auto)")
 	hnswUseLSH := flag.Bool("hnsw-use-lsh", false, "Enable LSH pre-filtering for high-dimensional vectors (dim >= 256)")
+	hnswUseSQ := flag.Bool("hnsw-use-sq", false, "Enable Scalar Quantization (int8) for frozen segments (dim<=256). 4x memory compression, ~96% recall, higher QPS via L3 cache locality")
+	compactionWorkers := flag.Int("compaction-workers", 0, "Number of parallel segment build workers (0 = auto NumCPU/2 clamped 2-8). Build Pool: insert does not block during heavy L2 compaction")
 	flag.Parse()
 
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
@@ -102,24 +104,41 @@ func main() {
 	defer ttl.Stop()
 
 	// === 2. Инициализация хранилища векторов и загрузка бинарного снапшота ===
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance, s)
-	vecStore.SetHNSWParams(*hnswM, *hnswEfConstruction, *hnswEfSearch)
-	vecStore.SetUseLSH(*hnswUseLSH)
+	// Используем LeveledVectorStore (LSM+CSR) как реализацию VectorIndex.
+	var vecStore vector.VectorIndex = vector.NewLeveledVectorStore(vector.LeveledConfig{
+		M:              *hnswM,
+		EfConstruction: *hnswEfConstruction,
+		EfSearch:       *hnswEfSearch,
+		Distance:       vector.EuclideanDistance,
+		Allocator:      s,
+		UseSQ:          *hnswUseSQ,
+		NumBuilders:    *compactionWorkers,
+	})
+	// LSH не применяется в LeveledVectorStore, вызов no-op через type assertion:
+	if lsh, ok := vecStore.(interface{ SetUseLSH(bool) }); ok {
+		lsh.SetUseLSH(*hnswUseLSH)
+	}
+
+	// Регистрация gauge-метрик векторного хранилища (segments/tombstones/bytes).
+	// Provider вызывается только при scrape /metrics — 0 overhead на hot path.
+	if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+		monitoring.SetVectorStateProvider(leveledStatsAdapter{lvs: lvs})
+	}
 
 	// === 2.5. Инициализация sorted sets (ZSet) ===
 	zsetReg := zset.New(s)
 
-	graphPath := filepath.Join(dataDir, "graph.bin")
+	graphPath := filepath.Join(dataDir, "graph_leveled.bin")
 	graphLoaded := false
 
 	if _, err := os.Stat(graphPath); err == nil {
-		log.Printf("Loading HNSW graph from binary snapshot %s...", graphPath)
+		log.Printf("Loading leveled vector store from binary snapshot %s...", graphPath)
 		f, err := os.Open(graphPath)
 		if err == nil {
 			if err := vecStore.LoadBinary(f); err != nil {
-				log.Printf("WARNING: failed to load HNSW graph from binary snapshot: %v. Will rebuild from WAL.", err)
+				log.Printf("WARNING: failed to load vector snapshot: %v. Will rebuild from WAL.", err)
 			} else {
-				log.Printf("HNSW graph loaded successfully from binary snapshot!")
+				log.Printf("Leveled vector store loaded successfully from snapshot!")
 				graphLoaded = true
 			}
 			f.Close()
@@ -241,9 +260,15 @@ func main() {
 		})
 	}
 
-	// saveVectors — сохраняет HNSW граф в graph.bin
+	// saveVectors — сохраняет LeveledVectorStore в graph_leveled.bin.
+	// Перед записью принудительно сбрасываем дельту в сегменты (FlushDeltaSync),
+	// гарантируя что снапшот содержит все данные.
 	saveVectors := func() error {
-		graphPath := filepath.Join(dataDir, "graph.bin")
+		// Приводим к *LeveledVectorStore для вызова FlushDeltaSync.
+		if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+			lvs.FlushDeltaSync()
+		}
+		graphPath := filepath.Join(dataDir, "graph_leveled.bin")
 		tmpPath := graphPath + ".tmp"
 		f, err := os.Create(tmpPath)
 		if err != nil {
@@ -359,7 +384,7 @@ func main() {
 		Key      string
 		Distance float32
 	} {
-		results, err := vecStore.Search(query, K)
+		results, err := vecStore.Search(query, K, nil)
 		if err != nil {
 			return nil
 		}
@@ -595,9 +620,31 @@ func arg(args [][]byte, i int) string {
 	return string(args[i])
 }
 
+// leveledStatsAdapter адаптирует *vector.LeveledVectorStore к monitoring.VectorStateProvider.
+// Избегает циклической зависимости monitoring ↔ vector: конверсия LeveledStats → VectorStats
+// происходит здесь, в cmd-слое.
+type leveledStatsAdapter struct {
+	lvs *vector.LeveledVectorStore
+}
+
+func (a leveledStatsAdapter) Stats() monitoring.VectorStats {
+	s := a.lvs.Stats()
+	return monitoring.VectorStats{
+		TotalVectors:    s.TotalVectors,
+		DeltaLen:        s.DeltaLen,
+		DeltaMax:        s.DeltaMax,
+		Dim:             s.Dim,
+		MaxLevel:        s.MaxLevel,
+		SegmentsByLevel: s.SegmentsByLevel,
+		Tombstones:      s.Tombstones,
+		AllocatorBytes:  s.AllocatorBytes,
+		DataBytes:       s.DataBytes,
+	}
+}
+
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
 	hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine,
-	triggers *compute.TriggerManager, vecStore *vector.VectorStore,
+	triggers *compute.TriggerManager, vecStore vector.VectorIndex,
 	zsetReg *zset.ZSetRegistry,
 	aiClient *ai.Client, aiWorker *ai.Worker,
 	iterateAll func(fn func(op byte, key string, value []byte)),
@@ -1005,10 +1052,13 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		vec := vector.DeserializeVectorZeroCopy(walValue)
 
 		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
+		monitoring.VectorAddTotal.Inc()
+		addStart := time.Now()
 		if err := vecStore.Add(key, vec); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
+		monitoring.VectorAddDuration.Update(time.Since(addStart).Seconds())
 		if cl != nil && cl.Repl != nil {
 			// Forward replication command in text format to replica nodes
 			// to avoid breaking existing replica replication protocols.
@@ -1046,10 +1096,13 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		walValue := vector.SerializeVector(vec)
 		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
+		monitoring.VectorAddTotal.Inc()
+		addStart := time.Now()
 		if err := vecStore.Add(key, vec); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
+		monitoring.VectorAddDuration.Update(time.Since(addStart).Seconds())
 		if cl != nil && cl.Repl != nil {
 			// Формат: VSIM.ADD key 0.1 0.2 0.3 ...
 			var sb strings.Builder
@@ -1075,6 +1128,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				return
 			}
 		}
+		monitoring.VectorDeleteTotal.Inc()
 		if vecStore.Delete(key) {
 			bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: key})
 			if cl != nil && cl.Repl != nil {
@@ -1157,7 +1211,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 			query[i-1] = float32(f)
 		}
-		results, err := vecStore.Search(query, K)
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
+		results, err := vecStore.Search(query, K, nil)
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
@@ -1186,7 +1243,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// Zero-copy cast directly from the read buffer
 		query := vector.DeserializeVectorZeroCopy(args[1])
 
-		results, err := vecStore.Search(query, K)
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
+		results, err := vecStore.Search(query, K, nil)
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
@@ -1198,6 +1258,13 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 
 	case "VSIM.INFO":
+		// FlushDeltaSync: гарантируем, что к моменту чтения состояния все вставленные
+		// векторы перенесены из дельты в сегменты. Иначе при burst-write Info() видит
+		// только частичные данные (компакция в полёте), а последующий Search работает
+		// по неполному индексу. Бенчмарки (ann_bench) зовут VSIM.INFO как sync-точку.
+		if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+			lvs.FlushDeltaSync()
+		}
 		count, dim, maxLevel := vecStore.Info()
 		info := fmt.Sprintf("vectors:%d dimension:%d max_level:%d", count, dim, maxLevel)
 		buf.WriteBulkString(info)
@@ -1269,7 +1336,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 		}
 
-		results, err := vecStore.SearchFiltered(query, K, filterFn)
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
+		results, err := vecStore.SearchFiltered(query, K, filterFn, nil)
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
@@ -1433,10 +1503,13 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 
 		// Шаг 2: HNSW SearchFiltered с hash-фильтром
 		// HashMember(key) — inline FNV-1a (~15ns), zero-alloc.
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
 		results, err := vecStore.SearchFiltered(query, K, func(key string) bool {
 			_, ok := allowed[btree.HashMember(key)]
 			return ok
-		})
+		}, nil)
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
@@ -1491,7 +1564,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError(fmt.Sprintf("ERR embed: %v", err))
 			return
 		}
-		results, err := vecStore.Search(embedding, K)
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
+		results, err := vecStore.Search(embedding, K, nil)
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR search: %v", err))
 			return
@@ -1523,7 +1599,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 
 		// RAG Step 2: поиск похожих документов
-		results, err := vecStore.Search(embedding, 3)
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
+		results, err := vecStore.Search(embedding, 3, nil)
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR search: %v", err))
 			return
@@ -1588,7 +1667,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 // а вектор оставался навечно в графе HNSW, занимая RAM.
 type compositeEvictor struct {
 	kv  *tcmalloc.TCMallocStore
-	vec *vector.VectorStore
+	vec vector.VectorIndex
 	wal *wal.BatchWAL
 }
 

@@ -1,8 +1,12 @@
 package vector
 
 import (
+	"encoding/binary"
+	"fmt"
+	"io"
 	"slices"
 	"sync"
+	"unsafe"
 )
 
 // =============================================================================
@@ -15,8 +19,10 @@ import (
 // Для dim ≥ 512 остаётся обычный *Graph (hnswSegment).
 //
 // Memory layout:
-//   data[i*dim : (i+1)*dim]  = вектор ноды i  (contiguous float32 slab)
-//   layers[lyr].neigh[layers[lyr].offs[i] : layers[lyr].offs[i+1]] = соседи ноды i на layer lyr (flat CSR)
+//
+//	data[i*dim : (i+1)*dim]  = вектор ноды i  (contiguous float32 slab)
+//	layers[lyr].neigh[layers[lyr].offs[i] : layers[lyr].offs[i+1]] = соседи ноды i на layer lyr (flat CSR)
+//
 // =============================================================================
 
 // frozenSearchState — pool-able буфер для Search (как searchPool в graph.go).
@@ -49,6 +55,12 @@ type FrozenResult struct {
 }
 
 // FlatLayer — плоское CSR представление связей одного слоя.
+//
+// neigh — uint32 (4 байта/сосед). Узлы в FrozenGraph нумеруются локально 0..n-1.
+// uint32 снимает прежний потолок n ≤ 65535 (uint16): теперь frozen-сегмент любого
+// размера корректен. Цена: +2 байта/сосед (~+11% памяти сегмента при dim=128,
+// ~+2% при dim=768 — топология мала относительно векторов). Без этого merge >65535
+// молча портил граф (overflow ID соседей) или падал на медленный hnswSegment.
 type FlatLayer struct {
 	neigh []uint32
 	offs  []uint32 // len = n+1
@@ -146,7 +158,11 @@ func (fg *FrozenGraph) MemoryBytes() int {
 // Search выполняет полный multi-level HNSW поиск по CSR-графу.
 // Фаза 1: greedyClosest по верхним слоям (0 аллок).
 // Фаза 2: beam search на layer 0 с sync.Pool (1 аллок — выходной срез).
-func (fg *FrozenGraph) Search(query []float32, K, efSearch int) []FrozenResult {
+//
+// filterFn != nil: фильтр применяется к РЕЗУЛЬТАТАМ, не к обходу графа.
+// Это критически важно для корректности — узлы-мосты не отсекаются,
+// граф-связность сохраняется. Только в result-heap кладём те, что прошли фильтр.
+func (fg *FrozenGraph) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
 	if fg.n == 0 {
 		return nil
 	}
@@ -174,7 +190,7 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int) []FrozenResult {
 				d := distFn(query, fg.data[nbBase:nbBase+dim])
 				if d < bestDist {
 					bestDist = d
-					ep = nb
+					ep = uint32(nb)
 					improved = true
 				}
 			}
@@ -280,12 +296,15 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int) []FrozenResult {
 		}
 	}
 
-	// Стартуем с entry point
+	// Стартуем с entry point: всегда в cands для обхода.
+	// В результаты — только если проходит фильтр.
 	epBase := int(ep) * dim
 	epDist := distFn(query, fg.data[epBase:epBase+dim])
 	setVisited(ep)
 	cPush(ep, epDist)
-	rPush(fg.keys[ep], epDist)
+	if filterFn == nil || (fg.keys[ep] != "" && filterFn(fg.keys[ep])) {
+		rPush(fg.keys[ep], epDist)
+	}
 
 	layer0 := fg.layers[0]
 	for len(st.cands) > 0 {
@@ -296,7 +315,7 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int) []FrozenResult {
 		start := layer0.offs[curr.id]
 		end := layer0.offs[curr.id+1]
 		for idx := start; idx < end; idx++ {
-			nb := layer0.neigh[idx]
+			nb := uint32(layer0.neigh[idx])
 			if isVisited(nb) {
 				continue
 			}
@@ -304,10 +323,14 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int) []FrozenResult {
 			nbBase := int(nb) * dim
 			d := distFn(query, fg.data[nbBase:nbBase+dim])
 			if len(st.res) < efSearch || d < st.res[0].Dist {
+				// Всегда добавляем в кандидаты (граф-обход не фильтруем).
 				cPush(nb, d)
-				rPush(fg.keys[nb], d)
-				if len(st.res) > efSearch {
-					rPopMax()
+				// В результаты — только если проходит фильтр.
+				if filterFn == nil || (fg.keys[nb] != "" && filterFn(fg.keys[nb])) {
+					rPush(fg.keys[nb], d)
+					if len(st.res) > efSearch {
+						rPopMax()
+					}
 				}
 			}
 		}
@@ -328,10 +351,192 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int) []FrozenResult {
 		}
 		return 0
 	})
-	out := make([]FrozenResult, topK) // только K, не efSearch
-	copy(out, st.res[:topK])
+
+	if cap(dst) < topK {
+		dst = make([]FrozenResult, topK)
+	} else {
+		dst = dst[:topK]
+	}
+	copy(dst, st.res[:topK])
 
 	// Возвращаем состояние в pool
 	frozenSearchPool.Put(st)
-	return out
+	return dst
+}
+
+// =============================================================================
+// Сериализация FrozenGraph — O(N) memcpy через unsafe.Slice.
+//
+// Формат (little-endian):
+//   [4B n][4B dim][4B maxLevel][4B entryPointID]
+//   [n*dim*4B data float32 slab]
+//   [4B nLayers]
+//   для каждого слоя:
+//     [4B nOffs][nOffs*4B offs uint32][4B nNeigh][nNeigh*4B neigh uint32]
+//   [4B nKeys]
+//   для каждого ключа:
+//     [2B keyLen][keyLen B key bytes]
+//
+// =============================================================================
+
+// WriteGraphTo сериализует FrozenGraph в w. Zero-alloc для data/offs/neigh слайсов
+// (используется unsafe.Slice → прямой доступ к памяти без копии в []byte).
+func (fg *FrozenGraph) WriteGraphTo(w io.Writer) error {
+	// Заголовок: n, dim, maxLevel, entryPointID
+	var hdr [16]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], uint32(fg.n))
+	binary.LittleEndian.PutUint32(hdr[4:8], uint32(fg.dim))
+	binary.LittleEndian.PutUint32(hdr[8:12], uint32(fg.maxLevel))
+	binary.LittleEndian.PutUint32(hdr[12:16], uint32(fg.entryPointID))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return fmt.Errorf("frozen: write header: %w", err)
+	}
+
+	// Data slab (float32 → bytes, zero-alloc)
+	if fg.n > 0 && fg.dim > 0 {
+		b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.data[0])), len(fg.data)*4)
+		if _, err := w.Write(b); err != nil {
+			return fmt.Errorf("frozen: write data: %w", err)
+		}
+	}
+
+	// Layers
+	var u4 [4]byte
+	binary.LittleEndian.PutUint32(u4[:], uint32(len(fg.layers)))
+	if _, err := w.Write(u4[:]); err != nil {
+		return fmt.Errorf("frozen: write nLayers: %w", err)
+	}
+	for i, layer := range fg.layers {
+		// offs
+		binary.LittleEndian.PutUint32(u4[:], uint32(len(layer.offs)))
+		if _, err := w.Write(u4[:]); err != nil {
+			return fmt.Errorf("frozen: write nOffs[%d]: %w", i, err)
+		}
+		if len(layer.offs) > 0 {
+			b := unsafe.Slice((*byte)(unsafe.Pointer(&layer.offs[0])), len(layer.offs)*4)
+			if _, err := w.Write(b); err != nil {
+				return fmt.Errorf("frozen: write offs[%d]: %w", i, err)
+			}
+		}
+		// neigh
+		binary.LittleEndian.PutUint32(u4[:], uint32(len(layer.neigh)))
+		if _, err := w.Write(u4[:]); err != nil {
+			return fmt.Errorf("frozen: write nNeigh[%d]: %w", i, err)
+		}
+		if len(layer.neigh) > 0 {
+			b := unsafe.Slice((*byte)(unsafe.Pointer(&layer.neigh[0])), len(layer.neigh)*4)
+			if _, err := w.Write(b); err != nil {
+				return fmt.Errorf("frozen: write neigh[%d]: %w", i, err)
+			}
+		}
+	}
+
+	// Keys: [4B nKeys] + для каждого [2B len][bytes]
+	binary.LittleEndian.PutUint32(u4[:], uint32(fg.n))
+	if _, err := w.Write(u4[:]); err != nil {
+		return fmt.Errorf("frozen: write nKeys: %w", err)
+	}
+	var klen [2]byte
+	for i := 0; i < fg.n; i++ {
+		key := fg.keys[i]
+		binary.LittleEndian.PutUint16(klen[:], uint16(len(key)))
+		if _, err := w.Write(klen[:]); err != nil {
+			return fmt.Errorf("frozen: write keyLen[%d]: %w", i, err)
+		}
+		if len(key) > 0 {
+			// io.WriteString избегает []byte(key) alloc для *bufio.Writer
+			if _, err := io.WriteString(w, key); err != nil {
+				return fmt.Errorf("frozen: write key[%d]: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+// ReadFrozenGraph десериализует FrozenGraph из r.
+// distFn должна совпадать с той, что использовалась при сохранении.
+func ReadFrozenGraph(r io.Reader, distFn DistanceFunc) (*FrozenGraph, error) {
+	// Заголовок
+	var hdr [16]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, fmt.Errorf("frozen: read header: %w", err)
+	}
+	n := int(binary.LittleEndian.Uint32(hdr[0:4]))
+	dim := int(binary.LittleEndian.Uint32(hdr[4:8]))
+	maxLevel := int(binary.LittleEndian.Uint32(hdr[8:12]))
+	entryPointID := uint32(binary.LittleEndian.Uint32(hdr[12:16]))
+
+	fg := &FrozenGraph{
+		n:            n,
+		dim:          dim,
+		maxLevel:     maxLevel,
+		entryPointID: entryPointID,
+		distFn:       distFn,
+	}
+
+	// Data slab
+	if n > 0 && dim > 0 {
+		fg.data = make([]float32, n*dim)
+		b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.data[0])), len(fg.data)*4)
+		if _, err := io.ReadFull(r, b); err != nil {
+			return nil, fmt.Errorf("frozen: read data: %w", err)
+		}
+	}
+
+	// Layers
+	var u4 [4]byte
+	if _, err := io.ReadFull(r, u4[:]); err != nil {
+		return nil, fmt.Errorf("frozen: read nLayers: %w", err)
+	}
+	nLayers := int(binary.LittleEndian.Uint32(u4[:]))
+	fg.layers = make([]FlatLayer, nLayers)
+	for i := range fg.layers {
+		// offs
+		if _, err := io.ReadFull(r, u4[:]); err != nil {
+			return nil, fmt.Errorf("frozen: read nOffs[%d]: %w", i, err)
+		}
+		nOffs := int(binary.LittleEndian.Uint32(u4[:]))
+		if nOffs > 0 {
+			fg.layers[i].offs = make([]uint32, nOffs)
+			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.layers[i].offs[0])), nOffs*4)
+			if _, err := io.ReadFull(r, b); err != nil {
+				return nil, fmt.Errorf("frozen: read offs[%d]: %w", i, err)
+			}
+		}
+		// neigh
+		if _, err := io.ReadFull(r, u4[:]); err != nil {
+			return nil, fmt.Errorf("frozen: read nNeigh[%d]: %w", i, err)
+		}
+		nNeigh := int(binary.LittleEndian.Uint32(u4[:]))
+		if nNeigh > 0 {
+			fg.layers[i].neigh = make([]uint32, nNeigh)
+			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.layers[i].neigh[0])), nNeigh*4)
+			if _, err := io.ReadFull(r, b); err != nil {
+				return nil, fmt.Errorf("frozen: read neigh[%d]: %w", i, err)
+			}
+		}
+	}
+
+	// Keys
+	if _, err := io.ReadFull(r, u4[:]); err != nil {
+		return nil, fmt.Errorf("frozen: read nKeys: %w", err)
+	}
+	nKeys := int(binary.LittleEndian.Uint32(u4[:]))
+	fg.keys = make([]string, nKeys)
+	var klen [2]byte
+	for i := 0; i < nKeys; i++ {
+		if _, err := io.ReadFull(r, klen[:]); err != nil {
+			return nil, fmt.Errorf("frozen: read keyLen[%d]: %w", i, err)
+		}
+		kl := int(binary.LittleEndian.Uint16(klen[:]))
+		if kl > 0 {
+			kb := make([]byte, kl)
+			if _, err := io.ReadFull(r, kb); err != nil {
+				return nil, fmt.Errorf("frozen: read key[%d]: %w", i, err)
+			}
+			fg.keys[i] = string(kb)
+		}
+	}
+
+	return fg, nil
 }

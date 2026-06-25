@@ -396,7 +396,14 @@ class MoltenClient:
         str
             ``"OK"`` on success.
         """
-        b_vec = struct.pack(f"<{len(vector)}f", *vector)
+        if hasattr(vector, "tobytes"):
+            # numpy array — zero-copy, ~1µs vs struct.pack(*vector) ~200µs
+            if hasattr(vector, "dtype") and str(vector.dtype) != "float32":
+                b_vec = vector.astype("float32").tobytes()
+            else:
+                b_vec = vector.tobytes()
+        else:
+            b_vec = struct.pack(f"<{len(vector)}f", *vector)
         return self.execute("VSIM.ADDBIN", key, b_vec)
 
     def vsim_del(self, key: str) -> int:
@@ -693,7 +700,13 @@ class MoltenPipeline:
         return self.queue("VSIM.ADD", key, *self.client._floats_to_args(vector))
 
     def vsim_add_bin(self, key: str, vector: Sequence[float]) -> "MoltenPipeline":
-        b_vec = struct.pack(f"<{len(vector)}f", *vector)
+        if hasattr(vector, "tobytes"):
+            if hasattr(vector, "dtype") and str(vector.dtype) != "float32":
+                b_vec = vector.astype("float32").tobytes()
+            else:
+                b_vec = vector.tobytes()
+        else:
+            b_vec = struct.pack(f"<{len(vector)}f", *vector)
         return self.queue("VSIM.ADDBIN", key, b_vec)
 
     def vsim_search(self, query_vector: Sequence[float], k: int = 10) -> "MoltenPipeline":

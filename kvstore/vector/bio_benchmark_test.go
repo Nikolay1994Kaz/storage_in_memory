@@ -113,7 +113,7 @@ func TestBioLoadBenchmark(t *testing.T) {
 			defer wg.Done()
 			offset := threadID * queriesPerThread
 			for i := 0; i < queriesPerThread; i++ {
-				_, err := vs.Search(queries[offset+i], 10) // Ищем топ-10 похожих белков
+				_, err := vs.Search(queries[offset+i], 10, nil) // Ищем топ-10 похожих белков
 				if err != nil {
 					return
 				}
@@ -196,7 +196,7 @@ func TestBioLoadBenchmark(t *testing.T) {
 		
 		// Делаем семантический поиск интересов среди всех подписчиков
 		// (Имитируем поведение Hub.SemanticPublish)
-		results, err := subIndex.Search(eventVec, numSubs)
+		results, err := subIndex.Search(eventVec, numSubs, nil)
 		if err != nil {
 			t.Fatalf("Event search error: %v", err)
 		}

@@ -38,7 +38,7 @@ func TestPprofNewCode(t *testing.T) {
 
 	// ─── 1. DeltaSegment ─────────────────────────────────────────────────────
 	t.Run("Delta_BruteForce", func(t *testing.T) {
-		d := NewDeltaSegment(dim, n+1)
+		d := NewDeltaSegment(dim, n+1, EuclideanDistance, 0, 0)
 		for i, v := range vecs {
 			d.Append(fmt.Sprintf("k%d", i), v)
 		}
@@ -51,7 +51,7 @@ func TestPprofNewCode(t *testing.T) {
 		runtime.ReadMemStats(&memBefore)
 
 		for i := 0; i < nQueries; i++ {
-			_ = d.BruteForce(query, K, EuclideanDistance)
+			_ = d.BruteForce(query, K, EuclideanDistance, nil)
 		}
 
 		pprof.StopCPUProfile()
@@ -86,7 +86,8 @@ func TestPprofNewCode(t *testing.T) {
 		runtime.ReadMemStats(&memBefore)
 
 		for i := 0; i < nQueries; i++ {
-			_ = fg.Search(query, K, efSearch)
+			_ = fg.Search(query, K, efSearch, nil, nil)
+
 		}
 
 		pprof.StopCPUProfile()
@@ -121,7 +122,7 @@ func TestPprofNewCode(t *testing.T) {
 		pprof.StartCPUProfile(cpuF)
 
 		for i := 0; i < nQueries; i++ {
-			_, _ = lvs.Search(query, K)
+		_, _ = lvs.Search(query, K, nil)
 		}
 
 		pprof.StopCPUProfile()
@@ -165,7 +166,7 @@ func TestPprofNewCode(t *testing.T) {
 		pprof.StartCPUProfile(cpuF)
 
 		for i := 0; i < nQueries; i++ {
-			_, _ = lvs.Search(query, K)
+		_, _ = lvs.Search(query, K, nil)
 		}
 
 		pprof.StopCPUProfile()
@@ -188,7 +189,7 @@ func TestPprofNewCode(t *testing.T) {
 
 func BenchmarkAlloc_Delta_BruteForce_dim128(b *testing.B) {
 	const n, dim, K = 5000, 128, 10
-	d := NewDeltaSegment(dim, n+1)
+	d := NewDeltaSegment(dim, n+1, EuclideanDistance, 0, 0)
 	rng := rand.New(rand.NewSource(42))
 	for i := 0; i < n; i++ {
 		d.Append(fmt.Sprintf("k%d", i), makeRandVec(dim, rng))
@@ -197,7 +198,7 @@ func BenchmarkAlloc_Delta_BruteForce_dim128(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = d.BruteForce(query, K, EuclideanDistance)
+		_ = d.BruteForce(query, K, EuclideanDistance, nil)
 	}
 }
 
@@ -218,7 +219,8 @@ func BenchmarkAlloc_FrozenSearch_dim128(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = fg.Search(query, K, 100)
+		_ = fg.Search(query, K, 100, nil, nil)
+
 	}
 }
 
@@ -238,7 +240,7 @@ func BenchmarkAlloc_LeveledSearch_DeltaOnly(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, _ = lvs.Search(query, K)
+		_, _ = lvs.Search(query, K, nil)
 	}
 }
 
@@ -261,7 +263,7 @@ func BenchmarkAlloc_LeveledSearch_Compacted(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, _ = lvs.Search(query, K)
+		_, _ = lvs.Search(query, K, nil)
 	}
 }
 

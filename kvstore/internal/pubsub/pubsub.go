@@ -322,7 +322,7 @@ func (h *Hub) SemanticPublish(queryVec []float32, message string) int {
 	}
 
 	// HNSW search: найти ближайших подписчиков
-	results, err := h.semIndex.Search(queryVec, subCount)
+	results, err := h.semIndex.Search(queryVec, subCount, nil)
 	if err != nil || len(results) == 0 {
 		h.mu.RUnlock()
 		return 0

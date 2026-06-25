@@ -168,7 +168,7 @@ func main() {
 			localRng := rand.New(rand.NewSource(int64(100 + workerID)))
 			for atomic.LoadUint32(&stop) == 0 {
 				q := genProtein(localRng)
-				_, _ = vs.Search(q, 10)
+				_, _ = vs.Search(q, 10, nil)
 				atomic.AddUint64(&searchCount, 1)
 			}
 		}(w)
@@ -186,7 +186,7 @@ func main() {
 		for atomic.LoadUint32(&stop) == 0 {
 			// А. Публикация событий (Pub/Sub)
 			eventVec := genProtein(localRng)
-			results, err := subIndex.Search(eventVec, numSubs)
+			results, err := subIndex.Search(eventVec, numSubs, nil)
 			if err == nil {
 				for _, r := range results {
 					if r.Distance <= 0.40 {

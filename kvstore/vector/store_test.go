@@ -13,7 +13,7 @@ func TestVectorStore_AddAndSearch(t *testing.T) {
 	vs.Add("dog", []float32{0.9, 0.1, 0})
 	vs.Add("car", []float32{0, 0, 1})
 
-	results, err := vs.Search([]float32{1, 0, 0}, 2)
+	results, err := vs.Search([]float32{1, 0, 0}, 2, nil)
 	if err != nil {
 		t.Fatalf("search error: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestVectorStore_DimensionMismatch(t *testing.T) {
 	}
 
 	// Search с неправильной размерностью
-	_, err = vs.Search([]float32{1, 2}, 1)
+	_, err = vs.Search([]float32{1, 2}, 1, nil)
 	if err == nil {
 		t.Fatal("expected search dimension mismatch error, got nil")
 	}
@@ -64,7 +64,7 @@ func TestVectorStore_Upsert(t *testing.T) {
 	if nodeCount != 1 {
 		t.Fatalf("expected 1 node after upsert, got %d", nodeCount)
 	}
-	results, err := vs.Search([]float32{0, 0, 0.9}, 1)
+	results, err := vs.Search([]float32{0, 0, 0.9}, 1, nil)
 	if err != nil {
 		t.Fatalf("search error: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestVectorStore_Delete(t *testing.T) {
 	}
 
 	// Поиск не должен возвращать "b"
-	results, _ := vs.Search([]float32{0, 1}, 3)
+	results, _ := vs.Search([]float32{0, 1}, 3, nil)
 	for _, r := range results {
 		if r.Key == "b" {
 			t.Error("deleted key 'b' found in search results")
@@ -167,7 +167,7 @@ func TestVectorStore_CosinePreNormalization(t *testing.T) {
 	vs.Add("up", []float32{0, 1})
 
 	// Запрос «вправо» — A и B должны быть ближайшими
-	results, err := vs.Search([]float32{5, 0}, 2)
+	results, err := vs.Search([]float32{5, 0}, 2, nil)
 	if err != nil {
 		t.Fatalf("search error: %v", err)
 	}
@@ -222,8 +222,8 @@ func TestVectorStore_CosineVsDotProduct(t *testing.T) {
 
 	query := []float32{2, 3, 0}
 
-	resCosine, _ := vsCosine.Search(query, 3)
-	resDot, _ := vsDot.Search(query, 3)
+	resCosine, _ := vsCosine.Search(query, 3, nil)
+	resDot, _ := vsDot.Search(query, 3, nil)
 
 	if len(resCosine) != len(resDot) {
 		t.Fatalf("result count mismatch: cosine=%d, dot=%d", len(resCosine), len(resDot))
@@ -262,7 +262,7 @@ func TestVectorStore_SearchFiltered_Basic(t *testing.T) {
 	query := []float32{0.95, 0.1, 0}
 
 	// Без фильтра — top-3 должны быть животные
-	allResults, err := vs.Search(query, 3)
+	allResults, err := vs.Search(query, 3, nil)
 	if err != nil {
 		t.Fatalf("Search error: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestVectorStore_SearchFiltered_Basic(t *testing.T) {
 	// С фильтром PREFIX "vehicle:" — должны вернуться только транспорт
 	filteredResults, err := vs.SearchFiltered(query, 3, func(key string) bool {
 		return len(key) > 8 && key[:8] == "vehicle:"
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("SearchFiltered error: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestVectorStore_SearchFiltered_NoMatch(t *testing.T) {
 	// Фильтр не пропускает никого
 	results, err := vs.SearchFiltered([]float32{1, 0}, 3, func(key string) bool {
 		return false
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -323,11 +323,11 @@ func TestVectorStore_SearchFiltered_AllMatch(t *testing.T) {
 	// Фильтр пропускает всех — должен быть идентичен обычному Search
 	filtered, err := vs.SearchFiltered([]float32{1, 0, 0}, 2, func(key string) bool {
 		return true
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
-	normal, _ := vs.Search([]float32{1, 0, 0}, 2)
+	normal, _ := vs.Search([]float32{1, 0, 0}, 2, nil)
 
 	if len(filtered) != len(normal) {
 		t.Fatalf("pass-all filter: expected %d results, got %d", len(normal), len(filtered))
@@ -346,7 +346,7 @@ func TestVectorStore_SearchFiltered_EmptyGraph(t *testing.T) {
 
 	results, err := vs.SearchFiltered([]float32{1, 0}, 3, func(key string) bool {
 		return true
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("error on empty graph: %v", err)
 	}
@@ -373,7 +373,7 @@ func TestVectorStore_SearchFiltered_HighSelectivity(t *testing.T) {
 	// Фильтр: только ключи начинающиеся с "target"
 	results, err := vs.SearchFiltered([]float32{0.5, 0.5}, 10, func(key string) bool {
 		return len(key) >= 6 && key[:6] == "target"
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestVectorStore_SearchFiltered_DimensionMismatch(t *testing.T) {
 
 	_, err := vs.SearchFiltered([]float32{1, 2}, 1, func(key string) bool {
 		return true
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("expected dimension mismatch error, got nil")
 	}

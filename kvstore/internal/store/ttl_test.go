@@ -571,7 +571,7 @@ func TestCompositeEvictor_Integration(t *testing.T) {
 	if _, ok := s.Get(key); ok {
 		t.Fatal("key still exists in KV store after expiration")
 	}
-	info, err := vecStore.Search([]float32{1, 2, 3}, 1)
+	info, err := vecStore.Search([]float32{1, 2, 3}, 1, nil)
 	if err == nil && len(info) > 0 && info[0].Key == key {
 		t.Fatal("vector still exists in vector store after expiration")
 	}
@@ -652,7 +652,7 @@ func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
 	if _, ok := s.Get(keyExpired); ok {
 		t.Fatal("expired key not deleted")
 	}
-	info, err := vecStore.Search([]float32{1, 2, 3}, 1)
+	info, err := vecStore.Search([]float32{1, 2, 3}, 1, nil)
 	if err == nil && len(info) > 0 && info[0].Key == keyExpired {
 		t.Fatal("expired vector not deleted from vector store")
 	}
@@ -675,7 +675,7 @@ func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
 	if _, ok := s.Get(keyDel); ok {
 		t.Fatal("deleted key still exists")
 	}
-	info, err = vecStore.Search([]float32{4, 5, 6}, 1)
+	info, err = vecStore.Search([]float32{4, 5, 6}, 1, nil)
 	if err == nil && len(info) > 0 && info[0].Key == keyDel {
 		t.Fatal("deleted vector still exists in vector store")
 	}

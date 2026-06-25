@@ -166,7 +166,7 @@ type VSearchResult struct {
 }
 
 // Search находит K ближайших векторов к запросу.
-func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
+func (vs *VectorStore) Search(query []float32, K int, dst []VSearchResult) ([]VSearchResult, error) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
@@ -179,7 +179,7 @@ func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 
 	// Если размерность высокая (>= 256) и LSH инициализирован, используем LSH
 	if vs.dim >= 256 && vs.lsh != nil {
-		return vs.searchWithLSHNoLock(query, K, 14)
+		return vs.searchWithLSHNoLock(query, K, 14, dst)
 	}
 
 	return vs.searchNoLSH(query, K)
@@ -196,7 +196,7 @@ func (vs *VectorStore) Search(query []float32, K int) ([]VSearchResult, error) {
 //		val, ok := kvStore.Get("meta:" + key)
 //		return ok && string(val) == "electronics"
 //	})
-func (vs *VectorStore) SearchFiltered(query []float32, K int, filterFn func(string) bool) ([]VSearchResult, error) {
+func (vs *VectorStore) SearchFiltered(query []float32, K int, filterFn func(string) bool, dst []VSearchResult) ([]VSearchResult, error) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
@@ -237,14 +237,18 @@ func (vs *VectorStore) SearchFiltered(query []float32, K int, filterFn func(stri
 
 	results := vs.graph.SearchFiltered(searchQuery, K, efSearch, internalFilter)
 
-	out := make([]VSearchResult, len(results))
+	if cap(dst) < len(results) {
+		dst = make([]VSearchResult, len(results))
+	} else {
+		dst = dst[:len(results)]
+	}
 	for i, r := range results {
-		out[i] = VSearchResult{
+		dst[i] = VSearchResult{
 			Key:      vs.keys[r.ID],
 			Distance: r.Distance,
 		}
 	}
-	return out, nil
+	return dst, nil
 }
 
 // Get возвращает копию вектора по его ключу.

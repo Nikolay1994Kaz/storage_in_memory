@@ -246,11 +246,11 @@ var lshSearchPool = sync.Pool{
 
 // SearchWithLSH выполняет двухфазный поиск: LSH pre-filter → Brute-force refine.
 // Блокирующая обертка для внешних вызовов.
-func (vs *VectorStore) SearchWithLSH(query []float32, K int, threshold int) ([]VSearchResult, error) {
+func (vs *VectorStore) SearchWithLSH(query []float32, K int, threshold int, dst []VSearchResult) ([]VSearchResult, error) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
-	return vs.searchWithLSHNoLock(query, K, threshold)
+	return vs.searchWithLSHNoLock(query, K, threshold, dst)
 }
 
 // searchWithLSHNoLock выполняет двухфазный поиск без захвата RLock.
@@ -259,7 +259,7 @@ func (vs *VectorStore) SearchWithLSH(query []float32, K int, threshold int) ([]V
 // Фаза 2: Считаем ТОЧНОЕ расстояние для каждого кандидата, выбираем top-K.
 //
 // Использует lshSearchPool для предотвращения аллокаций в куче на горячем пути.
-func (vs *VectorStore) searchWithLSHNoLock(query []float32, K int, threshold int) ([]VSearchResult, error) {
+func (vs *VectorStore) searchWithLSHNoLock(query []float32, K int, threshold int, dst []VSearchResult) ([]VSearchResult, error) {
 	if vs.dim == 0 || vs.lsh == nil {
 		return vs.searchNoLSH(query, K)
 	}

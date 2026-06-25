@@ -246,7 +246,7 @@ func (fg *lcFrozenGraph) Search(query []float32, K, efSearch int) []lcResult {
 				d := distFn(query, fg.data[nbBase:nbBase+dim])
 				if d < bestDist {
 					bestDist = d
-					ep = nb
+					ep = uint32(nb)
 					improved = true
 				}
 			}
@@ -369,7 +369,7 @@ func (fg *lcFrozenGraph) Search(query []float32, K, efSearch int) []lcResult {
 		start := layer0.offs[curr.id]
 		end := layer0.offs[curr.id+1]
 		for idx := start; idx < end; idx++ {
-			nb := layer0.neigh[idx]
+			nb := uint32(layer0.neigh[idx])
 			if isVisited(nb) {
 				continue
 			}

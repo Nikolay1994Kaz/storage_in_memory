@@ -117,7 +117,7 @@ func TestSnapshotPerformance(t *testing.T) {
 
 	// Поиск в оригинальном графе
 	startTime = time.Now()
-	resOriginal, err := storeOriginal.Search(queryVec, 10)
+	resOriginal, err := storeOriginal.Search(queryVec, 10, nil)
 	if err != nil {
 		t.Fatalf("Original search failed: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestSnapshotPerformance(t *testing.T) {
 
 	// Поиск в восстановленном графе
 	startTime = time.Now()
-	resRestored, err := storeRestored.Search(queryVec, 10)
+	resRestored, err := storeRestored.Search(queryVec, 10, nil)
 	if err != nil {
 		t.Fatalf("Restored search failed: %v", err)
 	}

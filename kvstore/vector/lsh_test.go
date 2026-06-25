@@ -147,7 +147,7 @@ func benchmarkHNSWSearch(b *testing.B, n, dim, K int) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		results, _ := vs.Search(query, K)
+		results, _ := vs.Search(query, K, nil)
 		_ = results
 	}
 }
@@ -159,7 +159,7 @@ func benchmarkLSHSearch(b *testing.B, n, dim, K, threshold int) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		results, _ := vs.SearchWithLSH(query, K, threshold)
+		results, _ := vs.SearchWithLSH(query, K, threshold, nil)
 		_ = results
 	}
 }
@@ -188,14 +188,14 @@ func TestLSH_Recall(t *testing.T) {
 						query := makeQuery(dim, int64(q*1000+1))
 
 						// Ground truth: обычный HNSW поиск
-						groundTruth, _ := vs.Search(query, K)
+						groundTruth, _ := vs.Search(query, K, nil)
 						groundSet := make(map[string]bool)
 						for _, r := range groundTruth {
 							groundSet[r.Key] = true
 						}
 
 						// LSH-ускоренный поиск
-						lshResults, _ := vs.SearchWithLSH(query, K, threshold)
+						lshResults, _ := vs.SearchWithLSH(query, K, threshold, nil)
 
 						// Считаем recall: сколько из ground truth нашёл LSH
 						hits := 0

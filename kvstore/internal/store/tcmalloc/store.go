@@ -471,6 +471,12 @@ func (s *TCMallocStore) Clear() {
 }
 
 // Alloc выделяет сырой блок памяти через per-worker mcache
+// NumShards возвращает число worker-shard'ов (len(caches)). Используется для
+// корректного распределения build workers по shard'ам (workerID % NumShards).
+func (s *TCMallocStore) NumShards() int {
+	return len(s.caches)
+}
+
 func (s *TCMallocStore) Alloc(workerID int, size int) ([]byte, Handle) {
 	return s.caches[workerID].Alloc(size)
 }

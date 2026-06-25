@@ -159,7 +159,7 @@ func BenchmarkSearch_Full_Go(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		vs.Search(queries[i%len(queries)], K)
+		vs.Search(queries[i%len(queries)], K, nil)
 	}
 }
 
@@ -200,7 +200,7 @@ func BenchmarkSearch_Full_Go_Parallel(b *testing.B) {
 		atomic.AddUint32(&counter, 1)
 		i := 0
 		for pb.Next() {
-			vs.Search(queries[i%len(queries)], K)
+			vs.Search(queries[i%len(queries)], K, nil)
 			i++
 		}
 	})
