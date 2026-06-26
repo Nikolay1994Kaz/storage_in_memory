@@ -250,6 +250,13 @@ type LeveledConfig struct {
 	// тяжёлый L2-сегмент (~100s), остальные параллельно флашат дельту и строят
 	// L0/L1 → вставка не блокируется при burst-write.
 	NumBuilders int
+
+	// DeltaShards — число шардов дельты для конкурентных вставок (шаг 5).
+	// 0/1 = один граф (прежнее поведение, freeze-on-flush применим).
+	// >1 = ключи роутятся hash%N в независимые шарды со своими локами →
+	// Add масштабируется по числу писателей. При шардинге flush идёт через
+	// rebuild из slab (freeze-on-flush требует единого графа).
+	DeltaShards int
 }
 
 // compactionResult — результат build/merge goroutine, передаётся через resultChan.
@@ -270,6 +277,11 @@ type LeveledVectorStore struct {
 	mu    sync.RWMutex
 	delta *DeltaSegment
 	dim   int // устанавливается при первой вставке или LoadBinary
+
+	// tombstoneMu сериализует COW-мутации tombstones на горячем пути Add,
+	// который теперь держит lvs.mu лишь как RLock (несколько писателей сразу).
+	// Чтения tombstones остаются lock-free через atomic.Pointer.
+	tombstoneMu sync.Mutex
 
 	// levels[i] — слой i, содержит []segment, упорядоченных по времени создания.
 	// levels[0] — самые свежие малые сегменты (каждый ≈ deltaMax векторов).
@@ -472,33 +484,75 @@ func deltaMax(dim, cfgMax int) int {
 // Add добавляет вектор с заданным ключом.
 // O(1) на горячем пути (append в flat slab).
 func (lvs *LeveledVectorStore) Add(key string, vec []float32) error {
-	lvs.mu.Lock()
-	defer lvs.mu.Unlock()
-
-	// Инициализация при первой вставке
-	if lvs.dim == 0 {
-		lvs.dim = len(vec)
-		max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
-		lvs.delta = NewDeltaSegment(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction)
-	} else if len(vec) != lvs.dim {
+	// Горячий путь держит lvs.mu лишь как RLock: несколько писателей идут
+	// параллельно, безопасность данных — на пер-шардовых локах дельты (шаг 5).
+	// Эксклюзивный Lock берут только swap дельты (compaction) и Delete/Clear.
+	lvs.mu.RLock()
+	if lvs.delta == nil {
+		// Первая вставка: инициализируем дельту под эксклюзивным локом.
+		lvs.mu.RUnlock()
+		if err := lvs.initDelta(len(vec)); err != nil {
+			return err
+		}
+		lvs.mu.RLock()
+	}
+	if len(vec) != lvs.dim {
+		lvs.mu.RUnlock()
 		return &dimMismatchError{expected: lvs.dim, got: len(vec)}
 	}
 
-	lvs.delta.Append(key, vec)
+	becameFull := lvs.delta.Append(key, vec)
 
 	// Если ключ ранее был удалён (есть в tombstones) — снимаем tombstone,
 	// иначе Delete(key) после Add(key,...) вновь удалит живой вектор.
-	deleteTombstone(&lvs.tombstones, key)
+	lvs.removeTombstone(key)
+	lvs.mu.RUnlock()
 
-	// Если дельта ТОЛЬКО ЧТО переполнилась — сигнализируем coordinator.
-	// НЕ шлём сигнал каждый Add после переполнения (busy-loop): проверяем ==maxSize,
-	// а не >=. Coordinator swap'нет delta при первой возможности (deltaFlushInFlight=false).
-	// Пока flush занят — delta копится, но сигналов не генерим.
-	if len(lvs.delta.keys) == lvs.delta.maxSize {
+	// Если дельта ТОЛЬКО ЧТО переполнилась (ровно maxSize слотов) — сигнализируем
+	// coordinator. becameFull истинен ровно у одного писателя → один сигнал, без
+	// busy-loop. Coordinator swap'нет delta при первой возможности.
+	if becameFull {
 		lvs.triggerCompact()
 	}
 
 	return nil
+}
+
+// initDelta лениво создаёт дельту при первой вставке (под эксклюзивным локом).
+// Double-check: при гонке первых вставок второй вызов застанет delta != nil.
+func (lvs *LeveledVectorStore) initDelta(dim int) error {
+	lvs.mu.Lock()
+	defer lvs.mu.Unlock()
+	if lvs.delta != nil {
+		if dim != lvs.dim {
+			return &dimMismatchError{expected: lvs.dim, got: dim}
+		}
+		return nil
+	}
+	lvs.dim = dim
+	max := deltaMax(dim, lvs.cfg.DeltaMax)
+	lvs.delta = NewDeltaSegmentSharded(dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
+	return nil
+}
+
+// deltaShardCount возвращает число шардов дельты (cfg.DeltaShards, >=1).
+func (lvs *LeveledVectorStore) deltaShardCount() int {
+	if lvs.cfg.DeltaShards > 1 {
+		return lvs.cfg.DeltaShards
+	}
+	return 1
+}
+
+// removeTombstone снимает tombstone с ключа на горячем пути Add под RLock.
+// COW-мутация сериализуется tombstoneMu (несколько писателей под RLock).
+// Fast path: если tombstones пусто — ничего не делаем (zero-overhead).
+func (lvs *LeveledVectorStore) removeTombstone(key string) {
+	if t := lvs.tombstones.Load(); t == nil || len(*t) == 0 {
+		return
+	}
+	lvs.tombstoneMu.Lock()
+	deleteTombstone(&lvs.tombstones, key)
+	lvs.tombstoneMu.Unlock()
 }
 
 // Delete помечает ключ как удалённый.
@@ -938,15 +992,9 @@ func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
 		ts = *t
 	}
 
-	// Delta (tombstones дельты — пустая строка ключа)
+	// Delta (tombstones дельты обработаны внутри; пер-шардовые RLock)
 	if lvs.delta != nil {
-		dim := lvs.dim
-		for i, key := range lvs.delta.keys {
-			if key == "" {
-				continue
-			}
-			fn(key, lvs.delta.data[i*dim:(i+1)*dim])
-		}
+		lvs.delta.ForEachLive(fn)
 	}
 
 	// Segments: пропускаем tombstoned ключи
@@ -1014,16 +1062,10 @@ func (lvs *LeveledVectorStore) Get(key string) ([]float32, bool) {
 	lvs.mu.RLock()
 	defer lvs.mu.RUnlock()
 
-	// Дельта: O(1) через keyIdx map — tombstones дельты обработаны внутри
+	// Дельта: O(1) через keyIdx map шарда — tombstones дельты обработаны внутри.
 	if lvs.delta != nil {
-		if idx, ok := lvs.delta.keyIdx[key]; ok {
-			if lvs.delta.keys[idx] != "" { // не tombstone дельты
-				vec := lvs.delta.data[idx*lvs.dim : (idx+1)*lvs.dim]
-				out := make([]float32, lvs.dim)
-				copy(out, vec)
-				return out, true
-			}
-			return nil, false // ключ удалён в дельте
+		if out, ok := lvs.delta.Get(key); ok {
+			return out, true
 		}
 	}
 
@@ -1421,7 +1463,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	}
 	if lvs.dim > 0 {
 		max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
-		lvs.delta = NewDeltaSegment(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction)
+		lvs.delta = NewDeltaSegmentSharded(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
 	}
 
 	return nil
@@ -1514,12 +1556,14 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 	}
 	oldDelta := lvs.delta
 	max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
-	lvs.delta = NewDeltaSegment(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction)
+	lvs.delta = NewDeltaSegmentSharded(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
 	lvs.mu.Unlock()
 
 	monitoring.VectorFlushDeltaTotal.Inc()
 	if oldDelta.Len() > 0 {
-		if lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold {
+		// Freeze-on-flush требует единого графа → только при одношардовой дельте.
+		// При шардинге (DeltaShards>1) единого графа нет → rebuild из merged slab.
+		if !oldDelta.Sharded() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold) {
 			// Freeze-on-flush: граф дельты УЖЕ построен инкрементально при Add —
 			// замораживаем его напрямую (SQ8 при UseSQ — любой dim; иначе CSR float32),
 			// без повторной сборки HNSW (нет double-build). Close аллокатора — внутри
@@ -2245,7 +2289,7 @@ func (lvs *LeveledVectorStore) Stats() LeveledStats {
 	deltaMax := 0
 	if lvs.delta != nil {
 		deltaLen = lvs.delta.Len()
-		deltaMax = lvs.delta.maxSize
+		deltaMax = lvs.delta.MaxSize()
 		totalVectors += deltaLen
 	}
 
