@@ -28,12 +28,12 @@ import (
 
 // FrozenGraphSQ — SQ8-compressed immutable CSR граф.
 type FrozenGraphSQ struct {
-	codes  []uint8 // n*dim байт — квантованные векторы (0..255)
-	sqMin  []float32 // [dim] — min по каждой размерности
+	codes   []uint8   // n*dim байт — квантованные векторы (0..255)
+	sqMin   []float32 // [dim] — min по каждой размерности
 	sqScale []float32 // [dim] — (max-min)/255 для деквантования
 
-	layers []FlatLayer // CSR для каждого слоя (без изменений vs FrozenGraph)
-	keys   []string    // [n], keys[i]="" если нода удалена (tombstone)
+	layers []FlatLayer  // CSR для каждого слоя (без изменений vs FrozenGraph)
+	keys   internedKeys // [n], интернированы (blob+offs); пустой = tombstone
 
 	entryPointID uint32
 	maxLevel     int
@@ -160,7 +160,7 @@ func FreezeGraphSQ(g *Graph, distFn DistanceFunc, keys map[uint64]string) *Froze
 		sqMin:        sqMin,
 		sqScale:      sqScale,
 		layers:       layers,
-		keys:         nodeKeys,
+		keys:         buildInternedKeys(nodeKeys),
 		entryPointID: uint32(g.entryPointID),
 		maxLevel:     g.maxLevel,
 		n:            n,
@@ -385,8 +385,10 @@ func (fg *FrozenGraphSQ) Search(query []float32, K, efSearch int, dst []FrozenRe
 	epDist := fg.sqApproxDist(query, fg.codes[epBase:epBase+dim])
 	setVisited(ep)
 	cPush(ep, epDist)
-	if filterFn == nil || (fg.keys[ep] != "" && filterFn(fg.keys[ep])) {
-		rPush(ep, fg.keys[ep], epDist)
+	// view() — zero-copy, валиден на время поиска (fg жив). Клонируем при выдаче.
+	epKey := fg.keys.view(int(ep))
+	if filterFn == nil || (epKey != "" && filterFn(epKey)) {
+		rPush(ep, epKey, epDist)
 	}
 
 	layer0 := fg.layers[0]
@@ -407,8 +409,9 @@ func (fg *FrozenGraphSQ) Search(query []float32, K, efSearch int, dst []FrozenRe
 			d := fg.sqApproxDist(query, fg.codes[nbBase:nbBase+dim])
 			if len(st.res) < efSearch || d < st.res[0].Dist {
 				cPush(nb, d)
-				if filterFn == nil || (fg.keys[nb] != "" && filterFn(fg.keys[nb])) {
-					rPush(nb, fg.keys[nb], d)
+				nbKey := fg.keys.view(int(nb))
+				if filterFn == nil || (nbKey != "" && filterFn(nbKey)) {
+					rPush(nb, nbKey, d)
 					if len(st.res) > efSearch {
 						rPopMax()
 					}
@@ -453,6 +456,8 @@ func (fg *FrozenGraphSQ) Search(query []float32, K, efSearch int, dst []FrozenRe
 	} else {
 		dst = dst[:topK]
 	}
+	// st.res[i].Key — zero-copy view в blob (валиден, пока жив fg). Отдаём views
+	// БЕЗ клонирования; клонирование — обязанность внешней границы (leveled search).
 	copy(dst, st.res[:topK])
 
 	frozenSQSearchPool.Put(st)
@@ -541,7 +546,7 @@ func (fg *FrozenGraphSQ) WriteGraphToSQ(w io.Writer) error {
 	}
 	var klen [2]byte
 	for i := 0; i < fg.n; i++ {
-		key := fg.keys[i]
+		key := fg.keys.view(i) // read-only, пишется сразу — view безопасен
 		binary.LittleEndian.PutUint16(klen[:], uint16(len(key)))
 		if _, err := w.Write(klen[:]); err != nil {
 			return fmt.Errorf("frozenSQ: write keyLen[%d]: %w", i, err)
@@ -637,7 +642,8 @@ func ReadFrozenGraphSQ(r io.Reader, distFn DistanceFunc) (*FrozenGraphSQ, error)
 		return nil, fmt.Errorf("frozenSQ: read nKeys: %w", err)
 	}
 	nKeys := int(binary.LittleEndian.Uint32(u4[:]))
-	fg.keys = make([]string, nKeys)
+	offs := make([]uint32, nKeys+1)
+	var blob []byte
 	var klen [2]byte
 	for i := 0; i < nKeys; i++ {
 		if _, err := io.ReadFull(r, klen[:]); err != nil {
@@ -645,13 +651,17 @@ func ReadFrozenGraphSQ(r io.Reader, distFn DistanceFunc) (*FrozenGraphSQ, error)
 		}
 		kl := int(binary.LittleEndian.Uint16(klen[:]))
 		if kl > 0 {
-			kb := make([]byte, kl)
-			if _, err := io.ReadFull(r, kb); err != nil {
+			// читаем байты ключа прямо в blob — без per-key string() аллокации
+			blob = slices.Grow(blob, kl)
+			start := len(blob)
+			blob = blob[:start+kl]
+			if _, err := io.ReadFull(r, blob[start:]); err != nil {
 				return nil, fmt.Errorf("frozenSQ: read key[%d]: %w", i, err)
 			}
-			fg.keys[i] = string(kb)
 		}
+		offs[i+1] = uint32(len(blob))
 	}
+	fg.keys = internedKeys{blob: blob, offs: offs}
 
 	return fg, nil
 }

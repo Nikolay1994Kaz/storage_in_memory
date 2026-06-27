@@ -7,6 +7,7 @@ import (
 	"math"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -104,7 +105,7 @@ func (s *frozenSegment) Len() int { return s.fg.Len() }
 func (s *frozenSegment) HasKey(key string) bool {
 	fg := s.fg
 	for i := 0; i < fg.n; i++ {
-		if fg.keys[i] == key {
+		if fg.keys.view(i) == key {
 			return true
 		}
 	}
@@ -129,7 +130,7 @@ func (s *frozenSQSegment) Len() int { return s.fg.Len() }
 func (s *frozenSQSegment) HasKey(key string) bool {
 	fg := s.fg
 	for i := 0; i < fg.n; i++ {
-		if fg.keys[i] == key {
+		if fg.keys.view(i) == key {
 			return true
 		}
 	}
@@ -209,7 +210,6 @@ func (s *hnswSegment) Search(query []float32, K, efSearch int, dst []FrozenResul
 	return dst
 }
 
-
 // =============================================================================
 // LeveledVectorStore
 // =============================================================================
@@ -263,11 +263,11 @@ type LeveledConfig struct {
 // Значение (не указатель) — channel receive создаёт happens-before для всех полей.
 type compactionResult struct {
 	kind      taskKind
-	sourceLvl int        // для merge: уровень источник
-	targetLvl int        // куда добавлен результат
-	epoch     uint64     // эпоха на момент GRAB
-	result    segment    // построенный сегмент (nil = failure)
-	oldSegs   []segment  // для merge: сегменты для удаления из sourceLvl
+	sourceLvl int       // для merge: уровень источник
+	targetLvl int       // куда добавлен результат
+	epoch     uint64    // эпоха на момент GRAB
+	result    segment   // построенный сегмент (nil = failure)
+	oldSegs   []segment // для merge: сегменты для удаления из sourceLvl
 }
 
 // LeveledVectorStore — основное хранилище с leveled compaction.
@@ -352,8 +352,8 @@ type LeveledVectorStore struct {
 	// mergeAllocator — изолированный аллокатор для merge goroutines.
 	// Может быть несколько параллельных merge (разные уровни) → нужен pool.
 	// mergeAllocatorsCounter раздаёт round-robin.
-	mergeAllocators         []*tcmalloc.TCMallocStore
-	mergeAllocatorsCounter  atomic.Int32
+	mergeAllocators        []*tcmalloc.TCMallocStore
+	mergeAllocatorsCounter atomic.Int32
 
 	// inFlightBuilds — счётчик delta-flush задач в работе.
 	// Increment перед запуском горутины, decrement в applyResult после publish/drop.
@@ -798,9 +798,10 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		if len(raw) == 0 {
 			return nil, nil
 		}
+		// Внешняя граница: r.Key — zero-copy view в blob сегмента; клонируем.
 		result := make([]VSearchResult, len(raw))
 		for i, r := range raw {
-			result[i] = VSearchResult{Key: r.Key, Distance: r.Dist}
+			result[i] = VSearchResult{Key: strings.Clone(r.Key), Distance: r.Dist}
 		}
 		return result, nil
 	}
@@ -907,8 +908,14 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		st.combined = st.combined[:K]
 	}
 
+	// Внешняя граница: клонируем ключи K выживших. Ключи из frozen-сегментов —
+	// zero-copy views в blob сегмента; клон делает результат независимым от времени
+	// жизни сегмента и не удерживает весь blob через указатель внутрь него. O(K)
+	// клонов на запрос вместо efSearch×N (которые раньше делались внутри Search).
 	result := make([]VSearchResult, len(st.combined))
-	copy(result, st.combined)
+	for i := range st.combined {
+		result[i] = VSearchResult{Key: strings.Clone(st.combined[i].Key), Distance: st.combined[i].Distance}
+	}
 	return result, nil
 }
 
@@ -1004,26 +1011,26 @@ func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
 			case *frozenSegment:
 				fg := s.fg
 				for i := 0; i < fg.n; i++ {
-					if fg.keys[i] == "" {
+					if fg.keys.view(i) == "" {
 						continue
 					}
 					if ts != nil {
-						if _, deleted := ts[fg.keys[i]]; deleted {
+						if _, deleted := ts[fg.keys.view(i)]; deleted {
 							continue
 						}
 					}
-					fn(fg.keys[i], fg.data[i*fg.dim:(i+1)*fg.dim])
+					fn(fg.keys.clone(i), fg.data[i*fg.dim:(i+1)*fg.dim])
 				}
 			case *frozenSQSegment:
 				fg := s.fg
 				dim := fg.dim
 				vecBuf := make([]float32, dim)
 				for i := 0; i < fg.n; i++ {
-					if fg.keys[i] == "" {
+					if fg.keys.view(i) == "" {
 						continue
 					}
 					if ts != nil {
-						if _, deleted := ts[fg.keys[i]]; deleted {
+						if _, deleted := ts[fg.keys.view(i)]; deleted {
 							continue
 						}
 					}
@@ -1032,7 +1039,7 @@ func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
 					for d := 0; d < dim; d++ {
 						vecBuf[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
 					}
-					fn(fg.keys[i], vecBuf)
+					fn(fg.keys.clone(i), vecBuf)
 				}
 			case *hnswSegment:
 				s.mu.RLock()
@@ -1083,7 +1090,7 @@ func (lvs *LeveledVectorStore) Get(key string) ([]float32, bool) {
 			case *frozenSegment:
 				fg := s.fg
 				for i := 0; i < fg.n; i++ {
-					if fg.keys[i] == key {
+					if fg.keys.view(i) == key {
 						out := make([]float32, fg.dim)
 						copy(out, fg.data[i*fg.dim:(i+1)*fg.dim])
 						return out, true
@@ -1093,7 +1100,7 @@ func (lvs *LeveledVectorStore) Get(key string) ([]float32, bool) {
 				fg := s.fg
 				dim := fg.dim
 				for i := 0; i < fg.n; i++ {
-					if fg.keys[i] == key {
+					if fg.keys.view(i) == key {
 						out := make([]float32, dim)
 						base := i * dim
 						for d := 0; d < dim; d++ {
@@ -1188,7 +1195,7 @@ func (lvs *LeveledVectorStore) Close() {
 	lvs.closeOnce.Do(func() {
 		close(lvs.done)
 		close(lvs.buildQueue) // build workers дорабатывают in-flight tasks и выходят
-		lvs.coordWG.Wait()   // coordinator вышел
+		lvs.coordWG.Wait()    // coordinator вышел
 		lvs.buildWG.Wait()    // все build workers вышли
 
 		// Пробудить зависший в FlushDeltaSync cond.Wait, если он ждёт.
@@ -1813,7 +1820,6 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 		return
 	}
 
-
 	switch r.kind {
 	case taskFlushDelta:
 		// remaining — кол-во delta-build горутин ПОСЛЕ декремента.
@@ -2052,7 +2058,6 @@ func (lvs *LeveledVectorStore) waitForBuildCompletion() {
 	}
 }
 
-
 // flushDeltaToSegment удалён — логика delta-flush интегрирована в coordinateCompaction
 // (Build Pool). Coordinator забирает delta и создаёт task{taskFlushDelta}, buildWorker
 // строит сегмент через buildSegment.
@@ -2090,18 +2095,18 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 		case *frozenSegment:
 			fg := s.fg
 			for i := 0; i < fg.n; i++ {
-				if fg.keys[i] == "" {
+				if fg.keys.view(i) == "" {
 					continue
 				}
 				if ts != nil {
-					if _, deleted := ts[fg.keys[i]]; deleted {
+					if _, deleted := ts[fg.keys.view(i)]; deleted {
 						continue // tombstone — физически удаляем
 					}
 				}
 				vec := fg.data[i*fg.dim : (i+1)*fg.dim]
 				vecCopy := make([]float32, dim)
 				copy(vecCopy, vec)
-				entries = append(entries, DeltaEntry{Key: fg.keys[i], Vec: vecCopy})
+				entries = append(entries, DeltaEntry{Key: fg.keys.clone(i), Vec: vecCopy})
 			}
 		case *frozenSQSegment:
 			// Деквантуем SQ8-векторы обратно в float32 для rebuild.
@@ -2110,11 +2115,11 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 			// При rebuild новый сегмент квантуется заново — накопления ошибки нет.
 			fg := s.fg
 			for i := 0; i < fg.n; i++ {
-				if fg.keys[i] == "" {
+				if fg.keys.view(i) == "" {
 					continue
 				}
 				if ts != nil {
-					if _, deleted := ts[fg.keys[i]]; deleted {
+					if _, deleted := ts[fg.keys.view(i)]; deleted {
 						continue
 					}
 				}
@@ -2123,7 +2128,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				for d := 0; d < dim; d++ {
 					vecCopy[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
 				}
-				entries = append(entries, DeltaEntry{Key: fg.keys[i], Vec: vecCopy})
+				entries = append(entries, DeltaEntry{Key: fg.keys.clone(i), Vec: vecCopy})
 			}
 		case *hnswSegment:
 			s.mu.RLock()

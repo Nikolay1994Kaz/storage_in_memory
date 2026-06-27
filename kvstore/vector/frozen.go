@@ -27,9 +27,9 @@ import (
 
 // frozenSearchState — pool-able буфер для Search (как searchPool в graph.go).
 type frozenSearchState struct {
-	visited []uint64        // bitset, размер (n+63)/64
+	visited []uint64         // bitset, размер (n+63)/64
 	cands   []frozenCandItem // minHeap кандидатов
-	res     []FrozenResult  // maxHeap результатов
+	res     []FrozenResult   // maxHeap результатов
 }
 
 type frozenCandItem struct {
@@ -75,8 +75,10 @@ type FrozenGraph struct {
 	// layers[0] - слой 0, layers[lyr] - слой lyr
 	layers []FlatLayer
 
-	// Ключи (userKey) для каждого внутреннего ID
-	keys []string // len = n, keys[i] = "" если нода удалена
+	// Ключи (userKey) для каждого внутреннего ID.
+	// Интернированы в blob+offs (см. internedKeys) — ноль указателей для GC.
+	// Пустой ключ (offs равны) = нода удалена (tombstone).
+	keys internedKeys
 
 	entryPointID uint32
 	maxLevel     int
@@ -134,7 +136,7 @@ func FreezeGraph(g *Graph, distFn DistanceFunc, keys map[uint64]string) *FrozenG
 	return &FrozenGraph{
 		data:         data,
 		layers:       layers,
-		keys:         nodeKeys,
+		keys:         buildInternedKeys(nodeKeys),
 		entryPointID: uint32(g.entryPointID),
 		maxLevel:     g.maxLevel,
 		n:            n,
@@ -302,8 +304,10 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int, dst []FrozenResu
 	epDist := distFn(query, fg.data[epBase:epBase+dim])
 	setVisited(ep)
 	cPush(ep, epDist)
-	if filterFn == nil || (fg.keys[ep] != "" && filterFn(fg.keys[ep])) {
-		rPush(fg.keys[ep], epDist)
+	// view() — zero-copy, валиден на время поиска (fg жив). Клонируем при выдаче.
+	epKey := fg.keys.view(int(ep))
+	if filterFn == nil || (epKey != "" && filterFn(epKey)) {
+		rPush(epKey, epDist)
 	}
 
 	layer0 := fg.layers[0]
@@ -326,8 +330,9 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int, dst []FrozenResu
 				// Всегда добавляем в кандидаты (граф-обход не фильтруем).
 				cPush(nb, d)
 				// В результаты — только если проходит фильтр.
-				if filterFn == nil || (fg.keys[nb] != "" && filterFn(fg.keys[nb])) {
-					rPush(fg.keys[nb], d)
+				nbKey := fg.keys.view(int(nb))
+				if filterFn == nil || (nbKey != "" && filterFn(nbKey)) {
+					rPush(nbKey, d)
 					if len(st.res) > efSearch {
 						rPopMax()
 					}
@@ -357,6 +362,10 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int, dst []FrozenResu
 	} else {
 		dst = dst[:topK]
 	}
+	// st.res[i].Key — zero-copy view в blob (валиден, пока жив fg). Отдаём views
+	// БЕЗ клонирования: семантика времени жизни та же, что была у []string.
+	// Клонирование — ОБЯЗАННОСТЬ внешней границы (leveled search), где клонируются
+	// только K выживших после merge, а не efSearch×N кандидатов на каждый сегмент.
 	copy(dst, st.res[:topK])
 
 	// Возвращаем состояние в pool
@@ -438,7 +447,7 @@ func (fg *FrozenGraph) WriteGraphTo(w io.Writer) error {
 	}
 	var klen [2]byte
 	for i := 0; i < fg.n; i++ {
-		key := fg.keys[i]
+		key := fg.keys.view(i) // read-only, пишется сразу — view безопасен
 		binary.LittleEndian.PutUint16(klen[:], uint16(len(key)))
 		if _, err := w.Write(klen[:]); err != nil {
 			return fmt.Errorf("frozen: write keyLen[%d]: %w", i, err)
@@ -522,7 +531,8 @@ func ReadFrozenGraph(r io.Reader, distFn DistanceFunc) (*FrozenGraph, error) {
 		return nil, fmt.Errorf("frozen: read nKeys: %w", err)
 	}
 	nKeys := int(binary.LittleEndian.Uint32(u4[:]))
-	fg.keys = make([]string, nKeys)
+	offs := make([]uint32, nKeys+1)
+	var blob []byte
 	var klen [2]byte
 	for i := 0; i < nKeys; i++ {
 		if _, err := io.ReadFull(r, klen[:]); err != nil {
@@ -530,13 +540,17 @@ func ReadFrozenGraph(r io.Reader, distFn DistanceFunc) (*FrozenGraph, error) {
 		}
 		kl := int(binary.LittleEndian.Uint16(klen[:]))
 		if kl > 0 {
-			kb := make([]byte, kl)
-			if _, err := io.ReadFull(r, kb); err != nil {
+			// читаем байты ключа прямо в blob — без per-key string() аллокации
+			blob = slices.Grow(blob, kl)
+			start := len(blob)
+			blob = blob[:start+kl]
+			if _, err := io.ReadFull(r, blob[start:]); err != nil {
 				return nil, fmt.Errorf("frozen: read key[%d]: %w", i, err)
 			}
-			fg.keys[i] = string(kb)
 		}
+		offs[i+1] = uint32(len(blob))
 	}
+	fg.keys = internedKeys{blob: blob, offs: offs}
 
 	return fg, nil
 }
