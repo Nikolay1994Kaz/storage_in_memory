@@ -73,6 +73,10 @@ type segment interface {
 	// HasKey проверяет, содержит ли сегмент живой вектор с этим ключом.
 	// Используется Delete для подтверждения, что tombstone нужно поставить.
 	HasKey(key string) bool
+	// Catalog возвращает тенант-каталог сегмента (Вещь 1) или nil, если
+	// тенант-режим выключен (cfg.TenantOf == nil). Диапазоны каталога индексируют
+	// flat-раскладку сегмента в порядке frozen id.
+	Catalog() *TenantCatalog
 }
 
 type leveledSearchState struct {
@@ -94,10 +98,12 @@ var leveledSearchPool = sync.Pool{
 // -----------------------------------------------------------------------------
 
 type frozenSegment struct {
-	fg *FrozenGraph
+	fg  *FrozenGraph
+	cat *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
 }
 
-func (s *frozenSegment) Len() int { return s.fg.Len() }
+func (s *frozenSegment) Len() int             { return s.fg.Len() }
+func (s *frozenSegment) Catalog() *TenantCatalog { return s.cat }
 
 // HasKey — O(N) линейный поиск по keys. Дорогая операция!
 // Вызывается только из Delete для редких ручных DEL / TTL-eviction.
@@ -121,10 +127,12 @@ func (s *frozenSegment) Search(query []float32, K, efSearch int, dst []FrozenRes
 // -----------------------------------------------------------------------------
 
 type frozenSQSegment struct {
-	fg *FrozenGraphSQ
+	fg  *FrozenGraphSQ
+	cat *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
 }
 
-func (s *frozenSQSegment) Len() int { return s.fg.Len() }
+func (s *frozenSQSegment) Len() int               { return s.fg.Len() }
+func (s *frozenSQSegment) Catalog() *TenantCatalog { return s.cat }
 
 // HasKey — O(N) линейный поиск по keys (аналог frozenSegment).
 func (s *frozenSQSegment) HasKey(key string) bool {
@@ -149,7 +157,10 @@ type hnswSegment struct {
 	g    *Graph
 	keys map[uint64]string // internal_id → user_key
 	mu   sync.RWMutex      // защита от чтения пока граф строится
+	cat  *TenantCatalog    // тенант-каталог (Вещь 1); nil если тенант-режим выключен
 }
+
+func (s *hnswSegment) Catalog() *TenantCatalog { return s.cat }
 
 func (s *hnswSegment) Len() int {
 	s.mu.RLock()
@@ -257,6 +268,18 @@ type LeveledConfig struct {
 	// Add масштабируется по числу писателей. При шардинге flush идёт через
 	// rebuild из slab (freeze-on-flush требует единого графа).
 	DeltaShards int
+
+	// TenantOf — если задана, включает тенант-локальную раскладку (Вещь 1):
+	// при build/merge entries сортируются по коду тенанта (#5 ведущий ключ) →
+	// каждый тенант ложится непрерывным блоком, на сегмент вешается TenantCatalog
+	// с типом индекса по порогу #6. nil = выключено (прежнее поведение).
+	// В тенант-режиме freeze-on-flush отключается (нужен rebuild для сортировки).
+	TenantOf func(key string) uint64
+
+	// BruteThreshold — порог #6 (абсолютный размер блока тенанта): блок ≤ порога →
+	// IndexBrute, иначе IndexGraph. 0 = DefaultBruteThreshold. Действует только
+	// при TenantOf != nil.
+	BruteThreshold int
 }
 
 // compactionResult — результат build/merge goroutine, передаётся через resultChan.
@@ -1570,7 +1593,10 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 	if oldDelta.Len() > 0 {
 		// Freeze-on-flush требует единого графа → только при одношардовой дельте.
 		// При шардинге (DeltaShards>1) единого графа нет → rebuild из merged slab.
-		if !oldDelta.Sharded() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold) {
+		// Тенант-режим (TenantOf != nil) требует rebuild для сортировки entries по
+		// тенанту → freeze-on-flush (заморозка инкрементального графа как есть)
+		// несовместим: он сохранил бы временной порядок вставки, а не тенант-порядок.
+		if lvs.cfg.TenantOf == nil && !oldDelta.Sharded() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold) {
 			// Freeze-on-flush: граф дельты УЖЕ построен инкрементально при Add —
 			// замораживаем его напрямую (SQ8 при UseSQ — любой dim; иначе CSR float32),
 			// без повторной сборки HNSW (нет double-build). Close аллокатора — внутри
@@ -2206,6 +2232,24 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 		monitoring.VectorSegmentBuildDuration.Update(time.Since(buildStart).Seconds())
 	}()
 
+	// Тенант-локальная раскладка (Вещь 1): #5 ведущий ключ компакции.
+	// Сортируем entries по коду тенанта ДО вставки в граф → node id (= frozen id)
+	// идут в тенант-порядке → каждый тенант непрерывным блоком. Затем строим
+	// каталог диапазонов (#6 тип индекса по размеру) и вешаем на сегмент.
+	var cat *TenantCatalog
+	if lvs.cfg.TenantOf != nil {
+		sortEntriesByTenant(entries, lvs.cfg.TenantOf)
+		c, err := buildTenantCatalog(entries, lvs.cfg.TenantOf, lvs.cfg.BruteThreshold)
+		if err != nil {
+			// Инвариант #5 нарушен (entries не сгруппированы после сортировки) —
+			// это баг сортировки/деривации тенанта, не данных. Фейлим build:
+			// coordinator откатит (seg=nil), сегмент не публикуется битым.
+			monitoring.VectorSegmentBuildDuration.Update(0)
+			return nil
+		}
+		cat = c
+	}
+
 	// Строим HNSW из всех векторов.
 	g := NewGraph(lvs.cfg.Distance, allocator)
 	g.workerID = 0 // изолированный allocator: всегда shard 0
@@ -2237,17 +2281,17 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 		if fg == nil {
 			return nil
 		}
-		return &frozenSQSegment{fg: fg}
+		return &frozenSQSegment{fg: fg, cat: cat}
 	}
 	if dim <= csrDimThreshold {
 		fg := FreezeGraph(g, lvs.cfg.Distance, keys)
 		if fg == nil {
 			return nil
 		}
-		return &frozenSegment{fg: fg}
+		return &frozenSegment{fg: fg, cat: cat}
 	}
 
-	return &hnswSegment{g: g, keys: keys}
+	return &hnswSegment{g: g, keys: keys, cat: cat}
 }
 
 // =============================================================================

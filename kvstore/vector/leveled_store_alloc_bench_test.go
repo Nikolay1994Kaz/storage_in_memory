@@ -15,6 +15,8 @@ func (d *dummySegment) Len() int {
 	return len(d.results)
 }
 
+func (d *dummySegment) Catalog() *TenantCatalog { return nil }
+
 func (d *dummySegment) HasKey(key string) bool {
 	for _, r := range d.results {
 		if r.Key == key {
