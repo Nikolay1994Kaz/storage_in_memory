@@ -17,6 +17,10 @@ func (d *dummySegment) Len() int {
 
 func (d *dummySegment) Catalog() *TenantCatalog { return nil }
 
+func (d *dummySegment) SearchTenant(query []float32, K, efSearch int, tenant uint64, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return d.Search(query, K, efSearch, dst, filterFn)
+}
+
 func (d *dummySegment) HasKey(key string) bool {
 	for _, r := range d.results {
 		if r.Key == key {

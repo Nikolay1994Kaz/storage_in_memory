@@ -330,3 +330,177 @@ func TestTenant_CompactionProducesContiguousSegments(t *testing.T) {
 		t.Fatal("после settle нет сегментов — нечего проверять")
 	}
 }
+
+// buildTenantStore — стор с tenant-режимом, набитый тенантами заданных размеров.
+func buildTenantStore(t *testing.T, dim int, useSQ bool, bruteThreshold int, sizes map[uint64]int, seed int64) (*LeveledVectorStore, map[uint64][][]float32) {
+	t.Helper()
+	rng := rand.New(rand.NewSource(seed))
+	cfg := LeveledConfig{
+		Distance:       EuclideanDistance,
+		Allocator:      tcmalloc.NewTCMallocStore(4),
+		DeltaMax:       2000,
+		Fanout:         4,
+		EfSearch:       128,
+		UseSQ:          useSQ,
+		TenantOf:       tenantOfKey,
+		BruteThreshold: bruteThreshold,
+	}
+	lvs := NewLeveledVectorStore(cfg)
+	vecsByTenant := make(map[uint64][][]float32)
+	type kv struct {
+		key string
+		vec []float32
+	}
+	var all []kv
+	for tenant, n := range sizes {
+		for i := 0; i < n; i++ {
+			v := make([]float32, dim)
+			for d := range v {
+				v[d] = rng.Float32()
+			}
+			vecsByTenant[tenant] = append(vecsByTenant[tenant], v)
+			all = append(all, kv{strconv.FormatUint(tenant, 10) + ":" + strconv.Itoa(i), v})
+		}
+	}
+	rng.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
+	for _, e := range all {
+		if err := lvs.Add(e.key, e.vec); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	settle(lvs)
+	return lvs, vecsByTenant
+}
+
+// tenantGT — точный top-K среди векторов ОДНОГО тенантa (ground truth).
+func tenantGT(vecs [][]float32, query []float32, K int) []int {
+	type c struct {
+		id int
+		d  float32
+	}
+	cs := make([]c, len(vecs))
+	for i, v := range vecs {
+		cs[i] = c{i, EuclideanDistance(query, v)}
+	}
+	for i := 1; i < len(cs); i++ {
+		for j := i; j > 0 && cs[j].d < cs[j-1].d; j-- {
+			cs[j], cs[j-1] = cs[j-1], cs[j]
+		}
+	}
+	if len(cs) > K {
+		cs = cs[:K]
+	}
+	ids := make([]int, len(cs))
+	for i := range cs {
+		ids[i] = cs[i].id
+	}
+	return ids
+}
+
+// TestTenant_SearchOnlyReturnsTenant — SearchTenant НИКОГДА не возвращает чужих,
+// и для мелкого тенанта (brute-путь) recall=1.0 против точного GT этого тенанта.
+func TestTenant_SearchFloat32BrutePath(t *testing.T) {
+	const dim = 32
+	const K = 10
+	// targetTenant=3 (40 векторов) < threshold=1000 → brute; tenant 1 крупный.
+	sizes := map[uint64]int{1: 5000, 2: 1200, 3: 40}
+	lvs, vecs := buildTenantStore(t, dim, false, 1000, sizes, 11)
+
+	const target = 3
+	rng := rand.New(rand.NewSource(777))
+	var sumRecall float64
+	const Q = 50
+	for q := 0; q < Q; q++ {
+		query := make([]float32, dim)
+		for d := range query {
+			query[d] = rng.Float32()
+		}
+		res, err := lvs.SearchTenant(query, K, target, nil)
+		if err != nil {
+			t.Fatalf("SearchTenant: %v", err)
+		}
+		// 1. Только свой тенант.
+		for _, r := range res {
+			if tenantOfKey(r.Key) != target {
+				t.Fatalf("SearchTenant вернул чужого тенанта: %q", r.Key)
+			}
+		}
+		// 2. recall против GT этого тенанта.
+		gtIDs := tenantGT(vecs[target], query, K)
+		gtKeys := make(map[string]struct{}, len(gtIDs))
+		for _, id := range gtIDs {
+			gtKeys[strconv.FormatUint(target, 10)+":"+strconv.Itoa(id)] = struct{}{}
+		}
+		hit := 0
+		for _, r := range res {
+			if _, ok := gtKeys[r.Key]; ok {
+				hit++
+			}
+		}
+		sumRecall += float64(hit) / float64(K)
+	}
+	recall := sumRecall / Q
+	t.Logf("float32 brute-path recall=%.4f", recall)
+	if recall < 0.999 {
+		t.Errorf("brute-путь должен давать recall=1.0, получили %.4f", recall)
+	}
+}
+
+// TestTenant_SearchSQGraphAndBrute — на SQ-сторе проверяем оба пути: мелкий тенант
+// (brute по SQ, recall≈1) и крупный (graph с тенант-фильтром, recall высокий).
+func TestTenant_SearchSQ(t *testing.T) {
+	const dim = 64
+	const K = 10
+	sizes := map[uint64]int{1: 6000, 2: 50}
+	lvs, vecs := buildTenantStore(t, dim, true, 1000, sizes, 22)
+
+	rng := rand.New(rand.NewSource(555))
+	check := func(target uint64, minRecall float64) {
+		var sumRecall float64
+		const Q = 50
+		for q := 0; q < Q; q++ {
+			query := make([]float32, dim)
+			for d := range query {
+				query[d] = rng.Float32()
+			}
+			res, err := lvs.SearchTenant(query, K, target, nil)
+			if err != nil {
+				t.Fatalf("SearchTenant: %v", err)
+			}
+			for _, r := range res {
+				if tenantOfKey(r.Key) != target {
+					t.Fatalf("tenant %d: вернул чужого %q", target, r.Key)
+				}
+			}
+			gtIDs := tenantGT(vecs[target], query, K)
+			gtKeys := make(map[string]struct{}, len(gtIDs))
+			for _, id := range gtIDs {
+				gtKeys[strconv.FormatUint(target, 10)+":"+strconv.Itoa(id)] = struct{}{}
+			}
+			hit := 0
+			for _, r := range res {
+				if _, ok := gtKeys[r.Key]; ok {
+					hit++
+				}
+			}
+			sumRecall += float64(hit) / float64(len(gtIDs))
+		}
+		recall := sumRecall / Q
+		t.Logf("SQ tenant=%d recall=%.4f (min %.2f)", target, recall, minRecall)
+		if recall < minRecall {
+			t.Errorf("tenant %d: recall %.4f < %.2f", target, recall, minRecall)
+		}
+	}
+	check(2, 0.95) // мелкий → brute по SQ, recall высокий
+	check(1, 0.85) // крупный → graph с фильтром
+}
+
+// TestTenant_SearchModeOff — без TenantOf SearchTenant обязан вернуть ошибку.
+func TestTenant_SearchModeOff(t *testing.T) {
+	cfg := LeveledConfig{Distance: EuclideanDistance, Allocator: tcmalloc.NewTCMallocStore(1)}
+	lvs := NewLeveledVectorStore(cfg)
+	_ = lvs.Add("a", []float32{1, 2, 3})
+	if _, err := lvs.SearchTenant([]float32{1, 2, 3}, 5, 0, nil); err == nil {
+		t.Fatal("ожидали ошибку при выключенном тенант-режиме")
+	}
+}

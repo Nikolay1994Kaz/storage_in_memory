@@ -148,6 +148,29 @@ func FreezeGraph(g *Graph, distFn DistanceFunc, keys map[uint64]string) *FrozenG
 // Len возвращает число нод в графе.
 func (fg *FrozenGraph) Len() int { return fg.n }
 
+// bruteRange — точный top-K по непрерывному диапазону [start,end) frozen-раскладки
+// (нижний режим #7: blocked-brute по блоку тенанта). Перебирается только диапазон —
+// чужие векторы не трогаются. filterFn != nil → применяется (tombstones/тенант).
+// Ключи — zero-copy views в blob; клон делается на внешней границе search().
+func (fg *FrozenGraph) bruteRange(query []float32, K, start, end int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	if K <= 0 || start >= end {
+		return dst[:0]
+	}
+	top := dst[:0]
+	for i := start; i < end; i++ {
+		key := fg.keys.view(i)
+		if key == "" {
+			continue
+		}
+		if filterFn != nil && !filterFn(key) {
+			continue
+		}
+		d := fg.distFn(query, fg.data[i*fg.dim:(i+1)*fg.dim])
+		top = insertTopK(top, K, key, d)
+	}
+	return top
+}
+
 // MemoryBytes возвращает приближённый размер в байтах.
 func (fg *FrozenGraph) MemoryBytes() int {
 	layerBytes := 0

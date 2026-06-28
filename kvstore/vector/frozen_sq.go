@@ -183,6 +183,33 @@ func isDotDistance(fn DistanceFunc) bool {
 // Len возвращает число нод в графе.
 func (fg *FrozenGraphSQ) Len() int { return fg.n }
 
+// bruteRange — точный top-K по непрерывному диапазону [start,end) (нижний режим #7
+// для SQ8-сегмента). Каждый вектор диапазона деквантуется (sqMin+code·sqScale) и
+// меряется точной distFn — это та же точность, что у rerank-фазы Search, но
+// исчерпывающе по блоку (recall=1.0 при SQ-точности). filterFn применяется к ключам.
+func (fg *FrozenGraphSQ) bruteRange(query []float32, K, start, end int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	if K <= 0 || start >= end {
+		return dst[:0]
+	}
+	top := dst[:0]
+	buf := make([]float32, fg.dim) // деквант-буфер (1 alloc на вызов)
+	for i := start; i < end; i++ {
+		key := fg.keys.view(i)
+		if key == "" {
+			continue
+		}
+		if filterFn != nil && !filterFn(key) {
+			continue
+		}
+		base := i * fg.dim
+		for d := 0; d < fg.dim; d++ {
+			buf[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
+		}
+		top = insertTopK(top, K, key, fg.distFn(query, buf))
+	}
+	return top
+}
+
 // MemoryBytes возвращает приближённый размер в байтах.
 func (fg *FrozenGraphSQ) MemoryBytes() int {
 	layerBytes := 0

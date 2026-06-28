@@ -207,23 +207,30 @@ func blockBruteSearch(data []float32, keys []string, dim int, r TenantRange, que
 			continue // tombstone
 		}
 		d := distFn(query, data[i*dim:(i+1)*dim])
-		if len(top) < K {
-			top = append(top, FrozenResult{Key: keys[i], Dist: d})
-			// держим хвост отсортированным после заполнения
-			for j := len(top) - 1; j > 0 && top[j].Dist < top[j-1].Dist; j-- {
-				top[j], top[j-1] = top[j-1], top[j]
-			}
-			continue
-		}
-		if d >= top[K-1].Dist {
-			continue
-		}
-		pos := K - 1
-		for pos > 0 && top[pos-1].Dist > d {
-			top[pos] = top[pos-1]
-			pos--
-		}
-		top[pos] = FrozenResult{Key: keys[i], Dist: d}
+		top = insertTopK(top, K, keys[i], d)
 	}
+	return top
+}
+
+// insertTopK вставляет кандидата (key,d) в отсортированный по дистанции срез top
+// длины ≤ K, поддерживая инвариант сортировки. O(K) на вставку. Используется
+// всеми brute-путями (blockBruteSearch и FrozenGraph(SQ).bruteRange).
+func insertTopK(top []FrozenResult, K int, key string, d float32) []FrozenResult {
+	if len(top) < K {
+		top = append(top, FrozenResult{Key: key, Dist: d})
+		for j := len(top) - 1; j > 0 && top[j].Dist < top[j-1].Dist; j-- {
+			top[j], top[j-1] = top[j-1], top[j]
+		}
+		return top
+	}
+	if d >= top[K-1].Dist {
+		return top
+	}
+	pos := K - 1
+	for pos > 0 && top[pos-1].Dist > d {
+		top[pos] = top[pos-1]
+		pos--
+	}
+	top[pos] = FrozenResult{Key: key, Dist: d}
 	return top
 }

@@ -77,6 +77,11 @@ type segment interface {
 	// тенант-режим выключен (cfg.TenantOf == nil). Диапазоны каталога индексируют
 	// flat-раскладку сегмента в порядке frozen id.
 	Catalog() *TenantCatalog
+	// SearchTenant ищет K ближайших ТОЛЬКО в блоке тенанта. Маршрутизация по
+	// собственному каталогу: brute-блок (#6) → перебор по диапазону (#7); graph-блок
+	// или каталог==nil → HNSW-обход с filterFn (включает тенант-предикат). Если
+	// каталог есть, но тенанта нет в сегменте → пустой результат (сегмент пропущен).
+	SearchTenant(query []float32, K, efSearch int, tenant uint64, dst []FrozenResult, filterFn func(string) bool) []FrozenResult
 }
 
 type leveledSearchState struct {
@@ -122,6 +127,20 @@ func (s *frozenSegment) Search(query []float32, K, efSearch int, dst []FrozenRes
 	return s.fg.Search(query, K, efSearch, dst, filterFn)
 }
 
+func (s *frozenSegment) SearchTenant(query []float32, K, efSearch int, tenant uint64, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	if s.cat == nil {
+		return s.fg.Search(query, K, efSearch, dst, filterFn) // нет каталога → фильтрованный обход
+	}
+	r, ok := s.cat.Lookup(tenant)
+	if !ok {
+		return dst[:0] // тенанта нет в этом сегменте
+	}
+	if r.Kind == IndexBrute {
+		return s.fg.bruteRange(query, K, r.Start, r.End, dst, filterFn)
+	}
+	return s.fg.Search(query, K, efSearch, dst, filterFn) // graph-блок: обход с тенант-фильтром
+}
+
 // -----------------------------------------------------------------------------
 // frozenSQSegment — обёртка вокруг *FrozenGraphSQ (SQ8-compressed), реализует segment.
 // -----------------------------------------------------------------------------
@@ -149,6 +168,20 @@ func (s *frozenSQSegment) Search(query []float32, K, efSearch int, dst []FrozenR
 	return s.fg.Search(query, K, efSearch, dst, filterFn)
 }
 
+func (s *frozenSQSegment) SearchTenant(query []float32, K, efSearch int, tenant uint64, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	if s.cat == nil {
+		return s.fg.Search(query, K, efSearch, dst, filterFn)
+	}
+	r, ok := s.cat.Lookup(tenant)
+	if !ok {
+		return dst[:0]
+	}
+	if r.Kind == IndexBrute {
+		return s.fg.bruteRange(query, K, r.Start, r.End, dst, filterFn)
+	}
+	return s.fg.Search(query, K, efSearch, dst, filterFn)
+}
+
 // -----------------------------------------------------------------------------
 // hnswSegment — обёртка вокруг *Graph (plain HNSW), реализует segment.
 // -----------------------------------------------------------------------------
@@ -161,6 +194,18 @@ type hnswSegment struct {
 }
 
 func (s *hnswSegment) Catalog() *TenantCatalog { return s.cat }
+
+// SearchTenant — для hnswSegment brute по arena не реализован (редкий случай:
+// dim>csr И !UseSQ). Всегда фильтрованный обход графа с тенант-предикатом — корректно,
+// но без brute-fast-path. Если тенанта нет в каталоге → пустой результат.
+func (s *hnswSegment) SearchTenant(query []float32, K, efSearch int, tenant uint64, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	if s.cat != nil {
+		if _, ok := s.cat.Lookup(tenant); !ok {
+			return dst[:0]
+		}
+	}
+	return s.Search(query, K, efSearch, dst, filterFn)
+}
 
 func (s *hnswSegment) Len() int {
 	s.mu.RLock()
@@ -696,15 +741,49 @@ func (lvs *LeveledVectorStore) FlushDelta() {
 // Поиск
 // =============================================================================
 
+// segSearchFn — как искать в одном сегменте. Подменяется для tenant-aware поиска
+// (роутинг через TenantCatalog: brute по диапазону / граф) без дублирования всей
+// merge-машинерии search(). nil → defaultSegSearch (обычный seg.Search).
+type segSearchFn func(seg segment, query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult
+
+func defaultSegSearch(seg segment, query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return seg.Search(query, K, efSearch, dst, filterFn)
+}
+
 // Search выполняет поиск K ближайших. dst — неиспользуется (для совместимости с VectorIndex).
 func (lvs *LeveledVectorStore) Search(query []float32, K int, dst []VSearchResult) ([]VSearchResult, error) {
-	return lvs.search(query, K, nil)
+	return lvs.search(query, K, nil, defaultSegSearch)
 }
 
 // SearchFiltered выполняет поиск K ближайших с фильтром по ключу. dst — неиспользуется.
 func (lvs *LeveledVectorStore) SearchFiltered(query []float32, K int, filterFn func(string) bool, dst []VSearchResult) ([]VSearchResult, error) {
-	return lvs.search(query, K, filterFn)
+	return lvs.search(query, K, filterFn, defaultSegSearch)
 }
+
+// SearchTenant — tenant-aware поиск (Вещь 1): результаты только из блока тенанта.
+// Маршрутизация через TenantCatalog сегмента: блок brute-типа (#6) → точный перебор
+// по непрерывному диапазону (#7, чужие векторы не трогаются); блок graph-типа →
+// HNSW-обход сегмента с тенант-предикатом. Сегменты без каталога (после LoadBinary)
+// и дельта — фильтрованный поиск с тем же предикатом. Требует cfg.TenantOf != nil.
+func (lvs *LeveledVectorStore) SearchTenant(query []float32, K int, tenant uint64, dst []VSearchResult) ([]VSearchResult, error) {
+	if lvs.cfg.TenantOf == nil {
+		return nil, errTenantModeOff
+	}
+	tenantOf := lvs.cfg.TenantOf
+	// Тенант-предикат для дельты и graph/fallback-путей. В brute-пути по чистому
+	// диапазону он избыточен (там только свой тенант), но дёшев (#2: ~10-15%).
+	tenantPred := func(key string) bool { return tenantOf(key) == tenant }
+	segSearch := func(seg segment, q []float32, k, efS int, d []FrozenResult, f func(string) bool) []FrozenResult {
+		return seg.SearchTenant(q, k, efS, tenant, d, f)
+	}
+	return lvs.search(query, K, tenantPred, segSearch)
+}
+
+var errTenantModeOff = errorString("SearchTenant требует cfg.TenantOf != nil (тенант-режим выключен)")
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }
 
 // search — внутренняя реализация с опциональным filterFn.
 //
@@ -717,7 +796,10 @@ func (lvs *LeveledVectorStore) SearchFiltered(query []float32, K int, filterFn f
 // Tombstones: snapshot захватывается ПОД lock вместе с указателями сегментов
 // и компонуется с filterFn в composedFilter. Если tombstones==nil (нет удалений)
 // — ни одной аллокации, overhead нулевой.
-func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(string) bool) ([]VSearchResult, error) {
+func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(string) bool, segSearch segSearchFn) ([]VSearchResult, error) {
+	if segSearch == nil {
+		segSearch = defaultSegSearch
+	}
 	lvs.mu.RLock()
 
 	if lvs.dim == 0 {
@@ -814,7 +896,7 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 			}
 		}
 		lvs.mu.RUnlock()
-		raw := seg.Search(query, K, efSearch, nil, composedFilter)
+		raw := segSearch(seg, query, K, efSearch, nil, composedFilter)
 		if len(raw) > K {
 			raw = raw[:K]
 		}
@@ -890,11 +972,11 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 	// огромный overhead на планировщик Go и context-switches на 12 ядрах.
 	// Теперь Worker Pool распределяет сегменты на горутины равномерно, без аллокаций.
 	if len(remainSegs) > 1 {
-		lvs.searchSegmentsParallel(query, efSearch, st, remainSegs, idx, composedFilter)
+		lvs.searchSegmentsParallel(query, efSearch, st, remainSegs, idx, composedFilter, segSearch)
 	} else {
 		// Fast-path: всего 1 сегмент, работаем в текущей горутине (0 overhead).
 		for _, seg := range remainSegs {
-			st.workerBufs[idx] = seg.Search(query, efSearch, efSearch, st.workerBufs[idx], composedFilter)
+			st.workerBufs[idx] = segSearch(seg, query, efSearch, efSearch, st.workerBufs[idx], composedFilter)
 			idx++
 		}
 	}
@@ -951,7 +1033,7 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 // Только immutable-сегменты — вызывается ПОСЛЕ lvs.mu.RUnlock().
 // startIdx — начальный индекс в st.workerBufs (0 если delta пуста, иначе 1,
 // т.к. delta-результат уже в workerBufs[0]).
-func (lvs *LeveledVectorStore) searchSegmentsParallel(query []float32, efSearch int, st *leveledSearchState, segs []segment, startIdx int, filterFn func(string) bool) {
+func (lvs *LeveledVectorStore) searchSegmentsParallel(query []float32, efSearch int, st *leveledSearchState, segs []segment, startIdx int, filterFn func(string) bool, segSearch segSearchFn) {
 	numWorkers := runtime.NumCPU()
 	if numWorkers > len(segs) {
 		numWorkers = len(segs)
@@ -963,7 +1045,7 @@ func (lvs *LeveledVectorStore) searchSegmentsParallel(query []float32, efSearch 
 	if numWorkers == 1 {
 		idx := startIdx
 		for _, seg := range segs {
-			st.workerBufs[idx] = seg.Search(query, efSearch, efSearch, st.workerBufs[idx], filterFn)
+			st.workerBufs[idx] = segSearch(seg, query, efSearch, efSearch, st.workerBufs[idx], filterFn)
 			idx++
 		}
 		return
@@ -997,7 +1079,7 @@ func (lvs *LeveledVectorStore) searchSegmentsParallel(query []float32, efSearch 
 			defer wg.Done()
 			idx := bufStartIdx
 			for _, seg := range workerSegs {
-				workerBufs[idx] = seg.Search(query, efSearch, efSearch, workerBufs[idx], filterFn)
+				workerBufs[idx] = segSearch(seg, query, efSearch, efSearch, workerBufs[idx], filterFn)
 				idx++
 			}
 		}(st.workerBufs)
