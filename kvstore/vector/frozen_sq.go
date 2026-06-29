@@ -51,7 +51,8 @@ type FrozenGraphSQ struct {
 
 // FreezeGraphSQ конвертирует *Graph → *FrozenGraphSQ (SQ8 CSR layout).
 // Два прохода: (1) вычислить per-dim min/max, (2) квантовать.
-func FreezeGraphSQ(g *Graph, distFn DistanceFunc, keys map[uint64]string) *FrozenGraphSQ {
+// metric задаёт ADC-режим обхода и каноническую distFn для rerank.
+func FreezeGraphSQ(g *Graph, metric Metric, keys map[uint64]string) *FrozenGraphSQ {
 	n := len(g.nodes)
 	if n == 0 {
 		return nil
@@ -151,10 +152,6 @@ func FreezeGraphSQ(g *Graph, distFn DistanceFunc, keys map[uint64]string) *Froze
 		layers[lyr] = FlatLayer{neigh: neigh, offs: offs}
 	}
 
-	// Детектируем режим distance: сравниваем указатель distFn с известными.
-	// Это определяет, какую SQ8-функцию использовать в traversal.
-	dotMode := isDotDistance(distFn)
-
 	return &FrozenGraphSQ{
 		codes:        codes,
 		sqMin:        sqMin,
@@ -165,25 +162,9 @@ func FreezeGraphSQ(g *Graph, distFn DistanceFunc, keys map[uint64]string) *Froze
 		maxLevel:     g.maxLevel,
 		n:            n,
 		dim:          dim,
-		distFn:       distFn,
-		dotMode:      dotMode,
+		distFn:       metric.DistanceFunc(),
+		dotMode:      metric.IsDot(),
 	}
-}
-
-// isDotDistance определяет, нужен ли SQ8-обходу dot-ADC (а не euclidean-ADC).
-// Сравниваем funcval-указатель distFn с ЭКСПОРТИРУЕМЫМИ dot-метриками
-// (DotProductDistance / CosineDistance). РАНЬШЕ сравнивали с внутренним
-// dotProductImpl — но публичные обёртки имеют другой funcval, поэтому условие
-// НИКОГДА не было истинным → SQ8 всегда уходил в euclidean-ADC. На нормализованных
-// векторах это маскируется (euclid и dot ранжируют одинаково), но на
-// ненормализованном cosine/dot обход считал не ту метрику. Контракт для cosine —
-// нормализованный вход (как FAISS/Qdrant): тогда dot-ADC точен.
-func isDotDistance(fn DistanceFunc) bool {
-	fnPtr := *(*uintptr)(unsafe.Pointer(&fn))
-	dot := DistanceFunc(DotProductDistance)
-	cos := DistanceFunc(CosineDistance)
-	return fnPtr == *(*uintptr)(unsafe.Pointer(&dot)) ||
-		fnPtr == *(*uintptr)(unsafe.Pointer(&cos))
 }
 
 // Len возвращает число нод в графе.
@@ -634,7 +615,8 @@ func (fg *FrozenGraphSQ) WriteGraphToSQ(w io.Writer) error {
 }
 
 // ReadFrozenGraphSQ десериализует FrozenGraphSQ.
-func ReadFrozenGraphSQ(r io.Reader, distFn DistanceFunc) (*FrozenGraphSQ, error) {
+// metric задаёт ADC-режим обхода и каноническую distFn для rerank.
+func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 	var hdr [16]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("frozenSQ: read header: %w", err)
@@ -649,8 +631,8 @@ func ReadFrozenGraphSQ(r io.Reader, distFn DistanceFunc) (*FrozenGraphSQ, error)
 		dim:          dim,
 		maxLevel:     maxLevel,
 		entryPointID: entryPointID,
-		distFn:       distFn,
-		dotMode:      isDotDistance(distFn),
+		distFn:       metric.DistanceFunc(),
+		dotMode:      metric.IsDot(),
 	}
 
 	// sqMin

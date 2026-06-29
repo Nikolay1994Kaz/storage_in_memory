@@ -56,7 +56,7 @@ func buildSegs(vecs [][]float32, k int, useSQ bool) []fseg {
 			keys[uint64(idx)] = strconv.Itoa(i)
 		}
 		if useSQ {
-			segs = append(segs, FreezeGraphSQ(g, EuclideanDistance, keys))
+			segs = append(segs, FreezeGraphSQ(g, MetricEuclidean, keys))
 		} else {
 			segs = append(segs, FreezeGraph(g, EuclideanDistance, keys))
 		}

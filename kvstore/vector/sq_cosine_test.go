@@ -12,23 +12,27 @@ import (
 // TestSQ8_CosineDotModeRecall — регрессия на dot-ADC режим SQ8 (cosine/dot метрика).
 //
 // Два бага, найденные валидацией на реальных эмбеддингах (dbpedia ada-002, cosine):
-//  1. isDotDistance сравнивал указатель с внутренним dotProductImpl, а не с
-//     публичными DotProductDistance/CosineDistance → ВСЕГДА false → SQ8 уходил в
-//     euclidean-ADC (маскируется на нормализованных, ломается на ненормализованных).
+//  1. (ИСТОРИЧЕСКИ) детекция dot-режима шла сравнением funcval-указателя с
+//     внутренним dotProductImpl → ВСЕГДА false → SQ8 уходил в euclidean-ADC.
+//     Класс багов устранён: метрика теперь first-class enum (Metric), dot-режим =
+//     Metric.IsDot(), а legacy-вывод из DistanceFunc централизован в inferMetric.
 //  2. dot-режим sqApproxDist возвращал СХОДСТВО (q·approx), а обход ждёт РАССТОЯНИЕ
 //     → инверсия порядка → recall=0.
 //
 // Тест защёлкивает оба: dot-режим включён И recall высокий (не ноль).
 func TestSQ8_CosineDotModeRecall(t *testing.T) {
-	// Защёлка #1: dot-метрики детектятся как dot-режим, euclidean — нет.
-	if !isDotDistance(DotProductDistance) {
-		t.Fatal("isDotDistance(DotProductDistance)=false — SQ8 уйдёт в euclidean-ADC на cosine")
+	// Защёлка #1: dot-метрики дают dot-режим, euclidean — нет (через enum и мост).
+	if !MetricDot.IsDot() || !MetricCosine.IsDot() {
+		t.Fatal("MetricDot/MetricCosine.IsDot()=false — SQ8 уйдёт в euclidean-ADC на cosine")
 	}
-	if !isDotDistance(CosineDistance) {
-		t.Fatal("isDotDistance(CosineDistance)=false")
+	if MetricEuclidean.IsDot() {
+		t.Fatal("MetricEuclidean.IsDot()=true — euclidean ошибочно считается dot")
 	}
-	if isDotDistance(EuclideanDistance) {
-		t.Fatal("isDotDistance(EuclideanDistance)=true — euclidean ошибочно считается dot")
+	if inferMetric(DotProductDistance) != MetricDot || inferMetric(CosineDistance) != MetricCosine {
+		t.Fatal("inferMetric не распознаёт публичные dot/cosine обёртки")
+	}
+	if inferMetric(EuclideanDistance) != MetricEuclidean {
+		t.Fatal("inferMetric(EuclideanDistance) != MetricEuclidean")
 	}
 
 	const (

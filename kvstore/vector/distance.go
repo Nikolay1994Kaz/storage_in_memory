@@ -1,6 +1,9 @@
 package vector
 
-import "math"
+import (
+	"math"
+	"unsafe"
+)
 
 // Глобальные указатели на реализации функций расстояния.
 // На amd64-системах с поддержкой AVX2 они будут перезаписаны в init()
@@ -65,6 +68,73 @@ func DotProductPureGo(a, b []float32) float32 {
 
 // DistanceFunc — тип функции расстояния.
 type DistanceFunc func(a, b []float32) float32
+
+// Metric — first-class идентификатор метрики расстояния.
+//
+// Зачем enum, а не сравнение указателей DistanceFunc: SQ8-обходу нужно знать,
+// какой ADC применять (euclidean-L2² или dot/1-dot). Раньше это выводилось
+// сравнением funcval-указателя через unsafe.Pointer (isDotDistance) — хрупкий
+// приём: любая обёртка/замыкание над метрикой ломала сравнение МОЛЧА (ровно
+// этот класс багов укусил нас в e4aa4e5, где сравнивали с внутренним impl).
+// Теперь метрика — явные данные: компилятор ловит незакрытые case в switch,
+// а dotMode выводится из значения, а не из адреса функции.
+type Metric uint8
+
+const (
+	// MetricAuto — метрика не задана явно; выводится из сконфигурированной
+	// DistanceFunc через inferMetric (legacy-мост). Нулевое значение, чтобы
+	// существующие вызовы, задающие только Distance, продолжали работать.
+	MetricAuto Metric = iota
+	// MetricEuclidean — квадрат евклидова расстояния (L2²).
+	MetricEuclidean
+	// MetricDot — 1 - dot product; контракт: pre-normalized векторы.
+	MetricDot
+	// MetricCosine — косинусное расстояние (1 - cos); rerank нормализует сам.
+	MetricCosine
+)
+
+// DistanceFunc возвращает каноническую функцию расстояния для метрики.
+// MetricAuto не имеет канонической функции — должен быть разрешён до вызова.
+func (m Metric) DistanceFunc() DistanceFunc {
+	switch m {
+	case MetricEuclidean:
+		return EuclideanDistance
+	case MetricDot:
+		return DotProductDistance
+	case MetricCosine:
+		return CosineDistance
+	default:
+		return EuclideanDistance
+	}
+}
+
+// IsDot сообщает, нужен ли SQ8-обходу dot-ADC (а не euclidean-ADC).
+// Истинно для dot и cosine (обе работают через dot product над codes).
+func (m Metric) IsDot() bool {
+	return m == MetricDot || m == MetricCosine
+}
+
+// inferMetric — ЕДИНСТВЕННЫЙ оставшийся compat-мост: выводит Metric из
+// DistanceFunc сравнением funcval-указателей. Используется ровно один раз при
+// инициализации стора, когда метрика не задана явно (MetricAuto). Новый код
+// должен задавать LeveledConfig.Metric напрямую и не полагаться на вывод.
+// Неизвестная функция трактуется как euclidean (исторический дефолт).
+func inferMetric(fn DistanceFunc) Metric {
+	if fn == nil {
+		return MetricEuclidean
+	}
+	fnPtr := *(*uintptr)(unsafe.Pointer(&fn))
+	dot := DistanceFunc(DotProductDistance)
+	cos := DistanceFunc(CosineDistance)
+	switch fnPtr {
+	case *(*uintptr)(unsafe.Pointer(&dot)):
+		return MetricDot
+	case *(*uintptr)(unsafe.Pointer(&cos)):
+		return MetricCosine
+	default:
+		return MetricEuclidean
+	}
+}
 
 // =============================================================================
 // SQ8 (Scalar Quantization, int8) distance functions.

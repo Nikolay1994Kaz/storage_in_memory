@@ -445,6 +445,12 @@ type LeveledConfig struct {
 	// Distance — функция расстояния.
 	Distance DistanceFunc
 
+	// Metric — first-class метрика для SQ8-обхода (ADC-режим). Источник истины:
+	// при MetricAuto (дефолт) выводится из Distance через inferMetric один раз
+	// при инициализации (legacy-мост). Новый код задаёт явно (напр. MetricCosine),
+	// чтобы не полагаться на хрупкий вывод по указателю. См. distance.go.
+	Metric Metric
+
 	// Allocator — менеджер памяти для HNSW.
 	Allocator *tcmalloc.TCMallocStore
 
@@ -630,6 +636,14 @@ func NewLeveledVectorStore(cfg LeveledConfig) *LeveledVectorStore {
 	}
 	if cfg.Distance == nil {
 		cfg.Distance = EuclideanDistance
+	}
+	// Резолвим метрику ОДИН раз: при MetricAuto выводим из Distance (legacy-мост),
+	// иначе синхронизируем Distance с явно заданной метрикой. После этого весь
+	// SQ8-путь оперирует cfg.Metric как данными — без сравнения указателей.
+	if cfg.Metric == MetricAuto {
+		cfg.Metric = inferMetric(cfg.Distance)
+	} else {
+		cfg.Distance = cfg.Metric.DistanceFunc()
 	}
 	if cfg.Allocator == nil {
 		cfg.Allocator = tcmalloc.NewTCMallocStore(1)
@@ -1743,7 +1757,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 				lvs.levels[lyr] = append(lvs.levels[lyr], seg)
 
 			case segTypeFrozenSQ8:
-				fg, err := ReadFrozenGraphSQ(r, lvs.cfg.Distance)
+				fg, err := ReadFrozenGraphSQ(r, lvs.cfg.Metric)
 				if err != nil {
 					return fmt.Errorf("leveled: read frozenSQ[%d][%d]: %w", lyr, si, err)
 				}
@@ -2035,7 +2049,7 @@ func (lvs *LeveledVectorStore) startFreezeDeltaGoroutine(oldDelta *DeltaSegment,
 			keys := oldDelta.FreezeKeys()
 			g := oldDelta.Graph()
 			if lvs.cfg.UseSQ {
-				if fg := FreezeGraphSQ(g, lvs.cfg.Distance, keys); fg != nil {
+				if fg := FreezeGraphSQ(g, lvs.cfg.Metric, keys); fg != nil {
 					seg = &frozenSQSegment{fg: fg}
 				}
 			} else {
@@ -2614,7 +2628,7 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 	//   UseSQ=false → float32-frozen только при dim ≤ csrDimThreshold (там CSR даёт
 	//     +QPS за счёт cache-locality); иначе обычный hnswSegment.
 	if lvs.cfg.UseSQ {
-		fg := FreezeGraphSQ(g, lvs.cfg.Distance, keys)
+		fg := FreezeGraphSQ(g, lvs.cfg.Metric, keys)
 		if fg == nil {
 			return nil
 		}

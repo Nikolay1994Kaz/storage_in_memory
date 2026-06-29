@@ -28,7 +28,7 @@ func TestFrozenGraphSQ_Build(t *testing.T) {
 		keys[uint64(idx)] = fmt.Sprintf("vec-%d", i)
 	}
 
-	fg := FreezeGraphSQ(g, EuclideanDistance, keys)
+	fg := FreezeGraphSQ(g, MetricEuclidean, keys)
 	if fg == nil {
 		t.Fatal("FreezeGraphSQ returned nil")
 	}
@@ -75,7 +75,7 @@ func TestFrozenGraphSQ_Recall(t *testing.T) {
 	// Float32 baseline
 	fgF32 := FreezeGraph(g, EuclideanDistance, keys)
 	// SQ8
-	fgSQ := FreezeGraphSQ(g, EuclideanDistance, keys)
+	fgSQ := FreezeGraphSQ(g, MetricEuclidean, keys)
 
 	queries := makeRandVecs(50, dim, 777)
 
@@ -134,7 +134,7 @@ func TestFrozenGraphSQ_RecallAtEfBoost(t *testing.T) {
 		idx := g.Insert(v)
 		keys[uint64(idx)] = fmt.Sprintf("%d", i)
 	}
-	fgSQ := FreezeGraphSQ(g, EuclideanDistance, keys)
+	fgSQ := FreezeGraphSQ(g, MetricEuclidean, keys)
 
 	queries := makeRandVecs(50, dim, 777)
 
@@ -175,7 +175,7 @@ func TestFrozenGraphSQ_SerializationRoundTrip(t *testing.T) {
 		idx := g.Insert(v)
 		keys[uint64(idx)] = fmt.Sprintf("%d", i)
 	}
-	fgOrig := FreezeGraphSQ(g, EuclideanDistance, keys)
+	fgOrig := FreezeGraphSQ(g, MetricEuclidean, keys)
 
 	// Serialize → buffer → deserialize
 	var buf bytes.Buffer
@@ -183,7 +183,7 @@ func TestFrozenGraphSQ_SerializationRoundTrip(t *testing.T) {
 		t.Fatalf("WriteGraphToSQ: %v", err)
 	}
 
-	fgLoaded, err := ReadFrozenGraphSQ(&buf, EuclideanDistance)
+	fgLoaded, err := ReadFrozenGraphSQ(&buf, MetricEuclidean)
 	if err != nil {
 		t.Fatalf("ReadFrozenGraphSQ: %v", err)
 	}

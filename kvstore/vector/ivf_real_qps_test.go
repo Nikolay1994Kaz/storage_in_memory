@@ -82,7 +82,7 @@ func trainIVFReal(vecs [][]float32, nlist, M, efConstruction int) *ivfRealIndex 
 			keys[uint64(idx)] = fmt.Sprintf("v:%d", vecIdx)
 		}
 		// Freeze to SQ8 (production code!).
-		fg := FreezeGraphSQ(g, EuclideanDistance, keys)
+		fg := FreezeGraphSQ(g, MetricEuclidean, keys)
 		clusters[c] = fg
 	}
 
@@ -178,7 +178,7 @@ func TestIVF_Real_QPS(t *testing.T) {
 		idx := g.Insert(v)
 		keys[uint64(idx)] = fmt.Sprintf("v:%d", i)
 	}
-	baselineFG := FreezeGraphSQ(g, EuclideanDistance, keys)
+	baselineFG := FreezeGraphSQ(g, MetricEuclidean, keys)
 	t.Logf("  baseline: n=%d mem=%.1fMB", baselineFG.n, float64(baselineFG.MemoryBytes())/1e6)
 
 	// Measure baseline recall + QPS.

@@ -72,7 +72,7 @@ func testQPSAtScale(t *testing.T, alloc *tcmalloc.TCMallocStore, vecs, queries [
 	for _, v := range vecs {
 		g.Insert(v)
 	}
-	baselineFG := FreezeGraphSQ(g, EuclideanDistance, nil)
+	baselineFG := FreezeGraphSQ(g, MetricEuclidean, nil)
 	baselineMem := float64(baselineFG.MemoryBytes()) / 1e6
 
 	baselineQPS := measureQPSBatch(func(q []float32) {
