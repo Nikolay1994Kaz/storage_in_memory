@@ -170,14 +170,20 @@ func FreezeGraphSQ(g *Graph, distFn DistanceFunc, keys map[uint64]string) *Froze
 	}
 }
 
-// isDotDistance определяет, является ли distFn dot-product-вариантом.
-// Сравниваем runtime-указатель функции (zero-cost, no reflection).
+// isDotDistance определяет, нужен ли SQ8-обходу dot-ADC (а не euclidean-ADC).
+// Сравниваем funcval-указатель distFn с ЭКСПОРТИРУЕМЫМИ dot-метриками
+// (DotProductDistance / CosineDistance). РАНЬШЕ сравнивали с внутренним
+// dotProductImpl — но публичные обёртки имеют другой funcval, поэтому условие
+// НИКОГДА не было истинным → SQ8 всегда уходил в euclidean-ADC. На нормализованных
+// векторах это маскируется (euclid и dot ранжируют одинаково), но на
+// ненормализованном cosine/dot обход считал не ту метрику. Контракт для cosine —
+// нормализованный вход (как FAISS/Qdrant): тогда dot-ADC точен.
 func isDotDistance(fn DistanceFunc) bool {
-	// CosineDistance и DotProductDistance оба используют dotProductImpl.
-	// Проверяем указатели через unsafe — сравниваем funcval.
 	fnPtr := *(*uintptr)(unsafe.Pointer(&fn))
-	dotPtr := *(*uintptr)(unsafe.Pointer(&dotProductImpl))
-	return fnPtr == dotPtr
+	dot := DistanceFunc(DotProductDistance)
+	cos := DistanceFunc(CosineDistance)
+	return fnPtr == *(*uintptr)(unsafe.Pointer(&dot)) ||
+		fnPtr == *(*uintptr)(unsafe.Pointer(&cos))
 }
 
 // Len возвращает число нод в графе.
@@ -281,7 +287,11 @@ var frozenSQSearchPool = sync.Pool{
 // Возвращает approximate distance query↔codes по SQ8-ADC.
 func (fg *FrozenGraphSQ) sqApproxDist(query []float32, codesSlice []uint8) float32 {
 	if fg.dotMode {
-		return sq8DotImpl(query, codesSlice, fg.sqMin, fg.sqScale)
+		// sq8DotImpl возвращает СХОДСТВО (q·approx, больше=ближе), а обход ждёт
+		// РАССТОЯНИЕ (меньше=ближе) → конвертируем в 1-dot (как DotProductDistance).
+		// Без этого dot-режим инвертирует порядок (recall→0). Путь не исполнялся
+		// раньше из-за бага isDotDistance, поэтому инверсия не всплывала.
+		return 1 - sq8DotImpl(query, codesSlice, fg.sqMin, fg.sqScale)
 	}
 	return sq8EuclidImpl(query, codesSlice, fg.sqMin, fg.sqScale)
 }
