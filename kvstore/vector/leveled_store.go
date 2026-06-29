@@ -950,6 +950,14 @@ func (lvs *LeveledVectorStore) SearchTenant(query []float32, K int, tenant uint6
 	if lvs.cfg.TenantOf == nil {
 		return nil, errTenantModeOff
 	}
+	// Footgun-гард: при PartitionAttr каталог адресуется dict-кодом атрибута,
+	// ЛОКАЛЬНЫМ для каждого сегмента (per-segment dict) — глобальный uint64 не может
+	// консистентно адресовать тенанта. SearchTenant(tenant) тихо попал бы в чужой
+	// блок и вернул мусор (вскрыто валидацией dbpedia). Правильный API — SearchFilter,
+	// который резолвит строку через dict каждого сегмента. См. TestTenant_PartitionAttr_*.
+	if lvs.cfg.PartitionAttr != "" {
+		return nil, errTenantWithPartition
+	}
 	tenantOf := lvs.cfg.TenantOf
 	// Тенант-предикат для дельты и graph/fallback-путей. В brute-пути по чистому
 	// диапазону он избыточен (там только свой тенант), но дёшев (#2: ~10-15%).
@@ -995,6 +1003,7 @@ func (lvs *LeveledVectorStore) SearchFilter(query []float32, K int, f Filter) ([
 }
 
 var errTenantModeOff = errorString("SearchTenant требует cfg.TenantOf != nil (тенант-режим выключен)")
+var errTenantWithPartition = errorString("SearchTenant несовместим с cfg.PartitionAttr (каталог keyed по per-segment dict-коду атрибута, глобальный uint64 не адресует тенанта); используйте SearchFilter(Filter{Eq:{<attr>:<value>}})")
 
 type errorString string
 
