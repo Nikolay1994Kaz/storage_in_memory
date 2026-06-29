@@ -210,6 +210,36 @@ func (fg *FrozenGraphSQ) bruteRange(query []float32, K, start, end int, dst []Fr
 	return top
 }
 
+// viewKey — zero-copy ключ вектора i (для frozenFilterable).
+func (fg *FrozenGraphSQ) viewKey(i int) string { return fg.keys.view(i) }
+
+// bruteRangeAttr — как bruteRange, но фильтр задан предикатом по frozen-индексу
+// (predIdx(i) bool), а не строковым ключом. Это рычаг #2: проверка атрибутов идёт
+// по uint-колонкам (codes[i]==code, lo≤vals[i]≤hi) — O(1) индексация, без strconv/hash
+// строки на каждый вектор. predIdx == nil → без фильтра (весь блок тенанта).
+func (fg *FrozenGraphSQ) bruteRangeAttr(query []float32, K, start, end int, dst []FrozenResult, predIdx func(int) bool) []FrozenResult {
+	if K <= 0 || start >= end {
+		return dst[:0]
+	}
+	top := dst[:0]
+	buf := make([]float32, fg.dim) // деквант-буфер (1 alloc на вызов)
+	for i := start; i < end; i++ {
+		if predIdx != nil && !predIdx(i) {
+			continue
+		}
+		key := fg.keys.view(i)
+		if key == "" {
+			continue
+		}
+		base := i * fg.dim
+		for d := 0; d < fg.dim; d++ {
+			buf[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
+		}
+		top = insertTopK(top, K, key, fg.distFn(query, buf))
+	}
+	return top
+}
+
 // MemoryBytes возвращает приближённый размер в байтах.
 func (fg *FrozenGraphSQ) MemoryBytes() int {
 	layerBytes := 0
@@ -264,6 +294,12 @@ func (fg *FrozenGraphSQ) sqApproxDist(query []float32, codesSlice []uint8) float
 //
 // filterFn != nil: фильтр применяется к результатам, не к обходу (как в FrozenGraph).
 func (fg *FrozenGraphSQ) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return fg.searchWithIdx(query, K, efSearch, dst, filterFn, nil)
+}
+
+// searchWithIdx — тело Search с доп. фильтром по frozen-индексу (node id = frozen id).
+// predIdx применяется к результатам наравне с filterFn (И). См. FrozenGraph.searchWithIdx.
+func (fg *FrozenGraphSQ) searchWithIdx(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool, predIdx func(int) bool) []FrozenResult {
 	if fg.n == 0 {
 		return nil
 	}
@@ -414,7 +450,7 @@ func (fg *FrozenGraphSQ) Search(query []float32, K, efSearch int, dst []FrozenRe
 	cPush(ep, epDist)
 	// view() — zero-copy, валиден на время поиска (fg жив). Клонируем при выдаче.
 	epKey := fg.keys.view(int(ep))
-	if filterFn == nil || (epKey != "" && filterFn(epKey)) {
+	if (filterFn == nil || (epKey != "" && filterFn(epKey))) && (predIdx == nil || predIdx(int(ep))) {
 		rPush(ep, epKey, epDist)
 	}
 
@@ -437,7 +473,7 @@ func (fg *FrozenGraphSQ) Search(query []float32, K, efSearch int, dst []FrozenRe
 			if len(st.res) < efSearch || d < st.res[0].Dist {
 				cPush(nb, d)
 				nbKey := fg.keys.view(int(nb))
-				if filterFn == nil || (nbKey != "" && filterFn(nbKey)) {
+				if (filterFn == nil || (nbKey != "" && filterFn(nbKey))) && (predIdx == nil || predIdx(int(nb))) {
 					rPush(nb, nbKey, d)
 					if len(st.res) > efSearch {
 						rPopMax()

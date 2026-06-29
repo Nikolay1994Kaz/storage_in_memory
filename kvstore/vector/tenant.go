@@ -48,8 +48,10 @@ func (k IndexKind) String() string {
 }
 
 // DefaultBruteThreshold — порог #6 по умолчанию (абсолютный размер блока).
-// Из бенчей: зона уверенной победы brute ~10–20К. Калибруется на консолидированном
-// сторе (открытый шаг #1), здесь — стартовое значение.
+// Калибровано на реальном SIFT-128/N=200k (TestTenant_CalibrateBruteThreshold):
+// кроссовер brute/graph ≈32k при recall=1.0 у обоих, но штраф асимметричен
+// (graph на малом блоке ×300 vs brute на крупном ×5.5) → дефолт держим ниже
+// кроссовера. 16384 — безопасное значение в зоне уверенной победы brute.
 const DefaultBruteThreshold = 16384
 
 // TenantRange — непрерывный диапазон одного тенанта внутри сегмента.
@@ -101,9 +103,9 @@ func (c *TenantCatalog) All() []TenantRange {
 // и для того, чтобы граф/SQ строились из стабильной раскладки).
 //
 // Это и есть «поменять comparator при merge». Вызывать на entries ДО buildSegment.
-func sortEntriesByTenant(entries []DeltaEntry, tenantOf func(key string) uint64) {
+func sortEntriesByTenant(entries []DeltaEntry, tenantOf func(DeltaEntry) uint64) {
 	slices.SortStableFunc(entries, func(a, b DeltaEntry) int {
-		ta, tb := tenantOf(a.Key), tenantOf(b.Key)
+		ta, tb := tenantOf(a), tenantOf(b)
 		switch {
 		case ta < tb:
 			return -1
@@ -115,6 +117,12 @@ func sortEntriesByTenant(entries []DeltaEntry, tenantOf func(key string) uint64)
 	})
 }
 
+// tenantByKey адаптирует key-based деривацию тенанта к entry-based сигнатуре
+// (legacy cfg.TenantOf и тесты, где тенант закодирован в ключе).
+func tenantByKey(f func(string) uint64) func(DeltaEntry) uint64 {
+	return func(e DeltaEntry) uint64 { return f(e.Key) }
+}
+
 // buildTenantCatalog строит каталог по записям, СГРУППИРОВАННЫМ по тенанту
 // (т.е. после sortEntriesByTenant). Каждому тенанту проставляется Kind по порогу
 // bruteThreshold (#6): блок ≤ порога → brute, иначе graph.
@@ -122,7 +130,7 @@ func sortEntriesByTenant(entries []DeltaEntry, tenantOf func(key string) uint64)
 // Если записи НЕ сгруппированы (тенант встречается двумя несмежными кусками) —
 // возвращает ошибку: это нарушение инварианта #5, которое нельзя молча проглотить
 // (иначе каталог укажет на неверный диапазон). Перед вызовом гарантируй сортировку.
-func buildTenantCatalog(entries []DeltaEntry, tenantOf func(key string) uint64, bruteThreshold int) (*TenantCatalog, error) {
+func buildTenantCatalog(entries []DeltaEntry, tenantOf func(DeltaEntry) uint64, bruteThreshold int) (*TenantCatalog, error) {
 	if bruteThreshold <= 0 {
 		bruteThreshold = DefaultBruteThreshold
 	}
@@ -135,7 +143,7 @@ func buildTenantCatalog(entries []DeltaEntry, tenantOf func(key string) uint64, 
 	}
 
 	start := 0
-	cur := tenantOf(entries[0].Key)
+	cur := tenantOf(entries[0])
 	flush := func(end int) error {
 		if _, dup := cat.ranges[cur]; dup {
 			return fmt.Errorf("tenant %d встречается несмежными блоками — entries не сгруппированы (нужен sortEntriesByTenant)", cur)
@@ -149,7 +157,7 @@ func buildTenantCatalog(entries []DeltaEntry, tenantOf func(key string) uint64, 
 	}
 
 	for i := 1; i < len(entries); i++ {
-		t := tenantOf(entries[i].Key)
+		t := tenantOf(entries[i])
 		if t != cur {
 			if err := flush(i); err != nil {
 				return nil, err
@@ -168,15 +176,15 @@ func buildTenantCatalog(entries []DeltaEntry, tenantOf func(key string) uint64, 
 // непрерывный диапазон. Возвращает ошибку, если тенант появляется двумя несмежными
 // кусками. Используется тестами компакции как защёлка: если кто-то поменяет порядок
 // раскладки и разорвёт блок тенанта — тест падает.
-func verifyContiguous(entries []DeltaEntry, tenantOf func(key string) uint64) error {
+func verifyContiguous(entries []DeltaEntry, tenantOf func(DeltaEntry) uint64) error {
 	if len(entries) == 0 {
 		return nil
 	}
 	seen := make(map[uint64]struct{})
-	cur := tenantOf(entries[0].Key)
+	cur := tenantOf(entries[0])
 	seen[cur] = struct{}{}
 	for i := 1; i < len(entries); i++ {
-		t := tenantOf(entries[i].Key)
+		t := tenantOf(entries[i])
 		if t == cur {
 			continue
 		}

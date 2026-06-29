@@ -38,8 +38,9 @@ import (
 
 // DeltaEntry — ключ + вектор в дельте.
 type DeltaEntry struct {
-	Key string
-	Vec []float32 // ссылка в data-слайсе, не копия
+	Key   string
+	Vec   []float32  // ссылка в data-слайсе, не копия
+	Attrs Attributes // колоночный слой (uint/multi-attr); zero-value = без атрибутов
 }
 
 // deltaResult — внутренний тип результата Search/BruteForce.
@@ -53,6 +54,7 @@ type deltaShard struct {
 	mu      sync.RWMutex
 	data    []float32      // flat: data[i*dim : (i+1)*dim] = вектор i (источник истины для flush)
 	keys    []string       // keys[i] = ключ вектора i ("" = tombstone)
+	attrs   []Attributes   // attrs[i] = атрибуты вектора i (nil-поля = без атрибутов)
 	keyIdx  map[string]int // ключ → индекс в data (для быстрого upsert/delete)
 	idx     *Graph         // инкрементальный HNSW-индекс для поиска (Qdrant-style)
 	alloc   *tcmalloc.TCMallocStore
@@ -186,11 +188,20 @@ func (d *DeltaSegment) MaxSize() int { return d.maxSize }
 // если ЭТА вставка довела число занятых слотов ровно до maxSize — сигнал для
 // единственного триггера компакции (без busy-loop, как прежний `==maxSize`).
 func (d *DeltaSegment) Append(key string, vec []float32) (becameFull bool) {
+	return d.AppendWithAttrs(key, vec, Attributes{})
+}
+
+// AppendWithAttrs — вставка с атрибутами (колоночный слой). attrs хранятся параллельно
+// keys/data в шарде и переживают flush через ExtractAll → buildSegmentAttrs.
+func (d *DeltaSegment) AppendWithAttrs(key string, vec []float32, attrs Attributes) (becameFull bool) {
 	s := d.shardFor(key)
 	s.mu.Lock()
 	if slot, exists := s.keyIdx[key]; exists {
 		// Upsert: перезаписываем slab in-place, число слотов/живых не меняется.
 		copy(s.data[slot*d.dim:(slot+1)*d.dim], vec)
+		if slot < len(s.attrs) {
+			s.attrs[slot] = attrs
+		}
 		if oldGid, ok := s.keyNode[key]; ok {
 			s.idx.Delete(uint64(oldGid))
 			delete(s.nodeKey, oldGid)
@@ -204,6 +215,7 @@ func (d *DeltaSegment) Append(key string, vec []float32) (becameFull bool) {
 	slot := len(s.keys)
 	s.data = append(s.data, vec...)
 	s.keys = append(s.keys, key)
+	s.attrs = append(s.attrs, attrs)
 	s.keyIdx[key] = slot
 	gid := s.idx.Insert(vec)
 	s.keyNode[key] = gid
@@ -394,6 +406,24 @@ func (d *DeltaSegment) BruteForce(query []float32, K int, distFn DistanceFunc, f
 	return heap
 }
 
+// AttrsSnapshot возвращает снимок атрибутов живых записей (key → Attributes).
+// Используется SearchFilter: дельта не имеет колонок, поэтому её атрибуты судятся
+// по этому снимку (matchAttrs). Bounded (delta ограничена), копия безопасна от гонок.
+func (d *DeltaSegment) AttrsSnapshot() map[string]Attributes {
+	out := make(map[string]Attributes, int(d.live.Load()))
+	for _, s := range d.shards {
+		s.mu.RLock()
+		for i, key := range s.keys {
+			if key == "" || i >= len(s.attrs) {
+				continue
+			}
+			out[key] = s.attrs[i]
+		}
+		s.mu.RUnlock()
+	}
+	return out
+}
+
 // ExtractAll возвращает все живые записи (key, vec-slice) для compaction.
 // Возвращает срезы на внутренний data-буфер шардов — не копирует.
 // Вызывать только когда дельта больше не используется для записи (после swap).
@@ -405,9 +435,14 @@ func (d *DeltaSegment) ExtractAll() []DeltaEntry {
 			if key == "" {
 				continue // tombstone
 			}
+			var attrs Attributes
+			if i < len(s.attrs) {
+				attrs = s.attrs[i]
+			}
 			out = append(out, DeltaEntry{
-				Key: key,
-				Vec: s.data[i*d.dim : (i+1)*d.dim],
+				Key:   key,
+				Vec:   s.data[i*d.dim : (i+1)*d.dim],
+				Attrs: attrs,
 			})
 		}
 		s.mu.RUnlock()

@@ -17,7 +17,13 @@ func (d *dummySegment) Len() int {
 
 func (d *dummySegment) Catalog() *TenantCatalog { return nil }
 
+func (d *dummySegment) Attrs() *segmentAttrs { return nil }
+
 func (d *dummySegment) SearchTenant(query []float32, K, efSearch int, tenant uint64, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return d.Search(query, K, efSearch, dst, filterFn)
+}
+
+func (d *dummySegment) SearchFilter(query []float32, K, efSearch int, partitionAttr string, f Filter, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
 	return d.Search(query, K, efSearch, dst, filterFn)
 }
 

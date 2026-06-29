@@ -51,15 +51,15 @@ func TestTenant_SortCreatesContiguity(t *testing.T) {
 	entries := makeEntries(sizes, 8, rng)
 
 	// До сортировки раскладка перемешана → инвариант должен НЕ держаться.
-	if err := verifyContiguous(entries, tenantOfKey); err == nil {
+	if err := verifyContiguous(entries, tenantByKey(tenantOfKey)); err == nil {
 		t.Fatal("ожидали нарушение инварианта на перемешанных entries, но verifyContiguous прошёл")
 	}
 
 	// Сортировка = ведущий ключ компакции.
-	sortEntriesByTenant(entries, tenantOfKey)
+	sortEntriesByTenant(entries, tenantByKey(tenantOfKey))
 
 	// После сортировки инвариант #5 обязан держаться.
-	if err := verifyContiguous(entries, tenantOfKey); err != nil {
+	if err := verifyContiguous(entries, tenantByKey(tenantOfKey)); err != nil {
 		t.Fatalf("после sortEntriesByTenant инвариант #5 нарушен: %v", err)
 	}
 }
@@ -74,10 +74,10 @@ func TestTenant_CatalogRangesAndKind(t *testing.T) {
 		30: 25000, // крупный → graph (выше порога)
 	}
 	entries := makeEntries(sizes, 4, rng)
-	sortEntriesByTenant(entries, tenantOfKey)
+	sortEntriesByTenant(entries, tenantByKey(tenantOfKey))
 
 	const threshold = 16384
-	cat, err := buildTenantCatalog(entries, tenantOfKey, threshold)
+	cat, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), threshold)
 	if err != nil {
 		t.Fatalf("buildTenantCatalog: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestTenant_CatalogRejectsUnsorted(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	entries := makeEntries(map[uint64]int{1: 10, 2: 10, 3: 10}, 4, rng)
 	// НЕ сортируем намеренно.
-	if _, err := buildTenantCatalog(entries, tenantOfKey, 16384); err == nil {
+	if _, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), 16384); err == nil {
 		t.Fatal("ожидали ошибку на несгруппированных entries, получили nil")
 	}
 }
@@ -139,9 +139,9 @@ func TestTenant_BlockBruteMatchesGroundTruth(t *testing.T) {
 	const dim = 16
 	sizes := map[uint64]int{1: 300, 2: 150, 3: 40}
 	entries := makeEntries(sizes, dim, rng)
-	sortEntriesByTenant(entries, tenantOfKey)
+	sortEntriesByTenant(entries, tenantByKey(tenantOfKey))
 
-	cat, err := buildTenantCatalog(entries, tenantOfKey, 16384)
+	cat, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), 16384)
 	if err != nil {
 		t.Fatalf("buildTenantCatalog: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestTenant_CompactionProducesContiguousSegments(t *testing.T) {
 			for i, k := range keys {
 				ents[i] = DeltaEntry{Key: k}
 			}
-			if err := verifyContiguous(ents, tenantOfKey); err != nil {
+			if err := verifyContiguous(ents, tenantByKey(tenantOfKey)); err != nil {
 				t.Fatalf("сегмент L%d не контигуозен: %v", lyr, err)
 			}
 			// 3. Каждый диапазон каталога содержит ТОЛЬКО своего тенанта,

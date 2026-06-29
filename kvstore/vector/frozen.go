@@ -171,6 +171,31 @@ func (fg *FrozenGraph) bruteRange(query []float32, K, start, end int, dst []Froz
 	return top
 }
 
+// viewKey — zero-copy ключ вектора i (для frozenFilterable).
+func (fg *FrozenGraph) viewKey(i int) string { return fg.keys.view(i) }
+
+// bruteRangeAttr — как bruteRange, но фильтр по frozen-индексу (predIdx(i) bool)
+// вместо строкового ключа (рычаг #2: атрибуты по uint-колонкам, без строк).
+// predIdx == nil → без фильтра.
+func (fg *FrozenGraph) bruteRangeAttr(query []float32, K, start, end int, dst []FrozenResult, predIdx func(int) bool) []FrozenResult {
+	if K <= 0 || start >= end {
+		return dst[:0]
+	}
+	top := dst[:0]
+	for i := start; i < end; i++ {
+		if predIdx != nil && !predIdx(i) {
+			continue
+		}
+		key := fg.keys.view(i)
+		if key == "" {
+			continue
+		}
+		d := fg.distFn(query, fg.data[i*fg.dim:(i+1)*fg.dim])
+		top = insertTopK(top, K, key, d)
+	}
+	return top
+}
+
 // MemoryBytes возвращает приближённый размер в байтах.
 func (fg *FrozenGraph) MemoryBytes() int {
 	layerBytes := 0
@@ -187,7 +212,16 @@ func (fg *FrozenGraph) MemoryBytes() int {
 // filterFn != nil: фильтр применяется к РЕЗУЛЬТАТАМ, не к обходу графа.
 // Это критически важно для корректности — узлы-мосты не отсекаются,
 // граф-связность сохраняется. Только в result-heap кладём те, что прошли фильтр.
+//
 func (fg *FrozenGraph) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return fg.searchWithIdx(query, K, efSearch, dst, filterFn, nil)
+}
+
+// searchWithIdx — тело Search с дополнительным фильтром по frozen-индексу узла
+// (node id = frozen id). predIdx применяется к результатам наравне с filterFn
+// (логическое И). Используется SearchFilter для атрибут-фильтрации по uint-колонкам
+// (рычаг #2) и для ограничения graph-обхода диапазоном блока тенанта. nil → без idx-фильтра.
+func (fg *FrozenGraph) searchWithIdx(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool, predIdx func(int) bool) []FrozenResult {
 	if fg.n == 0 {
 		return nil
 	}
@@ -329,7 +363,7 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int, dst []FrozenResu
 	cPush(ep, epDist)
 	// view() — zero-copy, валиден на время поиска (fg жив). Клонируем при выдаче.
 	epKey := fg.keys.view(int(ep))
-	if filterFn == nil || (epKey != "" && filterFn(epKey)) {
+	if (filterFn == nil || (epKey != "" && filterFn(epKey))) && (predIdx == nil || predIdx(int(ep))) {
 		rPush(epKey, epDist)
 	}
 
@@ -354,7 +388,7 @@ func (fg *FrozenGraph) Search(query []float32, K, efSearch int, dst []FrozenResu
 				cPush(nb, d)
 				// В результаты — только если проходит фильтр.
 				nbKey := fg.keys.view(int(nb))
-				if filterFn == nil || (nbKey != "" && filterFn(nbKey)) {
+				if (filterFn == nil || (nbKey != "" && filterFn(nbKey))) && (predIdx == nil || predIdx(int(nb))) {
 					rPush(nbKey, d)
 					if len(st.res) > efSearch {
 						rPopMax()

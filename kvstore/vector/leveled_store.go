@@ -77,11 +77,18 @@ type segment interface {
 	// тенант-режим выключен (cfg.TenantOf == nil). Диапазоны каталога индексируют
 	// flat-раскладку сегмента в порядке frozen id.
 	Catalog() *TenantCatalog
+	// Attrs возвращает колоночный слой атрибутов сегмента (uint/multi-attr) или nil.
+	// Колонки выровнены по frozen id (как Catalog). Используется SearchFilter.
+	Attrs() *segmentAttrs
 	// SearchTenant ищет K ближайших ТОЛЬКО в блоке тенанта. Маршрутизация по
 	// собственному каталогу: brute-блок (#6) → перебор по диапазону (#7); graph-блок
 	// или каталог==nil → HNSW-обход с filterFn (включает тенант-предикат). Если
 	// каталог есть, но тенанта нет в сегменте → пустой результат (сегмент пропущен).
 	SearchTenant(query []float32, K, efSearch int, tenant uint64, dst []FrozenResult, filterFn func(string) bool) []FrozenResult
+	// SearchFilter — мульти-атрибутный фильтр (колоночный слой). partitionAttr из f.Eq
+	// (если есть) задаёт блок тенанта через каталог; остальные Eq/Range — idx-предикат
+	// по uint-колонкам. filterFn — tombstone-фильтр, применяется наравне.
+	SearchFilter(query []float32, K, efSearch int, partitionAttr string, f Filter, dst []FrozenResult, filterFn func(string) bool) []FrozenResult
 }
 
 type leveledSearchState struct {
@@ -103,12 +110,14 @@ var leveledSearchPool = sync.Pool{
 // -----------------------------------------------------------------------------
 
 type frozenSegment struct {
-	fg  *FrozenGraph
-	cat *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
+	fg    *FrozenGraph
+	cat   *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
+	attrs *segmentAttrs  // колоночный слой атрибутов; nil если атрибутов нет
 }
 
-func (s *frozenSegment) Len() int             { return s.fg.Len() }
+func (s *frozenSegment) Len() int                { return s.fg.Len() }
 func (s *frozenSegment) Catalog() *TenantCatalog { return s.cat }
+func (s *frozenSegment) Attrs() *segmentAttrs    { return s.attrs }
 
 // HasKey — O(N) линейный поиск по keys. Дорогая операция!
 // Вызывается только из Delete для редких ручных DEL / TTL-eviction.
@@ -141,17 +150,92 @@ func (s *frozenSegment) SearchTenant(query []float32, K, efSearch int, tenant ui
 	return s.fg.Search(query, K, efSearch, dst, filterFn) // graph-блок: обход с тенант-фильтром
 }
 
+func (s *frozenSegment) SearchFilter(query []float32, K, efSearch int, partitionAttr string, f Filter, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return searchFilterFrozen(s.fg, s.cat, s.attrs, query, K, efSearch, partitionAttr, f, dst, filterFn)
+}
+
+// frozenFilterable — общий контракт frozen-сегментов (float32 и SQ8) для роутинга
+// фильтра: оба умеют brute по диапазону с idx-предикатом и graph-обход с idx-предикатом.
+type frozenFilterable interface {
+	bruteRangeAttr(query []float32, K, start, end int, dst []FrozenResult, predIdx func(int) bool) []FrozenResult
+	searchWithIdx(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool, predIdx func(int) bool) []FrozenResult
+	viewKey(i int) string
+}
+
+// searchFilterFrozen — общий роутинг мульти-атрибутного фильтра для frozen-сегментов.
+// Партиционный атрибут (если задан в f.Eq) резолвится в код через dict сегмента → блок
+// тенанта из каталога: brute-блок → bruteRangeAttr (рычаг #2), graph-блок → обход,
+// ограниченный диапазоном блока + остаточный idx-предикат. Остальные атрибуты (Eq/Range)
+// компилируются в idx-предикат по uint-колонкам. filterFn (tombstone) применяется наравне.
+func searchFilterFrozen(fg frozenFilterable, cat *TenantCatalog, sa *segmentAttrs,
+	query []float32, K, efSearch int, partitionAttr string, f Filter,
+	dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+
+	predIdx, matchable := sa.compile(f, partitionAttr)
+	if !matchable {
+		return dst[:0] // фильтр заведомо никого не пропустит в этом сегменте
+	}
+
+	// Партиционный роутинг по каталогу.
+	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" && cat != nil && sa != nil {
+		dict := sa.dict[partitionAttr]
+		if dict == nil {
+			return dst[:0]
+		}
+		code, ok := dict.lookup(pv)
+		if !ok {
+			return dst[:0] // тенанта нет в этом сегменте
+		}
+		r, ok := cat.Lookup(uint64(code))
+		if !ok {
+			return dst[:0]
+		}
+		if r.Kind == IndexBrute {
+			return fg.bruteRangeAttr(query, K, r.Start, r.End, dst, composeIdxKey(predIdx, filterFn, fg))
+		}
+		// graph-блок: обход всего сегмента, но в результаты — только узлы блока тенанта
+		// (i ∈ [Start,End)) + остаточный предикат.
+		start, end := r.Start, r.End
+		rangePred := func(i int) bool {
+			if i < start || i >= end {
+				return false
+			}
+			return predIdx == nil || predIdx(i)
+		}
+		return fg.searchWithIdx(query, K, efSearch, dst, filterFn, rangePred)
+	}
+
+	// Без партиционного атрибута — обход всего сегмента с остаточным предикатом.
+	return fg.searchWithIdx(query, K, efSearch, dst, filterFn, predIdx)
+}
+
+// composeIdxKey объединяет idx-предикат (атрибуты по колонкам) и строковый filterFn
+// (tombstone) в один idx-предикат для brute-пути.
+func composeIdxKey(predIdx func(int) bool, filterFn func(string) bool, fg frozenFilterable) func(int) bool {
+	if filterFn == nil {
+		return predIdx
+	}
+	return func(i int) bool {
+		if predIdx != nil && !predIdx(i) {
+			return false
+		}
+		return filterFn(fg.viewKey(i))
+	}
+}
+
 // -----------------------------------------------------------------------------
 // frozenSQSegment — обёртка вокруг *FrozenGraphSQ (SQ8-compressed), реализует segment.
 // -----------------------------------------------------------------------------
 
 type frozenSQSegment struct {
-	fg  *FrozenGraphSQ
-	cat *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
+	fg    *FrozenGraphSQ
+	cat   *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
+	attrs *segmentAttrs  // колоночный слой атрибутов; nil если атрибутов нет
 }
 
-func (s *frozenSQSegment) Len() int               { return s.fg.Len() }
+func (s *frozenSQSegment) Len() int                { return s.fg.Len() }
 func (s *frozenSQSegment) Catalog() *TenantCatalog { return s.cat }
+func (s *frozenSQSegment) Attrs() *segmentAttrs    { return s.attrs }
 
 // HasKey — O(N) линейный поиск по keys (аналог frozenSegment).
 func (s *frozenSQSegment) HasKey(key string) bool {
@@ -182,18 +266,24 @@ func (s *frozenSQSegment) SearchTenant(query []float32, K, efSearch int, tenant 
 	return s.fg.Search(query, K, efSearch, dst, filterFn)
 }
 
+func (s *frozenSQSegment) SearchFilter(query []float32, K, efSearch int, partitionAttr string, f Filter, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	return searchFilterFrozen(s.fg, s.cat, s.attrs, query, K, efSearch, partitionAttr, f, dst, filterFn)
+}
+
 // -----------------------------------------------------------------------------
 // hnswSegment — обёртка вокруг *Graph (plain HNSW), реализует segment.
 // -----------------------------------------------------------------------------
 
 type hnswSegment struct {
-	g    *Graph
-	keys map[uint64]string // internal_id → user_key
-	mu   sync.RWMutex      // защита от чтения пока граф строится
-	cat  *TenantCatalog    // тенант-каталог (Вещь 1); nil если тенант-режим выключен
+	g     *Graph
+	keys  map[uint64]string // internal_id → user_key
+	mu    sync.RWMutex      // защита от чтения пока граф строится
+	cat   *TenantCatalog    // тенант-каталог (Вещь 1); nil если тенант-режим выключен
+	attrs *segmentAttrs     // колоночный слой атрибутов; nil если атрибутов нет
 }
 
 func (s *hnswSegment) Catalog() *TenantCatalog { return s.cat }
+func (s *hnswSegment) Attrs() *segmentAttrs    { return s.attrs }
 
 // SearchTenant — для hnswSegment brute по arena не реализован (редкий случай:
 // dim>csr И !UseSQ). Всегда фильтрованный обход графа с тенант-предикатом — корректно,
@@ -205,6 +295,63 @@ func (s *hnswSegment) SearchTenant(query []float32, K, efSearch int, tenant uint
 		}
 	}
 	return s.Search(query, K, efSearch, dst, filterFn)
+}
+
+// SearchFilter — мульти-атрибутный фильтр для hnswSegment (редкий путь dim>csr И !UseSQ).
+// Без brute-fast-path: graph-обход с idx-фильтром (node id = frozen id = индекс колонки),
+// ограниченным диапазоном блока тенанта при заданном партиционном атрибуте.
+func (s *hnswSegment) SearchFilter(query []float32, K, efSearch int, partitionAttr string, f Filter, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	predIdx, matchable := s.attrs.compile(f, partitionAttr)
+	if !matchable {
+		return dst[:0]
+	}
+	lo, hi := -1, -1 // диапазон блока тенанта (-1 = без ограничения)
+	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" && s.cat != nil && s.attrs != nil {
+		dict := s.attrs.dict[partitionAttr]
+		if dict == nil {
+			return dst[:0]
+		}
+		code, ok := dict.lookup(pv)
+		if !ok {
+			return dst[:0]
+		}
+		r, ok := s.cat.Lookup(uint64(code))
+		if !ok {
+			return dst[:0]
+		}
+		lo, hi = r.Start, r.End
+	}
+	internalFilter := func(nodeID uint64) bool {
+		i := int(nodeID)
+		if lo >= 0 && (i < lo || i >= hi) {
+			return false
+		}
+		if predIdx != nil && !predIdx(i) {
+			return false
+		}
+		key, ok := s.keys[nodeID]
+		if !ok || key == "" {
+			return false
+		}
+		return filterFn == nil || filterFn(key)
+	}
+	rawSearch := s.g.SearchFiltered(query, K, efSearch, internalFilter)
+	if cap(dst) < len(rawSearch) {
+		dst = make([]FrozenResult, 0, len(rawSearch))
+	} else {
+		dst = dst[:0]
+	}
+	for _, r := range rawSearch {
+		key, ok := s.keys[r.ID]
+		if !ok || key == "" {
+			continue
+		}
+		dst = append(dst, FrozenResult{Key: key, Dist: r.Distance})
+	}
+	return dst
 }
 
 func (s *hnswSegment) Len() int {
@@ -321,9 +468,15 @@ type LeveledConfig struct {
 	// В тенант-режиме freeze-on-flush отключается (нужен rebuild для сортировки).
 	TenantOf func(key string) uint64
 
+	// PartitionAttr — имя категориального атрибута (колоночный слой), по которому
+	// идёт тенант-локальная раскладка (заменяет TenantOf продуктовым вводом через
+	// AddWithAttrs). Его dict-код служит ведущим ключом сортировки/каталога. "" =
+	// слой выключен. Имеет приоритет над TenantOf, если задан.
+	PartitionAttr string
+
 	// BruteThreshold — порог #6 (абсолютный размер блока тенанта): блок ≤ порога →
 	// IndexBrute, иначе IndexGraph. 0 = DefaultBruteThreshold. Действует только
-	// при TenantOf != nil.
+	// при TenantOf != nil или PartitionAttr != "".
 	BruteThreshold int
 }
 
@@ -552,6 +705,13 @@ func deltaMax(dim, cfgMax int) int {
 // Add добавляет вектор с заданным ключом.
 // O(1) на горячем пути (append в flat slab).
 func (lvs *LeveledVectorStore) Add(key string, vec []float32) error {
+	return lvs.AddWithAttrs(key, vec, Attributes{})
+}
+
+// AddWithAttrs вставляет вектор с атрибутами (колоночный слой uint/multi-attr).
+// Атрибуты едут с данными через дельту и переживают flush/merge. Партиционный
+// атрибут (cfg.PartitionAttr) задаёт тенант-раскладку. Add — обёртка без атрибутов.
+func (lvs *LeveledVectorStore) AddWithAttrs(key string, vec []float32, attrs Attributes) error {
 	// Горячий путь держит lvs.mu лишь как RLock: несколько писателей идут
 	// параллельно, безопасность данных — на пер-шардовых локах дельты (шаг 5).
 	// Эксклюзивный Lock берут только swap дельты (compaction) и Delete/Clear.
@@ -569,7 +729,7 @@ func (lvs *LeveledVectorStore) Add(key string, vec []float32) error {
 		return &dimMismatchError{expected: lvs.dim, got: len(vec)}
 	}
 
-	becameFull := lvs.delta.Append(key, vec)
+	becameFull := lvs.delta.AppendWithAttrs(key, vec, attrs)
 
 	// Если ключ ранее был удалён (есть в tombstones) — снимаем tombstone,
 	// иначе Delete(key) после Add(key,...) вновь удалит живой вектор.
@@ -777,6 +937,40 @@ func (lvs *LeveledVectorStore) SearchTenant(query []float32, K int, tenant uint6
 		return seg.SearchTenant(q, k, efS, tenant, d, f)
 	}
 	return lvs.search(query, K, tenantPred, segSearch)
+}
+
+// SearchFilter — мульти-атрибутный фильтр (колоночный слой uint/multi-attr).
+// Партиционный атрибут (cfg.PartitionAttr) из f.Eq задаёт блок тенанта (роутинг brute/
+// graph через каталог); остальные Eq (категориальное равенство) и Range (числовой
+// диапазон) фильтруют по uint-колонкам (рычаг #2). Дельта фильтруется по снимку её
+// атрибутов (matchAttrs); сегменты — колонками внутри seg.SearchFilter.
+func (lvs *LeveledVectorStore) SearchFilter(query []float32, K int, f Filter) ([]VSearchResult, error) {
+	partitionAttr := lvs.cfg.PartitionAttr
+
+	// Снимок атрибутов дельты (bounded): замыкание-«pass-through» для не-дельта-ключей,
+	// чтобы тот же composedFilter не отсёк frozen-результаты (их судят колонки сегмента).
+	var deltaAttrs map[string]Attributes
+	lvs.mu.RLock()
+	if lvs.delta != nil && lvs.delta.Len() > 0 {
+		deltaAttrs = lvs.delta.AttrsSnapshot()
+	}
+	lvs.mu.RUnlock()
+
+	var deltaFilter func(string) bool
+	if !f.empty() {
+		deltaFilter = func(key string) bool {
+			a, ok := deltaAttrs[key]
+			if !ok {
+				return true // не delta-ключ → не судим здесь (сегменты судят колонками)
+			}
+			return matchAttrs(a, f, "")
+		}
+	}
+
+	segSearch := func(seg segment, q []float32, k, efS int, d []FrozenResult, filterFn func(string) bool) []FrozenResult {
+		return seg.SearchFilter(q, k, efS, partitionAttr, f, d, filterFn)
+	}
+	return lvs.search(query, K, deltaFilter, segSearch)
 }
 
 var errTenantModeOff = errorString("SearchTenant требует cfg.TenantOf != nil (тенант-режим выключен)")
@@ -1678,7 +1872,7 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 		// Тенант-режим (TenantOf != nil) требует rebuild для сортировки entries по
 		// тенанту → freeze-on-flush (заморозка инкрементального графа как есть)
 		// несовместим: он сохранил бы временной порядок вставки, а не тенант-порядок.
-		if lvs.cfg.TenantOf == nil && !oldDelta.Sharded() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold) {
+		if lvs.cfg.TenantOf == nil && lvs.cfg.PartitionAttr == "" && !oldDelta.Sharded() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold) {
 			// Freeze-on-flush: граф дельты УЖЕ построен инкрементально при Add —
 			// замораживаем его напрямую (SQ8 при UseSQ — любой dim; иначе CSR float32),
 			// без повторной сборки HNSW (нет double-build). Close аллокатора — внутри
@@ -2214,7 +2408,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				vec := fg.data[i*fg.dim : (i+1)*fg.dim]
 				vecCopy := make([]float32, dim)
 				copy(vecCopy, vec)
-				entries = append(entries, DeltaEntry{Key: fg.keys.clone(i), Vec: vecCopy})
+				entries = append(entries, DeltaEntry{Key: fg.keys.clone(i), Vec: vecCopy, Attrs: s.attrs.decodeAt(i)})
 			}
 		case *frozenSQSegment:
 			// Деквантуем SQ8-векторы обратно в float32 для rebuild.
@@ -2236,7 +2430,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				for d := 0; d < dim; d++ {
 					vecCopy[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
 				}
-				entries = append(entries, DeltaEntry{Key: fg.keys.clone(i), Vec: vecCopy})
+				entries = append(entries, DeltaEntry{Key: fg.keys.clone(i), Vec: vecCopy, Attrs: s.attrs.decodeAt(i)})
 			}
 		case *hnswSegment:
 			s.mu.RLock()
@@ -2257,7 +2451,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				raw := g.arena.Get(g.nodes[i].VectorOffset)
 				vecCopy := make([]float32, dim)
 				copy(vecCopy, raw)
-				entries = append(entries, DeltaEntry{Key: key, Vec: vecCopy})
+				entries = append(entries, DeltaEntry{Key: key, Vec: vecCopy, Attrs: s.attrs.decodeAt(i)})
 			}
 			s.mu.RUnlock()
 		}
@@ -2319,9 +2513,24 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 	// идут в тенант-порядке → каждый тенант непрерывным блоком. Затем строим
 	// каталог диапазонов (#6 тип индекса по размеру) и вешаем на сегмент.
 	var cat *TenantCatalog
-	if lvs.cfg.TenantOf != nil {
-		sortEntriesByTenant(entries, lvs.cfg.TenantOf)
-		c, err := buildTenantCatalog(entries, lvs.cfg.TenantOf, lvs.cfg.BruteThreshold)
+	var attrs *segmentAttrs
+	if lvs.cfg.TenantOf != nil || lvs.cfg.PartitionAttr != "" {
+		// Источник тенант-кода: партиционный атрибут (колоночный слой) либо legacy
+		// деривация из ключа. Партиционный dict строим заранее и переиспользуем в
+		// каталоге И в колонке (коды каталога обязаны совпасть с кодами колонки —
+		// иначе SearchFilter не найдёт блок).
+		var tenantCode func(DeltaEntry) uint64
+		var presets map[string]*attrDict
+		if lvs.cfg.PartitionAttr != "" {
+			pa := lvs.cfg.PartitionAttr
+			pd := newAttrDict()
+			tenantCode = func(e DeltaEntry) uint64 { return uint64(pd.intern(e.Attrs.Cat[pa])) }
+			presets = map[string]*attrDict{pa: pd}
+		} else {
+			tenantCode = tenantByKey(lvs.cfg.TenantOf)
+		}
+		sortEntriesByTenant(entries, tenantCode)
+		c, err := buildTenantCatalog(entries, tenantCode, lvs.cfg.BruteThreshold)
 		if err != nil {
 			// Инвариант #5 нарушен (entries не сгруппированы после сортировки) —
 			// это баг сортировки/деривации тенанта, не данных. Фейлим build:
@@ -2330,6 +2539,8 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 			return nil
 		}
 		cat = c
+		// Колоночный слой строится на УЖЕ отсортированных entries (frozen id = позиция).
+		attrs = buildSegmentAttrs(entries, presets)
 	}
 
 	// Строим HNSW из всех векторов.
@@ -2363,17 +2574,17 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 		if fg == nil {
 			return nil
 		}
-		return &frozenSQSegment{fg: fg, cat: cat}
+		return &frozenSQSegment{fg: fg, cat: cat, attrs: attrs}
 	}
 	if dim <= csrDimThreshold {
 		fg := FreezeGraph(g, lvs.cfg.Distance, keys)
 		if fg == nil {
 			return nil
 		}
-		return &frozenSegment{fg: fg, cat: cat}
+		return &frozenSegment{fg: fg, cat: cat, attrs: attrs}
 	}
 
-	return &hnswSegment{g: g, keys: keys, cat: cat}
+	return &hnswSegment{g: g, keys: keys, cat: cat, attrs: attrs}
 }
 
 // =============================================================================
