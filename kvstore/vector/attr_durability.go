@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"unsafe"
 )
@@ -64,6 +65,92 @@ func getU32(r io.Reader) (uint32, error) {
 		return 0, err
 	}
 	return binary.LittleEndian.Uint32(u4[:]), nil
+}
+
+// writeAttrs сериализует атрибуты ОДНОГО вектора (per-entry формат, hnswSegment-путь).
+// hnsw-сегмент на load перестраивается через buildSegment(entries), который сам
+// регенерирует колонки+каталог из entries[].Attrs — поэтому колонки не пишем, а
+// едем атрибутами по вектору (симметрично decodeAt при merge). Формат:
+//   nCat(u32): [name(str) value(str)]×nCat ; nNum(u32): [name(str) value(f64)]×nNum
+func writeAttrs(w io.Writer, a Attributes) error {
+	if err := putU32(w, uint32(len(a.Cat))); err != nil {
+		return err
+	}
+	// Детерминированный порядок имён (стабильный снапшот).
+	catNames := make([]string, 0, len(a.Cat))
+	for name := range a.Cat {
+		catNames = append(catNames, name)
+	}
+	sort.Strings(catNames)
+	for _, name := range catNames {
+		if err := writeStr(w, name); err != nil {
+			return err
+		}
+		if err := writeStr(w, a.Cat[name]); err != nil {
+			return err
+		}
+	}
+	if err := putU32(w, uint32(len(a.Num))); err != nil {
+		return err
+	}
+	numNames := make([]string, 0, len(a.Num))
+	for name := range a.Num {
+		numNames = append(numNames, name)
+	}
+	sort.Strings(numNames)
+	var u8 [8]byte
+	for _, name := range numNames {
+		if err := writeStr(w, name); err != nil {
+			return err
+		}
+		binary.LittleEndian.PutUint64(u8[:], math.Float64bits(a.Num[name]))
+		if _, err := w.Write(u8[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readAttrs десериализует атрибуты одного вектора (парный к writeAttrs).
+func readAttrs(r io.Reader) (Attributes, error) {
+	var a Attributes
+	nCat, err := getU32(r)
+	if err != nil {
+		return a, err
+	}
+	if nCat > 0 {
+		a.Cat = make(map[string]string, nCat)
+		for i := uint32(0); i < nCat; i++ {
+			name, err := readStr(r)
+			if err != nil {
+				return a, err
+			}
+			val, err := readStr(r)
+			if err != nil {
+				return a, err
+			}
+			a.Cat[name] = val
+		}
+	}
+	nNum, err := getU32(r)
+	if err != nil {
+		return a, err
+	}
+	if nNum > 0 {
+		a.Num = make(map[string]float64, nNum)
+		var u8 [8]byte
+		for i := uint32(0); i < nNum; i++ {
+			name, err := readStr(r)
+			if err != nil {
+				return a, err
+			}
+			if _, err := io.ReadFull(r, u8[:]); err != nil {
+				return a, err
+			}
+			a.Num[name] = math.Float64frombits(binary.LittleEndian.Uint64(u8[:]))
+		}
+	}
+	return a, nil
 }
 
 // writeSegMeta сериализует тенант-каталог и колоночный слой сегмента.

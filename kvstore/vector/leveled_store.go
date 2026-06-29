@@ -61,8 +61,10 @@ const (
 
 // leveledMagic — магические байты заголовка бинарного снапшота LeveledVectorStore.
 // Версия в байте [5]: v1 — без тенант-меты; v2 — после каждого frozen/SQ-сегмента
-// сериализованы TenantCatalog + segmentAttrs (durability колоночного слоя).
-var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 2, 0, 0}
+// сериализованы TenantCatalog + segmentAttrs (durability колоночного слоя); v3 —
+// hnswSegment (flat, dim>256) тоже персистит атрибуты по вектору (writeAttrs),
+// колонки+каталог регенерируются buildSegment на load. v1/v2 читаются как прежде.
+var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 3, 0, 0}
 
 // leveledMagicPrefix — общая часть ('LVLV') для проверки формата без версии.
 var leveledMagicPrefix = [4]byte{'L', 'V', 'L', 'V'}
@@ -1645,6 +1647,13 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 							break
 						}
 					}
+					// Атрибуты вектора (v3): node id = индекс колонки → decodeAt(id).
+					// hnsw-сегмент на load перестраивается buildSegment(entries), который
+					// регенерирует колонки+каталог из entries[].Attrs (см. readAttrs ниже).
+					if err := writeAttrs(w, s.attrs.decodeAt(int(id))); err != nil {
+						writeErr = err
+						break
+					}
 				}
 				s.mu.RUnlock()
 				if writeErr != nil {
@@ -1671,7 +1680,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: invalid magic header (not a graph_leveled.bin?)")
 	}
 	version := magic[5]
-	if version != 1 && version != 2 {
+	if version != 1 && version != 2 && version != 3 {
 		return fmt.Errorf("leveled: unsupported snapshot version %d", version)
 	}
 
@@ -1774,7 +1783,15 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 							return fmt.Errorf("leveled: read vec[%d][%d][%d]: %w", lyr, si, vi, err)
 						}
 					}
-					entries = append(entries, DeltaEntry{Key: key, Vec: vec})
+					var attrs Attributes
+					if version >= 3 {
+						a, err := readAttrs(r)
+						if err != nil {
+							return fmt.Errorf("leveled: read hnswAttrs[%d][%d][%d]: %w", lyr, si, vi, err)
+						}
+						attrs = a
+					}
+					entries = append(entries, DeltaEntry{Key: key, Vec: vec, Attrs: attrs})
 				}
 
 				if len(entries) > 0 {

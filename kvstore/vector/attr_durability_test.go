@@ -133,6 +133,150 @@ func TestAttr_DurabilityRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAttr_DurabilityHNSWSegment — колоночный слой переживает round-trip для
+// hnswSegment (dim > csrDimThreshold=256, UseSQ=false → НЕ frozen/SQ, а flat-HNSW).
+// Этот путь персистит атрибуты ПО ВЕКТОРУ (writeAttrs/decodeAt) и регенерирует
+// колонки+каталог через buildSegment на load (формат v3). До фикса hnsw-ветка
+// SaveBinary не писала attrs вовсе → SearchFilter после загрузки молча пустел.
+func TestAttr_DurabilityHNSWSegment(t *testing.T) {
+	const (
+		dim = 300 // > csrDimThreshold(256) → hnswSegment при UseSQ=false
+		N   = 4000
+		K   = 10
+	)
+	rng := rand.New(rand.NewSource(20260629))
+
+	mkCfg := func() LeveledConfig {
+		return LeveledConfig{
+			Distance:       EuclideanDistance,
+			Allocator:      tcmalloc.NewTCMallocStore(4),
+			DeltaMax:       1500,
+			Fanout:         4,
+			EfSearch:       64,
+			PartitionAttr:  "tenant",
+			BruteThreshold: 700,
+			// UseSQ не задан (false) и dim>256 → buildSegment вернёт *hnswSegment.
+		}
+	}
+
+	lvs := NewLeveledVectorStore(mkCfg())
+	tenants := []string{"t1", "t2", "t3"}
+	cats := []string{"books", "toys"}
+	queries := make([][]float32, 50)
+	for i := range queries {
+		q := make([]float32, dim)
+		for d := range q {
+			q[d] = rng.Float32()
+		}
+		queries[i] = q
+	}
+	for i := 0; i < N; i++ {
+		v := make([]float32, dim)
+		for d := range v {
+			v[d] = rng.Float32()
+		}
+		if err := lvs.AddWithAttrs("k"+strconv.Itoa(i), v, Attributes{
+			Cat: map[string]string{"tenant": tenants[rng.Intn(3)], "cat": cats[rng.Intn(2)]},
+			Num: map[string]float64{"price": float64(rng.Intn(100))},
+		}); err != nil {
+			t.Fatalf("AddWithAttrs: %v", err)
+		}
+	}
+	settle(lvs)
+
+	// Защёлка: сегменты ДОЛЖНЫ быть hnswSegment (иначе тест бьёт не тот путь).
+	lvs.mu.RLock()
+	nHNSW, nOther := 0, 0
+	for _, lvl := range lvs.levels {
+		for _, s := range lvl {
+			if _, ok := s.(*hnswSegment); ok {
+				nHNSW++
+			} else {
+				nOther++
+			}
+		}
+	}
+	lvs.mu.RUnlock()
+	if nHNSW == 0 {
+		t.Fatalf("ожидали хотя бы один *hnswSegment (dim=%d>256, UseSQ=false), получили hnsw=%d other=%d", dim, nHNSW, nOther)
+	}
+
+	filters := []Filter{
+		{Eq: map[string]string{"tenant": "t1"}},
+		{Eq: map[string]string{"tenant": "t2", "cat": "books"}},
+		{Eq: map[string]string{"tenant": "t3", "cat": "toys"}, Range: map[string][2]float64{"price": {0, 50}}},
+	}
+	resultKeys := func(store *LeveledVectorStore, f Filter, q []float32) []string {
+		res, err := store.SearchFilter(q, K, f)
+		if err != nil {
+			t.Fatalf("SearchFilter: %v", err)
+		}
+		ks := make([]string, len(res))
+		for i, r := range res {
+			ks[i] = r.Key
+		}
+		return ks
+	}
+	before := make([][][]string, len(filters))
+	for fi, f := range filters {
+		before[fi] = make([][]string, len(queries))
+		for qi, q := range queries {
+			before[fi][qi] = resultKeys(lvs, f, q)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := lvs.SaveBinary(&buf); err != nil {
+		t.Fatalf("SaveBinary: %v", err)
+	}
+	loaded := NewLeveledVectorStore(mkCfg())
+	if err := loaded.LoadBinary(&buf); err != nil {
+		t.Fatalf("LoadBinary: %v", err)
+	}
+
+	// Каталог + колонки восстановлены на всех сегментах.
+	loaded.mu.RLock()
+	nSeg, withCat, withAttrs := 0, 0, 0
+	for _, lvl := range loaded.levels {
+		for _, s := range lvl {
+			nSeg++
+			if s.Catalog() != nil {
+				withCat++
+			}
+			if s.Attrs() != nil {
+				withAttrs++
+			}
+		}
+	}
+	loaded.mu.RUnlock()
+	if nSeg == 0 || withCat != nSeg || withAttrs != nSeg {
+		t.Fatalf("после загрузки: segs=%d, с каталогом=%d, с атрибутами=%d (ожидали все)", nSeg, withCat, withAttrs)
+	}
+
+	// Результаты идентичны до/после.
+	nonEmpty := 0
+	for fi, f := range filters {
+		for qi, q := range queries {
+			got := resultKeys(loaded, f, q)
+			want := before[fi][qi]
+			if len(got) > 0 {
+				nonEmpty++
+			}
+			if len(got) != len(want) {
+				t.Fatalf("filter#%d q%d: len %d != %d (до сохранения)", fi, qi, len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("filter#%d q%d поз %d: %q != %q (результаты разошлись)", fi, qi, i, got[i], want[i])
+				}
+			}
+		}
+	}
+	if nonEmpty == 0 {
+		t.Fatal("все фильтрованные запросы пусты — каталог/колонки не восстановились (регрессия hnsw-durability)")
+	}
+}
+
 // TestAttr_DurabilityLegacyTenantOf — segment в legacy-режиме TenantOf (без колонок)
 // переживает round-trip: каталог восстановлен, attrs nil, SearchTenant работает.
 func TestAttr_DurabilityLegacyTenantOf(t *testing.T) {
