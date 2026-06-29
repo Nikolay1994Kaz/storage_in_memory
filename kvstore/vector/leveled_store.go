@@ -60,7 +60,12 @@ const (
 )
 
 // leveledMagic — магические байты заголовка бинарного снапшота LeveledVectorStore.
-var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 1, 0, 0}
+// Версия в байте [5]: v1 — без тенант-меты; v2 — после каждого frozen/SQ-сегмента
+// сериализованы TenantCatalog + segmentAttrs (durability колоночного слоя).
+var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 2, 0, 0}
+
+// leveledMagicPrefix — общая часть ('LVLV') для проверки формата без версии.
+var leveledMagicPrefix = [4]byte{'L', 'V', 'L', 'V'}
 
 // =============================================================================
 // Segment interface — единица хранения (либо FrozenGraph, либо plain HNSW)
@@ -1585,6 +1590,9 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 				if err := s.fg.WriteGraphTo(w); err != nil {
 					return fmt.Errorf("leveled: write frozen[%d][%d]: %w", lyr, si, err)
 				}
+				if err := writeSegMeta(w, s.cat, s.attrs); err != nil {
+					return fmt.Errorf("leveled: write frozenMeta[%d][%d]: %w", lyr, si, err)
+				}
 
 			case *frozenSQSegment:
 				if _, err := w.Write([]byte{segTypeFrozenSQ8}); err != nil {
@@ -1592,6 +1600,9 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 				}
 				if err := s.fg.WriteGraphToSQ(w); err != nil {
 					return fmt.Errorf("leveled: write frozenSQ[%d][%d]: %w", lyr, si, err)
+				}
+				if err := writeSegMeta(w, s.cat, s.attrs); err != nil {
+					return fmt.Errorf("leveled: write frozenSQMeta[%d][%d]: %w", lyr, si, err)
 				}
 
 			case *hnswSegment:
@@ -1651,13 +1662,17 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
 
-	// Проверяем магию
+	// Проверяем магию: префикс 'LVLV' обязателен, версия в байте [5] (1 или 2).
 	var magic [8]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return fmt.Errorf("leveled: read magic: %w", err)
 	}
-	if magic != leveledMagic {
+	if [4]byte(magic[:4]) != leveledMagicPrefix {
 		return fmt.Errorf("leveled: invalid magic header (not a graph_leveled.bin?)")
+	}
+	version := magic[5]
+	if version != 1 && version != 2 {
+		return fmt.Errorf("leveled: unsupported snapshot version %d", version)
 	}
 
 	// Читаем snapshotTime
@@ -1710,14 +1725,26 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 				if err != nil {
 					return fmt.Errorf("leveled: read frozen[%d][%d]: %w", lyr, si, err)
 				}
-				lvs.levels[lyr] = append(lvs.levels[lyr], &frozenSegment{fg: fg})
+				seg := &frozenSegment{fg: fg}
+				if version >= 2 {
+					if seg.cat, seg.attrs, err = readSegMeta(r); err != nil {
+						return fmt.Errorf("leveled: read frozenMeta[%d][%d]: %w", lyr, si, err)
+					}
+				}
+				lvs.levels[lyr] = append(lvs.levels[lyr], seg)
 
 			case segTypeFrozenSQ8:
 				fg, err := ReadFrozenGraphSQ(r, lvs.cfg.Distance)
 				if err != nil {
 					return fmt.Errorf("leveled: read frozenSQ[%d][%d]: %w", lyr, si, err)
 				}
-				lvs.levels[lyr] = append(lvs.levels[lyr], &frozenSQSegment{fg: fg})
+				seg := &frozenSQSegment{fg: fg}
+				if version >= 2 {
+					if seg.cat, seg.attrs, err = readSegMeta(r); err != nil {
+						return fmt.Errorf("leveled: read frozenSQMeta[%d][%d]: %w", lyr, si, err)
+					}
+				}
+				lvs.levels[lyr] = append(lvs.levels[lyr], seg)
 
 			case segTypeHNSWFlat:
 				if _, err := io.ReadFull(r, u4[:]); err != nil {
