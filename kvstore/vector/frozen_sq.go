@@ -227,6 +227,16 @@ func (fg *FrozenGraphSQ) bruteRangeAttr(query []float32, K, start, end int, dst 
 	return top
 }
 
+// residualBruteBudget — для SQ8 (ADC-перебор дёшев) residual-brute по блоку выгоднее
+// обхода filtered-HNSW, пока совпавших ≤ efSearch×residualBruteFactor. См.
+// searchFilterFrozen. efSearch≤0 → берём 1 (хотя бы минимальный бюджет, не отключаем).
+func (fg *FrozenGraphSQ) residualBruteBudget(efSearch int) int {
+	if efSearch <= 0 {
+		efSearch = 1
+	}
+	return efSearch * residualBruteFactor
+}
+
 // MemoryBytes возвращает приближённый размер в байтах.
 func (fg *FrozenGraphSQ) MemoryBytes() int {
 	layerBytes := 0

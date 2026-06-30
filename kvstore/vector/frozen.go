@@ -196,6 +196,12 @@ func (fg *FrozenGraph) bruteRangeAttr(query []float32, K, start, end int, dst []
 	return top
 }
 
+// residualBruteBudget — residual-brute ВЫКЛЮЧЕН для float32-сегментов: на high-dim
+// несжатый перебор неконкурентен обходу графа (дистанция в 4× дороже SQ8-ADC; в
+// замерах dbpedia-1536 float32 brute давал ~1.0× везде). Низко-размерные блоки и так
+// классифицируются Kind=brute (dim-aware порог высок) и сюда не попадают.
+func (fg *FrozenGraph) residualBruteBudget(efSearch int) int { return 0 }
+
 // MemoryBytes возвращает приближённый размер в байтах.
 func (fg *FrozenGraph) MemoryBytes() int {
 	layerBytes := 0

@@ -167,6 +167,10 @@ type frozenFilterable interface {
 	bruteRangeAttr(query []float32, K, start, end int, dst []FrozenResult, predIdx func(int) bool) []FrozenResult
 	searchWithIdx(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool, predIdx func(int) bool) []FrozenResult
 	viewKey(i int) string
+	// residualBruteBudget — макс. число совпавших, при котором residual-brute по
+	// блоку выгоднее обхода filtered-HNSW (см. searchFilterFrozen). 0 — режим
+	// выключен для этого типа сегмента (float32 на high-dim: brute неконкурентен).
+	residualBruteBudget(efSearch int) int
 }
 
 // searchFilterFrozen — общий роутинг мульти-атрибутного фильтра для frozen-сегментов.
@@ -200,9 +204,37 @@ func searchFilterFrozen(fg frozenFilterable, cat *TenantCatalog, sa *segmentAttr
 		if r.Kind == IndexBrute {
 			return fg.bruteRangeAttr(query, K, r.Start, r.End, dst, composeIdxKey(predIdx, filterFn, fg))
 		}
+		start, end := r.Start, r.End
+		// Residual-aware brute: крупный тенант-блок (Kind=graph), но остаточный предикат
+		// (region/price/…) может оставить мало совпавших. Filtered-HNSW в этом случае
+		// переисследует граф (тратит фиксированный ef-бюджет дистанций НЕЗАВИСИМО от
+		// селективности — фильтр применяется к результатам, не к обходу), а brute
+		// считает дистанции ТОЛЬКО по совпавшим. Кроссовер тут — по числу совпавших
+		// (≈ef-бюджет графа), он ВЫШЕ и не привязан к dim-aware блок-порогу (#1).
+		//
+		// Считаем совпавших дёшево (целочисленный predIdx по uint-колонкам, без
+		// дистанций, с ранним выходом за бюджетом). Брутим ⟺ остаток СЕЛЕКТИВЕН:
+		//   1. абсолютно мало:  matched ≤ budget (=ef×residualBruteFactor);
+		//   2. мало как доля:   matched·denom ≤ block — иначе плотный остаток ≈
+		//      single-attr, и должен идти block-роутингом (#1), не сюда (иначе
+		//      regression на не-селективном среднем блоке);
+		//   3. SQ8-сегмент: budget>0 (float32-brute на high-dim неконкурентен —
+		//      FrozenGraph.residualBruteBudget возвращает 0).
+		budget := fg.residualBruteBudget(efSearch)
+		if predIdx != nil && budget > 0 {
+			block := end - start
+			matched := 0
+			for i := start; i < end && matched <= budget; i++ {
+				if predIdx(i) {
+					matched++
+				}
+			}
+			if matched <= budget && matched*residualBruteSelDenom <= block {
+				return fg.bruteRangeAttr(query, K, start, end, dst, composeIdxKey(predIdx, filterFn, fg))
+			}
+		}
 		// graph-блок: обход всего сегмента, но в результаты — только узлы блока тенанта
 		// (i ∈ [Start,End)) + остаточный предикат.
-		start, end := r.Start, r.End
 		rangePred := func(i int) bool {
 			if i < start || i >= end {
 				return false
@@ -2597,7 +2629,7 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 			tenantCode = tenantByKey(lvs.cfg.TenantOf)
 		}
 		sortEntriesByTenant(entries, tenantCode)
-		c, err := buildTenantCatalog(entries, tenantCode, lvs.cfg.BruteThreshold)
+		c, err := buildTenantCatalog(entries, tenantCode, lvs.cfg.BruteThreshold, dim)
 		if err != nil {
 			// Инвариант #5 нарушен (entries не сгруппированы после сортировки) —
 			// это баг сортировки/деривации тенанта, не данных. Фейлим build:

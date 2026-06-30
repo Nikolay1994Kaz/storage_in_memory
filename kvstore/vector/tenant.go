@@ -47,12 +47,55 @@ func (k IndexKind) String() string {
 	return "graph"
 }
 
-// DefaultBruteThreshold — порог #6 по умолчанию (абсолютный размер блока).
-// Калибровано на реальном SIFT-128/N=200k (TestTenant_CalibrateBruteThreshold):
-// кроссовер brute/graph ≈32k при recall=1.0 у обоих, но штраф асимметричен
-// (graph на малом блоке ×300 vs brute на крупном ×5.5) → дефолт держим ниже
-// кроссовера. 16384 — безопасное значение в зоне уверенной победы brute.
+// DefaultBruteThreshold — порог #6 по умолчанию (размер блока) НА ЭТАЛОННОЙ
+// размерности bruteDimRef. Калибровано на реальном SIFT-128/N=200k
+// (TestTenant_CalibrateBruteThreshold): кроссовер brute/graph ≈32k при recall=1.0
+// у обоих, но штраф асимметричен (graph на малом блоке ×300 vs brute на крупном
+// ×5.5) → дефолт держим ниже кроссовера. 16384 — безопасное значение в зоне
+// уверенной победы brute ПРИ dim=128.
 const DefaultBruteThreshold = 16384
+
+// bruteDimRef — эталонная размерность, при которой калибровался DefaultBruteThreshold
+// (SIFT-128). Порог масштабируется относительно неё (см. effectiveBruteThreshold).
+const bruteDimRef = 128
+
+// residualBruteFactor — бюджет residual-brute как множитель efSearch. Filtered-HNSW
+// тратит ~efSearch×(структурный множитель) дистанций независимо от селективности
+// остаточного предиката; residual-brute считает РОВНО matched дистанций. Brute
+// выигрывает при matched ≤ efSearch×residualBruteFactor. Калибровано на dbpedia-1536
+// (эмпирический кроссовер ≈45×ef); берём консервативно 32 (=4096 при ef=128), чтобы
+// взять выигрыши с запасом и не подходить вплотную к кроссоверу. В отличие от
+// блок-порога #1 — НЕ dim-aware: кроссовер по ЧИСЛУ дистанций, множитель dim
+// сокращается (и у brute, и у графа дистанция дорожает одинаково).
+const residualBruteFactor = 32
+
+// residualBruteSelDenom — порог селективности остатка: residual-brute включается
+// лишь если matched ≤ block/residualBruteSelDenom (остаток разрежен в блоке). При
+// плотном остатке (matched≈block) случай вырождается в single-attr и должен идти
+// блок-роутингом (#1); brute там проиграл бы графу на среднем блоке.
+const residualBruteSelDenom = 4
+
+// effectiveBruteThreshold масштабирует размер-блок-порог к размерности вектора.
+// Стоимость линейного перебора ∝ block×dim, поэтому кроссовер brute/graph по числу
+// векторов ∝ 1/dim: на high-dim дистанция дороже, brute выгоден на МЕНЬШЕМ блоке.
+// Якорь — bruteDimRef (порог калибровался на dim=128). Примеры при threshold=16384:
+// dim=128 → 16384 (без изменений); dim=1536 → ~1365; dim=64 → 32768.
+//
+// Закрывает яму, найденную на dbpedia-1536 (B≈16k brute проигрывал графу 0.2×):
+// фиксированный 16384 не был dim-aware и слал крупный high-dim блок в brute.
+func effectiveBruteThreshold(threshold, dim int) int {
+	if threshold <= 0 {
+		threshold = DefaultBruteThreshold
+	}
+	if dim <= 0 {
+		return threshold
+	}
+	t := threshold * bruteDimRef / dim
+	if t < 1 {
+		t = 1
+	}
+	return t
+}
 
 // TenantRange — непрерывный диапазон одного тенанта внутри сегмента.
 // [Start, End) — полуинтервал по индексам векторов в раскладке сегмента.
@@ -130,10 +173,11 @@ func tenantByKey(f func(string) uint64) func(DeltaEntry) uint64 {
 // Если записи НЕ сгруппированы (тенант встречается двумя несмежными кусками) —
 // возвращает ошибку: это нарушение инварианта #5, которое нельзя молча проглотить
 // (иначе каталог укажет на неверный диапазон). Перед вызовом гарантируй сортировку.
-func buildTenantCatalog(entries []DeltaEntry, tenantOf func(DeltaEntry) uint64, bruteThreshold int) (*TenantCatalog, error) {
-	if bruteThreshold <= 0 {
-		bruteThreshold = DefaultBruteThreshold
-	}
+func buildTenantCatalog(entries []DeltaEntry, tenantOf func(DeltaEntry) uint64, bruteThreshold, dim int) (*TenantCatalog, error) {
+	// dim-aware: храним УЖЕ масштабированный к размерности порог, чтобы и build-time
+	// классификация Kind, и query-time residual-brute (searchFilterFrozen) пользовались
+	// одним эффективным значением.
+	bruteThreshold = effectiveBruteThreshold(bruteThreshold, dim)
 	cat := &TenantCatalog{
 		ranges:         make(map[uint64]TenantRange),
 		bruteThreshold: bruteThreshold,

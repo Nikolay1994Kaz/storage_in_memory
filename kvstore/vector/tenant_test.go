@@ -77,7 +77,9 @@ func TestTenant_CatalogRangesAndKind(t *testing.T) {
 	sortEntriesByTenant(entries, tenantByKey(tenantOfKey))
 
 	const threshold = 16384
-	cat, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), threshold)
+	// dim=bruteDimRef → effectiveBruteThreshold == threshold (тест про диапазоны/Kind,
+	// не про dim-масштабирование — фиксируем эталонную размерность).
+	cat, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), threshold, bruteDimRef)
 	if err != nil {
 		t.Fatalf("buildTenantCatalog: %v", err)
 	}
@@ -126,7 +128,7 @@ func TestTenant_CatalogRejectsUnsorted(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	entries := makeEntries(map[uint64]int{1: 10, 2: 10, 3: 10}, 4, rng)
 	// НЕ сортируем намеренно.
-	if _, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), 16384); err == nil {
+	if _, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), 16384, bruteDimRef); err == nil {
 		t.Fatal("ожидали ошибку на несгруппированных entries, получили nil")
 	}
 }
@@ -141,7 +143,7 @@ func TestTenant_BlockBruteMatchesGroundTruth(t *testing.T) {
 	entries := makeEntries(sizes, dim, rng)
 	sortEntriesByTenant(entries, tenantByKey(tenantOfKey))
 
-	cat, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), 16384)
+	cat, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), 16384, bruteDimRef)
 	if err != nil {
 		t.Fatalf("buildTenantCatalog: %v", err)
 	}
@@ -315,13 +317,15 @@ func TestTenant_CompactionProducesContiguousSegments(t *testing.T) {
 							lyr, r.Tenant, keys[i], got)
 					}
 				}
+				// Kind согласован с ЭФФЕКТИВНЫМ (dim-aware) порогом, не с сырым cfg.
+				effThr := effectiveBruteThreshold(cfg.BruteThreshold, dim)
 				wantKind := IndexBrute
-				if r.Len() > cfg.BruteThreshold {
+				if r.Len() > effThr {
 					wantKind = IndexGraph
 				}
 				if r.Kind != wantKind {
-					t.Errorf("L%d тенант %d size=%d: Kind=%s, ожидали %s",
-						lyr, r.Tenant, r.Len(), r.Kind, wantKind)
+					t.Errorf("L%d тенант %d size=%d (effThr=%d): Kind=%s, ожидали %s",
+						lyr, r.Tenant, r.Len(), effThr, r.Kind, wantKind)
 				}
 			}
 		}
@@ -502,5 +506,72 @@ func TestTenant_SearchModeOff(t *testing.T) {
 	_ = lvs.Add("a", []float32{1, 2, 3})
 	if _, err := lvs.SearchTenant([]float32{1, 2, 3}, 5, 0, nil); err == nil {
 		t.Fatal("ожидали ошибку при выключенном тенант-режиме")
+	}
+}
+
+// TestTenant_EffectiveBruteThreshold_DimAware — дешёвый детерминированный тест на
+// dim-aware масштабирование порога brute/graph (фикс ямы dbpedia-1536, где
+// фиксированный 16384 слал крупный high-dim блок в проигрышный brute). Стоимость
+// brute ∝ block×dim → кроссовер по числу векторов ∝ 1/dim, заякорен на bruteDimRef.
+func TestTenant_EffectiveBruteThreshold_DimAware(t *testing.T) {
+	cases := []struct {
+		name      string
+		threshold int
+		dim       int
+		want      int
+	}{
+		{"ref dim → identity", 16384, bruteDimRef, 16384},
+		{"1536d shrinks (dbpedia)", 16384, 1536, 16384 * bruteDimRef / 1536}, // ~1365
+		{"784d (mnist)", 16384, 784, 16384 * bruteDimRef / 784},             // ~2674
+		{"low dim grows", 16384, 64, 32768},
+		{"zero threshold → default, scaled", 0, 1536, DefaultBruteThreshold * bruteDimRef / 1536},
+		{"zero dim → no scaling", 16384, 0, 16384},
+		{"huge dim floors at 1", 1, 4096, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := effectiveBruteThreshold(c.threshold, c.dim)
+			if got != c.want {
+				t.Errorf("effectiveBruteThreshold(%d, %d) = %d, ожидали %d", c.threshold, c.dim, got, c.want)
+			}
+		})
+	}
+
+	// Монотонность: при росте dim порог не растёт (брут выгоден на всё меньшем блоке).
+	prev := effectiveBruteThreshold(16384, 1)
+	for dim := 2; dim <= 4096; dim *= 2 {
+		cur := effectiveBruteThreshold(16384, dim)
+		if cur > prev {
+			t.Fatalf("немонотонно: dim=%d порог %d > предыдущего %d", dim, cur, prev)
+		}
+		prev = cur
+	}
+}
+
+// TestTenant_CatalogKindDimAware — каталог проставляет Kind по dim-aware порогу:
+// один и тот же блок классифицируется как graph на high-dim и как brute на low-dim.
+func TestTenant_CatalogKindDimAware(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	// Блок 4000 векторов: при threshold=16384 это brute на dim=128 (порог 16384),
+	// но graph на dim=1536 (порог ~1365 < 4000).
+	sizes := map[uint64]int{7: 4000}
+	entries := makeEntries(sizes, 4, rng)
+	sortEntriesByTenant(entries, tenantByKey(tenantOfKey))
+
+	lowDim, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), 16384, bruteDimRef)
+	if err != nil {
+		t.Fatalf("buildTenantCatalog low-dim: %v", err)
+	}
+	if r, _ := lowDim.Lookup(7); r.Kind != IndexBrute {
+		t.Errorf("dim=%d: блок 4000 ожидали brute, получили %s", bruteDimRef, r.Kind)
+	}
+
+	highDim, err := buildTenantCatalog(entries, tenantByKey(tenantOfKey), 16384, 1536)
+	if err != nil {
+		t.Fatalf("buildTenantCatalog high-dim: %v", err)
+	}
+	if r, _ := highDim.Lookup(7); r.Kind != IndexGraph {
+		t.Errorf("dim=1536: блок 4000 (порог ~%d) ожидали graph, получили %s",
+			effectiveBruteThreshold(16384, 1536), r.Kind)
 	}
 }
