@@ -164,6 +164,15 @@ func (s *Server) eventLoop(w *worker) {
 // больше данных чем нужно. Мы делаем то же, но осознанно и
 // без overhead bufio (без двойного буфера, без лишних memcpy).
 func (s *Server) handleConn(w *worker, cs *ConnState) {
+	// Defense-in-depth: паника в парсере или хендлере НЕ должна ронять воркер
+	// (а с ним весь процесс). Закрываем только это соединение и живём дальше.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Worker %d: recovered panic on connection, closing it: %v", w.id, r)
+			w.epoll.Remove(cs)
+		}
+	}()
+
 	n, err := cs.Buf.ReadFromConn()
 	if n == 0 || err != nil {
 		w.epoll.Remove(cs)
@@ -178,6 +187,15 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 				break
 			}
 			s.handler(cs, args)
+		}
+
+		// Нарушение протокола (напр. невалидная bulk-длина): битый кадр нельзя
+		// «дождать» — он навсегда застрянет в буфере. Отвечаем ошибкой и рвём conn.
+		if cs.Buf.ProtoErr() {
+			cs.Buf.WriteError("ERR Protocol error: invalid bulk length")
+			cs.Buf.Flush()
+			w.epoll.Remove(cs)
+			return
 		}
 
 		// Greedy drain: пробуем забрать ещё данные (non-blocking)

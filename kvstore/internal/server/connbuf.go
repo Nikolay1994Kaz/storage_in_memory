@@ -37,6 +37,11 @@ type ConnBuf struct {
 	rpos int
 	rend int
 
+	// protoErr — выставляется парсером при нарушении протокола (напр. невалидная
+	// bulk-длина). Битый кадр нельзя «дождать» — он навсегда останется в буфере,
+	// поэтому handleConn при этом флаге отвечает ошибкой и закрывает соединение.
+	protoErr bool
+
 	// ─── Write side ───
 	wbuf []byte
 
@@ -163,6 +168,11 @@ func (cb *ConnBuf) ParseCommand() [][]byte {
 	return result
 }
 
+// ProtoErr сообщает, что парсер встретил нарушение протокола и соединение нужно
+// закрыть. Битый кадр нельзя «дождать» (он останется в буфере навсегда), поэтому
+// handleConn проверяет этот флаг после разбора и рвёт соединение с RESP-ошибкой.
+func (cb *ConnBuf) ProtoErr() bool { return cb.protoErr }
+
 // parseArray разбирает RESP массив: *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
 func (cb *ConnBuf) parseArray() [][]byte {
 	line, ok := cb.peekLine()
@@ -217,8 +227,16 @@ func (cb *ConnBuf) parseBulkString() []byte {
 		return nil
 	}
 
-	if size == -1 {
-		return []byte{}
+	if size < 0 {
+		// $-1\r\n = легитимный null bulk string. Любая другая отрицательная длина —
+		// нарушение протокола: без этого гарда cb.rbuf[rpos:rpos+size] при size<-1
+		// даёт low>high → slice-bounds panic (remote unauth DoS, т.к. парсинг идёт
+		// до AUTH). Сигналим handleConn закрыть соединение.
+		if size == -1 {
+			return []byte{}
+		}
+		cb.protoErr = true
+		return nil
 	}
 
 	end := cb.rpos + size + 2
