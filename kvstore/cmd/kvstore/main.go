@@ -599,6 +599,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Снапшот загружен и listener поднят — помечаем процесс готовым (/ready → 200).
+	monitoring.SetReady(true)
+
 	log.Println("KVStore is running. Press Ctrl+C to stop.")
 
 	sigCh := make(chan os.Signal, 1)
@@ -606,6 +609,7 @@ func main() {
 	<-sigCh
 
 	log.Println("Shutting down...")
+	monitoring.SetReady(false) // /ready → 503: оркестратор уводит трафик до остановки
 	srv.Stop()
 }
 

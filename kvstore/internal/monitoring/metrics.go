@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -143,23 +144,63 @@ func RecordWasm(module, function string, duration time.Duration) {
 	h.Update(duration.Seconds())
 }
 
-// StartHttpServer runs the HTTP metrics server at /metrics on the given port.
-func StartHttpServer(port int) {
-	if port <= 0 {
+// ready — флаг готовности обслуживать трафик (снапшот загружен, сервер слушает).
+// Liveness (/health) этого не требует; readiness (/ready) — требует.
+var ready atomic.Bool
+
+// SetReady помечает процесс готовым/неготовым обслуживать запросы. Вызывается из
+// main после успешного запуска TCP-сервера (снапшот загружен, listener поднят).
+func SetReady(v bool) { ready.Store(v) }
+
+// liveHandler — liveness-проба: процесс жив и HTTP-цикл отвечает. Всегда 200.
+// Оркестратор по этому отличает «висит/мёртв» (→ рестарт) от «жив, но не готов».
+func liveHandler(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("OK\n"))
+}
+
+// readyHandler — readiness-проба: 200 только когда процесс готов принимать
+// трафик, иначе 503 (оркестратор не шлёт запросы, пока не прогрелись).
+func readyHandler(w http.ResponseWriter, _ *http.Request) {
+	if ready.Load() {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready\n"))
 		return
 	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte("not ready\n"))
+}
+
+// httpHandler собирает mux метрик + health-проб. Вынесено отдельно, чтобы
+// тестировать пробы через httptest без поднятия реального сокета.
+func httpHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metrics.WritePrometheus(w, true)
 	})
+	// Liveness под несколькими общепринятыми путями (k8s/curl-привычки).
+	mux.HandleFunc("/health", liveHandler)
+	mux.HandleFunc("/healthz", liveHandler)
+	mux.HandleFunc("/livez", liveHandler)
+	// Readiness.
+	mux.HandleFunc("/ready", readyHandler)
+	mux.HandleFunc("/readyz", readyHandler)
+	return mux
+}
+
+// StartHttpServer runs the HTTP metrics+health server on the given port.
+func StartHttpServer(port int) {
+	if port <= 0 {
+		return
+	}
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
+		Handler: httpHandler(),
 	}
 
 	go func() {
-		log.Printf("Starting HTTP metrics server on :%d/metrics", port)
+		log.Printf("Starting HTTP server on :%d (/metrics, /health, /ready)", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Metrics HTTP server error: %v", err)
 		}
