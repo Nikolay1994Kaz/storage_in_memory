@@ -12,6 +12,12 @@ import (
 const (
 	readBufSize = 65536 // 64KB — вмещает ~1000 команд SET
 	maxArgs     = 2048  // поддерживает высокоразмерные векторные команды (до 2046 floats)
+
+	// maxBulkSize — верхняя граница длины одного bulk-string (как Redis
+	// proto-max-bulk-len = 512 МБ). Без неё клиент объявляет "$<огромное>",
+	// парсер ждёт данные, а read-слой бесконечно удваивает rbuf → remote
+	// unauth OOM (mem-DoS). Превышение = protoErr (соединение закрывается).
+	maxBulkSize = 512 * 1024 * 1024
 )
 
 // ConnBuf — per-connection zero-alloc буфер чтения/записи.
@@ -183,7 +189,15 @@ func (cb *ConnBuf) parseArray() [][]byte {
 
 	// Zero-alloc parseInt: НЕ создаём string, парсим прямо из []byte
 	count, ok := parseIntBytes(line[1:])
-	if !ok || count <= 0 || count > maxArgs {
+	if count > maxArgs {
+		// Объявлено больше аргументов, чем влезает в стековый args[maxArgs].
+		// Кадр невалиден и его нельзя «дождать» — иначе он застрянет в буфере
+		// (wedge + рост памяти). Сигналим handleConn закрыть соединение.
+		cb.protoErr = true
+		return nil
+	}
+	if !ok || count <= 0 {
+		// Битый/неполный заголовок числа, *0, *-1 (null array) — легитимный nil.
 		return nil
 	}
 
@@ -235,6 +249,13 @@ func (cb *ConnBuf) parseBulkString() []byte {
 		if size == -1 {
 			return []byte{}
 		}
+		cb.protoErr = true
+		return nil
+	}
+
+	if size > maxBulkSize {
+		// Длина выше кэпа: данных столько ещё нет, парсер вернул бы nil
+		// («ждём»), а read-слой удваивал бы rbuf к OOM. Рвём соединение.
 		cb.protoErr = true
 		return nil
 	}
@@ -308,10 +329,16 @@ func parseIntBytes(b []byte) (int, bool) {
 			return 0, false
 		}
 	}
+	const maxInt = int(^uint(0) >> 1)
 	n := 0
 	for ; i < len(b); i++ {
 		c := b[i]
 		if c < '0' || c > '9' {
+			return 0, false
+		}
+		// Защита от переполнения: иначе огромная длина «обернулась» бы в
+		// положительное число и проскочила бы кэп maxBulkSize/maxArgs.
+		if n > (maxInt-int(c-'0'))/10 {
 			return 0, false
 		}
 		n = n*10 + int(c-'0')
