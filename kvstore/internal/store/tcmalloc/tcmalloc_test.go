@@ -201,6 +201,7 @@ func TestSpan_FreeCount(t *testing.T) {
 
 func TestStore_SetGetDel(t *testing.T) {
 	store := NewTCMallocStore(1) // 1 worker
+	defer store.Close()
 
 	store.Set(0, "hello", []byte("world"))
 
@@ -227,6 +228,7 @@ func TestStore_SetGetDel(t *testing.T) {
 
 func TestStore_GetMissing(t *testing.T) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 
 	_, ok := store.Get("nonexistent")
 	if ok {
@@ -236,6 +238,7 @@ func TestStore_GetMissing(t *testing.T) {
 
 func TestStore_Overwrite(t *testing.T) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 
 	store.Set(0, "key", []byte("first"))
 	store.Set(0, "key", []byte("second"))
@@ -251,6 +254,7 @@ func TestStore_Overwrite(t *testing.T) {
 
 func TestStore_OOM(t *testing.T) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 	store.SetMaxMemory(1024 * 1024) // 1MB лимит
 
 	if store.IsOOM() {
@@ -266,6 +270,7 @@ func TestStore_OOM(t *testing.T) {
 
 func TestStore_Len(t *testing.T) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 
 	if store.Len() != 0 {
 		t.Fatalf("empty store Len = %d", store.Len())
@@ -289,6 +294,7 @@ func TestStore_MultiWorker(t *testing.T) {
 	const numWorkers = 4
 	const keysPerWorker = 500
 	store := NewTCMallocStore(numWorkers)
+	defer store.Close()
 	// Каждый worker пишет свои ключи: "w0:0", "w0:1", ... "w3:499"
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
@@ -327,6 +333,7 @@ func TestStore_MultiWorker(t *testing.T) {
 func TestStore_ConcurrentReadWrite(t *testing.T) {
 	const numWorkers = 4
 	store := NewTCMallocStore(numWorkers)
+	defer store.Close()
 
 	for i := 0; i < 100; i++ {
 		store.Set(0, fmt.Sprintf("key%d", i), []byte("initial"))
@@ -357,6 +364,7 @@ func TestStore_ConcurrentReadWrite(t *testing.T) {
 
 func TestStore_LargeObject(t *testing.T) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 
 	bigVal := make([]byte, 8192)
 	for i := range bigVal {
@@ -381,6 +389,7 @@ func TestStore_LargeObject(t *testing.T) {
 
 func BenchmarkStore_Set(b *testing.B) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 	val := []byte("benchmark-value-data")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -390,6 +399,7 @@ func BenchmarkStore_Set(b *testing.B) {
 
 func BenchmarkStore_Get(b *testing.B) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 	// Подготовка: заполняем 10K ключей
 	for i := 0; i < 10000; i++ {
 		store.Set(0, fmt.Sprintf("k:%d", i), []byte("value"))
@@ -402,6 +412,7 @@ func BenchmarkStore_Get(b *testing.B) {
 
 func BenchmarkStore_Get_Parallel(b *testing.B) {
 	store := NewTCMallocStore(12)
+	defer store.Close()
 	for i := 0; i < 10000; i++ {
 		store.Set(0, fmt.Sprintf("k:%d", i), []byte("value"))
 	}
@@ -533,6 +544,7 @@ func TestHashTable_LinearProbing(t *testing.T) {
 
 func TestStore_ForcedGrow(t *testing.T) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 
 	// Находим ключи, которые все попадают в шард 0
 	// hash(key) % 256 == 0
@@ -565,6 +577,7 @@ func TestStore_ForcedGrow(t *testing.T) {
 
 func TestStore_ForcedRebuild(t *testing.T) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 
 	// Находим 500 ключей в одном шарде
 	var keys []string
@@ -659,6 +672,7 @@ func TestMCentral_ReturnToPartial(t *testing.T) {
 
 func TestStore_LargeObject_MemoryAccounting(t *testing.T) {
 	store := NewTCMallocStore(1)
+	defer store.Close()
 
 	memBefore := store.UsedMemory()
 
