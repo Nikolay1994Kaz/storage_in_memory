@@ -1,0 +1,61 @@
+name: CI
+
+# Гейт корректности на каждый push в master и каждый PR: код собирается,
+# отформатирован, проходит vet и тесты. Долгие нагрузочные прогоны — в
+# отдельных soak-воркфлоу.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Отменяем устаревшие прогоны на той же ветке/PR при новом пуше.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Build / vet / gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l kvstore/)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Файлы не отформатированы gofmt (запусти 'gofmt -w'):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Конкурентно-критичные пакеты (server, store, wal, cluster) — с -race.
+      - name: Test (race)
+        run: go test -short -race -timeout 15m ./kvstore/internal/...
+
+      # Алгоритмика vector — в основном однопоточная, тяжёлая (~7-8 мин);
+      # гоняем без -race, чтобы держать гейт в разумном времени.
+      - name: Test (vector)
+        run: go test -short -timeout 20m ./kvstore/vector/
