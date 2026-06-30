@@ -1,8 +1,10 @@
 package vector
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"sync"
 	"unsafe"
@@ -326,5 +328,46 @@ func DeserializeVectorZeroCopy(data []byte) []float32 {
 		return nil
 	}
 	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), len(data)/4)
+}
+
+// SerializeVectorWithAttrs кодирует вектор + атрибуты в один self-contained блоб
+// для WAL-операции OpVSimAddAttrs. Формат: [uint32 nFloats][vec float32 LE...][attrs].
+// Секция attrs использует тот же формат, что и снапшот (writeAttrs) → атрибуты
+// становятся durable через WAL так же, как через снапшот (закрывает P0-4: replay
+// больше не теряет attrs/tenant у векторов, добавленных после последнего снапшота).
+func SerializeVectorWithAttrs(vec []float32, attrs Attributes) []byte {
+	var buf bytes.Buffer
+	var u4 [4]byte
+	binary.LittleEndian.PutUint32(u4[:], uint32(len(vec)))
+	buf.Write(u4[:])
+	for _, v := range vec {
+		binary.LittleEndian.PutUint32(u4[:], math.Float32bits(v))
+		buf.Write(u4[:])
+	}
+	// writeAttrs пишет в io.Writer; на bytes.Buffer ошибки не бывает.
+	_ = writeAttrs(&buf, attrs)
+	return buf.Bytes()
+}
+
+// DeserializeVectorWithAttrs — обратная операция для replay OpVSimAddAttrs.
+func DeserializeVectorWithAttrs(data []byte) ([]float32, Attributes, error) {
+	r := bytes.NewReader(data)
+	var u4 [4]byte
+	if _, err := io.ReadFull(r, u4[:]); err != nil {
+		return nil, Attributes{}, fmt.Errorf("vec+attrs: read nFloats: %w", err)
+	}
+	n := int(binary.LittleEndian.Uint32(u4[:]))
+	vec := make([]float32, n)
+	for i := 0; i < n; i++ {
+		if _, err := io.ReadFull(r, u4[:]); err != nil {
+			return nil, Attributes{}, fmt.Errorf("vec+attrs: read float[%d]: %w", i, err)
+		}
+		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(u4[:]))
+	}
+	attrs, err := readAttrs(r)
+	if err != nil {
+		return nil, Attributes{}, fmt.Errorf("vec+attrs: read attrs: %w", err)
+	}
+	return vec, attrs, nil
 }
 

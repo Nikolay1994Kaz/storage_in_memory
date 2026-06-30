@@ -193,6 +193,27 @@ func main() {
 			}
 			vecRestored++
 			restored++
+		case wal.OpVSimAddAttrs:
+			// Вектор + атрибуты (P0-4): attrs/tenant восстанавливаются через
+			// AddWithAttrs, а не теряются как при голом Add.
+			if isFromSnapshot && graphLoaded {
+				return
+			}
+			vec, attrs, err := vector.DeserializeVectorWithAttrs(entry.Value)
+			if err != nil {
+				log.Printf("WARNING: failed to decode vector+attrs %s: %v", entry.Key, err)
+				return
+			}
+			if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+				if err := lvs.AddWithAttrs(entry.Key, vec, attrs); err != nil {
+					log.Printf("WARNING: failed to restore vector+attrs %s: %v", entry.Key, err)
+				}
+			} else if err := vecStore.Add(entry.Key, vec); err != nil {
+				// Индекс без attr-слоя — восстанавливаем хотя бы вектор.
+				log.Printf("WARNING: failed to restore vector %s: %v", entry.Key, err)
+			}
+			vecRestored++
+			restored++
 		case wal.OpVSimDel:
 			if isFromSnapshot && graphLoaded {
 				return
