@@ -5,6 +5,7 @@ import (
 	"net"
 	"strconv"
 	"syscall"
+	"time"
 
 	"kvstore/kvstore/internal/monitoring"
 )
@@ -61,6 +62,11 @@ type ConnBuf struct {
 
 	// ─── Write side ───
 	wbuf []byte
+
+	// WriteTimeout — макс. время на conn.Write в Flush. Без него медленный/
+	// застрявший reader (полное TCP-окно) блокирует горутину воркера со ВСЕМИ
+	// его соединениями. 0 = без дедлайна (legacy-поведение).
+	WriteTimeout time.Duration
 
 	// ─── Parser reuse ───
 	args [maxArgs][]byte
@@ -437,9 +443,16 @@ func (cb *ConnBuf) WriteArrayHeader(n int) {
 }
 
 // Flush отправляет все накопленные ответы одним syscall.
+//
+// WriteTimeout ограничивает время на conn.Write: застрявший reader (полное
+// TCP-окно) иначе блокирует горутину воркера со всеми его соединениями. По
+// истечении дедлайна Write вернёт ошибку → handleConn закроет соединение.
 func (cb *ConnBuf) Flush() error {
 	if len(cb.wbuf) == 0 {
 		return nil
+	}
+	if cb.WriteTimeout > 0 {
+		_ = cb.conn.SetWriteDeadline(time.Now().Add(cb.WriteTimeout))
 	}
 	n, err := cb.conn.Write(cb.wbuf)
 	if n > 0 {

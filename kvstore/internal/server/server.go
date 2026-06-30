@@ -67,6 +67,10 @@ type Server struct {
 	// реапится (защита от Slowloris/брошенных conn). 0 = реапинг выключен.
 	IdleTimeout time.Duration
 
+	// WriteTimeout — макс. время на отправку ответа (Flush). Защита от застрявшего
+	// reader, блокирующего горутину воркера. 0 = без дедлайна.
+	WriteTimeout time.Duration
+
 	// stopping — выставляется в Stop(); воркеры выходят из eventLoop, а не
 	// крутятся в tight-loop на EpollWait-ошибке после закрытия epoll-fd.
 	stopping atomic.Bool
@@ -140,6 +144,7 @@ func (s *Server) acceptLoop() {
 			Buf:      NewConnBuf(conn), // ← ConnBuf вместо Reader+Writer
 			WorkerID: w.id,
 		}
+		cs.Buf.WriteTimeout = s.WriteTimeout
 		cs.LastActivity.Store(time.Now().UnixNano())
 
 		if err := w.epoll.Add(cs); err != nil {
@@ -259,8 +264,12 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 		return
 	}
 
-	// Один write() для ВСЕХ ответов (включая greedy drain)
-	cs.Buf.Flush()
+	// Один write() для ВСЕХ ответов (включая greedy drain). Ошибка (в т.ч.
+	// write-таймаут на застрявшем reader) → закрываем соединение, чтобы залипший
+	// клиент не держал воркера и буфер.
+	if err := cs.Buf.Flush(); err != nil {
+		w.epoll.Remove(cs)
+	}
 }
 
 // closeProtoErr отвечает RESP-ошибкой и закрывает соединение при нарушении
