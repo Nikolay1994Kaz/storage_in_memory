@@ -61,12 +61,21 @@ const bruteDimRef = 128
 
 // residualBruteFactor — бюджет residual-brute как множитель efSearch. Filtered-HNSW
 // тратит ~efSearch×(структурный множитель) дистанций независимо от селективности
-// остаточного предиката; residual-brute считает РОВНО matched дистанций. Brute
-// выигрывает при matched ≤ efSearch×residualBruteFactor. Калибровано на dbpedia-1536
-// (эмпирический кроссовер ≈45×ef); берём консервативно 32 (=4096 при ef=128), чтобы
-// взять выигрыши с запасом и не подходить вплотную к кроссоверу. В отличие от
-// блок-порога #1 — НЕ dim-aware: кроссовер по ЧИСЛУ дистанций, множитель dim
-// сокращается (и у brute, и у графа дистанция дорожает одинаково).
+// остаточного предиката. Brute выигрывает при matched ≤ efSearch×residualBruteFactor.
+// В отличие от блок-порога #1 — НЕ dim-aware: кроссовер по ЧИСЛУ дистанций, множитель
+// dim сокращается (и у brute, и у графа дистанция дорожает одинаково). Калибровано на
+// dbpedia-1536 (эмпирич. кроссовер ≈45×ef); 32 (=4096 при ef=128) — консервативно.
+//
+// ⚠ ВАЖНО (TestDBpedia_FilterTenant сквозной, 30.06): bruteRangeAttr идёт по ВСЕМУ
+// блоку тенанта [start,end) — distFn только на matched, но проход и cache-gather —
+// O(block), а matched РАЗБРОСАНЫ по блоку (сортировка лишь по тенанту, не по
+// region/price). Поэтому поднятие бюджета НЕ даёт ускорения уровня «компактного»
+// brute по matched: B40k matched 5000 включил block-brute = 288 QPS (vs graph ~234,
+// лишь ~1.2×), а НЕ 2530, как показывал ceiling над КОМПАКТНЫМ срезом
+// (TestLargeTenant_FilterCeiling). Тот 2530 = потолок ВТОРИЧНОЙ contiguous-раскладки
+// (sort tenant→region→price → matched в подотрезке → brute O(matched)) — это рычаг
+// ~9×, но он про layout, НЕ про эту константу. Бюджет держим на 32.
+// См. [[vector-large-tenant-ceiling-20260630]].
 const residualBruteFactor = 32
 
 // residualBruteSelDenom — порог селективности остатка: residual-brute включается
