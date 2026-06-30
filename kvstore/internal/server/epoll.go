@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"syscall"
+	"time"
 
 	"kvstore/kvstore/internal/monitoring"
 )
@@ -76,13 +77,13 @@ func (e *Epoll) Remove(cs *ConnState) error {
 
 // Wait ждёт событий на зарегистрированных соединениях.
 // Возвращает список ConnState, на которых есть данные для чтения.
-// Это БЛОКИРУЮЩИЙ вызов — горутина спит, пока не появятся события.
-func (e *Epoll) Wait() ([]*ConnState, error) {
+//
+// timeoutMs — макс. время ожидания в миллисекундах: -1 = блокировать бесконечно,
+// >0 = проснуться по таймауту даже без событий (чтобы реапер мог подмести idle).
+func (e *Epoll) Wait(timeoutMs int) ([]*ConnState, error) {
 	events := make([]syscall.EpollEvent, 100) // до 100 событий за раз
 
-	// epoll_wait — ядро разбудит нас, когда на каком-то сокете появятся данные
-	// -1 означает "ждать бесконечно"
-	n, err := syscall.EpollWait(e.fd, events, -1)
+	n, err := syscall.EpollWait(e.fd, events, timeoutMs)
 	if err != nil {
 		// EINTR — нас прервал сигнал, это нормально, просто повторяем
 		if err == syscall.EINTR {
@@ -102,6 +103,27 @@ func (e *Epoll) Wait() ([]*ConnState, error) {
 		}
 	}
 	return states, nil
+}
+
+// reapIdle закрывает соединения, неактивные дольше timeout. Вызывается воркером
+// после каждого Wait. Сбор stale идёт под RLock, само закрытие (Remove берёт
+// Lock) — вне него, чтобы не словить рекурсивный лок.
+func (e *Epoll) reapIdle(timeout time.Duration) {
+	cutoff := time.Now().Add(-timeout).UnixNano()
+
+	e.mu.RLock()
+	var stale []*ConnState
+	for _, cs := range e.connections {
+		if cs.LastActivity.Load() < cutoff {
+			stale = append(stale, cs)
+		}
+	}
+	e.mu.RUnlock()
+
+	for _, cs := range stale {
+		e.Remove(cs)
+		monitoring.IdleReaped.Inc()
+	}
 }
 
 // Close закрывает epoll instance.

@@ -28,6 +28,12 @@ type ConnState struct {
 	InTx          bool
 	TxQueue       [][][]byte // ← was [][]protocol.Value
 	Authenticated bool       // true после успешной AUTH команды
+
+	// LastActivity — unix-наносекунды последней активности (приём данных).
+	// Реапер закрывает соединения, неактивные дольше Server.IdleTimeout. В этой
+	// epoll-архитектуре дедлайн на сокете не реапит молчащие conn (EpollWait не
+	// проснётся от Go-дедлайна), поэтому реапинг — по этому полю.
+	LastActivity atomic.Int64
 }
 
 // Handler — функция обработки RESP-команды.
@@ -56,6 +62,14 @@ type Server struct {
 	workers   []*worker
 	next      atomic.Uint64
 	TLSConfig *tls.Config // nil = plain TCP, not-nil = TLS
+
+	// IdleTimeout — макс. время без активности, после которого соединение
+	// реапится (защита от Slowloris/брошенных conn). 0 = реапинг выключен.
+	IdleTimeout time.Duration
+
+	// stopping — выставляется в Stop(); воркеры выходят из eventLoop, а не
+	// крутятся в tight-loop на EpollWait-ошибке после закрытия epoll-fd.
+	stopping atomic.Bool
 }
 
 func NewServer(addr string, handler Handler) *Server {
@@ -112,6 +126,9 @@ func (s *Server) acceptLoop() {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
+			if s.stopping.Load() {
+				return // штатная остановка: listener закрыт
+			}
 			log.Printf("Accept error: %v", err)
 			return
 		}
@@ -123,6 +140,7 @@ func (s *Server) acceptLoop() {
 			Buf:      NewConnBuf(conn), // ← ConnBuf вместо Reader+Writer
 			WorkerID: w.id,
 		}
+		cs.LastActivity.Store(time.Now().UnixNano())
 
 		if err := w.epoll.Add(cs); err != nil {
 			log.Printf("Epoll Add error (worker %d): %v", w.id, err)
@@ -133,16 +151,39 @@ func (s *Server) acceptLoop() {
 }
 
 // eventLoop — главный цикл воркера.
+//
+// Если IdleTimeout задан, EpollWait получает конечный таймаут (вместо -1), чтобы
+// воркер периодически просыпался и реапил неактивные соединения — даже когда по
+// ним нет событий (молчащий Slowloris-клиент epoll не разбудит).
 func (s *Server) eventLoop(w *worker) {
+	timeoutMs := -1 // по умолчанию блокируем бесконечно (реапинг выключен)
+	if s.IdleTimeout > 0 {
+		tick := s.IdleTimeout
+		if tick > time.Second {
+			tick = time.Second // подметаем не реже раза в секунду
+		}
+		timeoutMs = int(tick / time.Millisecond)
+		if timeoutMs < 1 {
+			timeoutMs = 1
+		}
+	}
+
 	for {
-		states, err := w.epoll.Wait()
+		states, err := w.epoll.Wait(timeoutMs)
 		if err != nil {
+			if s.stopping.Load() {
+				return // сервер останавливается, epoll-fd закрыт — выходим чисто
+			}
 			log.Printf("Worker %d: epoll wait error: %v", w.id, err)
 			continue
 		}
 
 		for _, cs := range states {
 			s.handleConn(w, cs)
+		}
+
+		if s.IdleTimeout > 0 {
+			w.epoll.reapIdle(s.IdleTimeout)
 		}
 	}
 }
@@ -174,6 +215,9 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 	}()
 
 	n, err := cs.Buf.ReadFromConn()
+	if n > 0 {
+		cs.LastActivity.Store(time.Now().UnixNano()) // сбрасываем счётчик idle
+	}
 	// ReadFromConn ставит ProtoErr, когда rbuf упёрся в потолок maxRbufSize
 	// (клиент льёт данные без завершённого кадра → mem-DoS). Рвём с ошибкой.
 	if cs.Buf.ProtoErr() {
@@ -230,6 +274,7 @@ func (s *Server) closeProtoErr(w *worker, cs *ConnState) {
 
 // Stop останавливает сервер.
 func (s *Server) Stop() error {
+	s.stopping.Store(true) // воркеры выйдут из eventLoop, а не зациклятся на ошибке
 	s.listener.Close()
 	for _, w := range s.workers {
 		w.epoll.Close()

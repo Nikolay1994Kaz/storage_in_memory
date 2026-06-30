@@ -14,6 +14,9 @@ var (
 	// Active connections (Gauge-like counter)
 	ActiveConnections = metrics.NewCounter("kvstore_network_active_connections")
 
+	// Idle connections reaped (Slowloris/брошенные соединения)
+	IdleReaped = metrics.NewCounter("kvstore_network_idle_reaped_total")
+
 	// Bytes read and written
 	BytesRead    = metrics.NewCounter("kvstore_network_bytes_read_total")
 	BytesWritten = metrics.NewCounter("kvstore_network_bytes_written_total")

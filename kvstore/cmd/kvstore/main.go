@@ -62,6 +62,7 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "путь к TLS сертификату (PEM)")
 	tlsKey := flag.String("tls-key", "", "путь к TLS ключу (PEM)")
 	metricsPort := flag.Int("metrics-port", 9090, "порт для HTTP сервера метрик VictoriaMetrics (0 = отключен)")
+	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute, "закрывать соединение после простоя без активности (защита от Slowloris/брошенных conn; 0 = выключено)")
 	hnswM := flag.Int("hnsw-m", 32, "HNSW M parameter (number of node connections)")
 	hnswEfConstruction := flag.Int("hnsw-ef-construction", 400, "HNSW efConstruction parameter")
 	hnswEfSearch := flag.Int("hnsw-ef-search", 100, "HNSW efSearch parameter (0 = auto). 100 = рабочая точка recall@10≈0.966 на MNIST-784, ~1.56× QPS vs 200 (recall 0.983). См. step_profit_test.go:TestStep2_EfSearch")
@@ -272,7 +273,6 @@ func main() {
 	//   3. Записывает OpVSimDel в WAL (чтобы удаление пережило рестарт)
 	ttl.SetEvictor(&compositeEvictor{kv: s, vec: vecStore, wal: bw})
 
-
 	// === 4. Syncer ===
 	// iterateAll — обход только KV данных для snapshot.wal (векторы хранятся отдельно)
 	iterateAll := func(fn func(op byte, key string, value []byte)) {
@@ -436,8 +436,6 @@ func main() {
 	triggers := compute.NewTriggerManager(wasm)
 	compute.LoadAll(dataDir, wasm, triggers)
 
-
-
 	// === 8. AI Engine (Ollama) ===
 	var aiClient *ai.Client
 	var aiWorker *ai.Worker
@@ -580,6 +578,7 @@ func main() {
 	// === 8. Сервер ===
 	listenAddr := fmt.Sprintf(":%d", *port)
 	srv := server.NewServer(listenAddr, handler)
+	srv.IdleTimeout = *idleTimeout
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
 	if *tlsCert != "" && *tlsKey != "" {
@@ -1371,7 +1370,6 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
 		}
 
-
 	// === Sorted Sets (ZSET) ===
 	case "ZADD":
 		// ZADD <setName> <score> <member>
@@ -1540,7 +1538,6 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteBulkString(r.Key)
 			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
 		}
-
 
 	// === AI Commands ===
 	case "AI.EMBED":
