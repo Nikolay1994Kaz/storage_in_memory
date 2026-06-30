@@ -292,11 +292,11 @@ func (d *DeltaSegment) Search(query []float32, K, efSearch int, filterFn func(st
 	}
 	// Быстрый путь для одного шарда — без merge.
 	if d.nShards == 1 {
-		return d.shards[0].search(query, K, efSearch, filterFn)
+		return d.shards[0].search(query, K, efSearch, filterFn, d.dim, d.distFn)
 	}
 	var merged []deltaResult
 	for _, s := range d.shards {
-		merged = append(merged, s.search(query, K, efSearch, filterFn)...)
+		merged = append(merged, s.search(query, K, efSearch, filterFn, d.dim, d.distFn)...)
 	}
 	if len(merged) <= K {
 		slices.SortFunc(merged, cmpDeltaResult)
@@ -307,9 +307,20 @@ func (d *DeltaSegment) Search(query []float32, K, efSearch int, filterFn func(st
 }
 
 // search — поиск в одном шарде под RLock.
-func (s *deltaShard) search(query []float32, K, efSearch int, filterFn func(string) bool) []deltaResult {
+func (s *deltaShard) search(query []float32, K, efSearch int, filterFn func(string) bool, dim int, distFn DistanceFunc) []deltaResult {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	// Фильтрованный путь — точный brute по шарду (recall=1.0). Индексный Graph.Search
+	// фильтрует POST-HOC: обходит граф БЕЗ фильтра, обрезает до топ-K по расстоянию, и
+	// лишь ПОТОМ выкидывает непрошедших → при селективном фильтре recall обваливается
+	// почти до selectivity (см. delta_filter_bug_test.go: 0.128 vs 1.0). Дельта
+	// ограничена (bounded ~maxSize), brute по совпавшим дёшев и точен; фильтр
+	// применяется к КАЖДОМУ вектору ДО отбора top-K. Без фильтра — быстрый граф-путь.
+	if filterFn != nil {
+		return s.bruteFiltered(query, K, dim, distFn, filterFn)
+	}
+
 	if s.idx == nil || len(s.nodeKey) == 0 {
 		return nil
 	}
@@ -320,12 +331,33 @@ func (s *deltaShard) search(query []float32, K, efSearch int, filterFn func(stri
 		if !ok {
 			continue // узел удалён — пропускаем
 		}
-		if filterFn != nil && !filterFn(key) {
-			continue
-		}
 		out = append(out, deltaResult{key: key, dist: r.Distance})
 	}
 	return out
+}
+
+// bruteFiltered — точный top-K среди ВЕКТОРОВ ШАРДА, прошедших filterFn. Вызывается
+// под s.mu.RLock. recall=1.0: дистанция считается для каждого совпавшего, top-K
+// берётся уже после фильтра (в отличие от post-filter в индексном пути). Стоимость
+// O(matched) дистанций — приемлемо, дельта ограничена. Семантика совпадает с
+// DeltaSegment.BruteForce (эталон тестов), но по одному шарду.
+func (s *deltaShard) bruteFiltered(query []float32, K, dim int, distFn DistanceFunc, filterFn func(string) bool) []deltaResult {
+	if K <= 0 || len(s.keys) == 0 {
+		return nil
+	}
+	var matched []deltaResult
+	for i := 0; i < len(s.keys); i++ {
+		key := s.keys[i]
+		if key == "" || !filterFn(key) { // "" = tombstone
+			continue
+		}
+		matched = append(matched, deltaResult{key: key, dist: distFn(query, s.data[i*dim:(i+1)*dim])})
+	}
+	slices.SortFunc(matched, cmpDeltaResult)
+	if len(matched) > K {
+		matched = matched[:K]
+	}
+	return matched
 }
 
 func cmpDeltaResult(a, b deltaResult) int {
