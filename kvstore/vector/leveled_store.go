@@ -3,6 +3,7 @@ package vector
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
 	"runtime"
@@ -64,7 +65,7 @@ const (
 // сериализованы TenantCatalog + segmentAttrs (durability колоночного слоя); v3 —
 // hnswSegment (flat, dim>256) тоже персистит атрибуты по вектору (writeAttrs),
 // колонки+каталог регенерируются buildSegment на load. v1/v2 читаются как прежде.
-var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 4, 0, 0}
+var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 5, 0, 0}
 
 // leveledMagicPrefix — общая часть ('LVLV') для проверки формата без версии.
 var leveledMagicPrefix = [4]byte{'L', 'V', 'L', 'V'}
@@ -1615,6 +1616,13 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 	tombSnap := lvs.tombstones.Load()
 	lvs.mu.RUnlock()
 
+	// CRC32 (v5+): весь payload пишется и в w, и в hasher; 4-байтный чексум
+	// дописывается в КОНЕЦ (в out, не в hasher) и проверяется при загрузке.
+	// Защита от тихого bit-rot в graph_leveled.bin (P0-3).
+	out := w
+	hasher := crc32.NewIEEE()
+	w = io.MultiWriter(out, hasher)
+
 	// Пишем без блокировки (frozenSegment иммутабелен, hnswSegment использует свой мьютекс)
 	if _, err := w.Write(leveledMagic[:]); err != nil {
 		return fmt.Errorf("leveled: write magic: %w", err)
@@ -1745,6 +1753,12 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 		}
 	}
 
+	// CRC32-трейлер (v5+): чексум всего payload выше. Пишется в out (НЕ в hasher).
+	binary.LittleEndian.PutUint32(u4[:], hasher.Sum32())
+	if _, err := out.Write(u4[:]); err != nil {
+		return fmt.Errorf("leveled: write crc: %w", err)
+	}
+
 	return nil
 }
 
@@ -1754,7 +1768,14 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
 
-	// Проверяем магию: префикс 'LVLV' обязателен, версия в байте [5] (1 или 2).
+	// CRC32 (v5+): весь payload читаем через tee → hasher; 4-байтный трейлер
+	// читаем отдельно из crcSource (НЕ через tee) и сверяем. crcSource держит
+	// оригинальный ридер, r переключаем на tee — все ReadFull ниже идут через него.
+	crcSource := r
+	hasher := crc32.NewIEEE()
+	r = io.TeeReader(r, hasher)
+
+	// Проверяем магию: префикс 'LVLV' обязателен, версия в байте [5].
 	var magic [8]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return fmt.Errorf("leveled: read magic: %w", err)
@@ -1763,7 +1784,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: invalid magic header (not a graph_leveled.bin?)")
 	}
 	version := magic[5]
-	if version != 1 && version != 2 && version != 3 && version != 4 {
+	if version < 1 || version > 5 {
 		return fmt.Errorf("leveled: unsupported snapshot version %d", version)
 	}
 
@@ -1913,6 +1934,19 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 				tomb[string(kb)] = struct{}{}
 			}
 			lvs.tombstones.Store(&tomb)
+		}
+	}
+
+	// CRC32-трейлер (v5+): сверяем чексум всего прочитанного payload. Ловит тихий
+	// bit-rot graph_leveled.bin до того, как битые данные попадут в индекс (P0-3).
+	if version >= 5 {
+		var crcBuf [4]byte
+		if _, err := io.ReadFull(crcSource, crcBuf[:]); err != nil {
+			return fmt.Errorf("leveled: read crc: %w", err)
+		}
+		want := binary.LittleEndian.Uint32(crcBuf[:])
+		if got := hasher.Sum32(); got != want {
+			return fmt.Errorf("leveled: snapshot CRC mismatch: got %08x want %08x (повреждён graph_leveled.bin)", got, want)
 		}
 	}
 
