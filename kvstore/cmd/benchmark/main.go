@@ -66,7 +66,7 @@ func main() {
 		runBenchmark(*addr, *numConns, *numRequests, func(r *protocol.Reader, w *protocol.Writer, id int) {
 			vec := generateRandomVector(*dim)
 			minScore := float64(20 + rand.Intn(20))
-			maxScore := minScore + float64(20 + rand.Intn(20))
+			maxScore := minScore + float64(20+rand.Intn(20))
 			sendVsimSearchRange(w, 10, setName, minScore, maxScore, vec)
 			r.Read() // array response
 		})
@@ -480,4 +480,3 @@ func sendVsimSearchRange(w *protocol.Writer, k int, setName string, minScore, ma
 	}
 	return sendCommand(w, args...)
 }
-

@@ -90,8 +90,6 @@ func SliceAt(offset, length uint32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(uintptr(offset))), int(length))
 }
 
-
-
 // Get возвращает значение по ключу из KV-хранилища (копирует данные в новый слайс)
 func Get(key string) ([]byte, bool) {
 	keyBytes := []byte(key)
@@ -100,7 +98,7 @@ func Get(key string) ([]byte, bool) {
 		return nil, false
 	}
 	rawVal := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(ValueOffset))), int(valLen))
-	
+
 	res := make([]byte, valLen)
 	copy(res, rawVal)
 	return res, true
@@ -125,7 +123,6 @@ func GetViewBytes(key []byte) ([]byte, bool) {
 	}
 	return unsafe.Slice((*byte)(unsafe.Pointer(uintptr(ValueOffset))), int(valLen)), true
 }
-
 
 // Set записывает значение по ключу в KV-хранилище (с записью в WAL)
 func Set(key string, val []byte) bool {
@@ -160,7 +157,6 @@ func PublishBytes(channel, message []byte) bool {
 	res := kvPublish(ptr(channel), uint32(len(channel)), ptr(message), uint32(len(message)))
 	return res == 1
 }
-
 
 // TxBegin открывает транзакцию в контексте WASM (команды группируются)
 func TxBegin() bool {
@@ -236,7 +232,7 @@ func AIEmbed(text string) []float32 {
 
 	// Указываем на буфер результатов ai_embed
 	resBytes := unsafe.Slice((*float32)(unsafe.Pointer(uintptr(aiEmbedOffset))), int(dim))
-	
+
 	// Возвращаем копию для безопасности
 	res := make([]float32, dim)
 	copy(res, resBytes)

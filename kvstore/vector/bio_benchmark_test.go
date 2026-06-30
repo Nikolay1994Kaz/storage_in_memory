@@ -24,7 +24,7 @@ func TestBioLoadBenchmark(t *testing.T) {
 	)
 
 	fmt.Printf("\n=== БЕНЧМАРК НАГРУЗКИ: БИОИНФОРМАТИКА (Dim=%d) ===\n", dim)
-	
+
 	// Выделяем память
 	runtime.GC()
 	var mBefore runtime.MemStats
@@ -64,7 +64,7 @@ func TestBioLoadBenchmark(t *testing.T) {
 			vec[j] = fam[j] + float32(rng.NormFloat64()*0.02)
 		}
 		Normalize(vec)
-		
+
 		key := fmt.Sprintf("protein:id:%d", i)
 		if err := vs.Add(key, vec); err != nil {
 			t.Fatalf("Add error at %d: %v", i, err)
@@ -99,13 +99,13 @@ func TestBioLoadBenchmark(t *testing.T) {
 	// 2. Тест параллельного поиска (Parallel Search QPS)
 	// ---------------------------------------------------------
 	fmt.Printf("2. Запуск параллельного поиска (%d запросов на всех ядрах)...\n", numQueries)
-	
+
 	concurrency := runtime.NumCPU()
 	fmt.Printf("   - Активных ядер CPU: %d\n", concurrency)
-	
+
 	var wg sync.WaitGroup
 	queriesPerThread := numQueries / concurrency
-	
+
 	startSearch := time.Now()
 	for tId := 0; tId < concurrency; tId++ {
 		wg.Add(1)
@@ -131,26 +131,26 @@ func TestBioLoadBenchmark(t *testing.T) {
 	// 3. Тест семантического Pub/Sub (Event Routing)
 	// ---------------------------------------------------------
 	fmt.Printf("3. Нагрузочный тест семантического Pub/Sub (%d подписчиков, %d событий)...\n", numSubs, numPubs)
-	
+
 	// Подготавливаем шину данных
 	subIndex := NewVectorStoreCosine(allocator)
-	
+
 	// Имитируем сетевые соединения подписчиков
 	type mockSub struct {
 		ch      chan []byte
 		done    chan struct{}
 		msgRecv int32
 	}
-	
+
 	subs := make([]*mockSub, numSubs)
-	
+
 	// Регистрируем подписчиков в индексе интересов (привязываем к семействам)
 	for i := 0; i < numSubs; i++ {
 		subs[i] = &mockSub{
 			ch:   make(chan []byte, 100),
 			done: make(chan struct{}),
 		}
-		
+
 		famIdx := rng.Intn(numFamilies)
 		fam := families[famIdx]
 
@@ -159,7 +159,7 @@ func TestBioLoadBenchmark(t *testing.T) {
 			interestVec[j] = fam[j] + float32(rng.NormFloat64()*0.02)
 		}
 		Normalize(interestVec)
-		
+
 		key := fmt.Sprintf("sub:%d", i)
 		if err := subIndex.Add(key, interestVec); err != nil {
 			t.Fatalf("Sub register error: %v", err)
@@ -183,7 +183,7 @@ func TestBioLoadBenchmark(t *testing.T) {
 	// Поток публикации событий
 	pubStart := time.Now()
 	deliveredTotal := 0
-	
+
 	for i := 0; i < numPubs; i++ {
 		famIdx := rng.Intn(numFamilies)
 		fam := families[famIdx]
@@ -193,14 +193,14 @@ func TestBioLoadBenchmark(t *testing.T) {
 			eventVec[j] = fam[j] + float32(rng.NormFloat64()*0.02)
 		}
 		Normalize(eventVec)
-		
+
 		// Делаем семантический поиск интересов среди всех подписчиков
 		// (Имитируем поведение Hub.SemanticPublish)
 		results, err := subIndex.Search(eventVec, numSubs, nil)
 		if err != nil {
 			t.Fatalf("Event search error: %v", err)
 		}
-		
+
 		// Доставляем тем, кто проходит по порогу (threshold = 0.40)
 		for _, r := range results {
 			if r.Distance <= 0.40 {
@@ -215,9 +215,9 @@ func TestBioLoadBenchmark(t *testing.T) {
 			}
 		}
 	}
-	
+
 	pubDuration := time.Since(pubStart)
-	
+
 	// Корректно завершаем горутины
 	for i := 0; i < numSubs; i++ {
 		close(subs[i].done)

@@ -342,4 +342,3 @@ func WorkerIDFromContext(ctx context.Context) int {
 func (wle *WorkerLocalEngine) NumWorkers() int {
 	return wle.numWorkers
 }
-

@@ -35,7 +35,10 @@ func makeRandVecs(n, dim int, seed int64) [][]float32 {
 
 // brute-force ground truth для recall тестов
 func bruteForceTopK(vecs [][]float32, query []float32, K int) []int {
-	type d struct{ idx int; dist float32 }
+	type d struct {
+		idx  int
+		dist float32
+	}
 	ds := make([]d, len(vecs))
 	for i, v := range vecs {
 		ds[i] = d{i, EuclideanDistance(query, v)}

@@ -35,13 +35,13 @@ type Cluster struct {
 	stopCh         chan struct{}  // Сигнал остановки всех горутин
 	wg             sync.WaitGroup // Ожидание завершения горутин
 
-	GetKeysInSlotFunc    func(slot uint16, count int) []string
-	MigrateGetFunc       func(key string) ([]byte, bool)
-	MigrateDelFunc       func(key string)
-	MigrateSetRemoteFunc func(addr, key string, value []byte) error
+	GetKeysInSlotFunc       func(slot uint16, count int) []string
+	MigrateGetFunc          func(key string) ([]byte, bool)
+	MigrateDelFunc          func(key string)
+	MigrateSetRemoteFunc    func(addr, key string, value []byte) error
 	MigrateGetVecFunc       func(key string) ([]float32, bool)
 	MigrateSetRemoteVecFunc func(addr, key string, vec []float32) error
-	Repl                 *ReplicationManager
+	Repl                    *ReplicationManager
 }
 
 // New создаёт кластер с текущей нодой.

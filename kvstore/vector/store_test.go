@@ -424,4 +424,3 @@ func TestVectorStore_DeserializeVectorZeroCopy(t *testing.T) {
 		t.Errorf("expected nil for nil input, got %v", empty)
 	}
 }
-

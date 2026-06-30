@@ -20,14 +20,14 @@ const (
 	OpDel     byte = 2
 	OpExpire  byte = 3 // TTL: Value = 8 байт unix nano (абсолютное время смерти)
 	OpPersist byte = 4 // Убрать TTL: Value пустой
-	OpVSimAdd byte = 5  // вектор добавлен в HNSW
-	OpVSimDel byte = 6  // вектор удалён из HNSW
+	OpVSimAdd byte = 5 // вектор добавлен в HNSW
+	OpVSimDel byte = 6 // вектор удалён из HNSW
 	// OpVSimAddAttrs: вектор + атрибуты (колоночный слой). Value кодируется
 	// vector.SerializeVectorWithAttrs. Replay восстанавливает attrs/tenant через
 	// AddWithAttrs (P0-4). Эмитится write-путём, когда AddWithAttrs выходит в RESP.
 	OpVSimAddAttrs byte = 7
-	OpZAdd    byte = 16 // sorted set: Key = setName, Value = [8B score LE float64][member string]
-	OpZRem    byte = 17 // sorted set: Key = setName, Value = [member string]
+	OpZAdd         byte = 16 // sorted set: Key = setName, Value = [8B score LE float64][member string]
+	OpZRem         byte = 17 // sorted set: Key = setName, Value = [member string]
 )
 
 // maxEntrySize — защита от мусорных данных при recovery.

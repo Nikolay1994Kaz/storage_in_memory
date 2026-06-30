@@ -344,4 +344,3 @@ func (h *MHeap) Stats() (numChunks int, totalBytes int, usedBytes int, numSpans 
 func (h *MHeap) MemoryCounter() *atomic.Int64 {
 	return &h.usedBytes
 }
-

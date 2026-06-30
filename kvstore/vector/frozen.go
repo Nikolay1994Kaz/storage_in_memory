@@ -218,7 +218,6 @@ func (fg *FrozenGraph) MemoryBytes() int {
 // filterFn != nil: фильтр применяется к РЕЗУЛЬТАТАМ, не к обходу графа.
 // Это критически важно для корректности — узлы-мосты не отсекаются,
 // граф-связность сохраняется. Только в result-heap кладём те, что прошли фильтр.
-//
 func (fg *FrozenGraph) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
 	return fg.searchWithIdx(query, K, efSearch, dst, filterFn, nil)
 }

@@ -556,10 +556,10 @@ func (s *TCMallocStore) DeferFree(h Handle) {
 //
 // Алгоритм двойной буферизации:
 //
-//	 Вызов N:
-//	   1. Освобождаем deferPrev (handle'ы из вызова N-1, пролежали целый цикл)
-//	   2. deferPrev = deferCurr (текущие handle'ы — начинают ждать)
-//	   3. deferCurr = пустой (переиспользуем backing array от prev)
+//	Вызов N:
+//	  1. Освобождаем deferPrev (handle'ы из вызова N-1, пролежали целый цикл)
+//	  2. deferPrev = deferCurr (текущие handle'ы — начинают ждать)
+//	  3. deferCurr = пустой (переиспользуем backing array от prev)
 //
 // Возвращает количество освобождённых handle'ов (для мониторинга).
 func (s *TCMallocStore) FlushDeferred() int {
@@ -596,4 +596,3 @@ func (s *TCMallocStore) DeferredQueueLen() int {
 func (s *TCMallocStore) MemoryCounter() *atomic.Int64 {
 	return s.heap.MemoryCounter()
 }
-

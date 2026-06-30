@@ -29,8 +29,8 @@ import (
 
 // ivfRealIndex — IVF с реальными production frozen сегментами внутри.
 type ivfRealIndex struct {
-	centroids [][]float32        // [nlist][dim]
-	clusters  []*FrozenGraphSQ   // production SQ8 frozen graphs!
+	centroids [][]float32      // [nlist][dim]
+	clusters  []*FrozenGraphSQ // production SQ8 frozen graphs!
 	nprobe    int
 	dim       int
 }
@@ -97,8 +97,8 @@ func trainIVFReal(vecs [][]float32, nlist, M, efConstruction int) *ivfRealIndex 
 // searchTopNprobe находит nprobe ближайших кластеров.
 func (idx *ivfRealIndex) searchTopNprobe(query []float32) []int {
 	type cd struct {
-		c     int
-		dist  float32
+		c    int
+		dist float32
 	}
 	cds := make([]cd, len(idx.centroids))
 	for c := range idx.centroids {

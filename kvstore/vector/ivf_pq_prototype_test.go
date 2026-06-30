@@ -163,7 +163,7 @@ type ivfIndex struct {
 	centroids [][]float32 // [nlist][dim]
 	lists     [][]int     // [nlist] → vector indices
 	vectors   [][]float32 // все векторы (для recall)
-	nprobe   int
+	nprobe    int
 }
 
 func trainIVF(vecs [][]float32, nlist int) *ivfIndex {
@@ -198,7 +198,7 @@ func (idx *ivfIndex) nearestCentroid(v []float32) int {
 // searchTopNprobe находит nprobe ближайших кластеров к query.
 func (idx *ivfIndex) searchTopNprobe(query []float32) []int {
 	type cd struct {
-		c   int
+		c    int
 		dist float32
 	}
 	cds := make([]cd, len(idx.centroids))

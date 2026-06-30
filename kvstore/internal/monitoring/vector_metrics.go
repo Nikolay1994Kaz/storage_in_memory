@@ -89,15 +89,15 @@ type VectorStateProvider interface {
 
 // VectorStats — снимок состояния для экспорта в метрики.
 type VectorStats struct {
-	TotalVectors   int   // живых векторов (delta + segments)
-	DeltaLen       int   // векторов в активной дельте
-	DeltaMax       int   // ёмкость дельты до flush
-	Dim            int   // размерность векторов
-	MaxLevel       int   // максимальный заполненный уровень LSM
+	TotalVectors    int   // живых векторов (delta + segments)
+	DeltaLen        int   // векторов в активной дельте
+	DeltaMax        int   // ёмкость дельты до flush
+	Dim             int   // размерность векторов
+	MaxLevel        int   // максимальный заполненный уровень LSM
 	SegmentsByLevel []int // [maxLevels] — число сегментов на каждом уровне
-	Tombstones     int   // активных tombstones (не применённых merge'ем)
-	AllocatorBytes int64 // память, занятая под графы/соседей (tcmalloc)
-	DataBytes      int64 // память под векторы (float32 slab'ы frozen/hnsw)
+	Tombstones      int   // активных tombstones (не применённых merge'ем)
+	AllocatorBytes  int64 // память, занятая под графы/соседей (tcmalloc)
+	DataBytes       int64 // память под векторы (float32 slab'ы frozen/hnsw)
 }
 
 var vectorStateFunc func() VectorStats

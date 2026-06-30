@@ -129,8 +129,6 @@ func TestRPSBenchmark(t *testing.T) {
 	t.Log("═══════════════════════════════════════")
 }
 
-
-
 // benchmarkCommand запускает concurrency горутин, каждая шлёт команды в цикле duration.
 // Возвращает итоговый RPS.
 func benchmarkCommand(t *testing.T, addr string, duration time.Duration, concurrency int, fn func(net.Conn) error) int64 {

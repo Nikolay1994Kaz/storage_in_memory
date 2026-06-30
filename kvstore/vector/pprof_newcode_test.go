@@ -122,7 +122,7 @@ func TestPprofNewCode(t *testing.T) {
 		pprof.StartCPUProfile(cpuF)
 
 		for i := 0; i < nQueries; i++ {
-		_, _ = lvs.Search(query, K, nil)
+			_, _ = lvs.Search(query, K, nil)
 		}
 
 		pprof.StopCPUProfile()
@@ -166,7 +166,7 @@ func TestPprofNewCode(t *testing.T) {
 		pprof.StartCPUProfile(cpuF)
 
 		for i := 0; i < nQueries; i++ {
-		_, _ = lvs.Search(query, K, nil)
+			_, _ = lvs.Search(query, K, nil)
 		}
 
 		pprof.StopCPUProfile()

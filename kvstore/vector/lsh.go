@@ -33,8 +33,8 @@ import (
 //   - RAM:    N × 8 байт
 
 const (
-	lshNumBits   = 64    // Количество бит в хэше (= количество гиперплоскостей)
-	lshSentinel  = ^uint64(0) // 0xFFFFFFFFFFFFFFFF — sentinel для удалённых
+	lshNumBits  = 64         // Количество бит в хэше (= количество гиперплоскостей)
+	lshSentinel = ^uint64(0) // 0xFFFFFFFFFFFFFFFF — sentinel для удалённых
 )
 
 // LSHIndex — индекс Locality-Sensitive Hashing.
@@ -94,9 +94,9 @@ func NewLSHIndex(dim int, seed int64) *LSHIndex {
 // ComputeHash вычисляет 64-бит SimHash для вектора.
 //
 // Алгоритм:
-//   1. Для каждой из 64 гиперплоскостей считаем dot product с вектором
-//   2. Если dot >= 0 → бит = 1, иначе бит = 0
-//   3. Собираем 64 бита в одно uint64
+//  1. Для каждой из 64 гиперплоскостей считаем dot product с вектором
+//  2. Если dot >= 0 → бит = 1, иначе бит = 0
+//  3. Собираем 64 бита в одно uint64
 //
 // Свойство: если два вектора близки по косинусному сходству,
 // их хэши будут отличаться на малое число бит (малое расстояние Хэмминга).
@@ -211,8 +211,8 @@ func (idx *LSHIndex) Stats() LSHStats {
 		}
 	}
 	return LSHStats{
-		TotalSlots: len(idx.hashes),
-		AliveCount: alive,
+		TotalSlots:  len(idx.hashes),
+		AliveCount:  alive,
 		MemoryBytes: len(idx.hashes)*8 + len(idx.projections)*idx.dim*4,
 	}
 }

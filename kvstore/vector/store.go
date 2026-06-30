@@ -91,7 +91,6 @@ func (vs *VectorStore) SetUseLSH(use bool) {
 	vs.UseLSH = use
 }
 
-
 // Add добавляет вектор с указанным ключом.
 func (vs *VectorStore) Add(key string, vec []float32) error {
 	vs.mu.Lock()
@@ -370,4 +369,3 @@ func DeserializeVectorWithAttrs(data []byte) ([]float32, Attributes, error) {
 	}
 	return vec, attrs, nil
 }
-

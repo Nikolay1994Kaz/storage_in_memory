@@ -41,9 +41,9 @@ func TestLeveledStore_500k(t *testing.T) {
 		EfSearch:       100,
 		Distance:       EuclideanDistance,
 		// 12 билдеров = NumCPU на этом железе; полностью загружает 12 ядер.
-		NumBuilders:    12,
-		Fanout:         4,
-		UseSQ:          true,
+		NumBuilders: 12,
+		Fanout:      4,
+		UseSQ:       true,
 	})
 	defer lvs.Close()
 

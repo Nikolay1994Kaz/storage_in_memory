@@ -82,8 +82,12 @@ func (d *lcDeltaSegment) BruteForce(query []float32, K int, distFn DistanceFunc)
 
 	// Сортируем по возрастанию дистанции
 	slices.SortFunc(heap, func(a, b lcResult) int {
-		if a.dist < b.dist { return -1 }
-		if a.dist > b.dist { return 1 }
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
 		return 0
 	})
 	return heap
@@ -121,7 +125,7 @@ func lcSiftDownMax(h []lcResult, i, n int) {
 
 // lcSearchState — переиспользуемый буфер для поиска (pool как в graph.go)
 type lcSearchState struct {
-	visited []uint64 // bitset — размер (n+63)/64
+	visited []uint64       // bitset — размер (n+63)/64
 	cands   []lcSearchItem // minHeap кандидатов
 	res     []lcResult     // maxHeap результатов
 }
@@ -617,6 +621,7 @@ func BenchmarkLC_Fast_Monolith_Search_50K_dim128(b *testing.B) {
 		_ = frozen.Search(query, K, 100)
 	}
 }
+
 // Медленный вариант с dim=768
 func BenchmarkLC_Slow_Segmented_Search_5x10K_dim768(b *testing.B) {
 	benchmarkLCSegmentedSearch(b, 5, 10000, 768)
@@ -682,8 +687,12 @@ func lcMergeResults(results [][]lcResult, K int) []lcResult {
 		all = append(all, r...)
 	}
 	slices.SortFunc(all, func(a, b lcResult) int {
-		if a.dist < b.dist { return -1 }
-		if a.dist > b.dist { return 1 }
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
 		return 0
 	})
 	if len(all) > K {

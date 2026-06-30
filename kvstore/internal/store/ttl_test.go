@@ -680,4 +680,3 @@ func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
 		t.Fatal("deleted vector still exists in vector store")
 	}
 }
-

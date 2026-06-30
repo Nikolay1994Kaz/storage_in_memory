@@ -134,9 +134,9 @@ func TestLargeTenant_FilterCeiling(t *testing.T) {
 
 	// Сценарии: крупнейший тенант t4, селективность через price-диапазон.
 	type scen struct {
-		name     string
-		priceHi  float64 // -1 => без price-фильтра
-		useReg   bool    // region=r0
+		name    string
+		priceHi float64 // -1 => без price-фильтра
+		useReg  bool    // region=r0
 	}
 	scens := []scen{
 		{"r0∧price[0,124]", 124, true},

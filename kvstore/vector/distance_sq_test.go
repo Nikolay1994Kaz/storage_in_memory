@@ -136,7 +136,7 @@ func TestSQ8_AVX2_RandomVectors(t *testing.T) {
 	}
 }
 
-func timeNow() time.Time       { return time.Now() }
+func timeNow() time.Time                  { return time.Now() }
 func timeSince(t time.Time) time.Duration { return time.Since(t) }
 
 // ── helpers ──

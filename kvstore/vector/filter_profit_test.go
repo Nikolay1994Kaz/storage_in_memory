@@ -15,13 +15,14 @@ import (
 // TestFilterProfit_SelectivityCrossover доказывает (или опровергает) ДВА тезиса
 // дизайна фильтрации на РЕАЛЬНЫХ данных (SIFT-200k, dim128), без реализации фич:
 //
-//   #3  frozen post-result фильтрация: при селективном фильтре recall фильтрованного
-//       HNSW-поиска проседает (доходим до K по дистанции, ПОТОМ фильтруем → <<K попаданий).
-//   #6  brute-force по отфильтрованному блоку при высокой селективности БЫСТРЕЕ
-//       фильтрованного HNSW И точен (recall=1.0). Ищем точку кроссовера.
+//	#3  frozen post-result фильтрация: при селективном фильтре recall фильтрованного
+//	    HNSW-поиска проседает (доходим до K по дистанции, ПОТОМ фильтруем → <<K попаданий).
+//	#6  brute-force по отфильтрованному блоку при высокой селективности БЫСТРЕЕ
+//	    фильтрованного HNSW И точен (recall=1.0). Ищем точку кроссовера.
 //
 // Запуск:
-//   go test ./kvstore/vector/ -run TestFilterProfit_SelectivityCrossover -v -timeout 1200s
+//
+//	go test ./kvstore/vector/ -run TestFilterProfit_SelectivityCrossover -v -timeout 1200s
 //
 // Требует /tmp/sift200k.bin (python3 convert_sift200k.py).
 func TestFilterProfit_SelectivityCrossover(t *testing.T) {
@@ -122,7 +123,7 @@ func TestFilterProfit_SelectivityCrossover(t *testing.T) {
 // мультитенантности. Здесь filtered-HNSW может НЕ дойти до отфильтрованной области →
 // проверяем, обваливается ли recall (в отличие от равномерного фильтра, где он держался).
 //
-//   go test ./kvstore/vector/ -run TestFilterProfit_Correlated -v -timeout 1200s
+//	go test ./kvstore/vector/ -run TestFilterProfit_Correlated -v -timeout 1200s
 func TestFilterProfit_Correlated(t *testing.T) {
 	train, test, err := loadSIFTRaw("/tmp/sift200k.bin")
 	if err != nil {
@@ -209,11 +210,11 @@ func TestFilterProfit_Correlated(t *testing.T) {
 // блок тенанта vs скан всего корпуса с предикатом). Без стора — чистый brute top-K по
 // train, селективность 1%, все варианты ТОЧНЫ (recall=1.0), мерим только QPS_1thr.
 //
-//   (a) STRING:  скан всех N, предикат = map[string]tenant lookup по strconv.Itoa(id)  ← текущий API
-//   (b) UINT:    скан всех N, предикат = passSet[id] []bool                              ← #2: коды вместо строк
-//   (c) BLOCK:   итерируем ТОЛЬКО непрерывный блок тенанта (раскладка)                   ← #7: не трогаем 99% чужих
+//	(a) STRING:  скан всех N, предикат = map[string]tenant lookup по strconv.Itoa(id)  ← текущий API
+//	(b) UINT:    скан всех N, предикат = passSet[id] []bool                              ← #2: коды вместо строк
+//	(c) BLOCK:   итерируем ТОЛЬКО непрерывный блок тенанта (раскладка)                   ← #7: не трогаем 99% чужих
 //
-//   go test ./kvstore/vector/ -run TestFilterProfit_PredicateCost -v -timeout 300s
+//	go test ./kvstore/vector/ -run TestFilterProfit_PredicateCost -v -timeout 300s
 func TestFilterProfit_PredicateCost(t *testing.T) {
 	train, test, err := loadSIFTRaw("/tmp/sift200k.bin")
 	if err != nil {
@@ -329,7 +330,7 @@ func bruteQPSBlock(blockVecs, queries [][]float32, K int, dur time.Duration) flo
 // (без strconv.Atoi). Это КОНСЕРВАТИВНО: настоящий tenantCodes[idx] uint32 был бы ещё
 // дешевле (индексация слайса < хеш строки), т.е. реальный кроссовер ещё ниже.
 //
-//   go test ./kvstore/vector/ -run TestFilterProfit_Crossover -v -timeout 1200s
+//	go test ./kvstore/vector/ -run TestFilterProfit_Crossover -v -timeout 1200s
 func TestFilterProfit_Crossover(t *testing.T) {
 	train, test, err := loadSIFTRaw("/tmp/sift200k.bin")
 	if err != nil {

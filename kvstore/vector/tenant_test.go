@@ -522,7 +522,7 @@ func TestTenant_EffectiveBruteThreshold_DimAware(t *testing.T) {
 	}{
 		{"ref dim → identity", 16384, bruteDimRef, 16384},
 		{"1536d shrinks (dbpedia)", 16384, 1536, 16384 * bruteDimRef / 1536}, // ~1365
-		{"784d (mnist)", 16384, 784, 16384 * bruteDimRef / 784},             // ~2674
+		{"784d (mnist)", 16384, 784, 16384 * bruteDimRef / 784},              // ~2674
 		{"low dim grows", 16384, 64, 32768},
 		{"zero threshold → default, scaled", 0, 1536, DefaultBruteThreshold * bruteDimRef / 1536},
 		{"zero dim → no scaling", 16384, 0, 16384},

@@ -357,7 +357,7 @@ func writeSectionVectorArena(w io.Writer, va *VectorArena) error {
 
 func writeSectionNeighbors(w io.Writer, g *Graph) error {
 	count := uint32(len(g.nodes))
-	
+
 	// Сначала посчитаем размер секции
 	sectionSize := uint32(4) // count
 	for i := uint32(0); i < count; i++ {

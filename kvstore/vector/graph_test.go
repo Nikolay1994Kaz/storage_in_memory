@@ -171,9 +171,9 @@ func TestCosineDistance(t *testing.T) {
 	// Три вектора с РАЗНЫМИ длинами, но одинаковым направлением
 	// A и B смотрят в одну сторону (Cosine distance ≈ 0)
 	// C смотрит в другую (Cosine distance ≈ 2)
-	g.Insert([]float32{1, 0})   // A: вправо
-	g.Insert([]float32{100, 0}) // B: тоже вправо, но "длиннее"
-	idC := g.Insert([]float32{0, 1})   // C: вверх (перпендикулярно)
+	g.Insert([]float32{1, 0})        // A: вправо
+	g.Insert([]float32{100, 0})      // B: тоже вправо, но "длиннее"
+	idC := g.Insert([]float32{0, 1}) // C: вверх (перпендикулярно)
 
 	// Запрос: вектор "вправо" — A и B должны быть ближайшими
 	results := g.Search([]float32{5, 0}, 2, 10)
@@ -759,4 +759,3 @@ func TestSearchState_VisitedAndAcquire(t *testing.T) {
 		}
 	}
 }
-

@@ -117,7 +117,7 @@ func TestVectorStore_BinarySnapshotRoundTrip(t *testing.T) {
 func TestVectorStore_BinarySnapshotErrorHandling(t *testing.T) {
 	dim := 128
 	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
-	
+
 	// Вставляем пару векторов
 	_ = vs.Add("v1", generateRandomVector(dim))
 	_ = vs.Add("v2", generateRandomVector(dim))
@@ -154,7 +154,7 @@ func TestVectorStore_BinarySnapshotErrorHandling(t *testing.T) {
 
 func TestVectorStore_BinarySnapshotEmptyGraph(t *testing.T) {
 	vsSource := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
-	
+
 	var buf bytes.Buffer
 	if err := vsSource.SaveBinary(&buf); err != nil {
 		t.Fatalf("SaveBinary failed on empty store: %v", err)

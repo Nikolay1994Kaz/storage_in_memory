@@ -41,12 +41,12 @@ func FuzzDecodeEntry(f *testing.F) {
 	f.Add(encodeEntry(Entry{Op: OpSet, Key: "empty-val", Value: nil}))
 
 	// Граничные случаи
-	f.Add([]byte{})                                        // пустой вход
-	f.Add([]byte{0})                                       // 1 байт
-	f.Add([]byte{0, 0, 0, 0, 0})                           // минимальный размер (Op + keyLen=0)
-	f.Add([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF})            // максимальные значения
-	f.Add([]byte{1, 0xFF, 0xFF, 0xFF, 0xFF})               // Op=1, keyLen=MaxUint32
-	f.Add([]byte{1, 0, 0, 0, 0})                           // Op=1, keyLen=0, no value
+	f.Add([]byte{})                                       // пустой вход
+	f.Add([]byte{0})                                      // 1 байт
+	f.Add([]byte{0, 0, 0, 0, 0})                          // минимальный размер (Op + keyLen=0)
+	f.Add([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF})           // максимальные значения
+	f.Add([]byte{1, 0xFF, 0xFF, 0xFF, 0xFF})              // Op=1, keyLen=MaxUint32
+	f.Add([]byte{1, 0, 0, 0, 0})                          // Op=1, keyLen=0, no value
 	f.Add([]byte{1, 3, 0, 0, 0, 'a', 'b', 'c', 'd', 'e'}) // key="abc", value="de"
 
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -105,8 +105,9 @@ func FuzzReadEntriesFromBytes(f *testing.F) {
 // FuzzEncodeDecodeRoundtrip — property-based тест: encode(decode(x)) == x.
 //
 // Для ЛЮБОГО валидного Entry:
-//   entry → encodeEntry → decodeEntry → entry'
-//   entry' ДОЛЖЕН быть идентичен entry.
+//
+//	entry → encodeEntry → decodeEntry → entry'
+//	entry' ДОЛЖЕН быть идентичен entry.
 //
 // Это проверяет что encode/decode — обратные операции,
 // и данные не теряются/не искажаются при сериализации.
@@ -117,8 +118,8 @@ func FuzzEncodeDecodeRoundtrip(f *testing.F) {
 	f.Add(byte(OpPersist), "persist", []byte{})
 	f.Add(byte(OpVSimAdd), "vec:embedding", []byte("float32-data-here"))
 	f.Add(byte(OpVSimDel), "vec:old", []byte{})
-	f.Add(byte(0), "", []byte{})           // пустой ключ и значение
-	f.Add(byte(255), "max-op", []byte{0})  // несуществующий Op
+	f.Add(byte(0), "", []byte{})          // пустой ключ и значение
+	f.Add(byte(255), "max-op", []byte{0}) // несуществующий Op
 
 	f.Fuzz(func(t *testing.T, op byte, key string, value []byte) {
 		original := Entry{Op: op, Key: key, Value: value}

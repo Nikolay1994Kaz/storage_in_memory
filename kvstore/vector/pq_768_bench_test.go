@@ -21,8 +21,8 @@ func TestBench_Dim768_Float32_vs_SQ8_vs_PQ(t *testing.T) {
 		t.Skip("Dim 768 scale benchmark is slow")
 	}
 
-	const n = 20000    // 20k векторов для быстрого теста
-	const dim = 768    // Целевая размерность (BERT, sentence-transformers)
+	const n = 20000 // 20k векторов для быстрого теста
+	const dim = 768 // Целевая размерность (BERT, sentence-transformers)
 	const testSecs = 3 * time.Second
 
 	// 1. Генерируем реальные по структуре векторы (нормальное распределение)
@@ -69,9 +69,9 @@ func TestBench_Dim768_Float32_vs_SQ8_vs_PQ(t *testing.T) {
 	pq := trainPQ(vecs, 32)
 
 	// 3. Считаем память на 1 вектор
-	memFloat32 := dim * 4     // 3072 байта
-	memSQ8 := dim             // 768 байт
-	memPQ := pq.M             // 32 байта
+	memFloat32 := dim * 4 // 3072 байта
+	memSQ8 := dim         // 768 байт
+	memPQ := pq.M         // 32 байта
 
 	// 4. Запускаем честные вычисления дистанций (ядро поиска HNSW)
 	// Float32 (AVX2 в production)

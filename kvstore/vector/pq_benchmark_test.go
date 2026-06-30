@@ -20,12 +20,12 @@ import (
 // Разбивает вектор dim=D на M подвекторов по dsub=D/M элементов.
 // Каждый подвектор квантуется в 1 байт (256 центроидов через k-means).
 type PQIndex struct {
-	dim       int          // исходная размерность (768)
-	m         int          // кол-во подвекторов (96)
-	dsub      int          // размер подвектора (8)
-	centroids []float32    // [m * 256 * dsub] — все центроиды
-	codes     []byte       // [n * m] — сжатые коды всех векторов
-	n         int          // кол-во закодированных векторов
+	dim       int       // исходная размерность (768)
+	m         int       // кол-во подвекторов (96)
+	dsub      int       // размер подвектора (8)
+	centroids []float32 // [m * 256 * dsub] — все центроиды
+	codes     []byte    // [n * m] — сжатые коды всех векторов
+	n         int       // кол-во закодированных векторов
 }
 
 // NewPQIndex создаёт PQ с m подвекторами.
@@ -184,8 +184,8 @@ func (pq *PQIndex) DistancePQ(distTable []float32, i int) float32 {
 
 func TestPQBenchmark(t *testing.T) {
 	const (
-		dim   = 768
-		m     = 96   // подвекторов (768/96 = 8 floats каждый)
+		dim = 768
+		m   = 96 // подвекторов (768/96 = 8 floats каждый)
 	)
 
 	sizes := []int{10_000, 50_000, 150_000}

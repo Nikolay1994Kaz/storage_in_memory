@@ -71,7 +71,8 @@ func getU32(r io.Reader) (uint32, error) {
 // hnsw-сегмент на load перестраивается через buildSegment(entries), который сам
 // регенерирует колонки+каталог из entries[].Attrs — поэтому колонки не пишем, а
 // едем атрибутами по вектору (симметрично decodeAt при merge). Формат:
-//   nCat(u32): [name(str) value(str)]×nCat ; nNum(u32): [name(str) value(f64)]×nNum
+//
+//	nCat(u32): [name(str) value(str)]×nCat ; nNum(u32): [name(str) value(f64)]×nNum
 func writeAttrs(w io.Writer, a Attributes) error {
 	if err := putU32(w, uint32(len(a.Cat))); err != nil {
 		return err

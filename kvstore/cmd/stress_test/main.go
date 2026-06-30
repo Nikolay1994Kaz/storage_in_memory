@@ -25,15 +25,15 @@ import (
 
 // ANSI colors for beautiful CLI output
 const (
-	ColorReset  = "\033[0m"
-	ColorRed    = "\033[31m"
-	ColorGreen  = "\033[32m"
-	ColorYellow = "\033[33m"
-	ColorBlue   = "\033[34m"
-	ColorMagenta= "\033[35m"
-	ColorCyan   = "\033[36m"
-	ColorWhite  = "\033[37m"
-	ColorBold   = "\033[1m"
+	ColorReset   = "\033[0m"
+	ColorRed     = "\033[31m"
+	ColorGreen   = "\033[32m"
+	ColorYellow  = "\033[33m"
+	ColorBlue    = "\033[34m"
+	ColorMagenta = "\033[35m"
+	ColorCyan    = "\033[36m"
+	ColorWhite   = "\033[37m"
+	ColorBold    = "\033[1m"
 )
 
 func main() {
@@ -127,8 +127,6 @@ func runPhase1(addr string) {
 	numVec := 500
 	dim := 128
 
-
-
 	// Загрузка KV
 	kvStart := time.Now()
 	for i := 0; i < numKV; i++ {
@@ -138,7 +136,7 @@ func runPhase1(addr string) {
 		r.Read()
 	}
 	kvDuration := time.Since(kvStart)
-	fmt.Printf("  ✅ Успешно записано %s%d KV-записей%s в базу за %v (RPS: %.0f)\n", 
+	fmt.Printf("  ✅ Успешно записано %s%d KV-записей%s в базу за %v (RPS: %.0f)\n",
 		ColorGreen, numKV, ColorReset, kvDuration.Round(time.Millisecond), float64(numKV)/kvDuration.Seconds())
 
 	// Загрузка векторов
@@ -154,7 +152,7 @@ func runPhase1(addr string) {
 		r.Read()
 	}
 	vecDuration := time.Since(vecStart)
-	fmt.Printf("  ✅ Успешно добавлено %s%d векторов (dim=%d)%s за %v (RPS: %.0f)\n\n", 
+	fmt.Printf("  ✅ Успешно добавлено %s%d векторов (dim=%d)%s за %v (RPS: %.0f)\n\n",
 		ColorGreen, numVec, dim, ColorReset, vecDuration.Round(time.Millisecond), float64(numVec)/vecDuration.Seconds())
 }
 
@@ -321,8 +319,8 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 						// 10% VSIM.SEARCHRANGE (B+Tree + HNSW)
 						minScore := rng.Float64() * 10
 						maxScore := minScore + 5.0
-						args := []string{"VSIM.SEARCHRANGE", "10", "benchset", 
-							strconv.FormatFloat(minScore, 'f', 2, 64), 
+						args := []string{"VSIM.SEARCHRANGE", "10", "benchset",
+							strconv.FormatFloat(minScore, 'f', 2, 64),
 							strconv.FormatFloat(maxScore, 'f', 2, 64)}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
@@ -374,7 +372,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		
+
 		var logInterval time.Duration
 		if testDuration > 10*time.Minute {
 			logInterval = 1 * time.Minute
@@ -383,10 +381,10 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 		} else {
 			logInterval = 1 * time.Second
 		}
-		
+
 		ticker := time.NewTicker(logInterval)
 		defer ticker.Stop()
-		
+
 		startTime := time.Now()
 		var lastCompleted int64
 
@@ -399,12 +397,12 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 				currCompleted := completedOps.Load()
 				diff := currCompleted - lastCompleted
 				lastCompleted = currCompleted
-				
+
 				rps := float64(diff) / logInterval.Seconds()
 				memBytes := getServerMemory(metricsAddr)
 				memMB := memBytes / 1024 / 1024
 				vecCount := getVectorCount(addr)
-				
+
 				fmt.Printf("  ⏱️  [%s] Прогресс: %s/%s | Текущий RPS: %s%.0f%s | Ошибок: %s%d%s | Память: %.2f MB | Векторов: %d\n",
 					time.Now().Format("15:04:05"),
 					elapsed.Round(time.Second),
@@ -413,7 +411,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 					GetErrorColor(errorOps.Load()), errorOps.Load(), ColorReset,
 					memMB, vecCount,
 				)
-				
+
 				if elapsed >= testDuration {
 					return
 				}
@@ -442,9 +440,9 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 
 	fmt.Printf("\n  📊 %sРезультаты стресс-теста под нагрузкой:%s\n", ColorBold, ColorReset)
 	fmt.Printf("    - Всего успешных транзакций:  %s%d%s\n", ColorGreen, total, ColorReset)
-	fmt.Printf("    - Ошибок / падений системы:  %s%d%s\n", 
+	fmt.Printf("    - Ошибок / падений системы:  %s%d%s\n",
 		GetErrorColor(errors), errors, ColorReset)
-	fmt.Printf("    - Средний RPS системы:       %s%.0f req/sec%s\n", 
+	fmt.Printf("    - Средний RPS системы:       %s%.0f req/sec%s\n",
 		ColorCyan, float64(total)/testDuration.Seconds(), ColorReset)
 	fmt.Printf("    - Задержка p50 (Медиана):     %v\n", p50)
 	fmt.Printf("    - Задержка p95 (95%% клиентов): %v\n", p95)
@@ -476,14 +474,14 @@ func runPhase4(addr string) {
 	fmt.Printf("  📝 Состояние системы перед сбоем: KV записей: %d, Векторный индекс: %s\n", preCrashCount, preCrashVecInfo)
 
 	fmt.Printf("  %s💥 Имитируем аварийное выключение (SIGKILL / kill -9)...%s\n", ColorRed, ColorReset)
-	
+
 	cmd := exec.Command("pgrep", "-f", "kvstore-server")
 	out, err := cmd.Output()
 	if err != nil {
 		fmt.Printf("    Не удалось найти процесс сервера! Убедитесь, что сервер запущен как ./kvstore-server\n")
 		return
 	}
-	
+
 	pids := strings.Fields(string(out))
 	for _, pidStr := range pids {
 		pid, _ := strconv.Atoi(pidStr)
@@ -493,7 +491,7 @@ func runPhase4(addr string) {
 	fmt.Println("    💀 Сервер успешно «упал». Подключение невозможно.")
 
 	fmt.Printf("  %s🔄 Перезапуск сервера и автоматическое восстановление из лога WAL...%s\n", ColorYellow, ColorReset)
-	
+
 	runCmd := exec.Command("./kvstore-server", "--port", "6380")
 	runCmd.Stdout = nil
 	runCmd.Stderr = nil
@@ -502,7 +500,7 @@ func runPhase4(addr string) {
 		fmt.Printf("    Не удалось запустить сервер: %v\n", err)
 		return
 	}
-	
+
 	time.Sleep(3 * time.Second)
 
 	conn2, err := net.Dial("tcp", addr)
@@ -546,7 +544,7 @@ func runPhase4(addr string) {
 	postVectors, postDim, _ := parseVecInfo(postCrashVecInfo)
 
 	if postCrashCount == preCrashCount && preVectors == postVectors && preDim == postDim {
-		fmt.Printf("  %s✅ [WAL ВЕРИФИЦИРОВАН] Восстановление прошло со 100%% точностью! Ни один байт данных не был утерян!%s\n\n", 
+		fmt.Printf("  %s✅ [WAL ВЕРИФИЦИРОВАН] Восстановление прошло со 100%% точностью! Ни один байт данных не был утерян!%s\n\n",
 			ColorGreen, ColorReset)
 	} else {
 		fmt.Printf("  %s❌ [ОШИБКА ДАННЫХ] Обнаружено несовпадение данных после краша!%s\n\n", ColorRed, ColorReset)
@@ -560,11 +558,11 @@ func runPhase5() {
 	fmt.Printf("%s[ФАЗА 5] Проверка лимитов оперативной памяти и OOM-защиты (Out Of Memory Prevention)...%s\n", ColorBold+ColorCyan, ColorReset)
 
 	const tempPort = 6389
-	const maxMemMB = 10 
+	const maxMemMB = 10
 
 	fmt.Printf("  🔒 Запуск тестового инстанса сервера с лимитом -maxmemory %d MB на порту %d...\n", maxMemMB, tempPort)
 	tempAddr := fmt.Sprintf("localhost:%d", tempPort)
-	
+
 	tempCmd := exec.Command("./kvstore-server", "--port", strconv.Itoa(tempPort), "--maxmemory", strconv.Itoa(maxMemMB))
 	tempCmd.Start()
 	defer func() {
@@ -585,10 +583,10 @@ func runPhase5() {
 	w := protocol.NewWriter(conn)
 	r := protocol.NewReader(conn)
 
-	largeVal := strings.Repeat("A", 100*1024) 
+	largeVal := strings.Repeat("A", 100*1024)
 
 	fmt.Println("  📥 Агрессивно наполняем сервер данными для достижения лимита в 10 МБ...")
-	
+
 	var oomBlocked bool
 	for i := 0; i < 200; i++ {
 		key := fmt.Sprintf("oom_check:%d", i)
@@ -596,7 +594,7 @@ func runPhase5() {
 		if err != nil {
 			break
 		}
-		
+
 		res, readErr := r.Read()
 		if readErr != nil {
 			break
@@ -604,14 +602,14 @@ func runPhase5() {
 
 		if res.Typ == '-' && strings.Contains(res.Str, "OOM") {
 			oomBlocked = true
-			fmt.Printf("    %s🛡️  [OOM БЛОКИРОВКА АКТИВИРОВАНА] Сервер успешно заблокировал запись на ключе %d с ошибкой: \"%s\"%s\n", 
+			fmt.Printf("    %s🛡️  [OOM БЛОКИРОВКА АКТИВИРОВАНА] Сервер успешно заблокировал запись на ключе %d с ошибкой: \"%s\"%s\n",
 				ColorYellow, i, res.Str, ColorReset)
 			break
 		}
 	}
 
 	if oomBlocked {
-		fmt.Printf("  %s✅ [OOM ЗАЩИТА ВЕРИФИЦИРОВАНА] Система гарантирует стабильность и никогда не упадет по нехватке памяти ОС!%s\n\n", 
+		fmt.Printf("  %s✅ [OOM ЗАЩИТА ВЕРИФИЦИРОВАНА] Система гарантирует стабильность и никогда не упадет по нехватке памяти ОС!%s\n\n",
 			ColorGreen, ColorReset)
 	} else {
 		fmt.Printf("  %s❌ [ОШИБКА] Лимит памяти не был сдержан, OOM защита не сработала!%s\n\n", ColorRed, ColorReset)
@@ -681,7 +679,7 @@ func runAssemblyValidation() {
 				ColorRed, dim, asmDot, goDot, diffDot, diffDot/maxValDot, ColorReset)
 			os.Exit(1)
 		}
-		
+
 		// 3. Тестируем Cosine Distance
 		asmCosine := vector.CosineDistance(a, b)
 		// Pure Go Cosine Distance

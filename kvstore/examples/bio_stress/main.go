@@ -179,7 +179,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		localRng := rand.New(rand.NewSource(2026))
-		
+
 		// Будем держать ID вставляемых белков в диапазоне, чтоб база не росла бесконечно
 		insertID := initSize
 
@@ -222,12 +222,12 @@ func main() {
 				newKey := fmt.Sprintf("protein:id:%d", insertID)
 				vs.Add(newKey, newVec)
 				writeToWAL(wal.OpVSimAdd, newKey, newVec)
-				
+
 				// И сразу удаляем самый старый из добавленных, сохраняя размер около 10k
 				oldKey := fmt.Sprintf("protein:id:%d", insertID-initSize)
 				vs.Delete(oldKey)
 				writeToWAL(wal.OpVSimDel, oldKey, nil)
-				
+
 				insertID++
 			}
 			atomic.AddUint64(&writeCount, 20)
@@ -242,13 +242,13 @@ func main() {
 	defer logTicker.Stop()
 
 	fmt.Println("🚀 Stress test running. Check metrics in stdout.")
-	
+
 	for {
 		select {
 		case <-logTicker.C:
 			elapsed := time.Since(startTime)
 			remaining := time.Until(endTime)
-			
+
 			// Собираем метрики памяти
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
@@ -260,23 +260,23 @@ func main() {
 			if fi, err := os.Stat(walPath); err == nil {
 				walSizeMB = float64(fi.Size()) / (1024 * 1024)
 			}
-			
-			fmt.Printf("[%s] Elapsed: %s | Remaining: %s\n", 
-				time.Now().Format("15:04:05"), 
-				elapsed.Round(time.Second), 
+
+			fmt.Printf("[%s] Elapsed: %s | Remaining: %s\n",
+				time.Now().Format("15:04:05"),
+				elapsed.Round(time.Second),
 				remaining.Round(time.Second),
 			)
-			fmt.Printf("   - Searches executed:  %d (%.2f QPS)\n", 
-				atomic.LoadUint64(&searchCount), 
+			fmt.Printf("   - Searches executed:  %d (%.2f QPS)\n",
+				atomic.LoadUint64(&searchCount),
 				float64(atomic.LoadUint64(&searchCount))/elapsed.Seconds(),
 			)
 			fmt.Printf("   - Events published:   %d\n", atomic.LoadUint64(&pubCount))
 			fmt.Printf("   - Messages delivered: %d\n", atomic.LoadUint64(&deliveredCount))
-			fmt.Printf("   - DB Mutations (ops): %d (%.2f wps)\n", 
+			fmt.Printf("   - DB Mutations (ops): %d (%.2f wps)\n",
 				atomic.LoadUint64(&writeCount),
 				float64(atomic.LoadUint64(&writeCount))/elapsed.Seconds(),
 			)
-			fmt.Printf("   - WAL Entries Written:%d (%.2f ops/sec)\n", 
+			fmt.Printf("   - WAL Entries Written:%d (%.2f ops/sec)\n",
 				atomic.LoadUint64(&walCount),
 				float64(atomic.LoadUint64(&walCount))/elapsed.Seconds(),
 			)
@@ -288,12 +288,12 @@ func main() {
 			if remaining <= 0 {
 				fmt.Println("⏳ Stress test time completed. Stopping workers...")
 				atomic.StoreUint32(&stop, 1)
-				
+
 				// Завершаем фоновые горутины подписчиков
 				for i := 0; i < numSubs; i++ {
 					close(subs[i].done)
 				}
-				
+
 				wg.Wait()
 				fmt.Println("🎉 STRESS TEST SUCCESSFULLY COMPLETED!")
 				return
