@@ -20,6 +20,17 @@ const (
 	maxBulkSize = 512 * 1024 * 1024
 )
 
+// maxRbufSize — потолок роста буфера чтения. Даже с кэпом на bulk-длину остаётся
+// вектор: клиент льёт байты БЕЗ \r\n (inline без перевода строки) → peekLine
+// всегда false → парсер не делает прогресс → ReadFromConn/TryRead удваивают rbuf
+// без предела → mem-DoS. По достижении потолка без полного кадра ставим protoErr.
+//
+// Запас readBufSize над maxBulkSize нужен, чтобы легитимный кадр максимального
+// bulk ("$<512МБ>\r\n<512МБ>\r\n" + рамка/пайплайн) поместился целиком.
+//
+// var (не const) — тесты понижают потолок, чтобы не аллоцировать 512 МБ.
+var maxRbufSize = maxBulkSize + readBufSize
+
 // ConnBuf — per-connection zero-alloc буфер чтения/записи.
 //
 // Заменяет: bufio.Reader + bufio.Writer + protocol.Value + Marshal().
@@ -76,14 +87,37 @@ func NewConnBuf(conn net.Conn) *ConnBuf {
 // READ SIDE
 // ══════════════════════════════════════════════════
 
+// ensureSpace гарантирует место в rbuf для следующего read.
+//
+// Если буфер заполнен — удваивает его, но НЕ выше maxRbufSize. По достижении
+// потолка без полного кадра (клиент льёт данные, парсер не делает прогресс)
+// выставляет protoErr и возвращает false: расти больше нельзя, соединение надо
+// закрыть. Это закрывает mem-DoS через неограниченный рост буфера (напр. inline
+// без \r\n), который кэп maxBulkSize сам по себе не ловит.
+func (cb *ConnBuf) ensureSpace() bool {
+	if cb.rend < len(cb.rbuf) {
+		return true // место ещё есть
+	}
+	if len(cb.rbuf) >= maxRbufSize {
+		cb.protoErr = true
+		return false
+	}
+	newSize := len(cb.rbuf) * 2
+	if newSize > maxRbufSize {
+		newSize = maxRbufSize
+	}
+	newBuf := make([]byte, newSize)
+	copy(newBuf, cb.rbuf)
+	cb.rbuf = newBuf
+	return true
+}
+
 // ReadFromConn читает данные из TCP сокета в буфер.
 // Перед чтением компактифицирует буфер.
 func (cb *ConnBuf) ReadFromConn() (int, error) {
 	cb.compact()
-	if cb.rend == len(cb.rbuf) {
-		newBuf := make([]byte, len(cb.rbuf)*2)
-		copy(newBuf, cb.rbuf)
-		cb.rbuf = newBuf
+	if !cb.ensureSpace() {
+		return 0, nil // потолок rbuf достигнут, protoErr выставлен → handleConn закроет
 	}
 	n, err := cb.conn.Read(cb.rbuf[cb.rend:])
 	if n > 0 {
@@ -109,10 +143,8 @@ func (cb *ConnBuf) TryRead() int {
 		return 0
 	}
 	cb.compact()
-	if cb.rend == len(cb.rbuf) {
-		newBuf := make([]byte, len(cb.rbuf)*2)
-		copy(newBuf, cb.rbuf)
-		cb.rbuf = newBuf
+	if !cb.ensureSpace() {
+		return 0 // потолок rbuf достигнут, protoErr выставлен → handleConn закроет
 	}
 
 	var nRead int

@@ -174,6 +174,12 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 	}()
 
 	n, err := cs.Buf.ReadFromConn()
+	// ReadFromConn ставит ProtoErr, когда rbuf упёрся в потолок maxRbufSize
+	// (клиент льёт данные без завершённого кадра → mem-DoS). Рвём с ошибкой.
+	if cs.Buf.ProtoErr() {
+		s.closeProtoErr(w, cs)
+		return
+	}
 	if n == 0 || err != nil {
 		w.epoll.Remove(cs)
 		return
@@ -189,12 +195,10 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 			s.handler(cs, args)
 		}
 
-		// Нарушение протокола (напр. невалидная bulk-длина): битый кадр нельзя
-		// «дождать» — он навсегда застрянет в буфере. Отвечаем ошибкой и рвём conn.
+		// Нарушение протокола (невалидная/огромная bulk-длина, count > maxArgs):
+		// битый кадр нельзя «дождать» — он застрянет в буфере. Рвём conn с ошибкой.
 		if cs.Buf.ProtoErr() {
-			cs.Buf.WriteError("ERR Protocol error: invalid bulk length")
-			cs.Buf.Flush()
-			w.epoll.Remove(cs)
+			s.closeProtoErr(w, cs)
 			return
 		}
 
@@ -205,8 +209,23 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 		// Есть данные — продолжаем обработку
 	}
 
+	// TryRead в greedy-цикле тоже мог упереться в потолок rbuf.
+	if cs.Buf.ProtoErr() {
+		s.closeProtoErr(w, cs)
+		return
+	}
+
 	// Один write() для ВСЕХ ответов (включая greedy drain)
 	cs.Buf.Flush()
+}
+
+// closeProtoErr отвечает RESP-ошибкой и закрывает соединение при нарушении
+// протокола или достижении потолка буфера. Битый/негодный кадр нельзя «дождать»,
+// поэтому соединение рвётся (защита от wedge и mem-DoS).
+func (s *Server) closeProtoErr(w *worker, cs *ConnState) {
+	cs.Buf.WriteError("ERR Protocol error")
+	cs.Buf.Flush()
+	w.epoll.Remove(cs)
 }
 
 // Stop останавливает сервер.
