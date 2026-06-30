@@ -64,7 +64,7 @@ const (
 // сериализованы TenantCatalog + segmentAttrs (durability колоночного слоя); v3 —
 // hnswSegment (flat, dim>256) тоже персистит атрибуты по вектору (writeAttrs),
 // колонки+каталог регенерируются buildSegment на load. v1/v2 читаются как прежде.
-var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 3, 0, 0}
+var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 4, 0, 0}
 
 // leveledMagicPrefix — общая часть ('LVLV') для проверки формата без версии.
 var leveledMagicPrefix = [4]byte{'L', 'V', 'L', 'V'}
@@ -1610,6 +1610,9 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 			copy(snapLevels[i], level)
 		}
 	}
+	// Снимаем tombstone-срез под тем же RLock — он консистентен с указателями
+	// сегментов (множество удалённых ⊆ актуальному набору сегментов).
+	tombSnap := lvs.tombstones.Load()
 	lvs.mu.RUnlock()
 
 	// Пишем без блокировки (frozenSegment иммутабелен, hnswSegment использует свой мьютекс)
@@ -1717,6 +1720,31 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 			}
 		}
 	}
+
+	// Tombstones (v4+): ключи, удалённые из иммутабельных сегментов, но ещё не
+	// вырезанные физически (это делает merge). Без их персиста Delete не переживает
+	// рестарт — вектор остаётся в данных сегмента и «воскресает» (см. P0-1).
+	var tcount uint32
+	if tombSnap != nil {
+		tcount = uint32(len(*tombSnap))
+	}
+	binary.LittleEndian.PutUint32(u4[:], tcount)
+	if _, err := w.Write(u4[:]); err != nil {
+		return fmt.Errorf("leveled: write nTombstones: %w", err)
+	}
+	if tombSnap != nil {
+		var tklen [2]byte
+		for key := range *tombSnap {
+			binary.LittleEndian.PutUint16(tklen[:], uint16(len(key)))
+			if _, err := w.Write(tklen[:]); err != nil {
+				return fmt.Errorf("leveled: write tombstoneKeyLen: %w", err)
+			}
+			if _, err := io.WriteString(w, key); err != nil {
+				return fmt.Errorf("leveled: write tombstoneKey: %w", err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1735,7 +1763,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: invalid magic header (not a graph_leveled.bin?)")
 	}
 	version := magic[5]
-	if version != 1 && version != 2 && version != 3 {
+	if version != 1 && version != 2 && version != 3 && version != 4 {
 		return fmt.Errorf("leveled: unsupported snapshot version %d", version)
 	}
 
@@ -1859,6 +1887,32 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 			default:
 				return fmt.Errorf("leveled: unknown segType=%d at [%d][%d]", segType, lyr, si)
 			}
+		}
+	}
+
+	// Tombstones (v4+): восстанавливаем множество удалённых-но-не-вырезанных ключей.
+	// Без этого удаления, сделанные до снапшота, «воскресают» после рестарта (P0-1).
+	// Старые снапшоты (v<4) секции не имеют → мапа остаётся пустой (прежнее поведение).
+	if version >= 4 {
+		if _, err := io.ReadFull(r, u4[:]); err != nil {
+			return fmt.Errorf("leveled: read nTombstones: %w", err)
+		}
+		tcount := int(binary.LittleEndian.Uint32(u4[:]))
+		if tcount > 0 {
+			tomb := make(map[string]struct{}, tcount)
+			var tklen [2]byte
+			for i := 0; i < tcount; i++ {
+				if _, err := io.ReadFull(r, tklen[:]); err != nil {
+					return fmt.Errorf("leveled: read tombstoneKeyLen[%d]: %w", i, err)
+				}
+				kl := int(binary.LittleEndian.Uint16(tklen[:]))
+				kb := make([]byte, kl)
+				if _, err := io.ReadFull(r, kb); err != nil {
+					return fmt.Errorf("leveled: read tombstoneKey[%d]: %w", i, err)
+				}
+				tomb[string(kb)] = struct{}{}
+			}
+			lvs.tombstones.Store(&tomb)
 		}
 	}
 
