@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"sync/atomic"
 	"time"
+
+	"kvstore/kvstore/internal/monitoring"
 )
 
 const (
@@ -71,6 +73,14 @@ type Server struct {
 	// reader, блокирующего горутину воркера. 0 = без дедлайна.
 	WriteTimeout time.Duration
 
+	// MaxConnections — потолок одновременных соединений (защита от исчерпания
+	// fd/RAM). 0 = без лимита. Сверх лимита acceptLoop сразу закрывает новый conn.
+	MaxConnections int
+
+	// activeConns — текущее число живых соединений (общий счётчик по всем epoll;
+	// inc в Epoll.Add, dec в Epoll.Remove). Читается acceptLoop для проверки лимита.
+	activeConns atomic.Int64
+
 	// stopping — выставляется в Stop(); воркеры выходят из eventLoop, а не
 	// крутятся в tight-loop на EpollWait-ошибке после закрытия epoll-fd.
 	stopping atomic.Bool
@@ -108,6 +118,7 @@ func (s *Server) Start() error {
 		if err != nil {
 			return fmt.Errorf("failed to create epoll for worker %d: %w", i, err)
 		}
+		ep.connCount = &s.activeConns // общий счётчик соединений на все воркеры
 		s.workers[i] = &worker{id: i, epoll: ep}
 
 		go s.eventLoop(s.workers[i])
@@ -135,6 +146,16 @@ func (s *Server) acceptLoop() {
 			}
 			log.Printf("Accept error: %v", err)
 			return
+		}
+
+		// Потолок одновременных соединений: защита от исчерпания fd/RAM. Сразу
+		// рвём лишнее соединение, не регистрируя его в epoll (не выделяя rbuf).
+		// acceptLoop — единственная горутина-аксептор, поэтому проверка-перед-Add
+		// без гонки: предыдущее соединение уже учтено (Add синхронный) к этому шагу.
+		if s.MaxConnections > 0 && s.activeConns.Load() >= int64(s.MaxConnections) {
+			conn.Close()
+			monitoring.ConnRejected.Inc()
+			continue
 		}
 
 		w := s.nextWorker()

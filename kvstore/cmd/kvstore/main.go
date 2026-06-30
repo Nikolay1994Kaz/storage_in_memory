@@ -64,6 +64,7 @@ func main() {
 	metricsPort := flag.Int("metrics-port", 9090, "порт для HTTP сервера метрик VictoriaMetrics (0 = отключен)")
 	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute, "закрывать соединение после простоя без активности (защита от Slowloris/брошенных conn; 0 = выключено)")
 	writeTimeout := flag.Duration("write-timeout", 30*time.Second, "макс. время на отправку ответа клиенту (защита от застрявшего reader; 0 = выключено)")
+	maxConnections := flag.Int("max-connections", 10000, "потолок одновременных соединений (защита от исчерпания fd/RAM; 0 = без лимита). Требует соответствующего ulimit -n")
 	hnswM := flag.Int("hnsw-m", 32, "HNSW M parameter (number of node connections)")
 	hnswEfConstruction := flag.Int("hnsw-ef-construction", 400, "HNSW efConstruction parameter")
 	hnswEfSearch := flag.Int("hnsw-ef-search", 100, "HNSW efSearch parameter (0 = auto). 100 = рабочая точка recall@10≈0.966 на MNIST-784, ~1.56× QPS vs 200 (recall 0.983). См. step_profit_test.go:TestStep2_EfSearch")
@@ -581,6 +582,7 @@ func main() {
 	srv := server.NewServer(listenAddr, handler)
 	srv.IdleTimeout = *idleTimeout
 	srv.WriteTimeout = *writeTimeout
+	srv.MaxConnections = *maxConnections
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
 	if *tlsCert != "" && *tlsKey != "" {

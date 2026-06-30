@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -16,6 +17,10 @@ type Epoll struct {
 	fd          int                // файловый дескриптор epoll instance
 	connections map[int]*ConnState // fd → состояние соединения
 	mu          sync.RWMutex
+
+	// connCount — общий на все воркеры счётчик живых соединений (указатель на
+	// Server.activeConns). Inc в Add, dec в Remove. nil = не считаем (legacy).
+	connCount *atomic.Int64
 }
 
 // NewEpoll создаёт новый epoll instance.
@@ -52,6 +57,9 @@ func (e *Epoll) Add(cs *ConnState) error {
 	e.connections[fd] = cs
 	e.mu.Unlock()
 
+	if e.connCount != nil {
+		e.connCount.Add(1)
+	}
 	monitoring.ActiveConnections.Inc()
 
 	return nil
@@ -70,6 +78,9 @@ func (e *Epoll) Remove(cs *ConnState) error {
 	delete(e.connections, fd)
 	e.mu.Unlock()
 
+	if e.connCount != nil {
+		e.connCount.Add(-1)
+	}
 	monitoring.ActiveConnections.Dec()
 
 	return cs.Conn.Close()
