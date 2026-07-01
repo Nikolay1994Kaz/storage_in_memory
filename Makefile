@@ -1,4 +1,4 @@
-.PHONY: build test bench vet clean run
+.PHONY: build test bench vet clean run backup restore
 
 # Версия сборки: git-тег/коммит, вшивается в бинарь через -ldflags.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -28,6 +28,21 @@ bench:
 # ─── Lint ───────────────────────────────────────────
 vet:
 	go vet ./kvstore/...
+
+# ─── Backup / Restore ───────────────────────────────
+# Каталог данных и место под архивы переопределяются: make backup DATA_DIR=... BACKUP_DIR=...
+DATA_DIR   ?= data
+BACKUP_DIR ?= backups
+
+# Полный crash-consistent снимок каталога данных в один tar.gz.
+backup:
+	./scripts/backup.sh $(DATA_DIR) $(BACKUP_DIR)
+
+# Восстановление из архива: make restore BACKUP=backups/kvstore-backup-*.tar.gz
+# СЕРВЕР ДОЛЖЕН БЫТЬ ОСТАНОВЛЕН.
+restore:
+	@test -n "$(BACKUP)" || { echo "укажите BACKUP=<путь к архиву>"; exit 1; }
+	./scripts/restore.sh $(BACKUP) $(DATA_DIR)
 
 # ─── Clean ──────────────────────────────────────────
 clean:
