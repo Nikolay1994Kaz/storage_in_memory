@@ -231,18 +231,23 @@ func (bw *BatchWAL) flusher() {
 //
 // Формат каждой записи в буфере (тот же что WAL.Write):
 //
-//	[CRC32 4B][PayloadLen 4B][Op 1B][KeyLen 4B][Key][Value]
+//	[CRC32 4B][PayloadLen 4B][LSN 8B][Op 1B][KeyLen 4B][Key][Value]
 //
 // Весь batch кодируется в bw.encodeBuf (pre-allocated, zero-alloc).
 func (bw *BatchWAL) flushBatch(batch []Entry) {
 	// Сбрасываем буфер (переиспользуем underlying array)
 	bw.encodeBuf = bw.encodeBuf[:0]
 
+	// Резервируем LSN на весь batch одним atomic Add. Присваиваем по возрастанию
+	// startLSN, startLSN+1, ... в порядке кодирования (== порядок в файле).
+	// flusher — единственный писатель, поэтому пачка непрерывна в файле.
+	startLSN := bw.wal.reserveLSN(uint64(len(batch)))
+
 	for i := range batch {
 		e := &batch[i] // pointer, не копия (avoid copy overhead)
 
-		// Вычисляем размер payload: [Op 1B][KeyLen 4B][Key][Value]
-		payloadSize := 1 + 4 + len(e.Key) + len(e.Value)
+		// Вычисляем размер payload: [LSN 8B][Op 1B][KeyLen 4B][Key][Value]
+		payloadSize := 8 + 1 + 4 + len(e.Key) + len(e.Value)
 
 		// Запоминаем позицию начала header (для записи CRC и длины)
 		headerStart := len(bw.encodeBuf)
@@ -254,6 +259,9 @@ func (bw *BatchWAL) flushBatch(batch []Entry) {
 		// Заполняем payload прямо в буфер (после header)
 		payloadStart := headerStart + 8
 		off := payloadStart
+
+		binary.LittleEndian.PutUint64(bw.encodeBuf[off:], startLSN+uint64(i))
+		off += 8
 
 		bw.encodeBuf[off] = e.Op
 		off++

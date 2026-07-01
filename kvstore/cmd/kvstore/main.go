@@ -189,12 +189,23 @@ func main() {
 	restored := 0
 	vecRestored := 0
 
+	// maxLSN — наибольший встреченный номер записи (или watermark из snapshot).
+	// После recovery ставим nextLSN = maxLSN+1 до приёма трафика, чтобы номера
+	// не переиспользовались (иначе резюмируемая репликация сломается).
+	var maxLSN uint64
+	bumpLSN := func(v uint64) {
+		if v > maxLSN {
+			maxLSN = v
+		}
+	}
+
 	// Шаг A: Сначала читаем и накатываем snapshot.wal (если есть)
 	snapshotPath := filepath.Join(dataDir, "snapshot.wal")
-	snapshotEntries, err := wal.ReadEntries(snapshotPath)
+	snapWatermark, snapshotEntries, err := wal.ReadFile(snapshotPath)
 	if err != nil {
 		log.Fatalf("Failed to read snapshot.wal: %v", err)
 	}
+	bumpLSN(snapWatermark) // watermark: snapshot покрывает состояние до этого LSN
 
 	applyEntry := func(entry wal.Entry, isFromSnapshot bool) {
 		switch entry.Op {
@@ -282,11 +293,12 @@ func main() {
 	sort.Strings(matches) // Сортируем по имени (по времени создания)
 
 	for _, path := range matches {
-		logEntries, err := wal.ReadEntries(path)
+		_, logEntries, err := wal.ReadFile(path)
 		if err != nil {
 			log.Fatalf("Failed to read WAL log %s: %v", path, err)
 		}
 		for _, entry := range logEntries {
+			bumpLSN(entry.LSN)
 			applyEntry(entry, false)
 		}
 	}
@@ -301,6 +313,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open WAL: %v", err)
 	}
+
+	// Выставляем счётчик LSN ДО того, как flusher начнёт присваивать номера
+	// новым записям. rawWAL.Open() инициализировал его в 1; продолжаем с maxLSN+1.
+	rawWAL.SetNextLSN(maxLSN + 1)
 
 	bw := wal.NewBatchWAL(rawWAL)
 	// bw.Close() вызывается явно в конце упорядоченного shutdown — ПОСЛЕ того,

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Типы операций
@@ -35,7 +36,13 @@ const (
 const maxEntrySize = 64 * 1024 * 1024
 
 // Entry — одна запись в WAL.
+//
+// LSN — монотонный номер записи (Log Sequence Number), присваивается писателем
+// при кодировании и входит в payload под CRC. Курсор для будущей резюмируемой
+// репликации (реплика стримит от последнего виденного LSN вместо full resync).
+// В snapshot-записях LSN=0 (watermark хранится в заголовке файла, не в записи).
 type Entry struct {
+	LSN   uint64
 	Op    byte
 	Key   string
 	Value []byte
@@ -61,29 +68,80 @@ type WAL struct {
 	file   *os.File
 	writer *bufio.Writer
 	dir    string // директория, где лежат WAL-файлы
+
+	// nextLSN — следующий свободный номер записи. Присваивает ЕДИНСТВЕННЫЙ
+	// писатель (batch-flusher; evictor тоже идёт через тот же канал), поэтому
+	// порядок LSN == порядок в файле держится как инвариант. atomic оставляет
+	// путь race-free даже если WAL.Write и flusher случайно смешаются в тестах.
+	// Стартует с 1; 0 зарезервирован под «нет LSN» (snapshot-записи).
+	// recovery ставит SetNextLSN(maxLSN+1) до приёма трафика.
+	nextLSN atomic.Uint64
 }
 
 // Open открывает или создаёт WAL-файл.
+//
+// Для свежесозданного (пустого) файла пишет заголовок [MAGIC][VER][baseLSN=0].
+// При переоткрытии непустого файла заголовок уже на месте — не трогаем.
 func Open(path string) (*WAL, error) {
 	dir := filepath.Dir(path)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("wal open: %w", err)
 	}
-	return &WAL{
+
+	w := &WAL{
 		file:   file,
 		writer: bufio.NewWriter(file),
 		dir:    dir,
-	}, nil
+	}
+	// nextLSN стартует с 1; recovery перезапишет через SetNextLSN до трафика.
+	w.nextLSN.Store(1)
+
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("wal stat: %w", err)
+	}
+	if info.Size() == 0 {
+		if err := writeFileHeader(w.writer, walBaseLSN); err != nil {
+			file.Close()
+			return nil, err
+		}
+	}
+	return w, nil
+}
+
+// reserveLSN резервирует n подряд идущих номеров и возвращает первый из них.
+// Присваивание start..start+n-1 монотонно. Один atomic Add на пачку.
+func (w *WAL) reserveLSN(n uint64) uint64 {
+	return w.nextLSN.Add(n) - n
+}
+
+// SetNextLSN выставляет счётчик перед приёмом трафика (recovery).
+func (w *WAL) SetNextLSN(v uint64) {
+	w.nextLSN.Store(v)
+}
+
+// LastLSN возвращает последний присвоенный номер (nextLSN-1), 0 если записей не
+// было. Используется как watermark при компакции.
+func (w *WAL) LastLSN() uint64 {
+	v := w.nextLSN.Load()
+	if v == 0 {
+		return 0
+	}
+	return v - 1
 }
 
 // Write записывает одну операцию в WAL.
-// Формат: [CRC32 4B][TotalLen 4B][Op 1B][KeyLen 4B][Key][Value]
+// Формат записи: [CRC32 4B][PayloadLen 4B][LSN 8B][Op 1B][KeyLen 4B][Key][Value]
+// LSN входит в payload → накрыт CRC.
 func (w *WAL) Write(entry Entry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	payload := encodeEntry(entry)
+	// Резерв LSN под тем же локом, что и запись → порядок LSN == порядок в файле.
+	lsn := w.reserveLSN(1)
+	payload := encodeEntry(lsn, entry)
 	checksum := crc32.ChecksumIEEE(payload)
 
 	// Создаем локальный массив на 8 байт (4 байта для CRC32 + 4 байта для длины).
@@ -158,6 +216,12 @@ func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
 	w.file = newFile
 	w.writer = bufio.NewWriter(newFile)
 
+	// Новый файл всегда пуст → пишем заголовок (baseLSN=0 для WAL).
+	// nextLSN НЕ сбрасываем — номера продолжаются сквозь ротацию.
+	if err := writeFileHeader(w.writer, walBaseLSN); err != nil {
+		return "", fmt.Errorf("wal rotate header: %w", err)
+	}
+
 	return oldPath, nil
 }
 
@@ -190,11 +254,14 @@ func (w *WAL) Path() string {
 
 // --- Кодирование/декодирование ---
 
-func encodeEntry(e Entry) []byte {
-	size := 1 + 4 + len(e.Key) + len(e.Value)
+func encodeEntry(lsn uint64, e Entry) []byte {
+	size := 8 + 1 + 4 + len(e.Key) + len(e.Value)
 	buf := make([]byte, size)
 
 	offset := 0
+	binary.LittleEndian.PutUint64(buf[offset:], lsn)
+	offset += 8
+
 	buf[offset] = e.Op
 	offset++
 
@@ -221,18 +288,39 @@ func encodeEntry(e Entry) []byte {
 //   - Реальная I/O ошибка → возвращаем error
 //   - Всё что прочитано до ошибки — валидные записи
 func ReadEntries(path string) ([]Entry, error) {
+	_, entries, err := ReadFile(path)
+	return entries, err
+}
+
+// ReadFile читает заголовок + все записи одного файла (WAL или snapshot).
+// Возвращает baseLSN из заголовка (для snapshot — watermark, для WAL — 0) и
+// записи с заполненным полем LSN. Отсутствующий/пустой файл → (0, nil, nil).
+//
+// Незнакомая магия или версия → ошибка (dual-format нет: смена формата до
+// прода = чистый старт).
+func ReadFile(path string) (uint64, []Entry, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return 0, nil, nil
 		}
-		return nil, fmt.Errorf("wal read: %w", err)
+		return 0, nil, fmt.Errorf("wal read: %w", err)
 	}
 	defer file.Close()
 
 	reader := bufio.NewReader(file)
-	var entries []Entry
 	baseName := filepath.Base(path)
+
+	// Заголовок: пустой файл (io.EOF) → нет записей, не ошибка.
+	baseLSN, err := readFileHeader(reader)
+	if err == io.EOF {
+		return 0, nil, nil
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("wal read %s: %w", baseName, err)
+	}
+
+	var entries []Entry
 
 	for {
 		// 1. Читаем header: [CRC32 4B][Length 4B]
@@ -249,7 +337,7 @@ func ReadEntries(path string) ([]Entry, error) {
 				break
 			}
 			// Реальная I/O ошибка — возвращаем что есть + error
-			return entries, fmt.Errorf("wal read header %s: %w", baseName, err)
+			return baseLSN, entries, fmt.Errorf("wal read header %s: %w", baseName, err)
 		}
 
 		checksum := binary.LittleEndian.Uint32(header[0:4])
@@ -271,7 +359,7 @@ func ReadEntries(path string) ([]Entry, error) {
 					baseName, len(entries), len(entries))
 				break
 			}
-			return entries, fmt.Errorf("wal read payload %s: %w", baseName, err)
+			return baseLSN, entries, fmt.Errorf("wal read payload %s: %w", baseName, err)
 		}
 
 		// 3. CRC проверка
@@ -291,15 +379,19 @@ func ReadEntries(path string) ([]Entry, error) {
 		entries = append(entries, entry)
 	}
 
-	return entries, nil
+	return baseLSN, entries, nil
 }
 
 func decodeEntry(data []byte) (Entry, error) {
-	if len(data) < 5 {
+	// Минимум: LSN(8) + Op(1) + KeyLen(4) = 13 байт.
+	if len(data) < 13 {
 		return Entry{}, fmt.Errorf("entry too short: %d bytes", len(data))
 	}
 
 	offset := 0
+	lsn := binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+
 	op := data[offset]
 	offset++
 
@@ -318,7 +410,7 @@ func decodeEntry(data []byte) (Entry, error) {
 		copy(value, data[offset:])
 	}
 
-	return Entry{Op: op, Key: key, Value: value}, nil
+	return Entry{LSN: lsn, Op: op, Key: key, Value: value}, nil
 }
 
 // ReadAllWALs читает snapshot + все WAL-файлы в правильном порядке.

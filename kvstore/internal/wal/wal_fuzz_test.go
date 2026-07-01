@@ -31,14 +31,14 @@ import (
 // Паника = баг. Зависание = баг.
 func FuzzDecodeEntry(f *testing.F) {
 	// Seed corpus: валидные записи, от которых фаззер отталкивается
-	f.Add(encodeEntry(Entry{Op: OpSet, Key: "hello", Value: []byte("world")}))
-	f.Add(encodeEntry(Entry{Op: OpDel, Key: "x", Value: nil}))
-	f.Add(encodeEntry(Entry{Op: OpExpire, Key: "ttl", Value: []byte{1, 2, 3, 4, 5, 6, 7, 8}}))
-	f.Add(encodeEntry(Entry{Op: OpPersist, Key: "persist-key", Value: nil}))
-	f.Add(encodeEntry(Entry{Op: OpVSimAdd, Key: "vec:1", Value: []byte("vector-data")}))
-	f.Add(encodeEntry(Entry{Op: OpVSimDel, Key: "vec:2", Value: nil}))
-	f.Add(encodeEntry(Entry{Op: OpSet, Key: "", Value: []byte("empty-key")}))
-	f.Add(encodeEntry(Entry{Op: OpSet, Key: "empty-val", Value: nil}))
+	f.Add(encodeEntry(0, Entry{Op: OpSet, Key: "hello", Value: []byte("world")}))
+	f.Add(encodeEntry(0, Entry{Op: OpDel, Key: "x", Value: nil}))
+	f.Add(encodeEntry(0, Entry{Op: OpExpire, Key: "ttl", Value: []byte{1, 2, 3, 4, 5, 6, 7, 8}}))
+	f.Add(encodeEntry(0, Entry{Op: OpPersist, Key: "persist-key", Value: nil}))
+	f.Add(encodeEntry(0, Entry{Op: OpVSimAdd, Key: "vec:1", Value: []byte("vector-data")}))
+	f.Add(encodeEntry(0, Entry{Op: OpVSimDel, Key: "vec:2", Value: nil}))
+	f.Add(encodeEntry(0, Entry{Op: OpSet, Key: "", Value: []byte("empty-key")}))
+	f.Add(encodeEntry(0, Entry{Op: OpSet, Key: "empty-val", Value: nil}))
 
 	// Граничные случаи
 	f.Add([]byte{})                                       // пустой вход
@@ -125,7 +125,7 @@ func FuzzEncodeDecodeRoundtrip(f *testing.F) {
 		original := Entry{Op: op, Key: key, Value: value}
 
 		// Encode
-		encoded := encodeEntry(original)
+		encoded := encodeEntry(0, original)
 
 		// Decode
 		decoded, err := decodeEntry(encoded)
@@ -167,7 +167,9 @@ func buildValidWALFile() []byte {
 		{Op: OpDel, Key: "user:1", Value: nil},
 	}
 
-	var buf []byte
+	var hdr bytes.Buffer
+	_ = writeFileHeader(&hdr, walBaseLSN)
+	buf := hdr.Bytes()
 	for _, e := range entries {
 		buf = append(buf, buildSingleEntryWAL(e)...)
 	}
@@ -176,7 +178,7 @@ func buildValidWALFile() []byte {
 
 // buildSingleEntryWAL кодирует одну Entry в формат WAL: [CRC32][Length][Payload].
 func buildSingleEntryWAL(e Entry) []byte {
-	payload := encodeEntry(e)
+	payload := encodeEntry(0, e)
 	checksum := crc32.ChecksumIEEE(payload)
 
 	var header [8]byte
