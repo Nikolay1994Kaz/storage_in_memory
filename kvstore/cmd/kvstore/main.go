@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -64,6 +65,8 @@ func main() {
 	requirePassFile := flag.String("requirepass-file", "", "путь к файлу с паролем для AUTH (приоритетнее env и -requirepass; секрет не светится в списке процессов)")
 	tlsCert := flag.String("tls-cert", "", "путь к TLS сертификату (PEM)")
 	tlsKey := flag.String("tls-key", "", "путь к TLS ключу (PEM)")
+	tlsMinVersion := flag.String("tls-min-version", "1.2", "минимальная версия TLS: 1.2 или 1.3")
+	tlsClientCA := flag.String("tls-client-ca", "", "путь к CA (PEM) для mTLS: если задан — требуем клиентский сертификат, подписанный этим CA")
 	metricsPort := flag.Int("metrics-port", 9090, "порт для HTTP сервера метрик VictoriaMetrics (0 = отключен)")
 	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute, "закрывать соединение после простоя без активности (защита от Slowloris/брошенных conn; 0 = выключено)")
 	writeTimeout := flag.Duration("write-timeout", 30*time.Second, "макс. время на отправку ответа клиенту (защита от застрявшего reader; 0 = выключено)")
@@ -613,12 +616,15 @@ func main() {
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
 	if *tlsCert != "" && *tlsKey != "" {
-		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		cfg, err := buildServerTLSConfig(*tlsCert, *tlsKey, *tlsMinVersion, *tlsClientCA)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to load TLS cert/key: %v\n", err)
+			fmt.Fprintf(os.Stderr, "TLS: %v\n", err)
 			os.Exit(1)
 		}
-		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		srv.TLSConfig = cfg
+		if *tlsClientCA != "" {
+			log.Println("TLS: mTLS включён — требуется клиентский сертификат, подписанный указанным CA")
+		}
 	}
 
 	if err := srv.Start(); err != nil {
@@ -683,6 +689,50 @@ func writeValue(buf *server.ConnBuf, v protocol.Value) {
 		}
 	case 0:
 		// пустой ответ (SUBSCRIBE — writePump сам отправляет)
+	}
+}
+
+// buildServerTLSConfig собирает *tls.Config для серверного listener'а с явным
+// MinVersion и опциональным mTLS. Если задан clientCAPath — сервер требует
+// клиентский сертификат, подписанный этим CA (сетевая идентичность поверх пароля).
+func buildServerTLSConfig(certPath, keyPath, minVersion, clientCAPath string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось загрузить сертификат/ключ: %w", err)
+	}
+	minVer, err := parseTLSVersion(minVersion)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   minVer,
+	}
+	if clientCAPath != "" {
+		caPEM, err := os.ReadFile(clientCAPath)
+		if err != nil {
+			return nil, fmt.Errorf("не удалось прочитать client-CA %q: %w", clientCAPath, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("client-CA %q: не найдено ни одного PEM-сертификата", clientCAPath)
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert // mTLS
+	}
+	return cfg, nil
+}
+
+// parseTLSVersion переводит "1.2"/"1.3" в константу crypto/tls. Более старые
+// версии не поддерживаем сознательно (TLS 1.0/1.1 сняты как небезопасные).
+func parseTLSVersion(s string) (uint16, error) {
+	switch s {
+	case "1.2":
+		return tls.VersionTLS12, nil
+	case "1.3":
+		return tls.VersionTLS13, nil
+	default:
+		return 0, fmt.Errorf("недопустимая -tls-min-version %q (ожидается 1.2 или 1.3)", s)
 	}
 }
 
