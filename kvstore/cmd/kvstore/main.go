@@ -104,7 +104,8 @@ func main() {
 	// CompositeEvictor при TTL-expire записывает OpVSimDel в WAL.
 	// Для фазы WAL replay используем временный KV-only evictor.
 	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
-	defer ttl.Stop()
+	// ttl.Stop() вызывается явно в упорядоченном shutdown (не через defer):
+	// TTL-эвиктор пишет в WAL-канал, поэтому его надо заглушить ДО bw.Close().
 
 	// === 2. Инициализация хранилища векторов и загрузка бинарного снапшота ===
 	// Используем LeveledVectorStore (LSM+CSR) как реализацию VectorIndex.
@@ -266,7 +267,9 @@ func main() {
 	}
 
 	bw := wal.NewBatchWAL(rawWAL)
-	defer bw.Close()
+	// bw.Close() вызывается явно в конце упорядоченного shutdown — ПОСЛЕ того,
+	// как заглушены все писатели в WAL-канал (воркеры, TTL-эвиктор, AI-воркер,
+	// syncer). Иначе запоздалый bw.Write словит send на закрытый канал.
 
 	// === TTL: подключаем CompositeEvictor ===
 	// Теперь при истечении TTL ключа TTLManager автоматически:
@@ -318,7 +321,7 @@ func main() {
 	}
 
 	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, iterateAll, saveVectors)
-	defer syncer.Stop()
+	// syncer.Stop() вызывается явно в упорядоченном shutdown перед bw.Close().
 
 	// === 5. Pub/Sub Hub (Classic + Semantic) ===
 	semanticIndex := vector.NewVectorStoreCosine(s)
@@ -474,7 +477,8 @@ func main() {
 			hub.Publish(channel, message)
 		}
 		aiWorker.Start(2) // 2 горутины (Ollama сама батчит)
-		defer aiWorker.Stop()
+		// aiWorker.Stop() вызывается явно в упорядоченном shutdown до bw.Close()
+		// (AI-воркер пишет OpVSimAdd в WAL-канал).
 	}
 
 	// ═══════════════════════════════════════════════════
@@ -610,7 +614,26 @@ func main() {
 
 	log.Println("Shutting down...")
 	monitoring.SetReady(false) // /ready → 503: оркестратор уводит трафик до остановки
+
+	// Graceful shutdown в строгом порядке. Цель — не потерять ни одной
+	// подтверждённой записи и не словить панику send-на-закрытый-канал:
+	//   1. srv.Stop()   — перестаём принимать команды и ДОЖИДАЕМСЯ завершения
+	//                      in-flight обработчиков (их bw.Write уже в канале).
+	//   2. ttl.Stop()   — глушим TTL-эвиктор (пишет OpVSimDel в WAL-канал).
+	//   3. aiWorker     — глушим AI-воркер (пишет OpVSimAdd в WAL-канал).
+	//   4. syncer.Stop()— останавливаем периодический fsync/compaction.
+	//   5. bw.Close()   — дренаж WAL-канала + flush + fsync последнего батча.
+	// Только после (1)-(4) закрываем канал в (5): все писатели уже заглушены.
 	srv.Stop()
+	ttl.Stop()
+	if aiWorker != nil {
+		aiWorker.Stop()
+	}
+	syncer.Stop()
+	if err := bw.Close(); err != nil {
+		log.Printf("WAL close error: %v", err)
+	}
+	log.Println("Shutdown complete: WAL flushed and fsynced.")
 }
 
 // writeValue — helper для записи protocol.Value в ConnBuf.
@@ -638,6 +661,19 @@ func writeValue(buf *server.ConnBuf, v protocol.Value) {
 	case 0:
 		// пустой ответ (SUBSCRIBE — writePump сам отправляет)
 	}
+}
+
+// isMemoryGrowingCmd сообщает, увеличивает ли команда использование памяти.
+// Под OOM-гейт попадают только такие команды; удаляющие/читающие (DEL, VSIM.DEL,
+// ZREM, EXPIRE, GET…) всегда разрешены — чтобы из состояния OOM можно было выйти
+// освобождением памяти, а не заблокировать себе единственный путь наружу.
+func isMemoryGrowingCmd(cmd string) bool {
+	switch cmd {
+	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN",
+		"WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
+		return true
+	}
+	return false
 }
 
 // arg — helper: безопасное получение string из args.
@@ -681,6 +717,17 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 
 	buf := cs.Buf
 	workerID := cs.WorkerID
+
+	// OOM-гейт (единая точка для всех растущих в памяти команд). Раньше проверка
+	// висела только на SET — LPUSH/HSET-класс и, главное, ZADD/VSIM.ADD/VSIM.ADDBIN
+	// шли мимо неё и уводили процесс в OOM. Удаляющие/читающие команды (DEL,
+	// VSIM.DEL, ZREM, GET…) НЕ блокируются — иначе из OOM не выйти освобождением.
+	// Покрывает и прямой путь, и EXEC (обе ветки зовут executeCommand).
+	if isMemoryGrowingCmd(cmd) && s.IsOOM() {
+		monitoring.OomEvents.Inc()
+		buf.WriteError("OOM command not allowed when used memory > 'maxmemory'")
+		return
+	}
 
 	switch cmd {
 	case "PING":
@@ -741,12 +788,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				return
 			}
 		}
-		// Проверка лимита памяти (OOM protection)
-		if s.IsOOM() {
-			monitoring.OomEvents.Inc()
-			buf.WriteError("OOM command not allowed when used memory > 'maxmemory'")
-			return
-		}
+		// OOM защищён единым гейтом в начале executeCommand.
 		// args[1] — слайс ring buffer. Нужна копия для TCMalloc (буфер будет перезаписан).
 		value := make([]byte, len(args[1]))
 		copy(value, args[1])
