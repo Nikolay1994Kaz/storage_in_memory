@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"flag"
@@ -58,7 +60,8 @@ func main() {
 	clusterSlotStart := flag.Int("slot-start", 0, "начало диапазона слотов")
 	clusterSlotEnd := flag.Int("slot-end", 16383, "конец диапазона слотов")
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "URL Ollama API")
-	requirePass := flag.String("requirepass", "", "пароль для AUTH (пусто = без аутентификации)")
+	requirePass := flag.String("requirepass", "", "пароль для AUTH через флаг (НЕБЕЗОПАСНО: виден в ps/history/proc; для прода см. -requirepass-file или env KVSTORE_REQUIREPASS)")
+	requirePassFile := flag.String("requirepass-file", "", "путь к файлу с паролем для AUTH (приоритетнее env и -requirepass; секрет не светится в списке процессов)")
 	tlsCert := flag.String("tls-cert", "", "путь к TLS сертификату (PEM)")
 	tlsKey := flag.String("tls-key", "", "путь к TLS ключу (PEM)")
 	metricsPort := flag.Int("metrics-port", 9090, "порт для HTTP сервера метрик VictoriaMetrics (0 = отключен)")
@@ -72,6 +75,22 @@ func main() {
 	hnswUseSQ := flag.Bool("hnsw-use-sq", false, "Enable Scalar Quantization (int8) for frozen segments (dim<=256). 4x memory compression, ~96% recall, higher QPS via L3 cache locality")
 	compactionWorkers := flag.Int("compaction-workers", 0, "Number of parallel segment build workers (0 = auto NumCPU/2 clamped 2-8). Build Pool: insert does not block during heavy L2 compaction")
 	flag.Parse()
+
+	// Разрешение пароля AUTH из (в порядке приоритета): файл → env → флаг.
+	// Файл/env предпочтительнее флага — секрет не попадает в ps/history/proc.
+	authPassword, err := resolveAuthPassword(*requirePass, *requirePassFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "requirepass: %v\n", err)
+		os.Exit(1)
+	}
+	if authPassword != "" && *requirePassFile == "" && os.Getenv("KVSTORE_REQUIREPASS") == "" {
+		log.Println("WARNING: пароль задан через флаг -requirepass — он виден в списке процессов; " +
+			"для прода используйте -requirepass-file или env KVSTORE_REQUIREPASS")
+	}
+	// Предвычисляем SHA-256 пароля один раз: на AUTH сравниваем дайджесты
+	// constant-time (crypto/subtle) — без утечки длины/содержимого по таймингу.
+	authEnabled := authPassword != ""
+	authHash := sha256.Sum256([]byte(authPassword))
 
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
 	s := tcmalloc.NewTCMallocStore(runtime.NumCPU())
@@ -497,13 +516,17 @@ func main() {
 		// ─── AUTH ───────────────────────────────────────────
 		// Если --requirepass задан, клиент должен пройти AUTH
 		// перед выполнением любых команд (кроме AUTH и PING).
-		if *requirePass != "" {
+		if authEnabled {
 			if cmd == "AUTH" {
 				if len(cmdArgs) != 1 {
 					cs.Buf.WriteError("ERR wrong number of arguments for 'AUTH' command")
 					return
 				}
-				if string(cmdArgs[0]) == *requirePass {
+				// Сравниваем SHA-256-дайджесты constant-time: одинаковая длина
+				// входа (32 байта) + subtle.ConstantTimeCompare убирают тайминг-
+				// сайд-канал (утечку длины/префикса пароля при переборе).
+				inHash := sha256.Sum256(cmdArgs[0])
+				if subtle.ConstantTimeCompare(inHash[:], authHash[:]) == 1 {
 					cs.Authenticated = true
 					cs.Buf.WriteSimpleString("OK")
 				} else {
@@ -661,6 +684,26 @@ func writeValue(buf *server.ConnBuf, v protocol.Value) {
 	case 0:
 		// пустой ответ (SUBSCRIBE — writePump сам отправляет)
 	}
+}
+
+// resolveAuthPassword разрешает пароль AUTH в порядке приоритета:
+// файл (-requirepass-file) → env (KVSTORE_REQUIREPASS) → флаг (-requirepass).
+// Файл/env предпочтительнее флага, т.к. секрет не попадает в список процессов
+// (ps/history//proc/<pid>/cmdline). Пустой результат = аутентификация выключена.
+func resolveAuthPassword(flagVal, fileVal string) (string, error) {
+	if fileVal != "" {
+		b, err := os.ReadFile(fileVal)
+		if err != nil {
+			return "", fmt.Errorf("не удалось прочитать файл пароля %q: %w", fileVal, err)
+		}
+		// Trailing newline из `echo pass > file` — частый источник «неверного
+		// пароля»; обрезаем окаймляющие пробелы/переводы строк.
+		return strings.TrimSpace(string(b)), nil
+	}
+	if env := os.Getenv("KVSTORE_REQUIREPASS"); env != "" {
+		return env, nil
+	}
+	return flagVal, nil
 }
 
 // isMemoryGrowingCmd сообщает, увеличивает ли команда использование памяти.
