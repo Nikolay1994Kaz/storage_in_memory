@@ -10,8 +10,14 @@ RUN go mod download
 # Копируем исходный код
 COPY kvstore/ kvstore/
 
-# Статическая сборка (CGO_ENABLED=0 для alpine)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /kvstore-server ./kvstore/cmd/kvstore/
+# Версия сборки: передаётся через --build-arg VERSION=$(git describe ...).
+# Дефолт "dev", если не задан.
+ARG VERSION=dev
+
+# Статическая сборка (CGO_ENABLED=0 для alpine); версия вшивается через -X.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -X main.version=${VERSION}" \
+    -o /kvstore-server ./kvstore/cmd/kvstore/
 
 # ─── Stage 2: Runtime ───────────────────────────────
 FROM alpine:3.20

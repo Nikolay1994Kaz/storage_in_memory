@@ -1,8 +1,12 @@
 .PHONY: build test bench vet clean run
 
+# Версия сборки: git-тег/коммит, вшивается в бинарь через -ldflags.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -X main.version=$(VERSION)
+
 # ─── Build ──────────────────────────────────────────
 build:
-	go build -o kvstore-server ./kvstore/cmd/kvstore/
+	go build -ldflags="$(LDFLAGS)" -o kvstore-server ./kvstore/cmd/kvstore/
 
 # ─── Run ────────────────────────────────────────────
 run: build
@@ -33,7 +37,7 @@ clean:
 
 # ─── Docker ─────────────────────────────────────────
 docker-build:
-	docker build -t kvstore:latest .
+	docker build --build-arg VERSION=$(VERSION) -t kvstore:latest .
 
 # Полный стек: kvstore + Ollama + auto-pull модели
 up:

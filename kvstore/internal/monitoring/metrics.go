@@ -91,6 +91,16 @@ func InitMemoryMetrics(used, chunks, spans, limit func() float64) {
 	})
 }
 
+// SetBuildInfo регистрирует gauge kvstore_build_info{version="..."} со значением 1.
+// Классический паттерн build-info: версия едет в лейбле, значение — константа,
+// что позволяет в Grafana/Alerting джойнить метрики по версии сборки.
+func SetBuildInfo(version string) {
+	metrics.GetOrCreateGauge(
+		fmt.Sprintf(`kvstore_build_info{version=%q}`, version),
+		func() float64 { return 1 },
+	)
+}
+
 // RecordCommand records executed command metrics with caching to avoid string format overhead.
 func RecordCommand(cmd string, duration time.Duration) {
 	commandsMu.RLock()

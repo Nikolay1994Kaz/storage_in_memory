@@ -44,6 +44,11 @@ const (
 	syncInterval = 100 * time.Millisecond
 )
 
+// version — версия сборки. Дефолт "dev" для локальных прогонов; в релизных
+// сборках проставляется через -ldflags "-X main.version=$(git describe ...)"
+// (см. Makefile/Dockerfile).
+var version = "dev"
+
 var globalTxMu sync.Mutex
 
 func unsafeString(b []byte) string {
@@ -77,7 +82,14 @@ func main() {
 	hnswUseLSH := flag.Bool("hnsw-use-lsh", false, "Enable LSH pre-filtering for high-dimensional vectors (dim >= 256)")
 	hnswUseSQ := flag.Bool("hnsw-use-sq", false, "Enable Scalar Quantization (int8) for frozen segments (dim<=256). 4x memory compression, ~96% recall, higher QPS via L3 cache locality")
 	compactionWorkers := flag.Int("compaction-workers", 0, "Number of parallel segment build workers (0 = auto NumCPU/2 clamped 2-8). Build Pool: insert does not block during heavy L2 compaction")
+	showVersion := flag.Bool("version", false, "вывести версию и выйти")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
+	log.Printf("KVStore version %s", version)
 
 	// Разрешение пароля AUTH из (в порядке приоритета): файл → env → флаг.
 	// Файл/env предпочтительнее флага — секрет не попадает в ps/history/proc.
@@ -98,6 +110,9 @@ func main() {
 	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
 	s := tcmalloc.NewTCMallocStore(runtime.NumCPU())
 	defer s.Close() // останавливает внутреннюю горутину deferred free
+
+	// build-info метрика: kvstore_build_info{version="..."} = 1
+	monitoring.SetBuildInfo(version)
 
 	// Инициализация метрик памяти TCMalloc
 	monitoring.InitMemoryMetrics(
