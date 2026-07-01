@@ -28,6 +28,11 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # experimental-сборка (кластер за build-tag): собираем и её, чтобы код
+      # за тегом не сгнил при рефакторингах прод-путей.
+      - name: Build (experimental)
+        run: go build -tags experimental ./...
+
       - name: gofmt
         run: |
           unformatted=$(gofmt -l kvstore/)
@@ -40,6 +45,9 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: go vet (experimental)
+        run: go vet -tags experimental ./...
+
   test:
     name: Tests
     runs-on: ubuntu-latest
@@ -51,9 +59,14 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Конкурентно-критичные пакеты (server, store, wal, cluster) — с -race.
+      # Конкурентно-критичные пакеты (server, store, wal) — с -race.
       - name: Test (race)
         run: go test -short -race -timeout 15m ./kvstore/internal/...
+
+      # Кластер за build-tag experimental — гоняем отдельно под тегом (gossip/
+      # репликация конкурентны, поэтому тоже с -race).
+      - name: Test (experimental cluster, race)
+        run: go test -short -race -tags experimental -timeout 15m ./kvstore/internal/cluster/...
 
       # Алгоритмика vector — в основном однопоточная, тяжёлая (~7-8 мин);
       # гоняем без -race, чтобы держать гейт в разумном времени.

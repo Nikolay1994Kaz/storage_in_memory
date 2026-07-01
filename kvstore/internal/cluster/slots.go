@@ -1,3 +1,5 @@
+//go:build experimental
+
 package cluster
 
 var crc16Table [256]uint16

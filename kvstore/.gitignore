@@ -1,6 +1,9 @@
 *.log
 *.txt
-kvstore
+# Только бинарь kvstore на уровне этого каталога (go build в ./kvstore).
+# Без ведущего слэша паттерн матчил ЛЮБОЙ каталог с именем kvstore, включая
+# cmd/kvstore/ — и молча игнорировал там исходники.
+/kvstore
 kvstore-*
 kvstore_*
 !kvstore_*.go

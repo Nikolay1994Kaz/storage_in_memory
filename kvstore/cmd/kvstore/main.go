@@ -26,7 +26,6 @@ import (
 
 	"kvstore/kvstore/internal/ai"
 	"kvstore/kvstore/internal/btree"
-	"kvstore/kvstore/internal/cluster"
 	"kvstore/kvstore/internal/compute"
 	"kvstore/kvstore/internal/monitoring"
 	"kvstore/kvstore/internal/protocol"
@@ -366,60 +365,17 @@ func main() {
 	semanticIndex.SetUseLSH(*hnswUseLSH)
 	hub := pubsub.NewHub(semanticIndex)
 
-	// === 6. Cluster (опционально) ===
-	var cl *cluster.Cluster
+	// === 6. Cluster (опционально, только в experimental-сборке) ===
+	// Вся обвязка вынесена за build-tag `experimental` (cluster_experimental.go).
+	// В прод-сборке newClusterRouter — заглушка, возвращающая ошибку, а сам
+	// distributed-код не линкуется. cl остаётся nil → single-node hot-path.
+	var cl clusterNode
 	if *clusterEnabled {
 		addr := fmt.Sprintf("127.0.0.1:%d", *port)
-		cl = cluster.New(addr, *port+1)
-		cl.State.Self.AssignSlots(*clusterSlotStart, *clusterSlotEnd)
-		cl.State.RebuildSlotTable()
-		log.Printf("Cluster mode: node %s, slots %d-%d",
-			cl.State.Self.ID, *clusterSlotStart, *clusterSlotEnd)
-		cl.GetKeysInSlotFunc = func(slot uint16, count int) []string {
-			return s.GetKeysInSlot(slot, count, cluster.KeySlot)
-		}
-		cl.MigrateGetFunc = func(key string) ([]byte, bool) {
-			return s.Get(key)
-		}
-		cl.MigrateDelFunc = func(key string) {
-			s.Del(0, key)
-			vecStore.Delete(key) // Очищаем вектор
-			ttl.OnDelete(key)
-		}
-		cl.MigrateGetVecFunc = func(key string) ([]float32, bool) {
-			return vecStore.Get(key)
-		}
-		cl.MigrateSetRemoteVecFunc = func(addr, key string, vec []float32) error {
-			return SendVectorToNode(addr, key, vec)
-		}
-
-		cl.Repl.StoreForEach = func(fn func(key string, value []byte)) {
-			s.ForEach(fn)
-		}
-		cl.Repl.VecStoreAdd = func(key string, vec []float32) {
-			vecStore.Add(key, vec)
-		}
-		cl.Repl.VecStoreDel = func(key string) {
-			vecStore.Delete(key)
-		}
-		cl.Repl.VecStoreForEach = func(fn func(key string, vec []float32)) {
-			vecStore.ForEach(fn)
-		}
-		cl.Repl.StoreSet = func(key string, value []byte) {
-			s.Set(0, key, value)
-		}
-		cl.Repl.StoreDel = func(key string) {
-			s.Del(0, key)
-		}
-		cl.Repl.StoreClear = func() {
-			s.Clear()
-		}
-		cl.Repl.VecStoreClear = func() {
-			vecStore.Clear()
-		}
-
-		if err := cl.StartGossip(); err != nil {
-			log.Fatalf("Failed to start gossip: %v", err)
+		var err error
+		cl, err = newClusterRouter(addr, *port+1, *clusterSlotStart, *clusterSlotEnd, s, vecStore, ttl)
+		if err != nil {
+			log.Fatalf("Failed to start cluster: %v", err)
 		}
 		defer cl.StopGossip()
 	}
@@ -815,7 +771,7 @@ func (a leveledStatsAdapter) Stats() monitoring.VectorStats {
 }
 
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
-	hub *pubsub.Hub, cl *cluster.Cluster, wasm *compute.Engine,
+	hub *pubsub.Hub, cl clusterNode, wasm *compute.Engine,
 	triggers *compute.TriggerManager, vecStore vector.VectorIndex,
 	zsetReg *zset.ZSetRegistry,
 	aiClient *ai.Client, aiWorker *ai.Worker,
@@ -882,7 +838,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		replicaID := string(args[0])
-		cl.Repl.HandlePsync(cs.Conn, replicaID)
+		cl.HandlePsync(cs.Conn, replicaID)
 
 	case "SET":
 		if len(args) < 2 {
@@ -904,8 +860,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		bw.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value})
 		s.Set(workerID, key, value)
 
-		if cl != nil && cl.Repl != nil {
-			cl.Repl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
+		if cl != nil {
+			cl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
 		}
 		triggers.Fire(compute.OnSet, key, workerID)
 
@@ -931,7 +887,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		key := string(args[0])
-		if cl != nil && cl.State.Self.Role != cluster.RoleReplica {
+		if cl != nil && !cl.IsReplica() {
 			if moved := cl.CheckKey(key); moved != nil {
 				writeValue(buf, *moved)
 				return
@@ -970,8 +926,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		ok := s.Del(workerID, key)
 		vecStore.Delete(key) // Также удаляем вектор при ручном DEL
 		ttl.OnDelete(key)
-		if cl != nil && cl.Repl != nil {
-			cl.Repl.ForwardWrite(fmt.Sprintf("DEL %s", key))
+		if cl != nil {
+			cl.ForwardWrite(fmt.Sprintf("DEL %s", key))
 		}
 		triggers.Fire(compute.OnDel, key, workerID)
 		if ok {
@@ -1237,7 +1193,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		monitoring.VectorAddDuration.Update(time.Since(addStart).Seconds())
-		if cl != nil && cl.Repl != nil {
+		if cl != nil {
 			// Forward replication command in text format to replica nodes
 			// to avoid breaking existing replica replication protocols.
 			var sb strings.Builder
@@ -1247,7 +1203,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				sb.WriteByte(' ')
 				sb.WriteString(strconv.FormatFloat(float64(v), 'f', -1, 32))
 			}
-			cl.Repl.ForwardWrite(sb.String())
+			cl.ForwardWrite(sb.String())
 		}
 		buf.WriteSimpleString("OK")
 
@@ -1281,7 +1237,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		monitoring.VectorAddDuration.Update(time.Since(addStart).Seconds())
-		if cl != nil && cl.Repl != nil {
+		if cl != nil {
 			// Формат: VSIM.ADD key 0.1 0.2 0.3 ...
 			var sb strings.Builder
 			sb.WriteString("VSIM.ADD ")
@@ -1290,7 +1246,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				sb.WriteByte(' ')
 				sb.WriteString(strconv.FormatFloat(float64(v), 'f', -1, 32))
 			}
-			cl.Repl.ForwardWrite(sb.String())
+			cl.ForwardWrite(sb.String())
 		}
 		buf.WriteSimpleString("OK")
 
@@ -1309,8 +1265,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		monitoring.VectorDeleteTotal.Inc()
 		if vecStore.Delete(key) {
 			bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: key})
-			if cl != nil && cl.Repl != nil {
-				cl.Repl.ForwardWrite("VSIM.DEL " + key)
+			if cl != nil {
+				cl.ForwardWrite("VSIM.DEL " + key)
 			}
 			buf.WriteInt(1)
 		} else {
