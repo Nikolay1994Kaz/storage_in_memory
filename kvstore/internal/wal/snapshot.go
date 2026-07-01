@@ -25,10 +25,15 @@ func NewSnapshotWriter(dir string) *SnapshotWriter {
 // Принимает функцию iterate, которая обходит все ключи store.
 // Вызывается в фоновой горутине.
 //
+// watermarkLSN идёт в baseLSN заголовка: «этот snapshot покрывает состояние
+// вплоть до LSN watermarkLSN». Recovery берёт max(watermark, maxLSN в WAL)+1 —
+// это не даёт nextLSN сброситься в 1 после компакции (rotate + удаление старого
+// WAL) с последующим крашем до появления новых записей.
+//
 // Оптимизация: пишет напрямую в файл через bufio (256KB буфер)
 // с pre-allocated encode buffer. Без промежуточного WAL.Write() —
 // нет mutex lock и аллокаций на каждый ключ.
-func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(op byte, key string, value []byte))) error {
+func (sw *SnapshotWriter) WriteSnapshot(watermarkLSN uint64, iterate func(fn func(op byte, key string, value []byte))) error {
 	tmpPath := filepath.Join(sw.dir, "snapshot.wal.tmp")
 	finalPath := filepath.Join(sw.dir, "snapshot.wal")
 
@@ -41,6 +46,14 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(op byte, key string
 	writer := bufio.NewWriterSize(file, 256*1024) // 256KB буфер
 	encodeBuf := make([]byte, 0, 64*1024)         // pre-allocated encode buffer
 
+	// Заголовок [MAGIC][VER][baseLSN=watermark] — читатель снимает те же 13 байт,
+	// что и у WAL, затем идут записи в общем формате.
+	if err := writeFileHeader(writer, watermarkLSN); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+
 	count := 0
 	var writeErr error
 	iterate(func(op byte, key string, value []byte) {
@@ -48,8 +61,10 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(op byte, key string
 			return // предыдущая запись упала — пропускаем остальные
 		}
 
-		// Кодируем entry прямо в encodeBuf (zero-alloc если capacity хватает)
-		payloadSize := 1 + 4 + len(key) + len(value)
+		// Кодируем entry прямо в encodeBuf (zero-alloc если capacity хватает).
+		// Payload несёт LSN=0: watermark хранится в заголовке, per-record LSN
+		// снапшоту не нужен, но префикс держим для единого decodeEntry.
+		payloadSize := 8 + 1 + 4 + len(key) + len(value)
 		totalSize := 8 + payloadSize
 
 		// Grow буфер если нужно
@@ -58,8 +73,10 @@ func (sw *SnapshotWriter) WriteSnapshot(iterate func(fn func(op byte, key string
 		}
 		encodeBuf = encodeBuf[:totalSize]
 
-		// Заполняем payload: [Op 1B][KeyLen 4B][Key][Value]
+		// Заполняем payload: [LSN=0 8B][Op 1B][KeyLen 4B][Key][Value]
 		off := 8
+		binary.LittleEndian.PutUint64(encodeBuf[off:], 0)
+		off += 8
 		encodeBuf[off] = op
 		off++
 
@@ -137,10 +154,15 @@ func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key str
 	}
 	log.Printf("WAL rotated: %s → %s", filepath.Base(oldPath), filepath.Base(newWALPath))
 
+	// Watermark: последний присвоенный LSN на момент ротации. Он ≥ максимального
+	// LSN в старом (удаляемом) WAL, поэтому после рестарта nextLSN не откатится
+	// и не переиспользует номера, даже если новый WAL пуст.
+	watermark := w.LastLSN()
+
 	// 2. Фоновый snapshot — клиенты продолжают работать!
 	go func() {
 		sw := NewSnapshotWriter(dir)
-		if err := sw.WriteSnapshot(iterate); err != nil {
+		if err := sw.WriteSnapshot(watermark, iterate); err != nil {
 			log.Printf("Snapshot failed: %v", err)
 			// НЕ удаляем старые WAL — snapshot не прошёл,
 			// старые WAL нужны для recovery!

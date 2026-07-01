@@ -337,7 +337,7 @@ func TestEncodeDecodeRoundtrip(t *testing.T) {
 
 	for _, original := range tests {
 		t.Run(original.Key, func(t *testing.T) {
-			encoded := encodeEntry(original)
+			encoded := encodeEntry(0, original)
 			decoded, err := decodeEntry(encoded)
 			if err != nil {
 				t.Fatalf("decode error: %v", err)
@@ -481,7 +481,8 @@ func TestSnapshot_WriteAndRead(t *testing.T) {
 		}
 	}
 
-	err := sw.WriteSnapshot(iterate)
+	const watermark = 777
+	err := sw.WriteSnapshot(watermark, iterate)
 	if err != nil {
 		t.Fatalf("WriteSnapshot: %v", err)
 	}
@@ -492,11 +493,14 @@ func TestSnapshot_WriteAndRead(t *testing.T) {
 		t.Fatal("snapshot.wal.tmp should not exist (should be renamed)")
 	}
 
-	// snapshot.wal должен существовать
+	// snapshot.wal должен существовать; baseLSN заголовка == watermark
 	finalPath := filepath.Join(dir, "snapshot.wal")
-	got, err := ReadEntries(finalPath)
+	base, got, err := ReadFile(finalPath)
 	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if base != watermark {
+		t.Fatalf("snapshot watermark: got %d, want %d", base, watermark)
 	}
 	if len(got) != 100 {
 		t.Fatalf("snapshot has %d entries, want 100", len(got))
@@ -523,7 +527,7 @@ func TestSnapshot_AtomicRename(t *testing.T) {
 		fn(OpSet, "only-key", []byte("only-value"))
 	}
 
-	sw.WriteSnapshot(iterate)
+	sw.WriteSnapshot(0, iterate)
 
 	// Проверяем: .tmp удалён (переименован)
 	if _, err := os.Stat(filepath.Join(dir, "snapshot.wal.tmp")); !os.IsNotExist(err) {
@@ -553,7 +557,7 @@ func TestSnapshot_ErrorCleansUp(t *testing.T) {
 		fn(OpSet, "k", []byte("v"))
 	}
 
-	err := sw.WriteSnapshot(iterate)
+	err := sw.WriteSnapshot(0, iterate)
 	if err == nil {
 		t.Fatal("expected error for read-only dir")
 	}
@@ -759,7 +763,7 @@ func BenchmarkEncode(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		payload := encodeEntry(entry)
+		payload := encodeEntry(uint64(i), entry)
 		_ = payload
 	}
 }
