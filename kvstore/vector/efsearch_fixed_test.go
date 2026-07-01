@@ -15,6 +15,9 @@ import (
 // TestEfSearchRecallFixed проверяет recall с ПРАВИЛЬНОЙ distance function
 // (DotProductDistance — та же что в HNSW, включая SIMD).
 func TestEfSearchRecallFixed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый бенчмарк; запуск без -short")
+	}
 	const dim = 768
 
 	sizes := []int{20_000}

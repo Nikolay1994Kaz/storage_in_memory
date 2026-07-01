@@ -15,6 +15,9 @@ import (
 // Имитирует базу данных белков (эмбеддинги ESM-2, размерность 640).
 // Запуск: go test -v -run=TestBioLoadBenchmark ./vector/ -timeout 30m
 func TestBioLoadBenchmark(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый бенчмарк; запуск без -short")
+	}
 	const (
 		numProteins = 10000 // Размер базы данных белков
 		dim         = 640   // Размерность ESM-2 белкового вектора

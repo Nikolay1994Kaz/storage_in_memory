@@ -18,6 +18,9 @@ import (
 //
 // Запуск: go test -v -run=TestEfSearchTradeoff ./vector/ -timeout 30m
 func TestEfSearchTradeoff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый бенчмарк; запуск без -short")
+	}
 	const dim = 768
 
 	sizes := []int{20_000, 50_000}

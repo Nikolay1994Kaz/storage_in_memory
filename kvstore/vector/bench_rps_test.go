@@ -22,6 +22,9 @@ import (
 //   2. go test ./kvstore/vector/ -run TestRPSBenchmark -v -count=1
 
 func TestRPSBenchmark(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый бенчмарк; запуск без -short")
+	}
 	addr := "localhost:6380"
 
 	// Проверяем, запущен ли сервер

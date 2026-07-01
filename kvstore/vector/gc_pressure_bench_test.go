@@ -56,6 +56,9 @@ func makeKeys(n int) []string {
 // Сценарий A: GC-скан строковой мапы vs интернированного эквивалента
 // -----------------------------------------------------------------------------
 func TestGCReport_InterningVsStringMap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый GC-репорт (до 1M ключей); запуск без -short")
+	}
 	const rounds = 20
 	sizes := []int{50_000, 200_000, 1_000_000}
 
@@ -113,6 +116,9 @@ func TestGCReport_InterningVsStringMap(t *testing.T) {
 // Сценарий C: churn аллокаций от COW-tombstones
 // -----------------------------------------------------------------------------
 func TestGCReport_TombstoneChurn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый GC-репорт (COW-tombstone churn); запуск без -short")
+	}
 	Ds := []int{1_000, 2_000, 4_000, 8_000, 16_000}
 
 	t.Logf("\n=== C. COW-tombstones: суммарные аллокации на D удалений ===")

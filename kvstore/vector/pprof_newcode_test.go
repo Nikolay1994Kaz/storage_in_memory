@@ -21,6 +21,9 @@ import (
 // =============================================================================
 
 func TestPprofNewCode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый профайл-прогон; запуск без -short")
+	}
 	const (
 		dim      = 128
 		n        = 5000

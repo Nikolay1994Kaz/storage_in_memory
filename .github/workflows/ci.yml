@@ -68,7 +68,7 @@ jobs:
       - name: Test (experimental cluster, race)
         run: go test -short -race -tags experimental -timeout 15m ./kvstore/internal/cluster/...
 
-      # Алгоритмика vector — в основном однопоточная, тяжёлая (~7-8 мин);
-      # гоняем без -race, чтобы держать гейт в разумном времени.
+      # Алгоритмика vector: под -short ~35с (тяжёлые бенчи/репорты скипаются,
+      # корректностные тесты остаются). Без -race — гоним однопоточно для скорости.
       - name: Test (vector)
-        run: go test -short -timeout 20m ./kvstore/vector/
+        run: go test -short -timeout 5m ./kvstore/vector/

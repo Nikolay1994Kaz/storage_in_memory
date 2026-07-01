@@ -183,6 +183,9 @@ func (pq *PQIndex) DistancePQ(distTable []float32, i int) float32 {
 // ============================================================================
 
 func TestPQBenchmark(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый бенчмарк; запуск без -short")
+	}
 	const (
 		dim = 768
 		m   = 96 // подвекторов (768/96 = 8 floats каждый)

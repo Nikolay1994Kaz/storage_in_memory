@@ -169,6 +169,9 @@ func benchmarkLSHSearch(b *testing.B, n, dim, K, threshold int) {
 // ─────────────────────────────────────────────
 
 func TestLSH_Recall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("тяжёлый recall-репорт (строит HNSW на 10k); запуск без -short")
+	}
 	dims := []int{256}
 	sizes := []int{1000, 5000, 10000}
 	thresholds := []int{8, 10, 12, 15}

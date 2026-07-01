@@ -33,7 +33,11 @@ func TestLeveledStore_MergeTrigger(t *testing.T) {
 	lvs.FlushDeltaSync()
 
 	// Ждём background merges
-	for i := 0; i < 30; i++ {
+	maxIters := 30
+	if testing.Short() {
+		maxIters = 3 // под -short не крутим polling до минуты, но целостность всё равно проверяем
+	}
+	for i := 0; i < maxIters; i++ {
 		s := lvs.Stats()
 		t.Logf("  [%ds] L0=%d L1=%d L2=%d delta=%d total=%d",
 			i*2, s.SegmentsByLevel[0], s.SegmentsByLevel[1], s.SegmentsByLevel[2],
