@@ -170,6 +170,14 @@ func (w *WAL) Close() error {
 		w.file.Close()
 		return fmt.Errorf("wal flush on close: %w", err)
 	}
+	// fsync на закрытии: Flush только сбрасывает bufio в page cache ОС.
+	// Без Sync потеря питания сразу после штатной остановки теряет последний
+	// батч (уже подтверждённый клиенту). Close — холодный путь (shutdown),
+	// поэтому стоимость fsync здесь приемлема.
+	if err := w.file.Sync(); err != nil {
+		w.file.Close()
+		return fmt.Errorf("wal fsync on close: %w", err)
+	}
 	return w.file.Close()
 }
 

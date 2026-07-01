@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,11 @@ const (
 	// Защита от Slowloris-атаки: если клиент прислал полкоманды
 	// и замолчал — через 5 секунд соединение закроется.
 	ReadTimeout = 5 * time.Second
+
+	// drainTimeout — предел ожидания завершения воркеров в Stop(). Страховка на
+	// случай, когда закрытие epoll-fd не разбудило заблокированный epoll_wait
+	// (idle-timeout=0 → timeoutMs=-1): shutdown не должен зависать навсегда.
+	drainTimeout = 5 * time.Second
 )
 
 // ConnState хранит состояние соединения.
@@ -84,6 +90,11 @@ type Server struct {
 	// stopping — выставляется в Stop(); воркеры выходят из eventLoop, а не
 	// крутятся в tight-loop на EpollWait-ошибке после закрытия epoll-fd.
 	stopping atomic.Bool
+
+	// wg отслеживает горутины воркеров для graceful drain: Stop() дожидается
+	// завершения in-flight обработчиков, чтобы их WAL-записи попали в канал
+	// ДО того, как вызывающий закроет WAL (иначе — send на закрытый канал).
+	wg sync.WaitGroup
 }
 
 func NewServer(addr string, handler Handler) *Server {
@@ -121,6 +132,7 @@ func (s *Server) Start() error {
 		ep.connCount = &s.activeConns // общий счётчик соединений на все воркеры
 		s.workers[i] = &worker{id: i, epoll: ep}
 
+		s.wg.Add(1)
 		go s.eventLoop(s.workers[i])
 	}
 
@@ -182,6 +194,8 @@ func (s *Server) acceptLoop() {
 // воркер периодически просыпался и реапил неактивные соединения — даже когда по
 // ним нет событий (молчащий Slowloris-клиент epoll не разбудит).
 func (s *Server) eventLoop(w *worker) {
+	defer s.wg.Done()
+
 	timeoutMs := -1 // по умолчанию блокируем бесконечно (реапинг выключен)
 	if s.IdleTimeout > 0 {
 		tick := s.IdleTimeout
@@ -195,6 +209,13 @@ func (s *Server) eventLoop(w *worker) {
 	}
 
 	for {
+		// Проверяем остановку и на таймаут-пробуждении, а не только на ошибке
+		// Wait: закрытие epoll-fd из другой горутины не всегда будит уже
+		// заблокированный epoll_wait, но при заданном idle-timeout воркер
+		// просыпается по тику и выходит здесь чисто (graceful drain).
+		if s.stopping.Load() {
+			return
+		}
 		states, err := w.epoll.Wait(timeoutMs)
 		if err != nil {
 			if s.stopping.Load() {
@@ -306,6 +327,29 @@ func (s *Server) closeProtoErr(w *worker, cs *ConnState) {
 func (s *Server) Stop() error {
 	s.stopping.Store(true) // воркеры выйдут из eventLoop, а не зациклятся на ошибке
 	s.listener.Close()
+
+	// Будим воркеров, стоящих в epoll_wait, ЧЕРЕЗ self-pipe — но пока НЕ закрываем
+	// epoll-fd: закрытие под заблокированным epoll_wait его не разбудит. Разбуженный
+	// воркер видит stopping=true и выходит из eventLoop сам.
+	for _, w := range s.workers {
+		w.epoll.Wake()
+	}
+
+	// Graceful drain: дожидаемся выхода воркеров — их in-flight обработчики
+	// дозавершатся и отправят свои WAL-записи в канал ДО его закрытия вызывающим.
+	// Ограничиваем drainTimeout, чтобы shutdown не завис при непредвиденной блокировке.
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(drainTimeout):
+		log.Println("Server.Stop: drain timeout — продолжаем остановку")
+	}
+
+	// Воркеры вышли (или таймаут) — теперь безопасно закрыть epoll-fd и соединения.
 	for _, w := range s.workers {
 		w.epoll.Close()
 	}

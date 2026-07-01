@@ -21,6 +21,13 @@ type Epoll struct {
 	// connCount — общий на все воркеры счётчик живых соединений (указатель на
 	// Server.activeConns). Inc в Add, dec в Remove. nil = не считаем (legacy).
 	connCount *atomic.Int64
+
+	// wakeR/wakeW — self-pipe для пробуждения заблокированного epoll_wait при
+	// остановке. Закрытие epoll-fd из другой горутины НЕ гарантирует возврат из
+	// epoll_wait(-1); Close() пишет байт в wakeW → read-конец готов к чтению →
+	// epoll_wait просыпается, и воркер выходит по флагу stopping (graceful drain).
+	wakeR int
+	wakeW int
 }
 
 // NewEpoll создаёт новый epoll instance.
@@ -30,9 +37,30 @@ func NewEpoll() (*Epoll, error) {
 	if err != nil {
 		return nil, fmt.Errorf("epoll_create1: %w", err)
 	}
+
+	// Self-pipe: read-конец регистрируем в epoll, в write-конец пишет Close().
+	// O_NONBLOCK — чтобы Write в Close() не заблокировался, если буфер полон;
+	// O_CLOEXEC — не наследуется дочерними процессами.
+	var p [2]int
+	if err := syscall.Pipe2(p[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("wake pipe: %w", err)
+	}
+	if err := syscall.EpollCtl(fd, syscall.EPOLL_CTL_ADD, p[0], &syscall.EpollEvent{
+		Events: syscall.EPOLLIN,
+		Fd:     int32(p[0]),
+	}); err != nil {
+		syscall.Close(p[0])
+		syscall.Close(p[1])
+		syscall.Close(fd)
+		return nil, fmt.Errorf("epoll_ctl wake pipe: %w", err)
+	}
+
 	return &Epoll{
 		fd:          fd,
 		connections: make(map[int]*ConnState),
+		wakeR:       p[0],
+		wakeW:       p[1],
 	}, nil
 }
 
@@ -137,7 +165,18 @@ func (e *Epoll) reapIdle(timeout time.Duration) {
 	}
 }
 
-// Close закрывает epoll instance.
+// Wake будит заблокированный epoll_wait, записывая байт в self-pipe.
+//
+// Вызывается ДО Close(): нельзя закрывать epoll-fd, пока воркер стоит в
+// epoll_wait — закрытие fd под ним не гарантирует возврат. Правильный порядок
+// (см. Server.Stop): Wake() всем воркерам → дождаться их выхода → Close() всем.
+// Best-effort: ошибку Write игнорируем (non-blocking pipe, воркер мог уже выйти).
+func (e *Epoll) Wake() {
+	syscall.Write(e.wakeW, []byte{1})
+}
+
+// Close закрывает epoll instance и self-pipe. Соединения тоже закрываются.
+// Вызывать только ПОСЛЕ выхода воркера из eventLoop (см. Wake).
 func (e *Epoll) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -145,6 +184,8 @@ func (e *Epoll) Close() error {
 	for _, cs := range e.connections {
 		cs.Conn.Close()
 	}
+	syscall.Close(e.wakeR)
+	syscall.Close(e.wakeW)
 	return syscall.Close(e.fd)
 }
 
