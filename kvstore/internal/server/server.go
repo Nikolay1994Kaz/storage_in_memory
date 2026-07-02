@@ -35,6 +35,7 @@ type ConnState struct {
 	WorkerID      int
 	InTx          bool
 	TxQueue       [][][]byte // ← was [][]protocol.Value
+	TxAborted     bool       // H2: в MULTI встретилась запрещённая команда → EXEC вернёт EXECABORT
 	Authenticated bool       // true после успешной AUTH команды
 
 	// LastActivity — unix-наносекунды последней активности (приём данных).

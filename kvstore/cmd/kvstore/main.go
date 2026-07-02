@@ -532,6 +532,8 @@ func main() {
 		case "MULTI":
 			start := time.Now()
 			cs.InTx = true
+			cs.TxQueue = nil
+			cs.TxAborted = false
 			cs.Buf.WriteSimpleString("OK")
 			monitoring.RecordCommand(cmd, time.Since(start))
 			return
@@ -544,6 +546,7 @@ func main() {
 			}
 			cs.InTx = false
 			cs.TxQueue = nil
+			cs.TxAborted = false
 			cs.Buf.WriteSimpleString("OK")
 			monitoring.RecordCommand(cmd, time.Since(start))
 			return
@@ -551,6 +554,16 @@ func main() {
 			startEXEC := time.Now()
 			if !cs.InTx {
 				cs.Buf.WriteError("ERR EXEC without MULTI")
+				monitoring.RecordCommand(cmd, time.Since(startEXEC))
+				return
+			}
+			// H2: если в очередь попала запрещённая команда — вся транзакция
+			// отменяется (как EXECABORT в Redis). Не выполняем ничего.
+			if cs.TxAborted {
+				cs.Buf.WriteError("EXECABORT Transaction discarded because of previous errors.")
+				cs.InTx = false
+				cs.TxQueue = nil
+				cs.TxAborted = false
 				monitoring.RecordCommand(cmd, time.Since(startEXEC))
 				return
 			}
@@ -566,13 +579,7 @@ func main() {
 		}
 
 		if cs.InTx {
-			// Копируем args — ring buffer будет перезаписан!
-			argsCopy := make([][]byte, len(args))
-			for i, a := range args {
-				argsCopy[i] = append([]byte(nil), a...)
-			}
-			cs.TxQueue = append(cs.TxQueue, argsCopy)
-			cs.Buf.WriteSimpleString("QUEUED")
+			queueTxCommand(cs, args, cmd)
 			return
 		}
 
@@ -1840,4 +1847,40 @@ func execQueuedTx(queue [][][]byte, writeHeader func(int), run func(qCmd string,
 		qCmd := strings.ToUpper(string(queuedArgs[0]))
 		run(qCmd, queuedArgs[1:])
 	}
+}
+
+// queueTxCommand ставит команду в очередь транзакции ИЛИ отклоняет её (H2).
+//
+// Pub/sub subscribe-команды (forbiddenInTx) переводят соединение в subscriber-
+// mode и пишут ответы мимо cs.Buf → внутри EXEC это укоротило бы обещанный
+// ArrayHeader(N) → RESP-десинк соединения навсегда. Такую команду НЕ ставим в
+// очередь, а помечаем транзакцию на отмену (cs.TxAborted) — как EXECABORT в
+// Redis: последующий EXEC ничего не выполнит и вернёт ошибку.
+func queueTxCommand(cs *server.ConnState, args [][]byte, cmd string) {
+	if forbiddenInTx(cmd) {
+		cs.TxAborted = true
+		cs.Buf.WriteError("ERR " + cmd + " is not allowed in transactions")
+		return
+	}
+	// Копируем args — ring buffer будет перезаписан!
+	argsCopy := make([][]byte, len(args))
+	for i, a := range args {
+		argsCopy[i] = append([]byte(nil), a...)
+	}
+	cs.TxQueue = append(cs.TxQueue, argsCopy)
+	cs.Buf.WriteSimpleString("QUEUED")
+}
+
+// forbiddenInTx — команды, недопустимые внутри MULTI/EXEC (H2).
+//
+// Pub/sub subscribe-команды переводят соединение в subscriber-mode: запускают
+// writePump (второй писатель в сокет) и шлют ответы через pub/sub-канал, а не в
+// cs.Buf. Внутри EXEC это ломает RESP-кадр (обещанный ArrayHeader(N) получает
+// меньше элементов) и рвёт соединение. Redis тоже запрещает их в транзакции.
+func forbiddenInTx(cmd string) bool {
+	switch cmd {
+	case "SUBSCRIBE", "UNSUBSCRIBE", "VSIM.SUBSCRIBE", "VSIM.UNSUBSCRIBE":
+		return true
+	}
+	return false
 }
