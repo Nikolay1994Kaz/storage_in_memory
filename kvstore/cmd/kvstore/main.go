@@ -554,16 +554,11 @@ func main() {
 				monitoring.RecordCommand(cmd, time.Since(startEXEC))
 				return
 			}
-			globalTxMu.Lock()
-			cs.Buf.WriteArrayHeader(len(cs.TxQueue))
-			for _, queuedArgs := range cs.TxQueue {
-				qCmd := strings.ToUpper(string(queuedArgs[0]))
-				qCmdArgs := queuedArgs[1:]
+			execQueuedTx(cs.TxQueue, cs.Buf.WriteArrayHeader, func(qCmd string, qCmdArgs [][]byte) {
 				startCmd := time.Now()
 				executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
 				monitoring.RecordCommand(qCmd, time.Since(startCmd))
-			}
-			globalTxMu.Unlock()
+			})
 			cs.InTx = false
 			cs.TxQueue = nil
 			monitoring.RecordCommand(cmd, time.Since(startEXEC))
@@ -1825,4 +1820,22 @@ func snapshotIterate(
 			fn(wal.OpZAdd, setName, zset.EncodeZAddValue(score, member))
 		})
 	})
+}
+
+// execQueuedTx выполняет очередь команд MULTI/EXEC под globalTxMu.
+//
+// H1: defer Unlock ОБЯЗАТЕЛЕН. Если run (executeCommand) паникует на битой
+// команде в очереди, её ловит recover в handleConn — но Unlock без defer был
+// бы пропущен → globalTxMu залочен НАВСЕГДА → EXEC всех соединений виснут,
+// воркеры застревают по одному. defer освобождает мьютекс на разворачивании
+// паники, после чего она уходит в recover (соединение закрывается).
+func execQueuedTx(queue [][][]byte, writeHeader func(int), run func(qCmd string, qCmdArgs [][]byte)) {
+	globalTxMu.Lock()
+	defer globalTxMu.Unlock()
+
+	writeHeader(len(queue))
+	for _, queuedArgs := range queue {
+		qCmd := strings.ToUpper(string(queuedArgs[0]))
+		run(qCmd, queuedArgs[1:])
+	}
 }
