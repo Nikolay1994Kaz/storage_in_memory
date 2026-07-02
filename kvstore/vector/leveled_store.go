@@ -547,6 +547,10 @@ type compactionResult struct {
 	epoch     uint64    // эпоха на момент GRAB
 	result    segment   // построенный сегмент (nil = failure)
 	oldSegs   []segment // для merge: сегменты для удаления из sourceLvl
+	// flushDelta — сфлашенная дельта (taskFlushDelta): держалась searchable в
+	// lvs.flushing до этого момента. applyResult удаляет её из flushing и Close'ит
+	// ПОСЛЕ публикации сегмента (единственный owner Close на нормальном пути).
+	flushDelta *DeltaSegment
 }
 
 // LeveledVectorStore — основное хранилище с leveled compaction.
@@ -556,6 +560,16 @@ type LeveledVectorStore struct {
 	mu    sync.RWMutex
 	delta *DeltaSegment
 	dim   int // устанавливается при первой вставке или LoadBinary
+
+	// flushing — дельты, сфлашиваемые в фоне: swap уже произошёл (новые Add идут в
+	// lvs.delta), но сегмент ещё НЕ опубликован в levels. Держим их searchable
+	// (immutable memtable á-la LSM), иначе между swap и публикацией сегмента
+	// сфлашиваемые векторы невидимы — flush-visibility gap (transient false-negative).
+	// Заполняется под mu.Lock при swap в handleCompactSignal; элемент удаляется и
+	// Close'ится в applyResult ПОСЛЕ публикации сегмента (единственный owner Close на
+	// нормальном пути — эксклюзивно к search-RLock, нет UAF). После swap дельта
+	// immutable (Add в неё не пишет) → конкурентный Search по ней безопасен под RLock.
+	flushing []*DeltaSegment
 
 	// tombstoneMu сериализует COW-мутации tombstones на горячем пути Add,
 	// который теперь держит lvs.mu лишь как RLock (несколько писателей сразу).
@@ -956,6 +970,10 @@ func (lvs *LeveledVectorStore) Clear() {
 	for i := range lvs.levels {
 		lvs.levels[i] = nil
 	}
+	// Снимаем сфлашиваемые дельты с searchable-списка: их эпоха устарела. Сам Close
+	// НЕ здесь — in-flight build/freeze-горутины ещё читают эти дельты; их закроет
+	// applyResult по epoch-mismatch, когда горутина завершится (нет UAF, нет утечки).
+	lvs.flushing = nil
 	lvs.tombstones.Store(nil)
 }
 
@@ -1108,9 +1126,13 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		nSegs += len(lvs.levels[i])
 	}
 	hasDelta := lvs.delta != nil && lvs.delta.Len() > 0
+	// hasFlushing — есть дельты, сфлашиваемые в фоне (swap уже был, сегмент ещё не
+	// опубликован). Их надо искать наравне с активной дельтой (flush-visibility gap).
+	// При наличии flushing идём общим путём — fast-path 2/3 их не учитывают.
+	hasFlushing := len(lvs.flushing) > 0
 
 	// Fast path 1: ничего нет — возвращаем nil
-	if !hasDelta && nSegs == 0 {
+	if !hasDelta && !hasFlushing && nSegs == 0 {
 		lvs.mu.RUnlock()
 		return nil, nil
 	}
@@ -1148,10 +1170,10 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 	// что приемлемо (delta bounded, flush регулярно освобождает lock).
 	delta := lvs.delta
 
-	// Fast path 2: только delta, нет сегментов — BruteForce под RLock.
-	// 1 alloc/op (выходной heap). BruteForce по ~10k векторов ~200μs — RLock на
-	// это время блокирует Add, что приемлемо (delta bounded).
-	if nSegs == 0 && hasDelta {
+	// Fast path 2: только активная delta, нет сегментов и нет flushing — BruteForce
+	// под RLock. 1 alloc/op (выходной heap). BruteForce по ~10k векторов ~200μs —
+	// RLock на это время блокирует Add, что приемлемо (delta bounded).
+	if nSegs == 0 && hasDelta && !hasFlushing {
 		raw := delta.Search(query, K, efSearch, composedFilter)
 		lvs.mu.RUnlock()
 		if len(raw) == 0 {
@@ -1164,8 +1186,8 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		return result, nil
 	}
 
-	// Fast path 3: один сегмент, delta пуста — прямой Search без merge
-	if nSegs == 1 && !hasDelta {
+	// Fast path 3: один сегмент, дельта пуста и нет flushing — прямой Search без merge
+	if nSegs == 1 && !hasDelta && !hasFlushing {
 		var seg segment
 		for i := range lvs.levels {
 			if len(lvs.levels[i]) > 0 {
@@ -1189,19 +1211,33 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		return result, nil
 	}
 
-	// General path: N сегментов + delta.
+	// General path: N сегментов + memtable-набор (активная дельта + flushing-дельты).
 	//
 	// Корректность concurrency:
 	//   - Сегменты immutable после публикации → поиск по ним идёт БЕЗ lvs.mu.
-	//   - Delta MUTABLE (Add делает append/copy в неё) → BruteForce по ней
-	//     обязан идти ПОД lvs.mu.RLock(), иначе data race с параллельным Add.
-	//     Поэтому delta обрабатываем синхронно под lock (~200μs при 10k векторов),
-	//     затем отпускаем lock и параллельно обходим immutable-сегменты.
+	//   - Memtable-дельты MUTABLE/в аллокаторе → Search по ним ОБЯЗАН идти ПОД
+	//     lvs.mu.RLock(): активная — из-за конкурентного Add; flushing — из-за Close
+	//     в applyResult (только под mu.Lock → эксклюзивно к RLock, нет UAF по slab).
+	//     Обрабатываем синхронно под lock (~200μs/10k), затем отпускаем lock и
+	//     параллельно обходим immutable-сегменты.
 	//
-	// 1 alloc/op для delta (выходной heap), сегменты — через sync.Pool.
-	var deltaRes []deltaResult
+	// memtables — дельты в порядке СВЕЖЕСТИ (freshest first): активная дельта, затем
+	// flushing от новейшей к старейшей. Порядок = провенанс: memtable[i] свежее любого
+	// сегмента и свежее memtable[j>i]. Contains ниже (после RUnlock) безопасен и на
+	// закрытой дельте (keyIdx — Go-map, переживает swap+Close).
+	memtables := make([]*DeltaSegment, 0, 1+len(lvs.flushing))
 	if hasDelta {
-		deltaRes = delta.Search(query, K, efSearch, composedFilter)
+		memtables = append(memtables, delta)
+	}
+	for i := len(lvs.flushing) - 1; i >= 0; i-- {
+		memtables = append(memtables, lvs.flushing[i])
+	}
+	nMem := len(memtables)
+
+	// 1 alloc/op на memtable (выходной heap), сегменты — через sync.Pool.
+	memRes := make([][]deltaResult, nMem)
+	for i, mt := range memtables {
+		memRes[i] = mt.Search(query, K, efSearch, composedFilter)
 	}
 
 	// Копируем указатели сегментов (дешёво: ~8 байт на сегмент) вместе с
@@ -1219,10 +1255,7 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 	}
 	lvs.mu.RUnlock()
 
-	nWorkers := nSegs
-	if hasDelta {
-		nWorkers++
-	}
+	nWorkers := nSegs + nMem
 
 	st := leveledSearchPool.Get().(*leveledSearchState)
 	defer leveledSearchPool.Put(st)
@@ -1240,16 +1273,15 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		}
 	}
 
-	// delta-результат вычислен под RLock в виде []deltaResult. Копируем в
-	// workerBufs[0] как FrozenResult (struct conversion — zero alloc, копирование
-	// string-header + float32 по значению).
-	idx := 0
-	if hasDelta {
-		for _, r := range deltaRes {
-			st.workerBufs[0] = append(st.workerBufs[0], FrozenResult{Key: r.key, Dist: r.dist})
+	// memtable-результаты вычислены под RLock ([]deltaResult). Копируем в
+	// workerBufs[0..nMem-1] (freshest first) как FrozenResult (struct conversion —
+	// zero alloc, копирование string-header + float32 по значению).
+	for i := 0; i < nMem; i++ {
+		for _, r := range memRes[i] {
+			st.workerBufs[i] = append(st.workerBufs[i], FrozenResult{Key: r.key, Dist: r.dist})
 		}
-		idx = 1
 	}
+	idx := nMem
 
 	// Сегменты — immutable, можно параллельно без lvs.mu.
 	remainSegs := segs
@@ -1274,15 +1306,14 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 	// сегментов — по segRank. Без дедупа stale-копия занимала слот в top-K и
 	// вытесняла легитимного соседа. Выбор ПО ПРОВЕНАНСУ, а не по дистанции — иначе
 	// более близкий, но устаревший вектор победил бы свежий.
-	segStart := 0
-	if hasDelta {
-		segStart = 1
-	}
+	// Ранг: memtable[i] (i<nMem) свежее любого сегмента; среди memtable меньший
+	// индекс = свежее (активная дельта = MinInt64). Сегменты — по segRank (>= ~-nSegs,
+	// т.е. всегда > MinInt64+nMem → memtable гарантированно побеждает).
 	rankFor := func(wb int) int64 {
-		if hasDelta && wb == 0 {
-			return math.MinInt64 // дельта всегда свежее сегментов
+		if wb < nMem {
+			return math.MinInt64 + int64(wb)
 		}
-		return segRank[wb-segStart]
+		return segRank[wb-nMem]
 	}
 
 	total := 0
@@ -1304,14 +1335,25 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 
 	for i := range st.workerBufs {
 		r := rankFor(i)
-		isFrozen := !(hasDelta && i == 0) // workerBufs[0] — дельта, остальные — сегменты
+		// Затенение: более свежий источник гасит stale-копию того же ключа, даже когда
+		// свежая копия далеко от запроса и не попала в top-K (провенанс-дедуп тогда
+		// бессилен — stale заняла бы слот и вытеснила легитимного соседа).
+		//   - сегмент (i>=nMem) затеняется ЛЮБОЙ memtable-дельтой;
+		//   - memtable[i] затеняется лишь БОЛЕЕ СВЕЖЕЙ memtable (индекс < i).
+		// Contains race-free и O(1), безопасен и на сфлашенной (закрытой) дельте.
+		shadowLimit := i
+		if i >= nMem {
+			shadowLimit = nMem
+		}
 		for _, res := range st.workerBufs[i] {
-			// Дельта ЗАТЕНЯЕТ frozen: если ключ жив в активной дельте, его frozen-копия
-			// устарела (upsert записал свежий вектор в дельту, старый остался в сегменте).
-			// Отбрасываем stale-копию в источнике — иначе она заняла бы слот в top-K и
-			// вытеснила легитимного соседа (провенанс-дедуп бессилен, когда свежая копия
-			// далеко от запроса и не попала в top-K дельты). delta.Contains race-free и O(1).
-			if isFrozen && hasDelta && delta.Contains(res.Key) {
+			shadowed := false
+			for j := 0; j < shadowLimit; j++ {
+				if memtables[j].Contains(res.Key) {
+					shadowed = true
+					break
+				}
+			}
+			if shadowed {
 				continue
 			}
 			if pos, ok := st.dedupPos[res.Key]; ok {
@@ -2099,6 +2141,10 @@ type compactionTask struct {
 	targetLvl int          // куда публиковать результат (0 для flush, L+1 для merge)
 	sourceLvl int          // для merge: уровень источника (L) — для cleanup oldSegs
 	epoch     uint64       // эпоха на момент GRAB (для PUBLISH-time check)
+	dim       int          // dim, захваченный под локом (build читает его вне лока)
+	// flushDelta — сфлашиваемая дельта (taskFlushDelta): остаётся searchable в
+	// lvs.flushing, пока applyResult не опубликует построенный из неё сегмент.
+	flushDelta *DeltaSegment
 	// result — заполнается goroutine после BUILD, читается coordinator при PUBLISH.
 	result segment
 }
@@ -2161,8 +2207,14 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 		return
 	}
 	oldDelta := lvs.delta
+	// dim захватываем ПОД локом: build-горутина иначе читает lvs.dim без синхронизации,
+	// а Clear() пишет lvs.dim=0 (pre-existing data race, обнажён Clear-during-build).
+	dim := lvs.dim
 	max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
 	lvs.delta = NewDeltaSegmentSharded(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
+	// Держим сфлашиваемую дельту searchable до публикации сегмента (закрывает
+	// flush-visibility gap). Close/удаление — в applyResult под mu.Lock.
+	lvs.flushing = append(lvs.flushing, oldDelta)
 	lvs.mu.Unlock()
 
 	monitoring.VectorFlushDeltaTotal.Inc()
@@ -2180,17 +2232,23 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 			lvs.startFreezeDeltaGoroutine(oldDelta, epoch)
 		} else {
 			// dim > порога: frozen-CSR не применим → rebuild в hnswSegment из slab.
-			// entries ссылаются на slab oldDelta (не на граф) → Close после ExtractAll безопасен.
+			// entries ссылаются на slab oldDelta (не на граф) → oldDelta должна жить до
+			// конца build → Close откладывается в applyResult (после публикации сегмента),
+			// а не сразу после ExtractAll (иначе UAF по slab при конкурентном Search).
 			entries := oldDelta.ExtractAll()
-			oldDelta.Close()
 			lvs.startBuildGoroutine(&compactionTask{
-				kind:      taskFlushDelta,
-				entries:   entries,
-				targetLvl: 0,
-				epoch:     epoch,
+				kind:       taskFlushDelta,
+				entries:    entries,
+				targetLvl:  0,
+				epoch:      epoch,
+				dim:        dim,
+				flushDelta: oldDelta,
 			})
 		}
 	} else {
+		// Пустая дельта (defensive; early-return выше отсекает Len==0): нечего строить.
+		// Убираем из flushing и закрываем сразу.
+		lvs.removeFlushing(oldDelta)
 		oldDelta.Close()
 		// entries пуст — пробудим FlushDeltaSync если ожидает.
 		lvs.mu.Lock()
@@ -2208,6 +2266,29 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 	lvs.maybeScheduleMerges(epoch)
 }
 
+// removeFlushing удаляет сфлашенную дельту из lvs.flushing (берёт mu.Lock).
+// Вызывается из build/freeze-горутин на shutdown-пути (lock не удержан).
+func (lvs *LeveledVectorStore) removeFlushing(d *DeltaSegment) {
+	if d == nil {
+		return
+	}
+	lvs.mu.Lock()
+	lvs.removeFlushingLocked(d)
+	lvs.mu.Unlock()
+}
+
+// removeFlushingLocked удаляет d из lvs.flushing С СОХРАНЕНИЕМ ПОРЯДКА (порядок =
+// свежесть для провенанс-дедупа). Вызывать под mu.Lock. Сдвиг in-place безопасен:
+// search копирует срез flushing под RLock, а мутация идёт под эксклюзивным Lock.
+func (lvs *LeveledVectorStore) removeFlushingLocked(d *DeltaSegment) {
+	for i, f := range lvs.flushing {
+		if f == d {
+			lvs.flushing = append(lvs.flushing[:i], lvs.flushing[i+1:]...)
+			return
+		}
+	}
+}
+
 // startBuildGoroutine запускает goroutine для BUILD delta-flush сегмента.
 // inFlightBuilds.Add(1) выполняется СИНХРОННО до запуска горутины —
 // FlushDeltaSync никогда не увидит ложный 0.
@@ -2221,13 +2302,17 @@ func (lvs *LeveledVectorStore) startBuildGoroutine(task *compactionTask) {
 	// Синхронный инкремент ДО запуска горутины — критично для FlushDeltaSync.
 	lvs.inFlightBuilds.Add(1)
 	epoch := task.epoch
+	flushDelta := task.flushDelta
 	go func() {
 		// Ожидаем свободный слот (семафор). Горутина блокируется, coordinator — нет.
 		select {
 		case lvs.buildSem <- struct{}{}:
 			defer func() { <-lvs.buildSem }()
 		case <-lvs.done:
-			// Shutdown: сигнализируем coordinator'у через resultChan.
+			// Shutdown: coordinator уже вышел → applyResult не отработает.
+			// Закрываем сфлашиваемую дельту сами (единственный owner Close на этом пути).
+			lvs.removeFlushing(flushDelta)
+			flushDelta.Close()
 			res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: nil}
 			select {
 			case lvs.resultChan <- res:
@@ -2249,13 +2334,18 @@ func (lvs *LeveledVectorStore) startBuildGoroutine(task *compactionTask) {
 					seg = nil // паника → rollback
 				}
 			}()
-			seg = lvs.buildSegmentWithAllocator(task.entries, lvs.dim, alloc)
+			seg = lvs.buildSegmentWithAllocator(task.entries, task.dim, alloc)
 		}()
 
-		res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: seg}
+		// flushDelta передаётся в результат — applyResult удалит её из flushing и
+		// Close'ит ПОСЛЕ публикации сегмента (держали searchable весь build).
+		res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: seg, flushDelta: flushDelta}
 		select {
 		case lvs.resultChan <- res:
 		case <-lvs.done:
+			// Shutdown до применения результата: coordinator не отработает — Close сами.
+			lvs.removeFlushing(flushDelta)
+			flushDelta.Close()
 			lvs.inFlightBuilds.Add(-1)
 		}
 	}()
@@ -2271,6 +2361,8 @@ func (lvs *LeveledVectorStore) startFreezeDeltaGoroutine(oldDelta *DeltaSegment,
 		case lvs.buildSem <- struct{}{}:
 			defer func() { <-lvs.buildSem }()
 		case <-lvs.done:
+			// Shutdown: coordinator уже вышел → Close сами (единственный owner).
+			lvs.removeFlushing(oldDelta)
 			oldDelta.Close()
 			res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: nil}
 			select {
@@ -2300,10 +2392,10 @@ func (lvs *LeveledVectorStore) startFreezeDeltaGoroutine(oldDelta *DeltaSegment,
 				}
 			}
 		}()
-		// freeze скопировал данные в Go-память → аллокатор графа дельты можно закрыть.
-		oldDelta.Close()
-
-		res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: seg}
+		// freeze скопировал данные в Go-память, НО oldDelta остаётся searchable в
+		// flushing до публикации сегмента → Close откладывается в applyResult
+		// (единственный owner Close на нормальном пути; эксклюзивно к search-RLock).
+		res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: seg, flushDelta: oldDelta}
 		select {
 		case lvs.resultChan <- res:
 		case <-lvs.done:
@@ -2407,6 +2499,12 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 	if lvs.compactionEpoch.Load() != r.epoch {
 		monitoring.VectorCompactionEpochMismatchTotal.Inc()
 		if r.kind == taskFlushDelta {
+			// Сегмент устарел (Clear) → не публикуем. Дельту всё равно снимаем с
+			// searchable-списка и закрываем (owner Close на этом пути — здесь).
+			lvs.removeFlushingLocked(r.flushDelta)
+			if r.flushDelta != nil {
+				r.flushDelta.Close()
+			}
 			remaining := lvs.inFlightBuilds.Add(-1)
 			// Broadcast только когда последний build завершился и delta пуста.
 			if lvs.flushPending.Load() && remaining == 0 {
@@ -2430,6 +2528,15 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 			lvs.levels[0] = append(lvs.levels[0], r.result)
 		} else {
 			monitoring.VectorCompactionRollbackTotal.Inc()
+		}
+		// Публикация сегмента и снятие дельты с searchable-списка — под одним Lock:
+		// для любого Search переход delta→segment атомарен (видит либо flushing-дельту,
+		// либо уже сегмент — но не «ни там, ни там» = закрытый flush-visibility gap).
+		// Close ПОСЛЕ снятия из flushing и публикации: с этого момента дельту никто не
+		// ищет (search берёт RLock, эксклюзивно к нашему Lock) → нет UAF по slab/графу.
+		lvs.removeFlushingLocked(r.flushDelta)
+		if r.flushDelta != nil {
+			r.flushDelta.Close()
 		}
 		// Broadcast только когда ЭТО последний build И delta пуста.
 		// Без этой проверки: первый же completed build сбрасывает flushPending=false,
