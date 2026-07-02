@@ -329,6 +329,39 @@ func (s *Server) closeProtoErr(w *worker, cs *ConnState) {
 	w.epoll.Remove(cs)
 }
 
+// CloseConn закрывает соединение по net.Conn через ЕДИНУЮ точку (Epoll.Remove):
+// декремент connCount/ActiveConnections + EpollCtl DEL + удаление из карты epoll
+// + очистка подписок (onRemove) + conn.Close().
+//
+// H3: Hub.disconnectSlow (эвикция медленного подписчика) обязан ходить сюда, а
+// не звать conn.Close() напрямую — иначе учёт epoll не чистится и слот течёт
+// навсегда → перманентный DoS при MaxConnections.
+//
+// Поиск по идентичности conn (а не по fd) — чтобы не звать socketFD на, возможно,
+// уже закрытом соединении (паника) и быть устойчивым к гонке двойного закрытия.
+// Путь редкий (эвикция) → O(N) допустим. Remove идемпотентен: если conn уже
+// снят другим путём, EpollCtl DEL вернёт ошибку и Remove выйдет без двойного
+// декремента.
+func (s *Server) CloseConn(conn net.Conn) {
+	for _, w := range s.workers {
+		var target *ConnState
+		w.epoll.mu.RLock()
+		for _, cs := range w.epoll.connections {
+			if cs.Conn == conn {
+				target = cs
+				break
+			}
+		}
+		w.epoll.mu.RUnlock()
+		if target != nil {
+			w.epoll.Remove(target)
+			return
+		}
+	}
+	// Не найдено среди epoll (уже снято / не регистрировалось) — закрываем прямо.
+	conn.Close()
+}
+
 // Stop останавливает сервер.
 func (s *Server) Stop() error {
 	s.stopping.Store(true) // воркеры выйдут из eventLoop, а не зациклятся на ошибке

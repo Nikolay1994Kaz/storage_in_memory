@@ -50,6 +50,21 @@ type Hub struct {
 	semIndex  *vector.VectorStore    // HNSW-индекс интересов подписчиков
 	semSubs   map[string]*Subscriber // HNSW key → subscriber
 	nextSemID atomic.Uint64
+
+	// onSlowClose — маршрут закрытия соединения через ЕДИНУЮ точку сервера
+	// (Epoll.Remove): декремент connCount/ActiveConnections + EpollCtl DEL +
+	// удаление из карты epoll. Без него disconnectSlow закрывал бы conn напрямую,
+	// минуя учёт epoll → slot течёт → DoS при MaxConnections (H3). nil в юнит-
+	// тестах без сервера → fallback на conn.Close(). Вызывается ВНЕ h.mu.
+	onSlowClose func(net.Conn)
+}
+
+// SetOnSlowClose задаёт маршрут закрытия соединения для disconnectSlow.
+// Сервер связывает его со Server.CloseConn (единая точка учёта epoll).
+func (h *Hub) SetOnSlowClose(fn func(net.Conn)) {
+	h.mu.Lock()
+	h.onSlowClose = fn
+	h.mu.Unlock()
 }
 
 // NewHub создаёт единый Hub.
@@ -630,12 +645,22 @@ func (s *Subscriber) writePump() {
 
 // disconnectSlow отключает медленного подписчика.
 // Очищает ОБА типа подписок. Безопасен при вызове из нескольких горутин.
+//
+// H3: само закрытие соединения идёт через ЕДИНУЮ точку (onSlowClose →
+// Server.CloseConn → Epoll.Remove), а НЕ через прямой conn.Close(). Иначе
+// учёт epoll (connCount/ActiveConnections, карта fd) не чистится → каждый
+// slow-subscriber навсегда съедает слот → перманентный DoS при MaxConnections.
+//
+// Порядок: очистка подписок + удаление sub из карты — под h.mu; закрытие
+// соединения — ВНЕ h.mu (Epoll.Remove зовёт onRemove=RemoveConn, который снова
+// берёт h.mu; sub уже удалён → ранний return, дедлока нет). Идемпотентно:
+// параллельные вызовы находят !exists и выходят — маршрутизирует ровно один.
 func (h *Hub) disconnectSlow(sub *Subscriber) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	// Проверяем: не отключили ли уже другой горутиной?
 	if _, exists := h.subscribers[sub.conn]; !exists {
+		h.mu.Unlock()
 		return // Уже отключен — выходим без паники
 	}
 
@@ -656,6 +681,15 @@ func (h *Hub) disconnectSlow(sub *Subscriber) {
 	}
 
 	close(sub.done)
-	sub.conn.Close()
 	delete(h.subscribers, sub.conn)
+	closer := h.onSlowClose
+	conn := sub.conn
+	h.mu.Unlock()
+
+	// Закрытие — ВНЕ лока, через единую точку учёта epoll (H3).
+	if closer != nil {
+		closer(conn)
+	} else {
+		conn.Close() // fallback: юнит-тесты Hub без сервера
+	}
 }

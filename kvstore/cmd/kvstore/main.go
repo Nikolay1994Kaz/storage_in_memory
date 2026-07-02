@@ -595,6 +595,8 @@ func main() {
 	// Отключение клиента чистит его подписки Pub/Sub (classic + semantic-вектор в
 	// HNSW). Без этого хука вектор течёт в индекс навсегда, а writePump висит.
 	srv.OnDisconnect = hub.RemoveConn
+	// H3: медленный подписчик отключается через единую точку учёта epoll.
+	hub.SetOnSlowClose(srv.CloseConn)
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
 	if *tlsCert != "" && *tlsKey != "" {
