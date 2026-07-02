@@ -686,6 +686,21 @@ func writeValue(buf *server.ConnBuf, v protocol.Value) {
 	}
 }
 
+// setClearTTL снимает прежний TTL с ключа при голом SET (без EX) — семантика
+// Redis без KEEPTTL: перезапись значения сбрасывает срок жизни, иначе новое
+// значение умрёт по старому таймеру.
+//
+// OpPersist пишется в WAL ТОЛЬКО если TTL реально был (ttl.Remove вернул true) —
+// без спама WAL на каждый SET и с durability: при реплее/компакции прежний
+// OpExpire не воскресит удалённый TTL (реплей: OpSet(new) → OpPersist(снять)).
+//
+// Вынесено из inline-обработчика SET для тестируемости.
+func setClearTTL(ttl *store.TTLManager, bw *wal.BatchWAL, key string) {
+	if ttl.Remove(key) {
+		bw.Write(wal.Entry{Op: wal.OpPersist, Key: key})
+	}
+}
+
 // buildServerTLSConfig собирает *tls.Config для серверного listener'а с явным
 // MinVersion и опциональным mTLS. Если задан clientCAPath — сервер требует
 // клиентский сертификат, подписанный этим CA (сетевая идентичность поверх пароля).
@@ -939,6 +954,11 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			binary.BigEndian.PutUint64(b[:], uint64(expiresAt.UnixNano()))
 			bw.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: b[:]})
 			ttl.Set(key, dur)
+		} else {
+			// Голый SET (без EX) снимает прежний TTL — семантика Redis без
+			// KEEPTTL. Иначе новое значение унаследует старый таймер и умрёт
+			// неожиданно. OpPersist пишется для durability (реплей/компакция).
+			setClearTTL(ttl, bw, key)
 		}
 
 		buf.WriteSimpleString("OK")
