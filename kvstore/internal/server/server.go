@@ -368,9 +368,9 @@ func (s *Server) closeProtoErr(w *worker, cs *ConnState) {
 //
 // Поиск по идентичности conn (а не по fd) — чтобы не звать socketFD на, возможно,
 // уже закрытом соединении (паника) и быть устойчивым к гонке двойного закрытия.
-// Путь редкий (эвикция) → O(N) допустим. Remove идемпотентен: если conn уже
-// снят другим путём, EpollCtl DEL вернёт ошибку и Remove выйдет без двойного
-// декремента.
+// Путь редкий (эвикция) → O(N) допустим. Remove идемпотентен (M4): гейт по
+// identity в карте epoll делает повторный Remove no-op'ом без двойного
+// декремента — независимо от исхода EpollCtl DEL.
 func (s *Server) CloseConn(conn net.Conn) {
 	for _, w := range s.workers {
 		var target *ConnState

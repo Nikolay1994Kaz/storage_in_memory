@@ -100,17 +100,41 @@ func (e *Epoll) Add(cs *ConnState) error {
 }
 
 // Remove убирает соединение из epoll и закрывает его.
+//
+// Идемпотентен и устойчив к ошибке EpollCtl DEL (M4). Учёт (connCount /
+// ActiveConnections), очистка подписок (onRemove) и Close выполняются РОВНО
+// ОДИН раз — по факту присутствия ИМЕННО этого cs в карте (identity), а НЕ по
+// успеху EpollCtl. Иначе:
+//   - ошибка EpollCtl DEL (EBADF — peer закрыл fd; ENOENT — уже снят) при
+//     раннем return роняла бы очистку → течёт connCount → ложный отказ по
+//     MaxConnections + утечка подписки Pub/Sub (вектор в HNSW навсегда);
+//   - повторный Remove того же conn (recover-путь handleConn + реапер/CloseConn)
+//     задвоил бы декремент.
+//
+// Проверка identity (а не только наличия fd) устойчива к fd-reuse: если fd уже
+// переиспользован другим соединением, его запись мы не трогаем.
 func (e *Epoll) Remove(cs *ConnState) error {
 	fd := socketFD(cs.Conn)
 
-	err := syscall.EpollCtl(e.fd, syscall.EPOLL_CTL_DEL, fd, nil)
-	if err != nil {
-		return fmt.Errorf("epoll_ctl DEL: %w", err)
-	}
+	// EpollCtl DEL — best-effort: ошибку запоминаем, но в очистку НЕ пропускаем.
+	ctlErr := syscall.EpollCtl(e.fd, syscall.EPOLL_CTL_DEL, fd, nil)
 
+	// Гейт идемпотентности: чистим учёт ТОЛЬКО если в карте лежит именно этот cs.
 	e.mu.Lock()
-	delete(e.connections, fd)
+	got, ok := e.connections[fd]
+	remove := ok && got == cs
+	if remove {
+		delete(e.connections, fd)
+	}
 	e.mu.Unlock()
+
+	if !remove {
+		// Уже снят другим вызовом (или fd переиспользован) — идемпотентный no-op.
+		if ctlErr != nil {
+			return fmt.Errorf("epoll_ctl DEL: %w", ctlErr)
+		}
+		return nil
+	}
 
 	if e.connCount != nil {
 		e.connCount.Add(-1)
@@ -124,7 +148,12 @@ func (e *Epoll) Remove(cs *ConnState) error {
 		e.onRemove(cs.Conn)
 	}
 
-	return cs.Conn.Close()
+	closeErr := cs.Conn.Close()
+	if ctlErr != nil {
+		// Соединение всё равно очищено; ошибку EpollCtl возвращаем для видимости.
+		return fmt.Errorf("epoll_ctl DEL: %w", ctlErr)
+	}
+	return closeErr
 }
 
 // Wait ждёт событий на зарегистрированных соединениях.
