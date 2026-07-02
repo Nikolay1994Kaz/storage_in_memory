@@ -27,9 +27,22 @@ import (
 //   B+Tree nodes, member strings, KV data, vectors — всё в TCMalloc.
 //   Один MemoryCounter, один DeferFree, один HeapStats.
 
+// zsetEntry — один sorted set: дерево + writer-мьютекс.
+//
+// S3: ZAdd/ZRem — это check-then-act (Get(__zidx) → DeleteMember → Insert →
+// Set(__zidx)). Без сериализации два конкурентных ZAdd одного member оба
+// читают «не существует» → оба Insert → ДУБЛЬ в дереве + сирота в обратном
+// индексе навсегда (ZCARD раздут, призрак в range). mu делает RMW атомарным
+// per-set. Readers (ZScore/ZRange/ZCard/ForEach) mu НЕ берут — их защищают
+// собственные локи BPTree (RLock/seqlock) и lock-free __zidx.
+type zsetEntry struct {
+	tree *btree.BPTree
+	mu   sync.Mutex // сериализует writers одного set
+}
+
 // ZSetRegistry — реестр sorted sets.
 type ZSetRegistry struct {
-	sets  sync.Map // map[string]*btree.BPTree — lock-free Load для существующих
+	sets  sync.Map // map[string]*zsetEntry — lock-free Load для существующих
 	store *tcmalloc.TCMallocStore
 }
 
@@ -79,33 +92,38 @@ func DecodeZAddValue(data []byte) (float64, string) {
 
 // getOrCreate возвращает существующее дерево или создаёт новое.
 // sync.Map.LoadOrStore — lock-free для существующих, мьютекс только при первом создании.
-func (r *ZSetRegistry) getOrCreate(setName string) *btree.BPTree {
+func (r *ZSetRegistry) getOrCreate(setName string) *zsetEntry {
 	if v, ok := r.sets.Load(setName); ok {
-		return v.(*btree.BPTree)
+		return v.(*zsetEntry)
 	}
 	// Lazy create — sync.Map корректно обрабатывает concurrent LoadOrStore.
-	// Если два ZADD одновременно создают "prices" — один BPTree победит,
+	// Если два ZADD одновременно создают "prices" — один entry победит,
 	// второй будет GC'd (один лишний узел, не страшно).
-	tree := btree.New(r.store, 0) // workerID=0 для внутренних аллокаций дерева
-	actual, _ := r.sets.LoadOrStore(setName, tree)
-	return actual.(*btree.BPTree)
+	e := &zsetEntry{tree: btree.New(r.store, 0)} // workerID=0 для внутренних аллокаций дерева
+	actual, _ := r.sets.LoadOrStore(setName, e)
+	return actual.(*zsetEntry)
 }
 
-// get возвращает дерево или nil если не существует.
-func (r *ZSetRegistry) get(setName string) *btree.BPTree {
+// get возвращает entry или nil если set не существует.
+func (r *ZSetRegistry) get(setName string) *zsetEntry {
 	v, ok := r.sets.Load(setName)
 	if !ok {
 		return nil
 	}
-	return v.(*btree.BPTree)
+	return v.(*zsetEntry)
 }
 
 // ZAdd добавляет member с score в sorted set.
 // Если member уже существует — обновляет score.
 // Возвращает true если новый member добавлен (не обновление).
 func (r *ZSetRegistry) ZAdd(workerID int, setName string, score float64, member string) bool {
-	tree := r.getOrCreate(setName)
+	e := r.getOrCreate(setName)
 	rk := reverseKey(setName, member)
+
+	// S3: весь check-then-act под per-set мьютексом — иначе конкурентные ZAdd
+	// одного member дают дубль в дереве + сироту в обратном индексе.
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	// Проверяем обратный индекс: есть ли уже этот member?
 	oldScoreBytes, existed := r.store.Get(rk)
@@ -117,11 +135,11 @@ func (r *ZSetRegistry) ZAdd(workerID int, setName string, score float64, member 
 			return false
 		}
 		// Удаляем старую запись из дерева (по old score + member)
-		tree.DeleteMember(oldScore, member)
+		e.tree.DeleteMember(oldScore, member)
 	}
 
 	// Вставляем новую запись
-	tree.Insert(score, member)
+	e.tree.Insert(score, member)
 
 	// Обновляем обратный индекс
 	r.store.Set(workerID, rk, encodeScore(score))
@@ -143,19 +161,24 @@ func (r *ZSetRegistry) ZScore(setName, member string) (float64, bool) {
 // ZRem удаляет member из sorted set.
 // Возвращает true если member существовал.
 func (r *ZSetRegistry) ZRem(workerID int, setName, member string) bool {
-	tree := r.get(setName)
-	if tree == nil {
+	e := r.get(setName)
+	if e == nil {
 		return false
 	}
 
 	rk := reverseKey(setName, member)
+
+	// S3: check-then-act под тем же per-set мьютексом, что и ZAdd.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	oldScoreBytes, existed := r.store.Get(rk)
 	if !existed {
 		return false
 	}
 
 	oldScore := DecodeScore(oldScoreBytes)
-	tree.DeleteMember(oldScore, member)
+	e.tree.DeleteMember(oldScore, member)
 	r.store.Del(workerID, rk)
 	return true
 }
@@ -169,12 +192,12 @@ type RangeResult struct {
 // ZRangeByScore возвращает все members в диапазоне [minScore, maxScore].
 // Результаты отсортированы по score (B+Tree гарантирует порядок).
 func (r *ZSetRegistry) ZRangeByScore(setName string, minScore, maxScore float64) []RangeResult {
-	tree := r.get(setName)
-	if tree == nil {
+	e := r.get(setName)
+	if e == nil {
 		return nil
 	}
 
-	raw := tree.RangeSearch(minScore, maxScore)
+	raw := e.tree.RangeSearch(minScore, maxScore)
 	results := make([]RangeResult, len(raw))
 	for i, item := range raw {
 		results[i] = RangeResult{Score: item.Score, Member: item.Member}
@@ -185,22 +208,22 @@ func (r *ZSetRegistry) ZRangeByScore(setName string, minScore, maxScore float64)
 // ZCard возвращает количество элементов в sorted set.
 // Lock-free: atomic.Int64.Load().
 func (r *ZSetRegistry) ZCard(setName string) int {
-	tree := r.get(setName)
-	if tree == nil {
+	e := r.get(setName)
+	if e == nil {
 		return 0
 	}
-	return tree.Len()
+	return e.tree.Len()
 }
 
 // MembersInRange возвращает множество member'ов в диапазоне score.
 // Оптимизирован для VSIM.SEARCHRANGE: B+Tree RangeSearch → map[string]bool.
 func (r *ZSetRegistry) MembersInRange(setName string, minScore, maxScore float64) map[string]bool {
-	tree := r.get(setName)
-	if tree == nil {
+	e := r.get(setName)
+	if e == nil {
 		return nil
 	}
 
-	raw := tree.RangeSearch(minScore, maxScore)
+	raw := e.tree.RangeSearch(minScore, maxScore)
 	if len(raw) == 0 {
 		return nil
 	}
@@ -229,21 +252,21 @@ func (r *ZSetRegistry) MembersInRange(setName string, minScore, maxScore float64
 // Caveat: FNV-1a коллизия теоретически возможна (~1/2^64).
 // Для mission-critical фильтрации можно верифицировать через ZSCORE.
 func (r *ZSetRegistry) MembersInRangeHashed(setName string, minScore, maxScore float64) map[uint64]struct{} {
-	tree := r.get(setName)
-	if tree == nil {
+	e := r.get(setName)
+	if e == nil {
 		return nil
 	}
-	return tree.RangeCollectHashes(minScore, maxScore)
+	return e.tree.RangeCollectHashes(minScore, maxScore)
 }
 
 // ForEach итерирует по sorted set в порядке score.
 // Для snapshot/WAL compaction.
 func (r *ZSetRegistry) ForEach(setName string, fn func(score float64, member string)) {
-	tree := r.get(setName)
-	if tree == nil {
+	e := r.get(setName)
+	if e == nil {
 		return
 	}
-	tree.ForEach(fn)
+	e.tree.ForEach(fn)
 }
 
 // ForEachSet итерирует по всем sorted sets.
