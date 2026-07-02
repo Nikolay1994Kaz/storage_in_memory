@@ -144,6 +144,23 @@ func Open(path string) (*WAL, error) {
 	return w, nil
 }
 
+// FsyncDir делает durable последний rename/create/unlink внутри директории,
+// синхронизируя саму директорию. Без этого потеря питания может откатить
+// переименование (данные файла уже на диске, но запись в каталоге — нет):
+// snapshot.wal/graph_leveled.bin «исчезнут», хотя старые WAL уже удалены → потеря.
+// Так же поступают SQLite/LMDB/PostgreSQL после атомарной замены файла.
+func FsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("fsync dir open %s: %w", dir, err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync dir %s: %w", dir, err)
+	}
+	return nil
+}
+
 // reserveLSN резервирует n подряд идущих номеров и возвращает первый из них.
 // Присваивание start..start+n-1 монотонно. Один atomic Add на пачку.
 func (w *WAL) reserveLSN(n uint64) uint64 {
@@ -262,6 +279,13 @@ func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
 	// nextLSN НЕ сбрасываем — номера продолжаются сквозь ротацию.
 	if err := writeFileHeader(w.writer, walBaseLSN); err != nil {
 		return "", fmt.Errorf("wal rotate header: %w", err)
+	}
+
+	// fsync каталога: делаем durable появление нового WAL-файла. Без этого
+	// power-loss может потерять запись каталога о новом файле (его данные
+	// синкаются позже Syncer'ом, но имя в каталоге ещё не durable).
+	if err := FsyncDir(w.dir); err != nil {
+		return "", fmt.Errorf("wal rotate dir fsync: %w", err)
 	}
 
 	return oldPath, nil

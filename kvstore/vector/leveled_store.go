@@ -65,7 +65,9 @@ const (
 // сериализованы TenantCatalog + segmentAttrs (durability колоночного слоя); v3 —
 // hnswSegment (flat, dim>256) тоже персистит атрибуты по вектору (writeAttrs),
 // колонки+каталог регенерируются buildSegment на load. v1/v2 читаются как прежде.
-var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 5, 0, 0}
+// leveledMagic: "LVLV" + версия формата. v6 добавил 8B snapshotLSN-watermark
+// в заголовок (после snapshotTime) — recovery-идемпотентность векторов.
+var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 6, 0, 0}
 
 // leveledMagicPrefix — общая часть ('LVLV') для проверки формата без версии.
 var leveledMagicPrefix = [4]byte{'L', 'V', 'L', 'V'}
@@ -102,6 +104,14 @@ type segment interface {
 type leveledSearchState struct {
 	workerBufs [][]FrozenResult // буфер результатов для каждой горутины-воркера
 	combined   []VSearchResult  // общий буфер для слияния (был []LeveledResult)
+
+	// dedupPos: key → индекс в combined. Дедуп по ключу на merge (один ключ может
+	// жить и в дельте, и во frozen после upsert). Пулится, чистится clear() каждый
+	// поиск → амортизированно zero-alloc.
+	dedupPos map[string]int
+	// rank[i] — провенанс-ранг combined[i] (меньше = свежее). Хранится параллельно
+	// combined, чтобы при коллизии ключа оставить копию из более свежего источника.
+	rank []int64
 }
 
 var leveledSearchPool = sync.Pool{
@@ -109,6 +119,8 @@ var leveledSearchPool = sync.Pool{
 		return &leveledSearchState{
 			workerBufs: make([][]FrozenResult, 0, 8),
 			combined:   make([]VSearchResult, 0, 256),
+			dedupPos:   make(map[string]int, 256),
+			rank:       make([]int64, 0, 256),
 		}
 	},
 }
@@ -654,6 +666,15 @@ type LeveledVectorStore struct {
 
 	// snapshotTime — UnixNano момента последнего успешного LoadBinary (для диагностики).
 	snapshotTime int64
+
+	// snapshotLSN — LSN-watermark снапшота: «graph_leveled.bin покрывает все
+	// векторные операции с LSN ≤ snapshotLSN». Пишется в заголовок при SaveBinary
+	// (значение выставляется SetSnapshotWatermark перед сохранением), читается при
+	// LoadBinary. Recovery пропускает реплей векторных WAL-записей с LSN ≤ этого
+	// watermark — иначе операции из окна «ротация WAL → запись снапшота» попали бы
+	// и в снапшот, и в новый WAL, дублируя векторы при каждом рестарте после
+	// компакции. Дедуп поиска/merge (#1) добивает async-хвост (см. SetSnapshotWatermark).
+	snapshotLSN uint64
 }
 
 // NewLeveledVectorStore создаёт хранилище и запускает Build Pool.
@@ -1183,10 +1204,18 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		deltaRes = delta.Search(query, K, efSearch, composedFilter)
 	}
 
-	// Копируем указатели сегментов (дешёво: ~8 байт на сегмент).
+	// Копируем указатели сегментов (дешёво: ~8 байт на сегмент) вместе с
+	// провенанс-рангом (меньше = свежее): levels[0] — свежайшие, внутри уровня
+	// позже добавленный (больший индекс) свежее. Ранг нужен дедупу в merge, чтобы
+	// при коллизии ключа (delta+frozen после upsert, либо frozen+frozen после
+	// повторного flush) оставить копию из САМОГО свежего источника, а не по дистанции.
 	segs := make([]segment, 0, nSegs)
-	for i := range lvs.levels {
-		segs = append(segs, lvs.levels[i]...)
+	segRank := make([]int64, 0, nSegs)
+	for lvl := range lvs.levels {
+		for pos := range lvs.levels[lvl] {
+			segs = append(segs, lvs.levels[lvl][pos])
+			segRank = append(segRank, int64(lvl)<<40-int64(pos))
+		}
 	}
 	lvs.mu.RUnlock()
 
@@ -1238,7 +1267,24 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		}
 	}
 
-	// Flat merge: собираем всё в один срез и берём top-K
+	// Flat merge с ДЕДУПОМ по ключу: один ключ может присутствовать сразу в
+	// нескольких воркер-буферах (в дельте и во frozen после upsert; в двух frozen
+	// после повторного flush). Оставляем копию из самого свежего источника
+	// (минимальный ранг): delta (workerBufs[0]) свежее любого сегмента, среди
+	// сегментов — по segRank. Без дедупа stale-копия занимала слот в top-K и
+	// вытесняла легитимного соседа. Выбор ПО ПРОВЕНАНСУ, а не по дистанции — иначе
+	// более близкий, но устаревший вектор победил бы свежий.
+	segStart := 0
+	if hasDelta {
+		segStart = 1
+	}
+	rankFor := func(wb int) int64 {
+		if hasDelta && wb == 0 {
+			return math.MinInt64 // дельта всегда свежее сегментов
+		}
+		return segRank[wb-segStart]
+	}
+
 	total := 0
 	for i := range st.workerBufs {
 		total += len(st.workerBufs[i])
@@ -1249,10 +1295,35 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 	} else {
 		st.combined = st.combined[:0]
 	}
+	if cap(st.rank) < total {
+		st.rank = make([]int64, 0, total)
+	} else {
+		st.rank = st.rank[:0]
+	}
+	clear(st.dedupPos)
 
 	for i := range st.workerBufs {
-		for _, r := range st.workerBufs[i] {
-			st.combined = append(st.combined, VSearchResult{Key: r.Key, Distance: r.Dist})
+		r := rankFor(i)
+		isFrozen := !(hasDelta && i == 0) // workerBufs[0] — дельта, остальные — сегменты
+		for _, res := range st.workerBufs[i] {
+			// Дельта ЗАТЕНЯЕТ frozen: если ключ жив в активной дельте, его frozen-копия
+			// устарела (upsert записал свежий вектор в дельту, старый остался в сегменте).
+			// Отбрасываем stale-копию в источнике — иначе она заняла бы слот в top-K и
+			// вытеснила легитимного соседа (провенанс-дедуп бессилен, когда свежая копия
+			// далеко от запроса и не попала в top-K дельты). delta.Contains race-free и O(1).
+			if isFrozen && hasDelta && delta.Contains(res.Key) {
+				continue
+			}
+			if pos, ok := st.dedupPos[res.Key]; ok {
+				if r < st.rank[pos] {
+					st.combined[pos] = VSearchResult{Key: res.Key, Distance: res.Dist}
+					st.rank[pos] = r
+				}
+				continue
+			}
+			st.dedupPos[res.Key] = len(st.combined)
+			st.combined = append(st.combined, VSearchResult{Key: res.Key, Distance: res.Dist})
+			st.rank = append(st.rank, r)
 		}
 	}
 
@@ -1551,6 +1622,27 @@ func (lvs *LeveledVectorStore) Len() int {
 // SnapshotTime возвращает UnixNano времени последнего успешного LoadBinary (для диагностики).
 func (lvs *LeveledVectorStore) SnapshotTime() int64 { return lvs.snapshotTime }
 
+// SnapshotLSN возвращает LSN-watermark, прочитанный последним LoadBinary (0 если
+// снапшот без watermark / не загружался). Recovery пропускает векторные WAL-записи
+// с LSN ≤ этого значения — они уже в снапшоте.
+func (lvs *LeveledVectorStore) SnapshotLSN() uint64 { return lvs.snapshotLSN }
+
+// SetSnapshotWatermark выставляет LSN-watermark, записываемый следующим SaveBinary.
+//
+// Вызывать ПЕРЕД SaveBinary со значением LastLSN() на момент НАЧАЛА сохранения
+// (до FlushDeltaSync). Контракт безопасности: любая векторная операция с
+// LSN ≤ watermark получила свой LSN до этого момента, значит вектор уже был в
+// дельте/сегментах и попадёт в снапшот через FlushDeltaSync → пропуск такой
+// записи при реплее не теряет данных. Векторы, чей WAL-LSN присвоился позже
+// (async batch-flusher), но которые всё же попали в снапшот, реплеятся повторно
+// и схлопываются дедупом поиска/merge (#1) — корректность сохраняется, лишь
+// возможен временный дубль в памяти до ближайшего merge.
+func (lvs *LeveledVectorStore) SetSnapshotWatermark(lsn uint64) {
+	lvs.mu.Lock()
+	lvs.snapshotLSN = lsn
+	lvs.mu.Unlock()
+}
+
 // Close останавливает coordinator и build workers, дожидаясь завершения.
 // Idempotent (sync.Once) — безопасен для многократного вызова.
 func (lvs *LeveledVectorStore) Close() {
@@ -1632,6 +1724,16 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 	binary.LittleEndian.PutUint64(u8[:], uint64(time.Now().UnixNano()))
 	if _, err := w.Write(u8[:]); err != nil {
 		return fmt.Errorf("leveled: write snapshotTime: %w", err)
+	}
+
+	// LSN-watermark (v6): «снапшот покрывает векторные операции до этого LSN».
+	// Значение выставлено SetSnapshotWatermark перед вызовом (под RLock снимаем).
+	lvs.mu.RLock()
+	wmLSN := lvs.snapshotLSN
+	lvs.mu.RUnlock()
+	binary.LittleEndian.PutUint64(u8[:], wmLSN)
+	if _, err := w.Write(u8[:]); err != nil {
+		return fmt.Errorf("leveled: write snapshotLSN: %w", err)
 	}
 
 	var u4 [4]byte
@@ -1784,7 +1886,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: invalid magic header (not a graph_leveled.bin?)")
 	}
 	version := magic[5]
-	if version < 1 || version > 5 {
+	if version < 1 || version > 6 {
 		return fmt.Errorf("leveled: unsupported snapshot version %d", version)
 	}
 
@@ -1794,6 +1896,17 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: read snapshotTime: %w", err)
 	}
 	lvs.snapshotTime = int64(binary.LittleEndian.Uint64(u8[:]))
+
+	// LSN-watermark (v6+): recovery пропустит векторные WAL-записи с LSN ≤ этого.
+	// Старые снапшоты (v≤5) без поля → watermark 0 (реплей всех записей, как раньше;
+	// дедуп #1 удержит корректность).
+	lvs.snapshotLSN = 0
+	if version >= 6 {
+		if _, err := io.ReadFull(r, u8[:]); err != nil {
+			return fmt.Errorf("leveled: read snapshotLSN: %w", err)
+		}
+		lvs.snapshotLSN = binary.LittleEndian.Uint64(u8[:])
+	}
 
 	// Читаем dim
 	var u4 [4]byte
@@ -2059,7 +2172,7 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 		// Тенант-режим (TenantOf != nil) требует rebuild для сортировки entries по
 		// тенанту → freeze-on-flush (заморозка инкрементального графа как есть)
 		// несовместим: он сохранил бы временной порядок вставки, а не тенант-порядок.
-		if lvs.cfg.TenantOf == nil && lvs.cfg.PartitionAttr == "" && !oldDelta.Sharded() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold) {
+		if lvs.cfg.TenantOf == nil && lvs.cfg.PartitionAttr == "" && !oldDelta.Sharded() && !oldDelta.HasAttrs() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold) {
 			// Freeze-on-flush: граф дельты УЖЕ построен инкрементально при Add —
 			// замораживаем его напрямую (SQ8 при UseSQ — любой dim; иначе CSR float32),
 			// без повторной сборки HNSW (нет double-build). Close аллокатора — внутри
@@ -2577,8 +2690,23 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 		return nil
 	}
 
-	// Извлекаем векторы, пропуская tombstoned ключи
+	// Извлекаем векторы, пропуская tombstoned ключи, и ДЕДУПЛИЦИРУЕМ по ключу.
+	// Один ключ может жить в двух merge-входах (upsert после flush: свежая копия
+	// уехала в новый сегмент, старая осталась в прежнем; оба попадают в один merge).
+	// segs идут oldest→newest (caller берёт levels[lyr][:fanout] в порядке создания),
+	// поэтому более поздняя запись СВЕЖЕЕ и перезаписывает раннюю — так stale-копия
+	// физически выметается из индекса (иначе она осталась бы дублем ВНУТРИ сегмента,
+	// который провенанс-дедуп поиска уже не различит — одинаковый ранг).
 	var entries []DeltaEntry
+	seen := make(map[string]int)
+	addEntry := func(key string, vec []float32, attrs Attributes) {
+		if pos, ok := seen[key]; ok {
+			entries[pos] = DeltaEntry{Key: key, Vec: vec, Attrs: attrs}
+			return
+		}
+		seen[key] = len(entries)
+		entries = append(entries, DeltaEntry{Key: key, Vec: vec, Attrs: attrs})
+	}
 	for _, seg := range segs {
 		switch s := seg.(type) {
 		case *frozenSegment:
@@ -2595,7 +2723,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				vec := fg.data[i*fg.dim : (i+1)*fg.dim]
 				vecCopy := make([]float32, dim)
 				copy(vecCopy, vec)
-				entries = append(entries, DeltaEntry{Key: fg.keys.clone(i), Vec: vecCopy, Attrs: s.attrs.decodeAt(i)})
+				addEntry(fg.keys.clone(i), vecCopy, s.attrs.decodeAt(i))
 			}
 		case *frozenSQSegment:
 			// Деквантуем SQ8-векторы обратно в float32 для rebuild.
@@ -2617,7 +2745,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				for d := 0; d < dim; d++ {
 					vecCopy[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
 				}
-				entries = append(entries, DeltaEntry{Key: fg.keys.clone(i), Vec: vecCopy, Attrs: s.attrs.decodeAt(i)})
+				addEntry(fg.keys.clone(i), vecCopy, s.attrs.decodeAt(i))
 			}
 		case *hnswSegment:
 			s.mu.RLock()
@@ -2638,7 +2766,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				raw := g.arena.Get(g.nodes[i].VectorOffset)
 				vecCopy := make([]float32, dim)
 				copy(vecCopy, raw)
-				entries = append(entries, DeltaEntry{Key: key, Vec: vecCopy, Attrs: s.attrs.decodeAt(i)})
+				addEntry(key, vecCopy, s.attrs.decodeAt(i))
 			}
 			s.mu.RUnlock()
 		}
@@ -2701,13 +2829,14 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 	// каталог диапазонов (#6 тип индекса по размеру) и вешаем на сегмент.
 	var cat *TenantCatalog
 	var attrs *segmentAttrs
+	// presets переиспользует партиционный dict в колонке, если тенант-раскладка
+	// строится (коды каталога обязаны совпасть с кодами колонки — иначе SearchFilter
+	// не найдёт блок). Без партиции остаётся nil → колонки строят свои dict.
+	var presets map[string]*attrDict
 	if lvs.cfg.TenantOf != nil || lvs.cfg.PartitionAttr != "" {
-		// Источник тенант-кода: партиционный атрибут (колоночный слой) либо legacy
-		// деривация из ключа. Партиционный dict строим заранее и переиспользуем в
-		// каталоге И в колонке (коды каталога обязаны совпасть с кодами колонки —
-		// иначе SearchFilter не найдёт блок).
+		// Тенант-раскладка (Вещь 1): сортируем entries по коду тенанта и строим
+		// каталог диапазонов. Источник кода: партиционный атрибут либо legacy-ключ.
 		var tenantCode func(DeltaEntry) uint64
-		var presets map[string]*attrDict
 		if lvs.cfg.PartitionAttr != "" {
 			pa := lvs.cfg.PartitionAttr
 			pd := newAttrDict()
@@ -2726,9 +2855,14 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 			return nil
 		}
 		cat = c
-		// Колоночный слой строится на УЖЕ отсортированных entries (frozen id = позиция).
-		attrs = buildSegmentAttrs(entries, presets)
 	}
+	// Колоночный слой строим ВСЕГДА, когда в entries есть атрибуты — НЕЗАВИСИМО от
+	// партиции. Иначе SearchFilter, работавший на свежих данных в дельте, молча
+	// выпадал бы после flush (attrs жили только в дельте). buildSegmentAttrs
+	// возвращает nil, если атрибутов нет (zero-overhead для чистых векторов).
+	// entries к этому моменту уже отсортированы (если была тенант-раскладка) →
+	// frozen id = позиция, колонки выровнены.
+	attrs = buildSegmentAttrs(entries, presets)
 
 	// Строим HNSW из всех векторов.
 	g := NewGraph(lvs.cfg.Distance, allocator)

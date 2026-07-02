@@ -198,6 +198,26 @@ func main() {
 		}
 	}
 
+	// vecWatermark — LSN, до которого векторный снапшот (graph_leveled.bin) уже
+	// содержит все операции. Реплей wal_*.log пропускает векторные записи с
+	// LSN ≤ watermark — иначе операции из окна «ротация WAL → запись снапшота»
+	// накатились бы поверх снапшота, дублируя векторы при каждом рестарте.
+	var vecWatermark uint64
+	if graphLoaded {
+		if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+			vecWatermark = lvs.SnapshotLSN()
+		}
+	}
+	// skipVec решает, пропустить ли векторную операцию как уже отражённую в снапшоте.
+	// Из snapshot.wal — пропускаем, если граф загружен из бинарного снапшота.
+	// Из wal_*.log — пропускаем, если LSN ≤ watermark (запись уже в graph_leveled.bin).
+	skipVec := func(entry wal.Entry, isFromSnapshot bool) bool {
+		if isFromSnapshot {
+			return graphLoaded
+		}
+		return entry.LSN <= vecWatermark
+	}
+
 	// Шаг A: Сначала читаем и накатываем snapshot.wal (если есть)
 	snapshotPath := filepath.Join(dataDir, "snapshot.wal")
 	snapWatermark, snapshotEntries, err := wal.ReadFile(snapshotPath)
@@ -233,8 +253,9 @@ func main() {
 			ttl.Remove(entry.Key)
 			restored++
 		case wal.OpVSimAdd:
-			// Если граф загружен из бинарного снапшота, мы пропускаем векторные операции из snapshot.wal
-			if isFromSnapshot && graphLoaded {
+			// Пропускаем, если операция уже в снапшоте (snapshot.wal при graphLoaded
+			// или wal_*.log с LSN ≤ watermark) — иначе дубль вектора после рестарта.
+			if skipVec(entry, isFromSnapshot) {
 				return
 			}
 			vec := vector.DeserializeVector(entry.Value)
@@ -246,7 +267,7 @@ func main() {
 		case wal.OpVSimAddAttrs:
 			// Вектор + атрибуты (P0-4): attrs/tenant восстанавливаются через
 			// AddWithAttrs, а не теряются как при голом Add.
-			if isFromSnapshot && graphLoaded {
+			if skipVec(entry, isFromSnapshot) {
 				return
 			}
 			vec, attrs, err := vector.DeserializeVectorWithAttrs(entry.Value)
@@ -265,7 +286,7 @@ func main() {
 			vecRestored++
 			restored++
 		case wal.OpVSimDel:
-			if isFromSnapshot && graphLoaded {
+			if skipVec(entry, isFromSnapshot) {
 				return
 			}
 			vecStore.Delete(entry.Key)
@@ -343,6 +364,11 @@ func main() {
 	saveVectors := func() error {
 		// Приводим к *LeveledVectorStore для вызова FlushDeltaSync.
 		if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+			// Watermark ДО FlushDeltaSync: любая векторная операция с LSN ≤ него
+			// уже присвоила LSN, значит вектор был в дельте/сегментах и попадёт в
+			// снапшот через FlushDeltaSync. Recovery пропустит такие WAL-записи —
+			// иначе окно «ротация → снапшот» дублировало бы векторы при рестарте.
+			lvs.SetSnapshotWatermark(rawWAL.LastLSN())
 			lvs.FlushDeltaSync()
 		}
 		graphPath := filepath.Join(dataDir, "graph_leveled.bin")
@@ -368,7 +394,12 @@ func main() {
 			return err
 		}
 		f.Close()
-		return os.Rename(tmpPath, graphPath)
+		if err := os.Rename(tmpPath, graphPath); err != nil {
+			return err
+		}
+		// fsync каталога: делаем rename graph_leveled.bin durable (иначе power-loss
+		// откатит замену снапшота при уже удалённых старых WAL).
+		return wal.FsyncDir(dataDir)
 	}
 
 	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, iterateAll, saveVectors)
