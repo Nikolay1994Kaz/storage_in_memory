@@ -604,6 +604,9 @@ func main() {
 	srv.OnDisconnect = hub.RemoveConn
 	// H3: медленный подписчик отключается через единую точку учёта epoll.
 	hub.SetOnSlowClose(srv.CloseConn)
+	// T2 (QSBR): воркеры рапортуют quiescence аллокатору — deferred-free слоты
+	// освобождаются по кворуму «тихих» состояний, а не по таймеру (фикс UAF).
+	srv.Reclaimer = s
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
 	if *tlsCert != "" && *tlsKey != "" {

@@ -30,10 +30,11 @@ import (
 //   - Writer: version++ (нечётный = "пишу") → modify → version++ (чётный = "готово")
 //   - Reader: v1 = load → read → v2 = load → if v1 != v2 || v1&1 → retry
 //
-// DeferFree (RCU-style grace period):
+// DeferFree (QSBR reclamation):
 //   - Delete/Insert(duplicate) вызывают store.DeferFree(memberH) вместо Free
 //   - Это гарантирует что in-flight lock-free Search не прочитает freed memory
-//   - Тот же механизм что в TCMalloc store Del → DeferFree → FlushDeferred
+//   - Тот же механизм что в TCMalloc store Del: слот освобождается не по
+//     таймеру, а по кворуму quiescent-состояний воркеров (см. tcmalloc/reclaim.go)
 //
 // Composite keys (score, memberHash):
 //   - Sorted sets допускают дублирующиеся score (два товара по $9.99).
@@ -245,7 +246,8 @@ func (t *BPTree) Search(score float64) (string, bool) {
 		}
 
 		// Версия не изменилась → данные консистентны.
-		// memberH защищён DeferFree (grace period ≥100ms >> ~200ns Search).
+		// memberH защищён DeferFree: не освобождается, пока читатель (этот
+		// воркер) не пройдёт quiescent-состояние (см. tcmalloc/reclaim.go).
 		if found {
 			return resolveMember(t.store, memberH), true
 		}
@@ -281,7 +283,7 @@ func (t *BPTree) Insert(score float64, member string) {
 
 // Delete удаляет первый элемент с данным score. Возвращает true если существовал.
 //
-// Member освобождается через DeferFree (grace period), а НЕ через Free.
+// Member освобождается через DeferFree (QSBR), а НЕ через Free.
 // Это гарантирует что in-flight lock-free Search не прочитает freed memory.
 // Тот же механизм что в TCMalloc store Del.
 func (t *BPTree) Delete(score float64) bool {
@@ -325,8 +327,8 @@ func (t *BPTree) Delete(score float64) bool {
 
 	t.len.Add(-1)
 
-	// Отложенное освобождение (как в TCMalloc store Del).
-	// Handle пролежит ≥100ms в очереди → in-flight Search (~200ns) успеет прочитать.
+	// Отложенное освобождение (как в TCMalloc store Del): handle не освободится,
+	// пока in-flight Search не пройдёт quiescent-состояние (QSBR, reclaim.go).
 	t.store.DeferFree(memberH)
 	return true
 }

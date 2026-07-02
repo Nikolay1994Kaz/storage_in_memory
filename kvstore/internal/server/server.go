@@ -45,6 +45,18 @@ type ConnState struct {
 	LastActivity atomic.Int64
 }
 
+// WorkerReclaimer — хук QSBR-управления памятью аллокатора (см. tcmalloc).
+//
+// Воркер сообщает «тихое» состояние (ReportQuiescent) после пробуждения из
+// epoll_wait — до обработки команд, и уходит offline (GoOffline) перед
+// блокировкой в epoll_wait, когда гарантированно не держит ни одного хендла.
+// Это позволяет аллокатору освобождать отложенные слоты не по таймеру, а по
+// кворуму quiescence (фикс UAF T2). nil = не используется.
+type WorkerReclaimer interface {
+	ReportQuiescent(workerID int)
+	GoOffline(workerID int)
+}
+
 // Handler — функция обработки RESP-команды.
 //
 // Было:  func(cs, args []Value) Value   — создаёт Value, возвращает Value
@@ -88,6 +100,10 @@ type Server struct {
 	// Epoll.Remove). Обычно = hub.RemoveConn, чтобы отключение клиента чистило
 	// его подписки Pub/Sub (иначе течёт семантический вектор в HNSW). nil = нет.
 	OnDisconnect func(net.Conn)
+
+	// Reclaimer — необязательный хук QSBR-освобождения памяти аллокатора.
+	// Обычно = tcmalloc-store. nil = воркеры не рапортуют quiescence (тесты).
+	Reclaimer WorkerReclaimer
 
 	// activeConns — текущее число живых соединений (общий счётчик по всем epoll;
 	// inc в Epoll.Add, dec в Epoll.Remove). Читается acceptLoop для проверки лимита.
@@ -223,7 +239,19 @@ func (s *Server) eventLoop(w *worker) {
 		if s.stopping.Load() {
 			return
 		}
+		// QSBR: уходим offline перед блокировкой в epoll_wait. Здесь воркер
+		// гарантированно не держит ни одного хендла (все команды обработаны,
+		// значения скопированы), поэтому исключение из кворума безопасно и не
+		// даёт спящему воркеру заморозить reclaim (см. tcmalloc/reclaim.go).
+		if s.Reclaimer != nil {
+			s.Reclaimer.GoOffline(w.id)
+		}
 		states, err := w.epoll.Wait(timeoutMs)
+		// Проснулись → online: публикуем наблюдаемое поколение ДО обработки
+		// команд (до любого lock-free Get).
+		if s.Reclaimer != nil {
+			s.Reclaimer.ReportQuiescent(w.id)
+		}
 		if err != nil {
 			if s.stopping.Load() {
 				return // сервер останавливается, epoll-fd закрыт — выходим чисто

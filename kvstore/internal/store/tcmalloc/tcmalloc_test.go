@@ -692,10 +692,8 @@ func TestStore_LargeObject_MemoryAccounting(t *testing.T) {
 		t.Fatal("memory decreased immediately after Del (should be deferred)")
 	}
 
-	// Двойная буферизация: нужно ДВА вызова FlushDeferred.
-	// Вызов 1: deferPrev=empty(free nothing), deferCurr→deferPrev
-	store.FlushDeferred()
-	// Вызов 2: deferPrev=handles(free them), deferCurr→deferPrev
+	// FlushDeferred безусловно освобождает всё отложенное за один вызов
+	// (force-drain, используется на shutdown и в тестах; штатный путь — QSBR).
 	freed := store.FlushDeferred()
 
 	if freed == 0 {
