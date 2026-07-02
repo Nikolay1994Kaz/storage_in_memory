@@ -83,6 +83,11 @@ type Server struct {
 	// fd/RAM). 0 = без лимита. Сверх лимита acceptLoop сразу закрывает новый conn.
 	MaxConnections int
 
+	// OnDisconnect — колбэк на закрытие любого соединения (единая точка в
+	// Epoll.Remove). Обычно = hub.RemoveConn, чтобы отключение клиента чистило
+	// его подписки Pub/Sub (иначе течёт семантический вектор в HNSW). nil = нет.
+	OnDisconnect func(net.Conn)
+
 	// activeConns — текущее число живых соединений (общий счётчик по всем epoll;
 	// inc в Epoll.Add, dec в Epoll.Remove). Читается acceptLoop для проверки лимита.
 	activeConns atomic.Int64
@@ -130,6 +135,7 @@ func (s *Server) Start() error {
 			return fmt.Errorf("failed to create epoll for worker %d: %w", i, err)
 		}
 		ep.connCount = &s.activeConns // общий счётчик соединений на все воркеры
+		ep.onRemove = s.OnDisconnect  // очистка подписок Pub/Sub при отключении
 		s.workers[i] = &worker{id: i, epoll: ep}
 
 		s.wg.Add(1)

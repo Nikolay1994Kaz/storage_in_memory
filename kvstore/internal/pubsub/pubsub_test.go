@@ -52,6 +52,117 @@ func TestHub_SubscribeAndPublish(t *testing.T) {
 	}
 }
 
+// ─── СТРАЖ C2: одиночное мелкое сообщение доставляется ────
+//
+// Регрессия к баге, когда writePump писал в bufio, но не флашил: одиночное
+// сообщение (< 4KB) оседало в буфере и НЕ доходило до клиента. Прошлые тесты
+// маскировали это, бомбя 150 сообщений ради авто-флаша при переполнении буфера.
+//
+// Здесь шлём РОВНО ОДНО сообщение и требуем, чтобы оно дошло. Если writePump
+// снова перестанет флашить — клиент упрётся в дедлайн, и тест упадёт.
+func TestHub_SingleMessageDelivered(t *testing.T) {
+	hub := NewHub(nil)
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	hub.Subscribe(serverConn, []string{"news"})
+
+	if d := hub.Publish("news", "hello-single"); d != 1 {
+		t.Fatalf("Publish delivered %d, want 1", d)
+	}
+
+	// Читаем со стороны клиента, накапливая, пока не увидим сообщение.
+	// Первым может прийти confirmation подписки (отдельным флашем) — поэтому цикл.
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var acc strings.Builder
+	buf := make([]byte, 4096)
+	for !strings.Contains(acc.String(), "hello-single") {
+		n, err := clientConn.Read(buf)
+		if err != nil {
+			t.Fatalf("одиночное сообщение не доставлено (writePump не флашит?): "+
+				"read вернул %v, накоплено %q", err, acc.String())
+		}
+		acc.Write(buf[:n])
+	}
+
+	if !strings.Contains(acc.String(), "news") {
+		t.Fatalf("в ответе нет имени канала 'news': %q", acc.String())
+	}
+}
+
+// readUntil читает с клиентской стороны net.Pipe, накапливая, пока не встретит
+// substr, либо не истечёт дедлайн. Возвращает накопленное.
+func readUntil(t *testing.T, conn net.Conn, substr string, timeout time.Duration) string {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	var acc strings.Builder
+	buf := make([]byte, 4096)
+	for !strings.Contains(acc.String(), substr) {
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("readUntil(%q): %v; накоплено %q", substr, err, acc.String())
+		}
+		acc.Write(buf[:n])
+	}
+	return acc.String()
+}
+
+// ─── СТРАЖ H3: subscriber-mode отклоняет чужие команды через writePump ───
+//
+// Регрессия к dual-writer: пока conn подписан (writePump активен), обычная
+// команда шла в основной обработчик и писала ответ в cs.Buf — второй писатель
+// в тот же сокет. Теперь subscriber-mode обслуживает такие команды здесь, и
+// ответ (ошибка) уходит через writePump — единственного писателя.
+func TestHub_SubscriberMode_RejectsForeignCommand(t *testing.T) {
+	hub := NewHub(nil)
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	hub.Subscribe(serverConn, []string{"news"}) // теперь conn — подписчик
+
+	// Подписчик шлёт GET — недопустимо в режиме подписки. readUntil упадёт,
+	// если ошибка НЕ придёт через writePump (значит ответ ушёл мимо, в cs.Buf).
+	hub.HandleSubscriberCommand(serverConn, "GET", [][]byte{[]byte("key")})
+	readUntil(t, clientConn, "not allowed in subscriber mode", 2*time.Second)
+}
+
+// ─── СТРАЖ H3: PING в режиме подписки отвечает через writePump ───
+func TestHub_SubscriberMode_Ping(t *testing.T) {
+	hub := NewHub(nil)
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	hub.Subscribe(serverConn, []string{"news"})
+	hub.HandleSubscriberCommand(serverConn, "PING", nil)
+
+	readUntil(t, clientConn, "PONG", 2*time.Second)
+}
+
+// ─── СТРАЖ H3: ack на UNSUBSCRIBE доставляется даже при закрытии writePump ───
+//
+// UNSUBSCRIBE снимает последнюю подписку → Unsubscribe закрывает writePump
+// (done). Ack «OK» ставится в канал ДО закрытия, и drain-on-done в writePump
+// обязан его дослать. После — соединение больше не подписчик.
+func TestHub_SubscriberMode_UnsubscribeAckThenExit(t *testing.T) {
+	hub := NewHub(nil)
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	hub.Subscribe(serverConn, []string{"only"})
+	hub.HandleSubscriberCommand(serverConn, "UNSUBSCRIBE", nil)
+
+	// ack должен прийти, несмотря на закрытие writePump на последней отписке.
+	readUntil(t, clientConn, "OK", 2*time.Second)
+
+	if hub.IsSubscriber(serverConn) {
+		t.Fatal("после UNSUBSCRIBE всех каналов соединение не должно быть подписчиком")
+	}
+}
+
 // ─── Subscribe: подтверждение (confirmation) ─────────────
 //
 // Redis при SUBSCRIBE возвращает: ["subscribe", "channel", count]

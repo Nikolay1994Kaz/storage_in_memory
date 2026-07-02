@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -418,6 +419,133 @@ func (h *Hub) RemoveConn(conn net.Conn) {
 	h.closeSub(sub)
 }
 
+// Send доставляет один RESP-кадр подписчику через его writePump — единственного
+// писателя для conn в режиме подписки. Возвращает false, если conn не подписчик
+// (тогда писать через writePump нельзя — его нет). Медленного подписчика отключает,
+// та же дисциплина, что в Publish.
+func (h *Hub) Send(conn net.Conn, v protocol.Value) bool {
+	h.mu.RLock()
+	sub, ok := h.subscribers[conn]
+	h.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	select {
+	case sub.ch <- v:
+		return true
+	default:
+		h.disconnectSlow(sub)
+		return false
+	}
+}
+
+// HandleSubscriberCommand обслуживает команду от соединения, УЖЕ находящегося в
+// режиме подписки (IsSubscriber == true). Ключевой инвариант: ВСЕ ответы уходят
+// через writePump (h.Send / подтверждения Subscribe), а НЕ через cs.Buf основного
+// обработчика. Иначе два писателя (writePump + cs.Buf) параллельно пишут в один
+// сокет — перемешанные кадры; плюс клиент-подписчик не ждёт обычных ответов
+// (как в Redis subscriber-mode).
+//
+// Разрешены только команды pub/sub-семейства и PING; остальные отклоняются
+// ошибкой (тоже через writePump).
+func (h *Hub) HandleSubscriberCommand(conn net.Conn, cmd string, args [][]byte) {
+	switch cmd {
+	case "SUBSCRIBE":
+		h.Subscribe(conn, toStrings(args)) // подтверждения — через writePump
+
+	case "UNSUBSCRIBE":
+		// ack ДО снятия: если это последняя подписка, Unsubscribe закроет writePump,
+		// но тот дренирует канал на done — ack успеет уйти.
+		h.Send(conn, protocol.Value{Typ: '+', Str: "OK"})
+		h.Unsubscribe(conn, toStrings(args))
+
+	case "PING":
+		h.Send(conn, protocol.Value{Typ: '+', Str: "PONG"})
+
+	case "PUBLISH":
+		if len(args) < 2 {
+			h.Send(conn, errValue("ERR wrong number of arguments for 'PUBLISH'"))
+			return
+		}
+		count := h.Publish(string(args[0]), string(args[1]))
+		h.Send(conn, protocol.Value{Typ: ':', Num: count})
+
+	case "VSIM.SUBSCRIBE":
+		vec, threshold, err := parseVecThreshold(args)
+		if err != nil {
+			h.Send(conn, errValue("ERR "+err.Error()))
+			return
+		}
+		if _, err := h.SemanticSubscribe(conn, vec, threshold); err != nil {
+			h.Send(conn, errValue("ERR "+err.Error())) // подтверждение — через writePump
+		}
+
+	case "VSIM.UNSUBSCRIBE":
+		h.Send(conn, protocol.Value{Typ: '+', Str: "OK"})
+		h.SemanticUnsubscribe(conn)
+
+	case "VSIM.PUBLISH":
+		vec, msg, err := parseMsgVec(args)
+		if err != nil {
+			h.Send(conn, errValue("ERR "+err.Error()))
+			return
+		}
+		count := h.SemanticPublish(vec, msg)
+		h.Send(conn, protocol.Value{Typ: ':', Num: count})
+
+	default:
+		h.Send(conn, errValue(fmt.Sprintf(
+			"ERR '%s' not allowed in subscriber mode (only pub/sub commands and PING)", cmd)))
+	}
+}
+
+func errValue(msg string) protocol.Value { return protocol.Value{Typ: '-', Str: msg} }
+
+func toStrings(args [][]byte) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = string(a)
+	}
+	return out
+}
+
+// parseVecThreshold разбирает "VSIM.SUBSCRIBE <threshold> <v1..vN>".
+func parseVecThreshold(args [][]byte) ([]float32, float32, error) {
+	if len(args) < 2 {
+		return nil, 0, fmt.Errorf("usage: VSIM.SUBSCRIBE <threshold> <v1> ... <vN>")
+	}
+	threshold, err := strconv.ParseFloat(string(args[0]), 32)
+	if err != nil || threshold < 0 {
+		return nil, 0, fmt.Errorf("invalid threshold (must be non-negative float)")
+	}
+	vec := make([]float32, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		f, err := strconv.ParseFloat(string(args[i]), 32)
+		if err != nil {
+			return nil, 0, fmt.Errorf("invalid float at position %d", i)
+		}
+		vec[i-1] = float32(f)
+	}
+	return vec, float32(threshold), nil
+}
+
+// parseMsgVec разбирает "VSIM.PUBLISH <message> <v1..vN>".
+func parseMsgVec(args [][]byte) ([]float32, string, error) {
+	if len(args) < 2 {
+		return nil, "", fmt.Errorf("usage: VSIM.PUBLISH <message> <v1> ... <vN>")
+	}
+	msg := string(args[0])
+	vec := make([]float32, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		f, err := strconv.ParseFloat(string(args[i]), 32)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid float at position %d", i)
+		}
+		vec[i-1] = float32(f)
+	}
+	return vec, msg, nil
+}
+
 // IsSubscriber проверяет наличие любой подписки (classic или semantic).
 func (h *Hub) IsSubscriber(conn net.Conn) bool {
 	h.mu.RLock()
@@ -439,7 +567,24 @@ func (h *Hub) closeSub(sub *Subscriber) {
 
 // writePump — единственная горутина подписчика.
 // Отправляет ВСЕ сообщения (classic + semantic) в TCP.
+//
+// КРИТИЧНО: protocol.Writer буферизирован (bufio, 4KB). Write() лишь копирует
+// в буфер — данные не уходят клиенту, пока буфер не переполнится ИЛИ пока не
+// вызван Flush(). Поэтому после каждой пачки записей ОБЯЗАТЕЛЕН Flush(), иначе
+// мелкие pub/sub-сообщения оседают в буфере и доставки фактически нет.
+//
+// Под нагрузкой сначала неблокирующе дренируем всё, что уже готово в канале
+// (coalescing), и флашим один раз на пачку — так сохраняется выигрыш bufio
+// (1 syscall на пачку), но без потери доставки на редких одиночных сообщениях.
 func (s *Subscriber) writePump() {
+	// recover: паника в Marshal/Write (напр. битый Value) не должна валить весь
+	// процесс — падает только доставка этому одному подписчику.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Pub/Sub: writePump panic recovered: %v", r)
+		}
+	}()
+
 	writer := protocol.NewWriter(s.conn)
 
 	for {
@@ -448,8 +593,37 @@ func (s *Subscriber) writePump() {
 			if err := writer.Write(msg); err != nil {
 				return
 			}
+			// Coalescing: забираем без блокировки всё, что уже накопилось.
+			for drained := false; !drained; {
+				select {
+				case msg := <-s.ch:
+					if err := writer.Write(msg); err != nil {
+						return
+					}
+				default:
+					drained = true
+				}
+			}
+			// Флаш: без него сообщения не доходят до клиента.
+			if err := writer.Flush(); err != nil {
+				return
+			}
 		case <-s.done:
-			return
+			// Дренируем остаток перед выходом: финальные кадры (напр. ack на
+			// UNSUBSCRIBE, снявший последнюю подписку) должны уйти клиенту, даже
+			// если done уже закрыт. select при готовности обоих каналов случаен —
+			// поэтому дренаж на done обязателен, иначе ack терялся бы.
+			for {
+				select {
+				case msg := <-s.ch:
+					if err := writer.Write(msg); err != nil {
+						return
+					}
+				default:
+					_ = writer.Flush()
+					return
+				}
+			}
 		}
 	}
 }

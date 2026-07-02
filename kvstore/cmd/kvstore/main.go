@@ -26,7 +26,6 @@ import (
 
 	"kvstore/kvstore/internal/ai"
 	"kvstore/kvstore/internal/btree"
-	"kvstore/kvstore/internal/compute"
 	"kvstore/kvstore/internal/monitoring"
 	"kvstore/kvstore/internal/protocol"
 	"kvstore/kvstore/internal/pubsub"
@@ -396,59 +395,19 @@ func main() {
 		defer cl.StopGossip()
 	}
 
-	// === 7. WASM Compute Engine ===
-	wasm := compute.NewEngine()
+	// === 7. WASM Compute Engine (за build-tag experimental; в прод-сборке no-op) ===
+	// Реальный движок и вся wazero-зависимость линкуются только с -tags experimental
+	// (см. wasm_seam.go / wasm_stub.go / wasm_experimental.go). Небезопасная ACE-
+	// поверхность (WASM.EXEC) в прод-бинарь не попадает.
+	wasm := newComputeEngine(computeDeps{
+		store:    s,
+		ttl:      ttl,
+		bw:       bw,
+		hub:      hub,
+		vecStore: vecStore,
+		globalMu: &globalTxMu,
+	})
 	defer wasm.Close()
-
-	wasm.GlobalLock = func() { globalTxMu.Lock() }
-	wasm.GlobalUnlock = func() { globalTxMu.Unlock() }
-
-	wasm.StoreGet = func(key string) ([]byte, bool) {
-		return s.Get(key)
-	}
-	wasm.StoreSet = func(workerID int, key string, value []byte) {
-		s.Set(workerID, key, value)
-	}
-	wasm.StoreDel = func(workerID int, key string) {
-		s.Del(workerID, key)
-	}
-	wasm.Publish = func(channel, message string) {
-		hub.Publish(channel, message)
-	}
-	wasm.VSimSearch = func(workerID int, query []float32, K int) []struct {
-		Key      string
-		Distance float32
-	} {
-		results, err := vecStore.Search(query, K, nil)
-		if err != nil {
-			return nil
-		}
-		out := make([]struct {
-			Key      string
-			Distance float32
-		}, len(results))
-		for i, r := range results {
-			out[i].Key = r.Key
-			out[i].Distance = r.Distance
-		}
-		return out
-	}
-
-	wasm.StoreSetWithWAL = func(workerID int, key string, value []byte) error {
-		bw.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value})
-		s.Set(workerID, key, value)
-		return nil
-	}
-	wasm.StoreDelWithWAL = func(workerID int, key string) error {
-		bw.Write(wal.Entry{Op: wal.OpDel, Key: key})
-		s.Del(workerID, key)
-		ttl.OnDelete(key)
-		return nil
-	}
-
-	// Загрузка WASM модулей с диска
-	triggers := compute.NewTriggerManager(wasm)
-	compute.LoadAll(dataDir, wasm, triggers)
 
 	// === 8. AI Engine (Ollama) ===
 	var aiClient *ai.Client
@@ -461,13 +420,9 @@ func main() {
 	} else {
 		log.Println("Ollama connected: nomic-embed-text + gemma4:e2b")
 
-		// Подключаем AI к WASM Engine — WASM-модули получают доступ к Ollama
-		wasm.AIEmbed = func(ctx context.Context, text string) ([]float32, error) {
-			return aiClient.Embed(ctx, text)
-		}
-		wasm.AIChat = func(ctx context.Context, prompt string) (string, error) {
-			return aiClient.Chat(ctx, prompt)
-		}
+		// Подключаем AI к WASM Engine — WASM-модули получают доступ к Ollama.
+		// В прод-сборке (без experimental) SetAI — no-op.
+		wasm.SetAI(aiClient.Embed, aiClient.Chat)
 
 		// Background Worker: асинхронный embedding с PubSub-нотификациями
 		aiWorker = ai.NewWorker(aiClient, 256)
@@ -530,6 +485,17 @@ func main() {
 			}
 		}
 
+		// Subscriber-mode (как в Redis): пока соединение имеет подписки, обслуживаем
+		// его ТОЛЬКО через pub/sub-шов, где все ответы идут через единственного
+		// писателя conn — writePump. Иначе основной обработчик пишет в cs.Buf
+		// параллельно с writePump → два писателя в один сокет (перемешанные кадры),
+		// а клиент-подписчик не ждёт обычных ответов. Первый SUBSCRIBE идёт обычным
+		// путём (ещё не подписчик) и переводит соединение в этот режим.
+		if hub.IsSubscriber(cs.Conn) {
+			hub.HandleSubscriberCommand(cs.Conn, cmd, cmdArgs)
+			return
+		}
+
 		// Транзакции
 		switch cmd {
 		case "MULTI":
@@ -563,7 +529,7 @@ func main() {
 				qCmd := strings.ToUpper(string(queuedArgs[0]))
 				qCmdArgs := queuedArgs[1:]
 				startCmd := time.Now()
-				executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
 				monitoring.RecordCommand(qCmd, time.Since(startCmd))
 			}
 			globalTxMu.Unlock()
@@ -585,7 +551,7 @@ func main() {
 		}
 
 		start := time.Now()
-		executeCommand(s, bw, ttl, hub, cl, wasm, triggers, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
 		monitoring.RecordCommand(cmd, time.Since(start))
 	}
 
@@ -600,6 +566,9 @@ func main() {
 	srv.IdleTimeout = *idleTimeout
 	srv.WriteTimeout = *writeTimeout
 	srv.MaxConnections = *maxConnections
+	// Отключение клиента чистит его подписки Pub/Sub (classic + semantic-вектор в
+	// HNSW). Без этого хука вектор течёт в индекс навсегда, а writePump висит.
+	srv.OnDisconnect = hub.RemoveConn
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
 	if *tlsCert != "" && *tlsKey != "" {
@@ -787,8 +756,8 @@ func (a leveledStatsAdapter) Stats() monitoring.VectorStats {
 }
 
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
-	hub *pubsub.Hub, cl clusterNode, wasm *compute.Engine,
-	triggers *compute.TriggerManager, vecStore vector.VectorIndex,
+	hub *pubsub.Hub, cl clusterNode, wasm computeRuntime,
+	vecStore vector.VectorIndex,
 	zsetReg *zset.ZSetRegistry,
 	aiClient *ai.Client, aiWorker *ai.Worker,
 	iterateAll func(fn func(op byte, key string, value []byte)),
@@ -806,6 +775,14 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	if isMemoryGrowingCmd(cmd) && s.IsOOM() {
 		monitoring.OomEvents.Inc()
 		buf.WriteError("OOM command not allowed when used memory > 'maxmemory'")
+		return
+	}
+
+	// WASM.* команды обслуживает compute-шов (за build-tag experimental). В прод-
+	// сборке это no-op-заглушка, отвечающая «WASM disabled» — весь код движка и
+	// wazero в бинарь не входят.
+	if strings.HasPrefix(cmd, "WASM.") {
+		wasm.HandleCommand(cmd, args, buf)
 		return
 	}
 
@@ -879,7 +856,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		if cl != nil {
 			cl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
 		}
-		triggers.Fire(compute.OnSet, key, workerID)
+		wasm.FireSet(key, workerID)
 
 		if len(args) >= 4 && strings.ToUpper(string(args[2])) == "EX" {
 			seconds, err := strconv.Atoi(string(args[3]))
@@ -945,7 +922,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		if cl != nil {
 			cl.ForwardWrite(fmt.Sprintf("DEL %s", key))
 		}
-		triggers.Fire(compute.OnDel, key, workerID)
+		wasm.FireDel(key, workerID)
 		if ok {
 			buf.WriteInt(1)
 		} else {
@@ -1058,124 +1035,6 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	case "COMPACT":
 		wal.BackgroundCompact(bw.RawWAL(), dataDir, iterateAll, saveVectors)
 		buf.WriteSimpleString("OK compaction started")
-
-	// === WASM ===
-	case "WASM.LOAD":
-		if len(args) < 2 {
-			buf.WriteError("ERR wrong number of arguments for 'WASM.LOAD'")
-			return
-		}
-		name := string(args[0])
-		wasmBytes := make([]byte, len(args[1]))
-		copy(wasmBytes, args[1])
-		if err := wasm.LoadModule(name, wasmBytes); err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		compute.SaveModule(dataDir, name, wasmBytes)
-		buf.WriteSimpleString("OK")
-
-	case "WASM.LOADFILE":
-		if len(args) < 2 {
-			buf.WriteError("ERR wrong number of arguments for 'WASM.LOADFILE'")
-			return
-		}
-		name := string(args[0])
-		filePath := string(args[1])
-		wasmBytes, err := os.ReadFile(filePath)
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR cannot read file: %v", err))
-			return
-		}
-		if err := wasm.LoadModule(name, wasmBytes); err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		compute.SaveModule(dataDir, name, wasmBytes)
-		buf.WriteSimpleString(fmt.Sprintf("OK loaded %d bytes", len(wasmBytes)))
-
-	case "WASM.DROP":
-		if len(args) < 1 {
-			buf.WriteError("ERR wrong number of arguments for 'WASM.DROP'")
-			return
-		}
-		name := string(args[0])
-		if err := wasm.DropModule(name); err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		compute.DeleteModule(dataDir, name)
-		buf.WriteSimpleString("OK")
-
-	case "WASM.LIST":
-		names := wasm.ListModules()
-		buf.WriteArrayHeader(len(names))
-		for _, n := range names {
-			buf.WriteBulkString(n)
-		}
-
-	case "WASM.EXEC":
-		if len(args) < 2 {
-			buf.WriteError("ERR wrong number of arguments for 'WASM.EXEC'")
-			return
-		}
-		results, err := wasm.ExecFunction(string(args[0]), string(args[1]))
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		if len(results) > 0 {
-			buf.WriteInt(int(results[0]))
-		} else {
-			buf.WriteSimpleString("OK")
-		}
-
-	case "WASM.INFO":
-		if len(args) < 1 {
-			buf.WriteError("ERR wrong number of arguments for 'WASM.INFO'")
-			return
-		}
-		name := string(args[0])
-		loadedAt, execCount, found := wasm.ModuleInfo(name)
-		if !found {
-			buf.WriteError(fmt.Sprintf("ERR module '%s' not found", name))
-			return
-		}
-		info := fmt.Sprintf("module:%s loaded_at:%s exec_count:%d",
-			name, loadedAt.Format(time.RFC3339), execCount)
-		buf.WriteBulkString(info)
-
-	case "WASM.TRIGGER":
-		if len(args) < 4 {
-			buf.WriteError("ERR usage: WASM.TRIGGER <SET|DEL> <pattern> <module> <func>")
-			return
-		}
-		event := compute.TriggerEvent(strings.ToUpper(string(args[0])))
-		pattern := string(args[1])
-		moduleName := string(args[2])
-		funcName := string(args[3])
-		id := triggers.AddTrigger(event, pattern, moduleName, funcName)
-		compute.SaveTriggers(dataDir, triggers)
-		buf.WriteSimpleString(id)
-
-	case "WASM.UNTRIGGER":
-		if len(args) < 1 {
-			buf.WriteError("ERR wrong number of arguments for 'WASM.UNTRIGGER'")
-			return
-		}
-		if triggers.RemoveTrigger(string(args[0])) {
-			compute.SaveTriggers(dataDir, triggers)
-			buf.WriteSimpleString("OK")
-		} else {
-			buf.WriteError("ERR trigger not found")
-		}
-
-	case "WASM.TRIGGERS":
-		all := triggers.ListTriggers()
-		buf.WriteArrayHeader(len(all))
-		for _, t := range all {
-			buf.WriteBulkString(fmt.Sprintf("%s %s %s %s.%s", t.ID, t.Event, t.Pattern, t.ModuleName, t.FuncName))
-		}
 
 	// === Vector Search ===
 	case "VSIM.ADDBIN":
