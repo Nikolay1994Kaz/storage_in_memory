@@ -439,13 +439,45 @@ func (h *Hub) closeSub(sub *Subscriber) {
 
 // writePump — единственная горутина подписчика.
 // Отправляет ВСЕ сообщения (classic + semantic) в TCP.
+//
+// КРИТИЧНО: protocol.Writer буферизирован (bufio, 4KB). Write() лишь копирует
+// в буфер — данные не уходят клиенту, пока буфер не переполнится ИЛИ пока не
+// вызван Flush(). Поэтому после каждой пачки записей ОБЯЗАТЕЛЕН Flush(), иначе
+// мелкие pub/sub-сообщения оседают в буфере и доставки фактически нет.
+//
+// Под нагрузкой сначала неблокирующе дренируем всё, что уже готово в канале
+// (coalescing), и флашим один раз на пачку — так сохраняется выигрыш bufio
+// (1 syscall на пачку), но без потери доставки на редких одиночных сообщениях.
 func (s *Subscriber) writePump() {
+	// recover: паника в Marshal/Write (напр. битый Value) не должна валить весь
+	// процесс — падает только доставка этому одному подписчику.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Pub/Sub: writePump panic recovered: %v", r)
+		}
+	}()
+
 	writer := protocol.NewWriter(s.conn)
 
 	for {
 		select {
 		case msg := <-s.ch:
 			if err := writer.Write(msg); err != nil {
+				return
+			}
+			// Coalescing: забираем без блокировки всё, что уже накопилось.
+			for drained := false; !drained; {
+				select {
+				case msg := <-s.ch:
+					if err := writer.Write(msg); err != nil {
+						return
+					}
+				default:
+					drained = true
+				}
+			}
+			// Флаш: без него сообщения не доходят до клиента.
+			if err := writer.Flush(); err != nil {
 				return
 			}
 		case <-s.done:

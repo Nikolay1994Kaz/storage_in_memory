@@ -22,6 +22,12 @@ type Epoll struct {
 	// Server.activeConns). Inc в Add, dec в Remove. nil = не считаем (legacy).
 	connCount *atomic.Int64
 
+	// onRemove — колбэк на удаление соединения (единая точка). Нужен, чтобы при
+	// отключении клиента почистить его подписки Pub/Sub: иначе семантический
+	// вектор навсегда остаётся в HNSW-индексе, а горутина writePump висит.
+	// Идемпотентен (для неподписанного conn — no-op). nil = не вызываем.
+	onRemove func(net.Conn)
+
 	// wakeR/wakeW — self-pipe для пробуждения заблокированного epoll_wait при
 	// остановке. Закрытие epoll-fd из другой горутины НЕ гарантирует возврат из
 	// epoll_wait(-1); Close() пишет байт в wakeW → read-конец готов к чтению →
@@ -110,6 +116,13 @@ func (e *Epoll) Remove(cs *ConnState) error {
 		e.connCount.Add(-1)
 	}
 	monitoring.ActiveConnections.Dec()
+
+	// Единая точка очистки подписок Pub/Sub при любом закрытии соединения
+	// (ошибка, EOF, idle-реап, shutdown). Вызывается вне e.mu — RemoveConn берёт
+	// свой лок в Hub, пересечения блокировок нет.
+	if e.onRemove != nil {
+		e.onRemove(cs.Conn)
+	}
 
 	return cs.Conn.Close()
 }

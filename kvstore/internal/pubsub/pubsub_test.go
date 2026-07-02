@@ -52,6 +52,45 @@ func TestHub_SubscribeAndPublish(t *testing.T) {
 	}
 }
 
+// ─── СТРАЖ C2: одиночное мелкое сообщение доставляется ────
+//
+// Регрессия к баге, когда writePump писал в bufio, но не флашил: одиночное
+// сообщение (< 4KB) оседало в буфере и НЕ доходило до клиента. Прошлые тесты
+// маскировали это, бомбя 150 сообщений ради авто-флаша при переполнении буфера.
+//
+// Здесь шлём РОВНО ОДНО сообщение и требуем, чтобы оно дошло. Если writePump
+// снова перестанет флашить — клиент упрётся в дедлайн, и тест упадёт.
+func TestHub_SingleMessageDelivered(t *testing.T) {
+	hub := NewHub(nil)
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	hub.Subscribe(serverConn, []string{"news"})
+
+	if d := hub.Publish("news", "hello-single"); d != 1 {
+		t.Fatalf("Publish delivered %d, want 1", d)
+	}
+
+	// Читаем со стороны клиента, накапливая, пока не увидим сообщение.
+	// Первым может прийти confirmation подписки (отдельным флашем) — поэтому цикл.
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var acc strings.Builder
+	buf := make([]byte, 4096)
+	for !strings.Contains(acc.String(), "hello-single") {
+		n, err := clientConn.Read(buf)
+		if err != nil {
+			t.Fatalf("одиночное сообщение не доставлено (writePump не флашит?): "+
+				"read вернул %v, накоплено %q", err, acc.String())
+		}
+		acc.Write(buf[:n])
+	}
+
+	if !strings.Contains(acc.String(), "news") {
+		t.Fatalf("в ответе нет имени канала 'news': %q", acc.String())
+	}
+}
+
 // ─── Subscribe: подтверждение (confirmation) ─────────────
 //
 // Redis при SUBSCRIBE возвращает: ["subscribe", "channel", count]
