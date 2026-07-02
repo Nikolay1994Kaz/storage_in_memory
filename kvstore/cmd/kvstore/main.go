@@ -351,11 +351,11 @@ func main() {
 	ttl.SetEvictor(&compositeEvictor{kv: s, vec: vecStore, wal: bw})
 
 	// === 4. Syncer ===
-	// iterateAll — обход только KV данных для snapshot.wal (векторы хранятся отдельно)
+	// iterateAll — переснимает ВСЁ KV-состояние, живущее только в реплее WAL,
+	// для snapshot.wal (векторы хранятся отдельно). Компакция удаляет старые
+	// WAL, поэтому всё, что не попадёт сюда, теряется после рестарта.
 	iterateAll := func(fn func(op byte, key string, value []byte)) {
-		s.ForEach(func(key string, value []byte) {
-			fn(wal.OpSet, key, value)
-		})
+		snapshotIterate(s, ttl, zsetReg, fn)
 	}
 
 	// saveVectors — сохраняет LeveledVectorStore в graph_leveled.bin.
@@ -1785,4 +1785,44 @@ func SendVectorToNode(addr, key string, vec []float32) error {
 	}
 
 	return nil
+}
+
+// snapshotIterate переснимает всё KV-состояние, живущее только в реплее WAL,
+// в snapshot.wal при компакции. Вынесено из iterateAll ради тестируемости
+// (стражи S1/S2): компакция удаляет старые WAL, поэтому всё, что не попадёт
+// сюда, теряется после рестарта.
+//
+//   - обычные KV-ключи → OpSet;
+//   - внутренние __zidx-ключи ПРОПУСКАЕМ — zset перестраивается из реестра
+//     через OpZAdd (S2). Иначе split-brain: __zidx выживает как OpSet, а
+//     дерево нет; к тому же при реплее __zidx (OpSet) ДО OpZAdd ранний return
+//     ZAdd (oldScore==score) не вставил бы member в дерево;
+//   - TTL → OpExpire с абсолютным временем смерти (S1): иначе после компакции
+//     ключи с TTL становятся бессмертными (correctness + утечка памяти);
+//   - zset-деревья → OpZAdd (score+member) (S2): реплей восстанавливает И
+//     дерево, И __zidx-обратный индекс.
+func snapshotIterate(
+	s *tcmalloc.TCMallocStore,
+	ttl *store.TTLManager,
+	zsetReg *zset.ZSetRegistry,
+	fn func(op byte, key string, value []byte),
+) {
+	s.ForEach(func(key string, value []byte) {
+		if strings.HasPrefix(key, "__zidx:") {
+			return
+		}
+		fn(wal.OpSet, key, value)
+	})
+
+	ttl.ForEach(func(key string, expiresAtUnixNano int64) {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(expiresAtUnixNano))
+		fn(wal.OpExpire, key, b[:])
+	})
+
+	zsetReg.ForEachSet(func(setName string) {
+		zsetReg.ForEach(setName, func(score float64, member string) {
+			fn(wal.OpZAdd, setName, zset.EncodeZAddValue(score, member))
+		})
+	})
 }

@@ -264,6 +264,34 @@ func (m *TTLManager) OnDelete(key string) {
 	s.mu.Unlock()
 }
 
+// ForEach отдаёт все ключи с их абсолютным временем смерти (UnixNano).
+//
+// Для WAL-компакции (S1): TTL живёт ТОЛЬКО в реплее OpExpire. Компакция
+// обязана переснять его в snapshot.wal — иначе после удаления старых WAL
+// ключи становятся бессмертными (correctness + утечка памяти).
+//
+// Снимает содержимое шарда в локальный срез под RLock и вызывает fn ВНЕ
+// замка: fn пишет в WAL (потенциально с flush на диск), а держать замок
+// шарда во время I/O означало бы стопорить GET-hot-path на этом шарде.
+func (m *TTLManager) ForEach(fn func(key string, expiresAtUnixNano int64)) {
+	type kv struct {
+		key string
+		exp int64
+	}
+	for i := range m.shards {
+		s := &m.shards[i]
+		s.mu.RLock()
+		batch := make([]kv, 0, len(s.expires))
+		for k, exp := range s.expires {
+			batch = append(batch, kv{k, exp})
+		}
+		s.mu.RUnlock()
+		for _, e := range batch {
+			fn(e.key, e.exp)
+		}
+	}
+}
+
 // Len возвращает количество ключей с TTL.
 func (m *TTLManager) Len() int {
 	total := 0
