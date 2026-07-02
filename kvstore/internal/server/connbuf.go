@@ -227,6 +227,14 @@ func (cb *ConnBuf) parseArray() [][]byte {
 
 	// Zero-alloc parseInt: НЕ создаём string, парсим прямо из []byte
 	count, ok := parseIntBytes(line[1:])
+	if !ok {
+		// Строка прочитана ЦЕЛИКОМ (peekLine ok), но длина массива — не число
+		// (напр. "*abc"). Это не «неполные данные», а битый кадр: его нельзя
+		// «дождать», он застрянет в буфере (wedge, спасал только idle-реапер).
+		// Рвём соединение через protoErr. (M3)
+		cb.protoErr = true
+		return nil
+	}
 	if count > maxArgs {
 		// Объявлено больше аргументов, чем влезает в стековый args[maxArgs].
 		// Кадр невалиден и его нельзя «дождать» — иначе он застрянет в буфере
@@ -234,8 +242,8 @@ func (cb *ConnBuf) parseArray() [][]byte {
 		cb.protoErr = true
 		return nil
 	}
-	if !ok || count <= 0 {
-		// Битый/неполный заголовок числа, *0, *-1 (null array) — легитимный nil.
+	if count <= 0 {
+		// *0, *-1 (null array) — легитимный nil.
 		return nil
 	}
 
@@ -276,6 +284,9 @@ func (cb *ConnBuf) parseBulkString() []byte {
 	// Zero-alloc parseInt вместо strconv.Atoi(string(...))
 	size, ok := parseIntBytes(line[1:])
 	if !ok {
+		// Полная строка, но длина bulk — не число (напр. "$abc"): битый кадр,
+		// «дождать» нельзя → рвём соединение, иначе wedge. (M3)
+		cb.protoErr = true
 		return nil
 	}
 
@@ -329,7 +340,11 @@ func (cb *ConnBuf) parseInline() [][]byte {
 	}
 
 	if argc == 0 {
-		return nil
+		// Пустая inline-строка (напр. одинокий "\r\n"): строка ПРОЧИТАНА целиком,
+		// rpos уже сдвинут. Возвращаем непустой пустой срез — обработчик ответит
+		// "ERR empty command". Вернуть nil нельзя: ParseCommand сбросил бы rpos на
+		// savedPos, и та же строка перечитывалась бы вечно (wedge). (M3)
+		return cb.args[:0]
 	}
 	return cb.args[:argc]
 }
