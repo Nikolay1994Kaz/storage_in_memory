@@ -709,3 +709,42 @@ func TestStore_LargeObject_MemoryAccounting(t *testing.T) {
 	t.Logf("memory: before=%d, afterSet=%d, afterFlush=%d (freed %d bytes, %d handles)",
 		memBefore, memAfterSet, memAfterFlush, memAfterSet-memAfterFlush, freed)
 }
+
+// TestT3_LargeReuseDoesNotLeakOOMAccounting — страж T3.
+//
+// FreeLarge вычитает elemSize (large-объект ушёл в largeFree). Раньше reuse-путь
+// AllocLarge НЕ добавлял его обратно → после alloc(+size)→free(−size)→reuse(+0)
+// usedBytes недосчитывал занятую память, а free→reuse→free уводил счётчик В
+// МИНУС → IsOOM дырявел (лимит памяти не срабатывал на large alloc/free-циклах).
+// После фикса reuse снова учитывает elemSize → usedBytes не падает ниже занятой
+// large-памяти. Тест падает на старом поведении (на i=0).
+func TestT3_LargeReuseDoesNotLeakOOMAccounting(t *testing.T) {
+	store := NewTCMallocStore(1)
+	defer store.Close()
+
+	const large = 8192 // > 4096 → путь large-объектов
+
+	base := store.UsedMemory()
+
+	// Первая аллокация: usedBytes растёт.
+	_, h := store.Alloc(0, large)
+	afterAlloc := store.UsedMemory()
+	if afterAlloc <= base {
+		t.Fatalf("usedBytes не вырос после large alloc: base=%d after=%d", base, afterAlloc)
+	}
+
+	// Цикл free→reuse: объект СНОВА занят после каждого reuse.
+	for i := 0; i < 100; i++ {
+		store.Free(0, h)             // FreeLarge: span → largeFree (usedBytes −elemSize)
+		_, h = store.Alloc(0, large) // reuse из largeFree (usedBytes +elemSize)
+		if u := store.UsedMemory(); u < afterAlloc {
+			t.Fatalf("usedBytes упал ниже занятой large-памяти на итерации %d: "+
+				"u=%d < afterAlloc=%d (дырявый OOM-учёт, T3)", i, u, afterAlloc)
+		}
+	}
+
+	// Счётчик не должен уйти в минус / ниже базы.
+	if u := store.UsedMemory(); u < base {
+		t.Fatalf("usedBytes ниже базового после free/reuse-циклов: u=%d < base=%d", u, base)
+	}
+}
