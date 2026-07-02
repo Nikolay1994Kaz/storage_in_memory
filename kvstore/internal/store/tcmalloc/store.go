@@ -559,7 +559,13 @@ func (s *TCMallocStore) DeferFree(h Handle) {
 //	Вызов N:
 //	  1. Освобождаем deferPrev (handle'ы из вызова N-1, пролежали целый цикл)
 //	  2. deferPrev = deferCurr (текущие handle'ы — начинают ждать)
-//	  3. deferCurr = пустой (переиспользуем backing array от prev)
+//	  3. deferCurr = nil (новая очередь; backing prev НЕ переиспользуем)
+//
+// ВАЖНО: backing array от toFree НЕЛЬЗЯ отдавать под новый deferCurr.
+// toFree освобождается ВНЕ мьютекса, а конкурентный DeferFree под мьютексом
+// делает append в deferCurr. Если бы deferCurr делил backing с toFree,
+// append перезаписал бы ещё не освобождённые (живые!) элементы toFree →
+// освобождение чужого/живого handle = порча данных. Поэтому deferCurr = nil.
 //
 // Возвращает количество освобождённых handle'ов (для мониторинга).
 func (s *TCMallocStore) FlushDeferred() int {
@@ -570,11 +576,12 @@ func (s *TCMallocStore) FlushDeferred() int {
 	// 2. Текущая очередь уходит в prev (начинает grace period)
 	s.deferPrev = s.deferCurr
 
-	// 3. Переиспользуем backing array от prev для нового curr
-	s.deferCurr = toFree[:0]
+	// 3. Новая очередь — свежий backing (НЕ переиспользуем toFree, см. выше)
+	s.deferCurr = nil
 	s.deferMu.Unlock()
 
-	// 4. Освобождаем за пределами мьютекса — не блокируем Del
+	// 4. Освобождаем за пределами мьютекса — не блокируем Del.
+	//    toFree теперь эксклюзивно наш: deferCurr его не делит.
 	for _, h := range toFree {
 		s.caches[0].Free(s.heap, h)
 	}
