@@ -725,6 +725,23 @@ func isMemoryGrowingCmd(cmd string) bool {
 	return false
 }
 
+// isWriteCmd сообщает, мутирует ли команда состояние и потому требует durable
+// записи в WAL. Используется durability fail-stop гейтом: при сломанном WAL
+// (ENOSPC/I/O error) ВСЕ такие команды отклоняются — включая удаляющие
+// (DEL/VSIM.DEL/ZREM/EXPIRE/PERSIST), потому что удаление тоже надо записать в
+// лог, иначе оно «воскреснет» после рестарта. Это отличается от OOM-гейта
+// (isMemoryGrowingCmd), где удаления РАЗРЕШЕНЫ — там цель освободить память,
+// а здесь диск не может принять вообще ничего. Чтение (GET/…) не затронуто.
+func isWriteCmd(cmd string) bool {
+	switch cmd {
+	case "SET", "DEL", "EXPIRE", "PERSIST",
+		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.DEL",
+		"ZADD", "ZREM", "AI.INGEST":
+		return true
+	}
+	return false
+}
+
 // arg — helper: безопасное получение string из args.
 func arg(args [][]byte, i int) string {
 	if i >= len(args) {
@@ -776,6 +793,20 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		monitoring.OomEvents.Inc()
 		buf.WriteError("OOM command not allowed when used memory > 'maxmemory'")
 		return
+	}
+
+	// Durability fail-stop: если WAL перестал durable-писать на диск (ENOSPC,
+	// I/O error), мы больше не можем честно подтверждать мутации. Отклоняем ВСЕ
+	// пишущие команды — включая удаляющие (в отличие от OOM-гейта выше), т.к. на
+	// полном диске нельзя записать даже удаление. Чтение остаётся доступным,
+	// чтобы клиенты могли снять данные. Аналог Redis stop-writes-on-bgsave-error:
+	// лучше явная ошибка, чем тихая потеря уже подтверждённой записи.
+	if isWriteCmd(cmd) {
+		if err := bw.Failed(); err != nil {
+			monitoring.WalFailStop.Inc()
+			buf.WriteError("WAL persistence failed, writes are blocked (durability fail-stop): " + err.Error())
+			return
+		}
 	}
 
 	// WASM.* команды обслуживает compute-шов (за build-tag experimental). В прод-
