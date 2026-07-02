@@ -90,24 +90,26 @@ var nodeSize = int(unsafe.Sizeof(node{}))
 // mu — RWMutex: writers берут Lock, ForEach/Range/Min/Max берут RLock.
 // Search НЕ берёт никаких мьютексов (seqlock).
 type BPTree struct {
-	mu       sync.RWMutex
-	store    *tcmalloc.TCMallocStore
-	workerID int
-	root     atomic.Uint64 // Handle корня (atomic для lock-free Search)
-	len      atomic.Int64  // количество элементов (atomic для lock-free Len)
+	mu    sync.RWMutex
+	store *tcmalloc.TCMallocStore
+	root  atomic.Uint64 // Handle корня (atomic для lock-free Search)
+	len   atomic.Int64  // количество элементов (atomic для lock-free Len)
 }
 
 // New создаёт пустое B+дерево.
 //
 // store — TCMallocStore (тот же что для KV-данных).
-// workerID — ID epoll-воркера для lock-free аллокации через MCache.
+// workerID — ID epoll-воркера ВЫЗЫВАЮЩЕГО (для аллокации корня из его MCache).
+//
+// ВАЖНО: workerID НЕ сохраняется в дереве. Каждая последующая мутация (Insert)
+// аллоцирует из кэша СВОЕГО вызывающего воркера — иначе все деревья писали бы в
+// один caches[0] из произвольных epoll-горутин (data race: MCache — single-writer).
 func New(store *tcmalloc.TCMallocStore, workerID int) *BPTree {
 	rootH := allocNode(store, workerID)
 	root := resolveNode(store, rootH)
 	root.leaf = true
 	t := &BPTree{
-		store:    store,
-		workerID: workerID,
+		store: store,
 	}
 	t.root.Store(uint64(rootH))
 	return t
@@ -255,21 +257,24 @@ func (t *BPTree) Search(score float64) (string, bool) {
 	}
 }
 
-// Insert вставляет (score, member).
-// Если (score, member) уже есть — обновляет member (no-op для sorted sets).
-// Если score есть с другим member — добавляет как отдельный элемент.
-func (t *BPTree) Insert(score float64, member string) {
+// Insert вставляет (score, member), аллоцируя из кэша ВЫЗЫВАЮЩЕГО воркера
+// (workerID). Если (score, member) уже есть — обновляет member (no-op для
+// sorted sets). Если score есть с другим member — добавляет отдельным элементом.
+//
+// Единственный аллоцирующий путь дерева (Delete/DeleteMember только DeferFree,
+// без Alloc), поэтому только он получает workerID.
+func (t *BPTree) Insert(workerID int, score float64, member string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	mhash := hashMember(member)
-	memberH := allocMember(t.store, t.workerID, member)
+	memberH := allocMember(t.store, workerID, member)
 	it := item{score: score, memberHash: mhash, member: memberH}
 
-	splitKey, splitMHash, splitH := t.insertRec(t.loadRoot(), it)
+	splitKey, splitMHash, splitH := t.insertRec(workerID, t.loadRoot(), it)
 
 	if splitH != nilHandle {
-		newRootH := allocNode(t.store, t.workerID)
+		newRootH := allocNode(t.store, workerID)
 		newRoot := resolveNode(t.store, newRootH)
 		newRoot.items[0] = item{score: splitKey, memberHash: splitMHash}
 		newRoot.children[0] = t.loadRoot()
@@ -711,24 +716,24 @@ func (t *BPTree) findLeafOptimisticByScore(score float64) (tcmalloc.Handle, bool
 	return h, true
 }
 
-func (t *BPTree) insertRec(h tcmalloc.Handle, it item) (float64, uint64, tcmalloc.Handle) {
+func (t *BPTree) insertRec(workerID int, h tcmalloc.Handle, it item) (float64, uint64, tcmalloc.Handle) {
 	nd := resolveNode(t.store, h)
 	if nd.leaf {
-		return t.insertLeaf(h, it)
+		return t.insertLeaf(workerID, h, it)
 	}
 
 	i := nd.childIndex(it.score, it.memberHash)
 	childH := nd.children[i]
-	splitKey, splitMHash, splitH := t.insertRec(childH, it)
+	splitKey, splitMHash, splitH := t.insertRec(workerID, childH, it)
 
 	if splitH == nilHandle {
 		return 0, 0, nilHandle
 	}
 
-	return t.insertInternal(h, splitKey, splitMHash, splitH)
+	return t.insertInternal(workerID, h, splitKey, splitMHash, splitH)
 }
 
-func (t *BPTree) insertLeaf(h tcmalloc.Handle, it item) (float64, uint64, tcmalloc.Handle) {
+func (t *BPTree) insertLeaf(workerID int, h tcmalloc.Handle, it item) (float64, uint64, tcmalloc.Handle) {
 	nd := resolveNode(t.store, h)
 	idx, found := nd.keyIndex(it.score, it.memberHash)
 
@@ -766,14 +771,14 @@ func (t *BPTree) insertLeaf(h tcmalloc.Handle, it item) (float64, uint64, tcmall
 		return 0, 0, nilHandle
 	}
 
-	return t.splitLeaf(h)
+	return t.splitLeaf(workerID, h)
 }
 
-func (t *BPTree) splitLeaf(h tcmalloc.Handle) (float64, uint64, tcmalloc.Handle) {
+func (t *BPTree) splitLeaf(workerID int, h tcmalloc.Handle) (float64, uint64, tcmalloc.Handle) {
 	nd := resolveNode(t.store, h)
 	mid := nd.count / 2
 
-	rightH := allocNode(t.store, t.workerID)
+	rightH := allocNode(t.store, workerID)
 	nd = resolveNode(t.store, h)
 	right := resolveNode(t.store, rightH)
 
@@ -796,7 +801,7 @@ func (t *BPTree) splitLeaf(h tcmalloc.Handle) (float64, uint64, tcmalloc.Handle)
 	return right.items[0].score, right.items[0].memberHash, rightH
 }
 
-func (t *BPTree) insertInternal(h tcmalloc.Handle, score float64, mhash uint64, childH tcmalloc.Handle) (float64, uint64, tcmalloc.Handle) {
+func (t *BPTree) insertInternal(workerID int, h tcmalloc.Handle, score float64, mhash uint64, childH tcmalloc.Handle) (float64, uint64, tcmalloc.Handle) {
 	nd := resolveNode(t.store, h)
 	idx, _ := nd.keyIndex(score, mhash)
 
@@ -822,16 +827,16 @@ func (t *BPTree) insertInternal(h tcmalloc.Handle, score float64, mhash uint64, 
 		return 0, 0, nilHandle
 	}
 
-	return t.splitInternal(h)
+	return t.splitInternal(workerID, h)
 }
 
-func (t *BPTree) splitInternal(h tcmalloc.Handle) (float64, uint64, tcmalloc.Handle) {
+func (t *BPTree) splitInternal(workerID int, h tcmalloc.Handle) (float64, uint64, tcmalloc.Handle) {
 	nd := resolveNode(t.store, h)
 	mid := nd.count / 2
 	upScore := nd.items[mid].score
 	upMHash := nd.items[mid].memberHash
 
-	rightH := allocNode(t.store, t.workerID)
+	rightH := allocNode(t.store, workerID)
 	nd = resolveNode(t.store, h)
 	right := resolveNode(t.store, rightH)
 

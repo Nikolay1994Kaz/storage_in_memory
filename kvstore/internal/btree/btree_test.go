@@ -34,11 +34,11 @@ func TestNodeSize(t *testing.T) {
 func TestInsertAndSearch(t *testing.T) {
 	tree, _ := newTestTree()
 
-	tree.Insert(50, "fifty")
-	tree.Insert(30, "thirty")
-	tree.Insert(70, "seventy")
-	tree.Insert(10, "ten")
-	tree.Insert(40, "forty")
+	tree.Insert(0, 50, "fifty")
+	tree.Insert(0, 30, "thirty")
+	tree.Insert(0, 70, "seventy")
+	tree.Insert(0, 10, "ten")
+	tree.Insert(0, 40, "forty")
 
 	tests := []struct {
 		score float64
@@ -64,15 +64,15 @@ func TestInsertAndSearch(t *testing.T) {
 func TestInsertDuplicate(t *testing.T) {
 	tree, _ := newTestTree()
 
-	tree.Insert(10, "old")
-	tree.Insert(10, "new") // другой member, тот же score → 2 элемента
+	tree.Insert(0, 10, "old")
+	tree.Insert(0, 10, "new") // другой member, тот же score → 2 элемента
 
 	if tree.Len() != 2 {
 		t.Fatalf("Len = %d, want 2 (different members at same score)", tree.Len())
 	}
 
 	// Тот же member, тот же score → update (no new item)
-	tree.Insert(10, "old")
+	tree.Insert(0, 10, "old")
 	if tree.Len() != 2 {
 		t.Fatalf("Len = %d, want 2 (re-insert same member)", tree.Len())
 	}
@@ -81,10 +81,10 @@ func TestInsertDuplicate(t *testing.T) {
 // TestDuplicateScores — множество членов с одинаковым score.
 func TestDuplicateScores(t *testing.T) {
 	tree, _ := newTestTree()
-	tree.Insert(10, "alice")
-	tree.Insert(10, "bob")
-	tree.Insert(10, "charlie")
-	tree.Insert(20, "dave")
+	tree.Insert(0, 10, "alice")
+	tree.Insert(0, 10, "bob")
+	tree.Insert(0, 10, "charlie")
+	tree.Insert(0, 20, "dave")
 
 	if tree.Len() != 4 {
 		t.Fatalf("Len = %d, want 4", tree.Len())
@@ -121,7 +121,7 @@ func TestSplit(t *testing.T) {
 	tree, _ := newTestTree()
 
 	for i := 0; i < 1000; i++ {
-		tree.Insert(float64(i), fmt.Sprintf("val-%d", i))
+		tree.Insert(0, float64(i), fmt.Sprintf("val-%d", i))
 	}
 	if tree.Len() != 1000 {
 		t.Fatalf("Len = %d, want 1000", tree.Len())
@@ -138,7 +138,7 @@ func TestSplitReverse(t *testing.T) {
 	tree, _ := newTestTree()
 
 	for i := 999; i >= 0; i-- {
-		tree.Insert(float64(i), fmt.Sprintf("val-%d", i))
+		tree.Insert(0, float64(i), fmt.Sprintf("val-%d", i))
 	}
 	if tree.Len() != 1000 {
 		t.Fatalf("Len = %d, want 1000", tree.Len())
@@ -157,7 +157,7 @@ func TestDelete(t *testing.T) {
 	tree, _ := newTestTree()
 
 	for i := 0; i < 100; i++ {
-		tree.Insert(float64(i), fmt.Sprintf("v%d", i))
+		tree.Insert(0, float64(i), fmt.Sprintf("v%d", i))
 	}
 	if !tree.Delete(50) {
 		t.Fatal("Delete(50) should return true")
@@ -177,7 +177,7 @@ func TestDeleteAll(t *testing.T) {
 	tree, _ := newTestTree()
 
 	for i := 0; i < 100; i++ {
-		tree.Insert(float64(i), fmt.Sprintf("v%d", i))
+		tree.Insert(0, float64(i), fmt.Sprintf("v%d", i))
 	}
 	for i := 0; i < 100; i++ {
 		if !tree.Delete(float64(i)) {
@@ -195,7 +195,7 @@ func TestRangeSearch(t *testing.T) {
 	tree, _ := newTestTree()
 
 	for i := 0; i < 100; i++ {
-		tree.Insert(float64(i), fmt.Sprintf("v%d", i))
+		tree.Insert(0, float64(i), fmt.Sprintf("v%d", i))
 	}
 	results := tree.RangeSearch(25, 30)
 	if len(results) != 6 { // 25,26,27,28,29,30
@@ -213,7 +213,7 @@ func TestRangeSearchEmpty(t *testing.T) {
 	tree, _ := newTestTree()
 
 	for i := 0; i < 10; i++ {
-		tree.Insert(float64(i), "v")
+		tree.Insert(0, float64(i), "v")
 	}
 	results := tree.RangeSearch(100, 200)
 	if len(results) != 0 {
@@ -226,9 +226,9 @@ func TestRangeSearchEmpty(t *testing.T) {
 func TestMinMax(t *testing.T) {
 	tree, _ := newTestTree()
 
-	tree.Insert(50, "a")
-	tree.Insert(10, "b")
-	tree.Insert(90, "c")
+	tree.Insert(0, 50, "a")
+	tree.Insert(0, 10, "b")
+	tree.Insert(0, 90, "c")
 
 	minK, _, _ := tree.Min()
 	maxK, _, _ := tree.Max()
@@ -258,9 +258,9 @@ func TestMinMaxEmpty(t *testing.T) {
 func TestForEach(t *testing.T) {
 	tree, _ := newTestTree()
 
-	tree.Insert(30, "c")
-	tree.Insert(10, "a")
-	tree.Insert(20, "b")
+	tree.Insert(0, 30, "c")
+	tree.Insert(0, 10, "a")
+	tree.Insert(0, 20, "b")
 
 	var scores []float64
 	tree.ForEach(func(score float64, member string) {
@@ -280,7 +280,7 @@ func TestRandomInsertSearch(t *testing.T) {
 	for i := 0; i < 10000; i++ {
 		score := float64(i) // уникальные score
 		val := fmt.Sprintf("v%d", rng.Intn(100000))
-		tree.Insert(score, val)
+		tree.Insert(0, score, val)
 	}
 	if tree.Len() != 10000 {
 		t.Fatalf("Len = %d, want 10000", tree.Len())
@@ -309,7 +309,7 @@ func TestMemoryAccounting(t *testing.T) {
 	t.Logf("empty tree: %d bytes allocated", afterCreate-before)
 
 	for i := 0; i < 1000; i++ {
-		tree.Insert(float64(i), fmt.Sprintf("member-%d", i))
+		tree.Insert(0, float64(i), fmt.Sprintf("member-%d", i))
 	}
 	afterInsert := store.UsedMemory()
 	t.Logf("1000 inserts: %d bytes total (%d bytes for tree data)",
@@ -332,14 +332,14 @@ func BenchmarkInsert(b *testing.B) {
 	tree, _ := newTestTree()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		tree.Insert(float64(i), "v")
+		tree.Insert(0, float64(i), "v")
 	}
 }
 
 func BenchmarkSearch(b *testing.B) {
 	tree, _ := newTestTree()
 	for i := 0; i < 100000; i++ {
-		tree.Insert(float64(i), "v")
+		tree.Insert(0, float64(i), "v")
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -350,7 +350,7 @@ func BenchmarkSearch(b *testing.B) {
 func BenchmarkRangeSearch(b *testing.B) {
 	tree, _ := newTestTree()
 	for i := 0; i < 100000; i++ {
-		tree.Insert(float64(i), "v")
+		tree.Insert(0, float64(i), "v")
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -366,7 +366,7 @@ func BenchmarkRangeSearch(b *testing.B) {
 func BenchmarkSearchParallel(b *testing.B) {
 	tree, _ := newTestTree()
 	for i := 0; i < 100000; i++ {
-		tree.Insert(float64(i), "v")
+		tree.Insert(0, float64(i), "v")
 	}
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -384,7 +384,7 @@ func BenchmarkSearchParallel(b *testing.B) {
 func BenchmarkSearchParallelWithWrites(b *testing.B) {
 	tree, _ := newTestTree()
 	for i := 0; i < 100000; i++ {
-		tree.Insert(float64(i), "v")
+		tree.Insert(0, float64(i), "v")
 	}
 
 	// Фоновый writer: Insert + Delete в цикле
@@ -396,7 +396,7 @@ func BenchmarkSearchParallelWithWrites(b *testing.B) {
 			case <-stopCh:
 				return
 			default:
-				tree.Insert(float64(j), "w")
+				tree.Insert(0, float64(j), "w")
 				tree.Delete(float64(j))
 				j++
 			}

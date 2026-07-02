@@ -92,14 +92,18 @@ func DecodeZAddValue(data []byte) (float64, string) {
 
 // getOrCreate возвращает существующее дерево или создаёт новое.
 // sync.Map.LoadOrStore — lock-free для существующих, мьютекс только при первом создании.
-func (r *ZSetRegistry) getOrCreate(setName string) *zsetEntry {
+//
+// workerID вызывающего воркера прокидывается в btree.New (аллокация корня из
+// его MCache) — иначе все деревья аллоцировали бы из общего caches[0] из
+// произвольных epoll-горутин (data race, см. [[zset alloc race]]).
+func (r *ZSetRegistry) getOrCreate(workerID int, setName string) *zsetEntry {
 	if v, ok := r.sets.Load(setName); ok {
 		return v.(*zsetEntry)
 	}
 	// Lazy create — sync.Map корректно обрабатывает concurrent LoadOrStore.
 	// Если два ZADD одновременно создают "prices" — один entry победит,
 	// второй будет GC'd (один лишний узел, не страшно).
-	e := &zsetEntry{tree: btree.New(r.store, 0)} // workerID=0 для внутренних аллокаций дерева
+	e := &zsetEntry{tree: btree.New(r.store, workerID)}
 	actual, _ := r.sets.LoadOrStore(setName, e)
 	return actual.(*zsetEntry)
 }
@@ -117,7 +121,7 @@ func (r *ZSetRegistry) get(setName string) *zsetEntry {
 // Если member уже существует — обновляет score.
 // Возвращает true если новый member добавлен (не обновление).
 func (r *ZSetRegistry) ZAdd(workerID int, setName string, score float64, member string) bool {
-	e := r.getOrCreate(setName)
+	e := r.getOrCreate(workerID, setName)
 	rk := reverseKey(setName, member)
 
 	// S3: весь check-then-act под per-set мьютексом — иначе конкурентные ZAdd
@@ -138,8 +142,8 @@ func (r *ZSetRegistry) ZAdd(workerID int, setName string, score float64, member 
 		e.tree.DeleteMember(oldScore, member)
 	}
 
-	// Вставляем новую запись
-	e.tree.Insert(score, member)
+	// Вставляем новую запись (аллокация из кэша этого воркера)
+	e.tree.Insert(workerID, score, member)
 
 	// Обновляем обратный индекс
 	r.store.Set(workerID, rk, encodeScore(score))

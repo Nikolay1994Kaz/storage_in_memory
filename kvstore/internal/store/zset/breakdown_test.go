@@ -14,10 +14,10 @@ func BenchmarkZAddBreakdown(b *testing.B) {
 	reg, store := newTestRegistry()
 
 	b.Run("1_BPTree_Insert_only", func(b *testing.B) {
-		tree := reg.getOrCreate("bench_insert").tree
+		tree := reg.getOrCreate(0, "bench_insert").tree
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			tree.Insert(float64(i), fmt.Sprintf("item:%d", i))
+			tree.Insert(0, float64(i), fmt.Sprintf("item:%d", i))
 		}
 	})
 
@@ -57,7 +57,7 @@ func BenchmarkRangeBreakdown(b *testing.B) {
 	for i := 0; i < 100000; i++ {
 		reg.ZAdd(0, "bench", float64(i), fmt.Sprintf("item:%d", i))
 	}
-	tree := reg.getOrCreate("bench").tree
+	tree := reg.getOrCreate(0, "bench").tree
 
 	b.Run("1_BPTree_RangeSearch_raw", func(b *testing.B) {
 		b.ResetTimer()
