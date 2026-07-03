@@ -1158,6 +1158,18 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// Zero-copy cast to []float32
 		vec := vector.DeserializeVectorZeroCopy(walValue)
 
+		// Санитизация ДО записи в WAL: пустой вектор (div-by-zero → crash-loop),
+		// NaN/Inf (отрава SQ8), пустой/слишком длинный ключ. Иначе отрава
+		// переживёт рестарт через реплей.
+		if err := vector.ValidateKey(key); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if err := vector.ValidateVector(vec); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+
 		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		monitoring.VectorAddTotal.Inc()
 		addStart := time.Now()
@@ -1200,6 +1212,16 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				return
 			}
 			vec[i-1] = float32(f)
+		}
+		// Санитизация ДО записи в WAL (см. VSIM.ADDBIN): недоверенный вход не
+		// должен отравлять WAL/сегмент. ParseFloat пропускает NaN/Inf — ловим тут.
+		if err := vector.ValidateKey(key); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if err := vector.ValidateVector(vec); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
 		}
 		walValue := vector.SerializeVector(vec)
 		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
@@ -1308,8 +1330,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(unsafeString(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K (must be positive integer)")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		query := make([]float32, len(args)-1)
@@ -1341,8 +1363,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(unsafeString(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K (must be positive integer)")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		if len(args[1])%4 != 0 {
@@ -1403,8 +1425,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(unsafeString(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K (must be positive integer)")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		filterField := string(args[1])
@@ -1571,8 +1593,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(unsafeString(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K (must be positive integer)")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		setName := string(args[1])
@@ -1661,8 +1683,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(string(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

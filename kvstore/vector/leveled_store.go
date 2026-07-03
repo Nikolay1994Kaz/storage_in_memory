@@ -783,6 +783,12 @@ func deltaMax(dim, cfgMax int) int {
 	if cfgMax > 0 {
 		return cfgMax
 	}
+	if dim <= 0 {
+		// Defense-in-depth: ValidateVector отсекает пустой вектор до сюда, но
+		// deltaMax не должен паниковать делением на ноль ни при каком входе
+		// (напр. реплей отравленного до фикса WAL). Безопасное значение.
+		return 1
+	}
 	const maxBytes = 100 * 1024 * 1024 // 100MB лимит на дельту
 	bySize := maxBytes / (dim * 4)
 	if bySize > 50_000 {
@@ -801,6 +807,16 @@ func (lvs *LeveledVectorStore) Add(key string, vec []float32) error {
 // Атрибуты едут с данными через дельту и переживают flush/merge. Партиционный
 // атрибут (cfg.PartitionAttr) задаёт тенант-раскладку. Add — обёртка без атрибутов.
 func (lvs *LeveledVectorStore) AddWithAttrs(key string, vec []float32, attrs Attributes) error {
+	// Choke-point персистентности: и Add, и реплей WAL (OpVSimAdd/OpVSimAddAttrs)
+	// идут сюда. Санитизируем недоверенный вход до любых сайд-эффектов — ошибка
+	// вместо паники (deltaMax dim=0), тихой потери (пустой ключ = tombstone) или
+	// порчи снапшота (ключ > uint16) / SQ8-калибровки (NaN/Inf).
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
+	if err := ValidateVector(vec); err != nil {
+		return err
+	}
 	// Горячий путь держит lvs.mu лишь как RLock: несколько писателей идут
 	// параллельно, безопасность данных — на пер-шардовых локах дельты (шаг 5).
 	// Эксклюзивный Lock берут только swap дельты (compaction) и Delete/Clear.
