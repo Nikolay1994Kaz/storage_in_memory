@@ -201,7 +201,15 @@ func searchFilterFrozen(fg frozenFilterable, cat *TenantCatalog, sa *segmentAttr
 	}
 
 	// Партиционный роутинг по каталогу.
-	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" && cat != nil && sa != nil {
+	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" {
+		// Партиционный фильтр задан — сегмент обязан выполнить его через каталог+dict.
+		// Если каталога/атрибутов нет (сегмент из смешанной истории ингеста без
+		// колоночного слоя, sa==nil), тенанта в нём нет → пусто. НЕ падать в полный
+		// обход ниже: иначе безатрибутный сегмент вернул бы ВСЕ векторы = утечка
+		// между тенантами (compile пропускает партиц-атрибут → predIdx=always-true).
+		if cat == nil || sa == nil {
+			return dst[:0]
+		}
 		dict := sa.dict[partitionAttr]
 		if dict == nil {
 			return dst[:0]
@@ -361,7 +369,12 @@ func (s *hnswSegment) SearchFilter(query []float32, K, efSearch int, partitionAt
 		return dst[:0]
 	}
 	lo, hi := -1, -1 // диапазон блока тенанта (-1 = без ограничения)
-	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" && s.cat != nil && s.attrs != nil {
+	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" {
+		// см. searchFilterFrozen: партиционный фильтр на сегменте без каталога/
+		// атрибутов → пусто, НЕ полный обход (утечка между тенантами).
+		if s.cat == nil || s.attrs == nil {
+			return dst[:0]
+		}
 		dict := s.attrs.dict[partitionAttr]
 		if dict == nil {
 			return dst[:0]
