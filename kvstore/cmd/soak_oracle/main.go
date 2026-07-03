@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"kvstore/kvstore/internal/protocol"
@@ -33,7 +34,13 @@ const (
 	kvNS     = "oracle:kv:"
 	vecNS    = "oracle:vec:"
 	delEvery = 5 // удаляем каждый 5-й ключ (i%5==0)
+	// Тенант-изоляция: ключи oracle:tn:t<T>:<i>, атрибут tenant=t<T>. Проверяем,
+	// что VSIM.FILTER EQ tenant=t0 не отдаёт ключи t1 (сетевой вход в путь #2).
+	tnPerTenant = 40
+	tnTenants   = 2
 )
+
+func tnKey(t, i int) string { return fmt.Sprintf("oracle:tn:t%d:%d", t, i) }
 
 func main() {
 	addr := flag.String("addr", "localhost:6380", "адрес сервера")
@@ -117,11 +124,23 @@ func seed(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error {
 		}
 		deleted++
 	}
+	// Тенант-векторы через VSIM.ADDATTR (изоляция #2). Разные seed-базы на тенант,
+	// чтобы векторы не совпадали между тенантами/namespace'ами.
+	for t := 0; t < tnTenants; t++ {
+		for i := 0; i < tnPerTenant; i++ {
+			args := []string{"VSIM.ADDATTR", tnKey(t, i), "CAT", "tenant", fmt.Sprintf("t%d", t), "VEC"}
+			args = append(args, vecFor(rngSeed+int64(1000*(t+1)), i)...)
+			if _, err := cmd(w, r, args...); err != nil {
+				return err
+			}
+		}
+	}
 	// VSIM.INFO триггерит FlushDeltaSync — векторы уезжают в сегменты до нагрузки.
 	if _, err := cmd(w, r, "VSIM.INFO"); err != nil {
 		return err
 	}
-	fmt.Printf("[oracle seed] n=%d live=%d deleted=%d dim=%d\n", n, n-deleted, deleted, dim)
+	fmt.Printf("[oracle seed] n=%d live=%d deleted=%d tenants=%dx%d dim=%d\n",
+		n, n-deleted, deleted, tnTenants, tnPerTenant, dim)
 	return nil
 }
 
@@ -180,12 +199,31 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error 
 		}
 	}
 
-	bugs := kvLost + kvResurrect + vecLost + vecResurrect + badVal
-	fmt.Printf("[oracle verify] n=%d | KV lost=%d resurrect=%d badval=%d | VEC lost=%d resurrect=%d\n",
-		n, kvLost, kvResurrect, badVal, vecLost, vecResurrect)
-	if bugs > 0 {
-		return fmt.Errorf("ORACLE FAIL: %d нарушений durability/tombstone (потеря/воскрешение/порча)", bugs)
+	// Тенант-изоляция: VSIM.FILTER EQ tenant=t0 не должен вернуть ключи t1.
+	tnLeak := 0
+	for i := 0; i < tnPerTenant; i++ {
+		args := []string{"VSIM.FILTER", "10", "EQ", "tenant", "t0", "VEC"}
+		args = append(args, vecFor(rngSeed+1000, i)...)
+		v, err := cmd(w, r, args...)
+		if err != nil {
+			return err
+		}
+		if v.Typ != '*' {
+			return fmt.Errorf("VSIM.FILTER: ждали массив, got typ=%q str=%q", v.Typ, v.Str)
+		}
+		for j := 0; j < len(v.Array); j += 2 {
+			if strings.HasPrefix(v.Array[j].Str, "oracle:tn:t1:") {
+				tnLeak++
+			}
+		}
 	}
-	fmt.Println("[oracle verify] OK — данные пережили рестарт, удалённые не воскресли")
+
+	bugs := kvLost + kvResurrect + vecLost + vecResurrect + badVal + tnLeak
+	fmt.Printf("[oracle verify] n=%d | KV lost=%d resurrect=%d badval=%d | VEC lost=%d resurrect=%d | tenant-leak=%d\n",
+		n, kvLost, kvResurrect, badVal, vecLost, vecResurrect, tnLeak)
+	if bugs > 0 {
+		return fmt.Errorf("ORACLE FAIL: %d нарушений (durability/tombstone/tenant-изоляция)", bugs)
+	}
+	fmt.Println("[oracle verify] OK — данные пережили рестарт, удалённые не воскресли, тенанты изолированы")
 	return nil
 }

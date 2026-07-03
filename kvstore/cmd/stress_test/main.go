@@ -328,12 +328,27 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 					switch {
 					case dice < 25: // 25% GET
 						err = sendCommand(w, "GET", fmt.Sprintf("key:%d", rng.Intn(5000)))
-					case dice < 48: // 23% VSIM.SEARCH
+					case dice < 45: // 20% VSIM.SEARCH
 						args := []string{"VSIM.SEARCH", "10"}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
+					case dice < 48: // 3% tenant ADDATTR/FILTER (колоночный attr/tenant-слой, путь #2)
+						tn := fmt.Sprintf("t%d", rng.Intn(3))
+						if rng.Intn(2) == 0 {
+							args := []string{"VSIM.ADDATTR", fmt.Sprintf("tn:%d", rng.Intn(300)), "CAT", "tenant", tn, "VEC"}
+							for j := 0; j < dim; j++ {
+								args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
+							}
+							err = sendCommand(w, args...)
+						} else {
+							args := []string{"VSIM.FILTER", "10", "EQ", "tenant", tn, "VEC"}
+							for j := 0; j < dim; j++ {
+								args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
+							}
+							err = sendCommand(w, args...)
+						}
 					case dice < 56: // 8% VSIM.SEARCHRANGE (B+Tree + HNSW)
 						minScore := rng.Float64() * 10
 						args := []string{"VSIM.SEARCHRANGE", "10", "benchset",

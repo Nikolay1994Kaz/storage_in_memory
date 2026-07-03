@@ -94,6 +94,7 @@ func main() {
 	hnswUseLSH := flag.Bool("hnsw-use-lsh", false, "Enable LSH pre-filtering for high-dimensional vectors (dim >= 256)")
 	hnswUseSQ := flag.Bool("hnsw-use-sq", false, "Enable Scalar Quantization (int8) for frozen segments (dim<=256). 4x memory compression, ~96% recall, higher QPS via L3 cache locality")
 	compactionWorkers := flag.Int("compaction-workers", 0, "Number of parallel segment build workers (0 = auto NumCPU/2 clamped 2-8). Build Pool: insert does not block during heavy L2 compaction")
+	partitionAttr := flag.String("partition-attr", "", "Categorical attribute name for tenant-contiguous layout (enables VSIM.FILTER tenant routing via columnar SearchFilter). Empty = no partition; attrs still filterable, just no tenant block-routing")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
 	flag.Parse()
 
@@ -166,6 +167,7 @@ func main() {
 		Allocator:      s,
 		UseSQ:          *hnswUseSQ,
 		NumBuilders:    *compactionWorkers,
+		PartitionAttr:  *partitionAttr,
 	})
 	// LSH не применяется в LeveledVectorStore, вызов no-op через type assertion:
 	if lsh, ok := vecStore.(interface{ SetUseLSH(bool) }); ok {
@@ -804,7 +806,7 @@ func resolveAuthPassword(flagVal, fileVal string) (string, error) {
 // освобождением памяти, а не заблокировать себе единственный путь наружу.
 func isMemoryGrowingCmd(cmd string) bool {
 	switch cmd {
-	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN",
+	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR",
 		"WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
 		return true
 	}
@@ -821,7 +823,7 @@ func isMemoryGrowingCmd(cmd string) bool {
 func isWriteCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "DEL", "EXPIRE", "PERSIST",
-		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.DEL",
+		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.DEL",
 		"ZADD", "ZREM", "AI.INGEST":
 		return true
 	}
@@ -1278,6 +1280,92 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		buf.WriteSimpleString("OK")
 
+	case "VSIM.ADDATTR":
+		// VSIM.ADDATTR <key> [CAT <k> <v>]... [NUM <k> <v>]... VEC <f1> ... <fN>
+		// Ингест вектора с колоночными атрибутами (tenant/категории/числа). Пишет
+		// OpVSimAddAttrs → атрибуты durable через WAL (как через снапшот). Это
+		// сетевой вход в colоночный tenant/attr-слой (SearchFilter/tenant-раскладка).
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: VSIM.ADDATTR <key> [CAT k v]... [NUM k v]... VEC <v1> ... <vN>")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR attribute vectors not supported by this vector store")
+			return
+		}
+		key := string(args[0])
+		if cl != nil {
+			if moved := cl.CheckKey(key); moved != nil {
+				writeValue(buf, *moved)
+				return
+			}
+		}
+		attrs := vector.Attributes{Cat: map[string]string{}, Num: map[string]float64{}}
+		var vec []float32
+		parseErr := ""
+	addAttrParse:
+		for i := 1; i < len(args); {
+			switch strings.ToUpper(string(args[i])) {
+			case "CAT":
+				if i+2 >= len(args) {
+					parseErr = "CAT requires <attr> <value>"
+					break addAttrParse
+				}
+				attrs.Cat[string(args[i+1])] = string(args[i+2])
+				i += 3
+			case "NUM":
+				if i+2 >= len(args) {
+					parseErr = "NUM requires <attr> <value>"
+					break addAttrParse
+				}
+				f, err := strconv.ParseFloat(unsafeString(args[i+2]), 64)
+				if err != nil {
+					parseErr = "NUM value not a float"
+					break addAttrParse
+				}
+				attrs.Num[string(args[i+1])] = f
+				i += 3
+			case "VEC":
+				vec = make([]float32, 0, len(args)-i-1)
+				for j := i + 1; j < len(args); j++ {
+					f, err := strconv.ParseFloat(unsafeString(args[j]), 32)
+					if err != nil {
+						parseErr = fmt.Sprintf("invalid float %q", unsafeString(args[j]))
+						break addAttrParse
+					}
+					vec = append(vec, float32(f))
+				}
+				break addAttrParse
+			default:
+				parseErr = fmt.Sprintf("unexpected token %q (want CAT|NUM|VEC)", unsafeString(args[i]))
+				break addAttrParse
+			}
+		}
+		if parseErr != "" {
+			buf.WriteError("ERR " + parseErr)
+			return
+		}
+		if err := vector.ValidateKey(key); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if err := vector.ValidateVector(vec); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		monitoring.VectorAddTotal.Inc()
+		// Add ДО bw.Write (watermark-safety, как VSIM.ADD): вектор в дельте раньше,
+		// чем LSN покрыт снапшот-watermark'ом → нет потери на рестарте.
+		if err := lvs.AddWithAttrs(key, vec, attrs); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		bw.Write(wal.Entry{Op: wal.OpVSimAddAttrs, Key: key, Value: vector.SerializeVectorWithAttrs(vec, attrs)})
+		// Репликация ADDATTR в кластере пока не проброшена (cluster experimental,
+		// attrs+legacy-replica-протокол не определён) — CheckKey-редирект работает.
+		buf.WriteSimpleString("OK")
+
 	case "VSIM.DEL":
 		if len(args) < 1 {
 			buf.WriteError("ERR usage: VSIM.DEL <key>")
@@ -1412,6 +1500,88 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		searchStart := time.Now()
 		results, err := vecStore.Search(query, K, nil)
 		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(results) * 2)
+		for _, r := range results {
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
+		}
+
+	case "VSIM.FILTER":
+		// VSIM.FILTER <K> [EQ <attr> <val>]... [RANGE <attr> <lo> <hi>]... VEC <f1> ... <fN>
+		// Колоночный фильтр-поиск: EQ (категориальное равенство) и RANGE (числовой
+		// диапазон) по attr-колонкам + tenant-роутинг, если partitionAttr задан в EQ.
+		// Это сетевой вход в LeveledVectorStore.SearchFilter (в отличие от KV-метаданного
+		// VSIM.SEARCHFILTER, который дёргает GET на каждого кандидата).
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: VSIM.FILTER <K> [EQ attr val]... [RANGE attr lo hi]... VEC <v1> ... <vN>")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR attribute filter not supported by this vector store")
+			return
+		}
+		K, err := strconv.Atoi(unsafeString(args[0]))
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
+			return
+		}
+		f := vector.Filter{Eq: map[string]string{}, Range: map[string][2]float64{}}
+		var query []float32
+		parseErr := ""
+	filterParse:
+		for i := 1; i < len(args); {
+			switch strings.ToUpper(string(args[i])) {
+			case "EQ":
+				if i+2 >= len(args) {
+					parseErr = "EQ requires <attr> <value>"
+					break filterParse
+				}
+				f.Eq[string(args[i+1])] = string(args[i+2])
+				i += 3
+			case "RANGE":
+				if i+3 >= len(args) {
+					parseErr = "RANGE requires <attr> <lo> <hi>"
+					break filterParse
+				}
+				lo, e1 := strconv.ParseFloat(unsafeString(args[i+2]), 64)
+				hi, e2 := strconv.ParseFloat(unsafeString(args[i+3]), 64)
+				if e1 != nil || e2 != nil {
+					parseErr = "RANGE lo/hi not floats"
+					break filterParse
+				}
+				f.Range[string(args[i+1])] = [2]float64{lo, hi}
+				i += 4
+			case "VEC":
+				query = make([]float32, 0, len(args)-i-1)
+				for j := i + 1; j < len(args); j++ {
+					fv, e := strconv.ParseFloat(unsafeString(args[j]), 32)
+					if e != nil {
+						parseErr = fmt.Sprintf("invalid float %q", unsafeString(args[j]))
+						break filterParse
+					}
+					query = append(query, float32(fv))
+				}
+				break filterParse
+			default:
+				parseErr = fmt.Sprintf("unexpected token %q (want EQ|RANGE|VEC)", unsafeString(args[i]))
+				break filterParse
+			}
+		}
+		if parseErr != "" {
+			buf.WriteError("ERR " + parseErr)
+			return
+		}
+		if len(query) == 0 {
+			buf.WriteError("ERR missing VEC query vector")
+			return
+		}
+		monitoring.VectorSearchTotal.Inc()
+		results, err := lvs.SearchFilter(query, K, f)
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
