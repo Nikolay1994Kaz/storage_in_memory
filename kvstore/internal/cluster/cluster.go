@@ -5,7 +5,7 @@ package cluster
 import (
 	"crypto/rand"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -244,7 +244,7 @@ func (c *Cluster) clusterReplicate(args []protocol.Value) protocol.Value {
 	masterAddr := master.Addr
 	c.State.mu.Unlock()
 
-	log.Printf("[replication] Becoming replica of %s (%s)", masterID, masterAddr)
+	slog.Info("replication: becoming replica", "masterID", masterID, "masterAddr", masterAddr)
 
 	// Подключаемся к мастеру в горутине
 	go c.Repl.ConnectToMaster(masterAddr)

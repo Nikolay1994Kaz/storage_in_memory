@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -136,7 +136,7 @@ func (sw *SnapshotWriter) WriteSnapshot(watermarkLSN uint64, iterate func(fn fun
 		return fmt.Errorf("snapshot dir fsync: %w", err)
 	}
 
-	log.Printf("Snapshot complete: %d keys written", count)
+	slog.Info("snapshot complete", "keys", count)
 	return nil
 }
 
@@ -154,10 +154,10 @@ func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key str
 
 	oldPath, err := w.Rotate(newWALPath)
 	if err != nil {
-		log.Printf("Compact rotate failed: %v", err)
+		slog.Error("compact rotate failed", "err", err)
 		return
 	}
-	log.Printf("WAL rotated: %s → %s", filepath.Base(oldPath), filepath.Base(newWALPath))
+	slog.Info("WAL rotated", "from", filepath.Base(oldPath), "to", filepath.Base(newWALPath))
 
 	// Watermark: последний присвоенный LSN на момент ротации. Он ≥ максимального
 	// LSN в старом (удаляемом) WAL, поэтому после рестарта nextLSN не откатится
@@ -168,7 +168,7 @@ func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key str
 	go func() {
 		sw := NewSnapshotWriter(dir)
 		if err := sw.WriteSnapshot(watermark, iterate); err != nil {
-			log.Printf("Snapshot failed: %v", err)
+			slog.Error("snapshot failed", "err", err)
 			// НЕ удаляем старые WAL — snapshot не прошёл,
 			// старые WAL нужны для recovery!
 			return
@@ -177,7 +177,7 @@ func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key str
 		// Записываем бинарный снапшот векторов
 		if saveVectors != nil {
 			if err := saveVectors(); err != nil {
-				log.Printf("Vector snapshot failed: %v", err)
+				slog.Error("vector snapshot failed", "err", err)
 				return
 			}
 		}
@@ -185,6 +185,6 @@ func BackgroundCompact(w *WAL, dir string, iterate func(fn func(op byte, key str
 		// 3. Удаляем старые WAL-файлы ТОЛЬКО после успешного snapshot.
 		// Snapshot уже содержит их данные + атомарно переименован.
 		CleanupOldWALs(dir, newWALPath)
-		log.Printf("Old WAL files cleaned up")
+		slog.Info("old WAL files cleaned up")
 	}()
 }

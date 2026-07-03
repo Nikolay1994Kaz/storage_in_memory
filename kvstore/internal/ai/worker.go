@@ -3,7 +3,7 @@ package ai
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -89,7 +89,7 @@ func (w *Worker) Start(concurrency int) {
 		w.done.Add(1)
 		go w.loop(i)
 	}
-	log.Printf("[ai] Worker started: %d goroutines, buffer=%d", concurrency, cap(w.tasks))
+	slog.Info("ai worker started", "goroutines", concurrency, "buffer", cap(w.tasks))
 }
 
 // Submit отправляет задачу на embedding.
@@ -125,7 +125,7 @@ func (w *Worker) Stop() {
 	w.done.Wait()
 	timer.Stop()
 	w.cancelEmbed() // освобождаем контекст (идемпотентно), если вышли раньше бюджета
-	log.Printf("[ai] Worker stopped")
+	slog.Info("ai worker stopped")
 }
 
 // loop — рабочий цикл одной горутины.
@@ -173,7 +173,7 @@ func (w *Worker) drain(id int) {
 func (w *Worker) processTaskSafe(workerID int, task Task) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[ai] Worker %d: recovered panic on key '%s': %v", workerID, task.Key, r)
+			slog.Error("ai worker: recovered panic", "worker", workerID, "key", task.Key, "panic", r)
 			if w.Publish != nil {
 				w.Publish("ai:errors", fmt.Sprintf("panic:%s", task.Key))
 			}
@@ -213,12 +213,12 @@ func (w *Worker) processTask(workerID int, task Task) {
 			break
 		}
 		if attempt == 0 {
-			log.Printf("[ai] Worker %d: embed retry for key '%s': %v", workerID, task.Key, err)
+			slog.Warn("ai worker: embed retry", "worker", workerID, "key", task.Key, "err", err)
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
 	if err != nil {
-		log.Printf("[ai] Worker %d: embed failed for key '%s': %v", workerID, task.Key, err)
+		slog.Error("ai worker: embed failed", "worker", workerID, "key", task.Key, "err", err)
 		if w.Publish != nil {
 			w.Publish("ai:errors", fmt.Sprintf("embed_failed:%s:%v", task.Key, err))
 		}
@@ -228,7 +228,7 @@ func (w *Worker) processTask(workerID int, task Task) {
 	// 2. Сохраняем вектор в HNSW
 	if w.VecStoreAdd != nil {
 		if err := w.VecStoreAdd(task.Key, embedding); err != nil {
-			log.Printf("[ai] Worker %d: vecstore add error for key '%s': %v", workerID, task.Key, err)
+			slog.Error("ai worker: vecstore add error", "worker", workerID, "key", task.Key, "err", err)
 			if w.Publish != nil {
 				w.Publish("ai:errors", fmt.Sprintf("vecstore_failed:%s:%v", task.Key, err))
 			}
@@ -251,6 +251,6 @@ func (w *Worker) processTask(workerID int, task Task) {
 		w.Publish("ai:metrics", fmt.Sprintf("embed_time:%s:%.1fms", task.Key, float64(elapsed.Microseconds())/1000.0))
 	}
 
-	log.Printf("[ai] Worker %d: indexed '%s' (dim=%d, %.1fms)",
-		workerID, task.Key, len(embedding), float64(elapsed.Microseconds())/1000.0)
+	slog.Info("ai worker: indexed",
+		"worker", workerID, "key", task.Key, "dim", len(embedding), "ms", float64(elapsed.Microseconds())/1000.0)
 }

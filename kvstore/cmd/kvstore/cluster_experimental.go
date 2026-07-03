@@ -4,7 +4,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 
 	"kvstore/kvstore/internal/cluster"
@@ -50,8 +50,7 @@ func newClusterRouter(addr string, gossipPort, slotStart, slotEnd int,
 	cl := cluster.New(addr, gossipPort)
 	cl.State.Self.AssignSlots(slotStart, slotEnd)
 	cl.State.RebuildSlotTable()
-	log.Printf("Cluster mode (experimental): node %s, slots %d-%d",
-		cl.State.Self.ID, slotStart, slotEnd)
+	slog.Info("cluster mode (experimental)", "node", cl.State.Self.ID, "slotStart", slotStart, "slotEnd", slotEnd)
 
 	cl.GetKeysInSlotFunc = func(slot uint16, count int) []string {
 		return s.GetKeysInSlot(slot, count, cluster.KeySlot)

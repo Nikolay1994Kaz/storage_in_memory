@@ -5,7 +5,7 @@ package cluster
 import (
 	"bufio"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -61,7 +61,7 @@ func NewReplicationManager(c *Cluster) *ReplicationManager {
 //  3. Шлём "+FULLSYNC_DONE\r\n"
 //  4. Сохраняем соединение в replicas map (для incremental sync)
 func (rm *ReplicationManager) HandlePsync(conn net.Conn, replicaID string) {
-	log.Printf("[replication] Full sync started for replica %s", replicaID)
+	slog.Info("replication: full sync started for replica", "replicaID", replicaID)
 
 	// 1. Начало полной синхронизации
 	fmt.Fprintf(conn, "+FULLSYNC\r\n")
@@ -93,8 +93,7 @@ func (rm *ReplicationManager) HandlePsync(conn net.Conn, replicaID string) {
 	// 4. Конец полной синхронизации
 	fmt.Fprintf(conn, "+FULLSYNC_DONE\r\n")
 
-	log.Printf("[replication] Full sync done: sent %d keys + %d vectors to replica %s",
-		count, vecCount, replicaID)
+	slog.Info("replication: full sync done", "keys", count, "vectors", vecCount, "replicaID", replicaID)
 
 	// 5. Сохраняем соединение для incremental sync
 	rm.mu.Lock()
@@ -126,7 +125,7 @@ func (rm *ReplicationManager) ForwardWrite(command string) {
 	for id, conn := range rm.replicas {
 		_, err := fmt.Fprintf(conn, "%s\r\n", command)
 		if err != nil {
-			log.Printf("[replication] Replica %s disconnected: %v", id, err)
+			slog.Warn("replication: replica disconnected", "replicaID", id, "err", err)
 			dead = append(dead, id)
 		}
 	}
@@ -139,7 +138,7 @@ func (rm *ReplicationManager) ForwardWrite(command string) {
 			if conn, ok := rm.replicas[id]; ok {
 				conn.Close() // закрываем TCP-соединение
 				delete(rm.replicas, id)
-				log.Printf("[replication] Removed dead replica %s", id)
+				slog.Error("replication: removed dead replica", "replicaID", id)
 			}
 		}
 		rm.mu.Unlock()
@@ -165,7 +164,7 @@ func (rm *ReplicationManager) ConnectToMaster(masterAddr string) {
 		// Проверяем, не остановили ли нас
 		select {
 		case <-rm.stopCh:
-			log.Println("[replication] Replication stopped")
+			slog.Info("replication: stopped")
 			return
 		default:
 		}
@@ -177,7 +176,7 @@ func (rm *ReplicationManager) ConnectToMaster(masterAddr string) {
 			return
 		}
 
-		log.Printf("[replication] Connection to master lost: %v. Reconnecting in %v...", err, backoff)
+		slog.Warn("replication: connection to master lost, reconnecting", "err", err, "backoff", backoff)
 
 		// Ждём перед повторной попыткой (или выходим если stopCh)
 		select {
@@ -205,7 +204,7 @@ func (rm *ReplicationManager) replicationLoop(masterAddr string) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	rm.masterConn = conn
-	log.Printf("[replication] Connected to master %s", masterAddr)
+	slog.Info("replication: connected to master", "masterAddr", masterAddr)
 
 	// Гарантируем закрытие соединения при выходе
 	defer func() {
@@ -232,24 +231,24 @@ func (rm *ReplicationManager) replicationLoop(masterAddr string) error {
 
 		// Служебные сообщения
 		if line == "+FULLSYNC" {
-			log.Println("[replication] Full sync started, clearing local data...")
+			slog.Info("replication: full sync started, clearing local data")
 
 			// Очищаем ВСЕ локальные данные перед полной синхронизацией.
 			// Без этого ключи, удалённые на мастере за время отключки,
 			// останутся на реплике как "призраки" (ghost keys).
 			if rm.StoreClear != nil {
 				rm.StoreClear()
-				log.Println("[replication] KV store cleared")
+				slog.Info("replication: KV store cleared")
 			}
 			if rm.VecStoreClear != nil {
 				rm.VecStoreClear()
-				log.Println("[replication] Vector store cleared")
+				slog.Info("replication: vector store cleared")
 			}
 
 			continue
 		}
 		if line == "+FULLSYNC_DONE" {
-			log.Println("[replication] Full sync done, switching to incremental")
+			slog.Info("replication: full sync done, switching to incremental")
 			fullSyncDone = true
 			continue
 		}
@@ -283,14 +282,14 @@ func (rm *ReplicationManager) applyReplicationCommand(line string, incremental b
 		value := parts[2]
 		rm.StoreSet(key, []byte(value))
 		if incremental {
-			log.Printf("[replication] Applied: SET %s", key)
+			slog.Info("replication: applied SET", "key", key)
 		}
 
 	case "DEL":
 		key := parts[1]
 		rm.StoreDel(key)
 		if incremental {
-			log.Printf("[replication] Applied: DEL %s", key)
+			slog.Info("replication: applied DEL", "key", key)
 		}
 
 	case "VSIM.ADD":
@@ -305,7 +304,7 @@ func (rm *ReplicationManager) applyReplicationCommand(line string, incremental b
 		for i, s := range floatStrs {
 			f, err := strconv.ParseFloat(s, 32)
 			if err != nil {
-				log.Printf("[replication] VSIM.ADD parse error: %v", err)
+				slog.Error("replication: VSIM.ADD parse error", "err", err)
 				return
 			}
 			vec[i] = float32(f)
@@ -314,7 +313,7 @@ func (rm *ReplicationManager) applyReplicationCommand(line string, incremental b
 			rm.VecStoreAdd(key, vec)
 		}
 		if incremental {
-			log.Printf("[replication] Applied: VSIM.ADD %s (%d dims)", key, len(vec))
+			slog.Info("replication: applied VSIM.ADD", "key", key, "dims", len(vec))
 		}
 
 	case "VSIM.DEL":
@@ -323,7 +322,7 @@ func (rm *ReplicationManager) applyReplicationCommand(line string, incremental b
 			rm.VecStoreDel(key)
 		}
 		if incremental {
-			log.Printf("[replication] Applied: VSIM.DEL %s", key)
+			slog.Info("replication: applied VSIM.DEL", "key", key)
 		}
 	}
 }

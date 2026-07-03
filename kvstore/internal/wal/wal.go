@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -269,7 +269,7 @@ func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
 	oldPath = w.file.Name()
 	if err := w.file.Close(); err != nil {
 		// Данные уже synced — логируем, но продолжаем ротацию.
-		log.Printf("WAL rotate: error closing old file %s: %v", oldPath, err)
+		slog.Warn("WAL rotate: error closing old file", "file", oldPath, "err", err)
 	}
 
 	w.file = newFile
@@ -398,8 +398,8 @@ func ReadFile(path string) (uint64, []Entry, error) {
 			}
 			if err == io.ErrUnexpectedEOF {
 				// Truncated header — ожидаемо после crash
-				log.Printf("WAL %s: truncated header at entry %d (crash recovery), %d entries recovered",
-					baseName, len(entries), len(entries))
+				slog.Warn("WAL: truncated header (crash recovery)",
+					"wal", baseName, "entry", len(entries), "recovered", len(entries))
 				break
 			}
 			// Реальная I/O ошибка — возвращаем что есть + error
@@ -411,8 +411,8 @@ func ReadFile(path string) (uint64, []Entry, error) {
 
 		// Защита от мусорных данных: если length > maxEntrySize — это corruption
 		if length > maxEntrySize {
-			log.Printf("WAL %s: suspicious entry length %d at entry %d, stopping recovery (%d entries recovered)",
-				baseName, length, len(entries), len(entries))
+			slog.Warn("WAL: suspicious entry length, stopping recovery",
+				"wal", baseName, "length", length, "entry", len(entries), "recovered", len(entries))
 			break
 		}
 
@@ -421,8 +421,8 @@ func ReadFile(path string) (uint64, []Entry, error) {
 		_, err = io.ReadFull(reader, payload)
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				log.Printf("WAL %s: truncated payload at entry %d (crash recovery), %d entries recovered",
-					baseName, len(entries), len(entries))
+				slog.Warn("WAL: truncated payload (crash recovery)",
+					"wal", baseName, "entry", len(entries), "recovered", len(entries))
 				break
 			}
 			return baseLSN, entries, fmt.Errorf("wal read payload %s: %w", baseName, err)
@@ -430,16 +430,16 @@ func ReadFile(path string) (uint64, []Entry, error) {
 
 		// 3. CRC проверка
 		if crc32.ChecksumIEEE(payload) != checksum {
-			log.Printf("WAL %s: CRC mismatch at entry %d, stopping recovery (%d entries recovered)",
-				baseName, len(entries), len(entries))
+			slog.Warn("WAL: CRC mismatch, stopping recovery",
+				"wal", baseName, "entry", len(entries), "recovered", len(entries))
 			break
 		}
 
 		// 4. Декодируем
 		entry, err := decodeEntry(payload)
 		if err != nil {
-			log.Printf("WAL %s: decode error at entry %d: %v, stopping recovery (%d entries recovered)",
-				baseName, len(entries), err, len(entries))
+			slog.Warn("WAL: decode error, stopping recovery",
+				"wal", baseName, "entry", len(entries), "err", err, "recovered", len(entries))
 			break
 		}
 		entries = append(entries, entry)
