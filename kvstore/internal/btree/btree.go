@@ -286,55 +286,28 @@ func (t *BPTree) Insert(workerID int, score float64, member string) {
 	}
 }
 
+// minKeys — минимум ключей в НЕ-корневом узле. При count < minKeys узел
+// underflow'ит: восстанавливаем баланс borrow (занять у соседа) или merge
+// (слить с соседом, освободив узел). Гарантирует утилизацию ≥50% и, главное,
+// возврат узлов в аллокатор — без этого freeNode не звался нигде и дерево
+// держало high-water-mark узлов навсегда (space leak на churn/ZREM).
+const minKeys = order / 2
+
 // Delete удаляет первый элемент с данным score. Возвращает true если существовал.
 //
-// Member освобождается через DeferFree (QSBR), а НЕ через Free.
-// Это гарантирует что in-flight lock-free Search не прочитает freed memory.
-// Тот же механизм что в TCMalloc store Del.
+// Member и опустевшие узлы освобождаются через DeferFree (QSBR), а НЕ через Free:
+// in-flight lock-free Search может держать указатель в арену. Освобождённый узел
+// НЕ затирается — устаревший читатель видит валидный снимок. Тот же механизм что
+// в TCMalloc store Del.
 func (t *BPTree) Delete(score float64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Ищем лист с score (score-only навигация)
-	h := t.findLeafByScore(score)
-	nd := resolveNode(t.store, h)
-
-	// Score-only binary search для нахождения первого item с данным score
-	lo, hi := int32(0), nd.count
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if nd.items[mid].score < score {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-
-	if lo >= nd.count || nd.items[lo].score != score {
+	if !t.deleteRec(t.loadRoot(), score, 0, true) {
 		return false
 	}
-	idx := int(lo)
-
-	// Сохраняем handle ДО модификации (для DeferFree)
-	memberH := nd.items[idx].member
-
-	// Seqlock: version odd → "пишу"
-	atomic.AddUint32(&nd.version, 1)
-
-	// Сдвигаем влево
-	for i := idx; i < int(nd.count)-1; i++ {
-		nd.items[i] = nd.items[i+1]
-	}
-	nd.count--
-
-	// Seqlock: version even → "готово"
-	atomic.AddUint32(&nd.version, 1)
-
 	t.len.Add(-1)
-
-	// Отложенное освобождение (как в TCMalloc store Del): handle не освободится,
-	// пока in-flight Search не пройдёт quiescent-состояние (QSBR, reclaim.go).
-	t.store.DeferFree(memberH)
+	t.collapseRoot()
 	return true
 }
 
@@ -347,33 +320,257 @@ func (t *BPTree) DeleteMember(score float64, member string) bool {
 	defer t.mu.Unlock()
 
 	mhash := hashMember(member)
-	h := t.findLeaf(score, mhash)
-	nd := resolveNode(t.store, h)
-	idx, found := nd.keyIndex(score, mhash)
-	if !found {
+	if !t.deleteRec(t.loadRoot(), score, mhash, false) {
 		return false
 	}
+	t.len.Add(-1)
+	t.collapseRoot()
+	return true
+}
 
-	// Сохраняем handle ДО модификации (для DeferFree)
+// deleteRec спускается к листу с целевым ключом, удаляет его и на обратном пути
+// ребалансирует underflow'нувших детей. Возвращает found. Все мутации под
+// mu.Lock (writers сериализованы), каждая обёрнута seqlock-версией для lock-free
+// Search. scoreOnly=true → навигация и удаление по score (первый с этим score);
+// иначе — по composite (score, memberHash).
+func (t *BPTree) deleteRec(h tcmalloc.Handle, score float64, mhash uint64, scoreOnly bool) bool {
+	nd := resolveNode(t.store, h)
+	if nd.leaf {
+		return t.removeFromLeaf(h, score, mhash, scoreOnly)
+	}
+
+	var ci int
+	if scoreOnly {
+		ci = nd.childIndexByScore(score)
+	} else {
+		ci = nd.childIndex(score, mhash)
+	}
+	childH := nd.children[ci]
+	if !t.deleteRec(childH, score, mhash, scoreOnly) {
+		return false
+	}
+	if resolveNode(t.store, childH).count < minKeys {
+		t.rebalanceChild(h, ci)
+	}
+	return true
+}
+
+// removeFromLeaf удаляет item из листа (seqlock + DeferFree member).
+func (t *BPTree) removeFromLeaf(h tcmalloc.Handle, score float64, mhash uint64, scoreOnly bool) bool {
+	nd := resolveNode(t.store, h)
+
+	var idx int
+	if scoreOnly {
+		lo, hi := int32(0), nd.count
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if nd.items[mid].score < score {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo >= nd.count || nd.items[lo].score != score {
+			return false
+		}
+		idx = int(lo)
+	} else {
+		i, found := nd.keyIndex(score, mhash)
+		if !found {
+			return false
+		}
+		idx = i
+	}
+
 	memberH := nd.items[idx].member
 
-	// Seqlock: version odd → "пишу"
-	atomic.AddUint32(&nd.version, 1)
-
-	// Сдвигаем влево
+	atomic.AddUint32(&nd.version, 1) // odd → "пишу"
 	for i := idx; i < int(nd.count)-1; i++ {
 		nd.items[i] = nd.items[i+1]
 	}
 	nd.count--
+	atomic.AddUint32(&nd.version, 1) // even → "готово"
 
-	// Seqlock: version even → "готово"
-	atomic.AddUint32(&nd.version, 1)
-
-	t.len.Add(-1)
-
-	// Отложенное освобождение
 	t.store.DeferFree(memberH)
 	return true
+}
+
+// collapseRoot схлопывает корень, оставшийся с 0 ключей после merge его детей:
+// internal-корень с count=0 имеет ровно 1 ребёнка — делаем его новым корнем.
+// Атомарная подмена root (Search увидит старый ИЛИ новый; старый через DeferFree
+// живёт до quiescence). Цикл — на случай нескольких уровней вырождения.
+func (t *BPTree) collapseRoot() {
+	for {
+		rootH := t.loadRoot()
+		root := resolveNode(t.store, rootH)
+		if root.leaf || root.count > 0 {
+			return
+		}
+		newRootH := root.children[0]
+		t.storeRoot(newRootH)
+		t.store.DeferFree(rootH)
+	}
+}
+
+// rebalanceChild восстанавливает баланс underflow'нувшего children[ci]:
+// borrow у соседа с запасом (> minKeys), иначе merge с соседом.
+func (t *BPTree) rebalanceChild(parentH tcmalloc.Handle, ci int) {
+	parent := resolveNode(t.store, parentH)
+
+	if ci > 0 && resolveNode(t.store, parent.children[ci-1]).count > minKeys {
+		t.borrowFromLeft(parentH, ci)
+		return
+	}
+	if ci < int(parent.count) && resolveNode(t.store, parent.children[ci+1]).count > minKeys {
+		t.borrowFromRight(parentH, ci)
+		return
+	}
+	// Сосед впритык (== minKeys) — merge. Слияние двух узлов ≤ order (см. minKeys).
+	if ci > 0 {
+		t.mergeChildren(parentH, ci-1) // ci сливается В левого соседа
+	} else {
+		t.mergeChildren(parentH, ci) // правый сосед сливается В ci
+	}
+}
+
+// mergeChildren сливает children[i] (left) и children[i+1] (right) в left,
+// используя разделитель parent.items[i]. Порядок операций важен для lock-free
+// Search: сперва достраиваем survivor (left), ПОТОМ убираем разделитель+ссылку
+// из parent, и лишь затем DeferFree правого — чтобы читатель, ведомый ещё старым
+// parent, всегда попадал в узел, где ключ ЕСТЬ (в left, уже дополненном, либо в
+// right, ещё не освобождённом).
+func (t *BPTree) mergeChildren(parentH tcmalloc.Handle, i int) {
+	parent := resolveNode(t.store, parentH)
+	leftH := parent.children[i]
+	rightH := parent.children[i+1]
+	left := resolveNode(t.store, leftH)
+	right := resolveNode(t.store, rightH)
+
+	// 1) Достраиваем left.
+	atomic.AddUint32(&left.version, 1) // odd
+	if left.leaf {
+		base := left.count
+		for j := int32(0); j < right.count; j++ {
+			left.items[base+j] = right.items[j]
+		}
+		left.count += right.count
+		left.next = right.next
+	} else {
+		// Разделитель спускается вниз ключом между поддеревьями.
+		left.items[left.count] = item{score: parent.items[i].score, memberHash: parent.items[i].memberHash}
+		base := left.count + 1
+		for j := int32(0); j < right.count; j++ {
+			left.items[base+j] = right.items[j]
+		}
+		for j := int32(0); j <= right.count; j++ {
+			left.children[base+j] = right.children[j]
+		}
+		left.count += 1 + right.count
+	}
+	atomic.AddUint32(&left.version, 1) // even
+
+	// 2) Убираем разделитель items[i] и ссылку children[i+1] из parent.
+	atomic.AddUint32(&parent.version, 1) // odd
+	for j := i; j < int(parent.count)-1; j++ {
+		parent.items[j] = parent.items[j+1]
+	}
+	for j := i + 1; j < int(parent.count); j++ {
+		parent.children[j] = parent.children[j+1]
+	}
+	parent.count--
+	atomic.AddUint32(&parent.version, 1) // even
+
+	// 3) Освобождаем поглощённый узел (DeferFree: устаревший Search мог зайти в него).
+	t.store.DeferFree(rightH)
+}
+
+// borrowFromLeft переносит последний элемент левого соседа в начало
+// underflow'нувшего children[ci], обновляя разделитель parent.items[ci-1].
+// Порядок: дополняем child → правим разделитель → урезаем соседа (читатель,
+// ведомый старым разделителем, находит ключ у соседа, пока тот не урезан).
+func (t *BPTree) borrowFromLeft(parentH tcmalloc.Handle, ci int) {
+	parent := resolveNode(t.store, parentH)
+	child := resolveNode(t.store, parent.children[ci])
+	ls := resolveNode(t.store, parent.children[ci-1])
+
+	atomic.AddUint32(&child.version, 1) // odd
+	if child.leaf {
+		for i := child.count; i > 0; i-- {
+			child.items[i] = child.items[i-1]
+		}
+		child.items[0] = ls.items[ls.count-1]
+		child.count++
+	} else {
+		for i := child.count; i > 0; i-- {
+			child.items[i] = child.items[i-1]
+		}
+		for i := child.count + 1; i > 0; i-- {
+			child.children[i] = child.children[i-1]
+		}
+		// Разделитель спускается в child, последний ключ соседа поднимается вверх.
+		child.items[0] = item{score: parent.items[ci-1].score, memberHash: parent.items[ci-1].memberHash}
+		child.children[0] = ls.children[ls.count]
+		child.count++
+	}
+	atomic.AddUint32(&child.version, 1) // even
+
+	// Новый разделитель.
+	var sep item
+	if child.leaf {
+		sep = child.items[0]
+	} else {
+		sep = ls.items[ls.count-1]
+	}
+	atomic.AddUint32(&parent.version, 1)
+	parent.items[ci-1] = item{score: sep.score, memberHash: sep.memberHash}
+	atomic.AddUint32(&parent.version, 1)
+
+	atomic.AddUint32(&ls.version, 1)
+	ls.count--
+	atomic.AddUint32(&ls.version, 1)
+}
+
+// borrowFromRight переносит первый элемент правого соседа в конец
+// underflow'нувшего children[ci], обновляя разделитель parent.items[ci].
+func (t *BPTree) borrowFromRight(parentH tcmalloc.Handle, ci int) {
+	parent := resolveNode(t.store, parentH)
+	child := resolveNode(t.store, parent.children[ci])
+	rs := resolveNode(t.store, parent.children[ci+1])
+
+	atomic.AddUint32(&child.version, 1) // odd
+	if child.leaf {
+		child.items[child.count] = rs.items[0]
+		child.count++
+	} else {
+		child.items[child.count] = item{score: parent.items[ci].score, memberHash: parent.items[ci].memberHash}
+		child.children[child.count+1] = rs.children[0]
+		child.count++
+	}
+	atomic.AddUint32(&child.version, 1) // even
+
+	// Новый разделитель = ключ, поднимающийся из соседа.
+	var sep item
+	if child.leaf {
+		sep = rs.items[1] // после снятия items[0] первым станет items[1]
+	} else {
+		sep = rs.items[0]
+	}
+	atomic.AddUint32(&parent.version, 1)
+	parent.items[ci] = item{score: sep.score, memberHash: sep.memberHash}
+	atomic.AddUint32(&parent.version, 1)
+
+	// Урезаем соседа: сдвигаем влево items (и children для internal).
+	atomic.AddUint32(&rs.version, 1) // odd
+	for i := int32(0); i < rs.count-1; i++ {
+		rs.items[i] = rs.items[i+1]
+	}
+	if !rs.leaf {
+		for i := int32(0); i < rs.count; i++ {
+			rs.children[i] = rs.children[i+1]
+		}
+	}
+	rs.count--
+	atomic.AddUint32(&rs.version, 1) // even
 }
 
 // RangeSearch — все элементы где minScore ≤ score ≤ maxScore.
