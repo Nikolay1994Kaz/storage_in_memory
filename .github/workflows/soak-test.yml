@@ -1,63 +1,156 @@
-name: Soak Test (Load & Memory Leak Audit)
+name: Soak Test (Load, Drift & Durability Oracle)
+
+# Ручной запуск. Гоняет нагрузку двумя фазами с рестартом сервера между ними и
+# ПОСЛЕ, проверяя между делом durability-oracle: seed известных KV+векторов (часть
+# удалена) → нагрузка → рестарт → verify, что живые пережили, а удалённые НЕ
+# воскресли. Ловит класс багов, чинённых 03.07 (watermark-гонка/OpDel-гейт/
+# tombstone-воскрешение) — то, что чистая нагрузка не видит.
+#
+# hosted-раннер GitHub капает job на 6ч, поэтому per-фаза по умолчанию 2h30m
+# (итого ~5ч load) + запас на build/seed/verify. timeout-minutes: 350 держит нас
+# под капом с полем.
 
 on:
   workflow_dispatch:
     inputs:
-      duration:
-        description: 'Duration of the stress test (e.g., 10m, 1h, 5h)'
+      phase_duration:
+        description: 'Длительность ОДНОЙ фазы нагрузки (всего 2 фазы). Напр. 2h30m, 30m, 5m'
         required: true
-        default: '5h'
+        default: '2h30m'
       concurrency:
-        description: 'Number of parallel clients'
+        description: 'Число параллельных клиентов нагрузки'
         required: true
         default: '32'
+      restart_mode:
+        description: 'graceful (SIGTERM, полный flush) или crash (SIGKILL с барьером fsync)'
+        required: true
+        default: 'graceful'
+        type: choice
+        options: [graceful, crash]
+      oracle_keys:
+        description: 'Число контрольных ключей oracle'
+        required: true
+        default: '500'
 
 jobs:
-  soak-test:
+  soak:
     runs-on: ubuntu-latest
+    timeout-minutes: 350 # < 6ч кап hosted-раннера, с запасом на сборку/verify
+
+    env:
+      PORT: '6380'
+      MPORT: '9090'
+      DUR: ${{ github.event.inputs.phase_duration || '2h30m' }}
+      CONC: ${{ github.event.inputs.concurrency || '32' }}
+      MODE: ${{ github.event.inputs.restart_mode || 'graceful' }}
+      NKEYS: ${{ github.event.inputs.oracle_keys || '500' }}
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: 'stable'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
 
-    - name: Build Server
-      run: |
-        go build -o kvstore-server ./kvstore/cmd/kvstore/
+      - name: Build binaries
+        run: |
+          go build -o kvstore-server ./kvstore/cmd/kvstore/
+          go build -o kvstore-stress ./kvstore/cmd/stress_test/
+          go build -o soak-oracle   ./kvstore/cmd/soak_oracle/
 
-    - name: Build Stress Test Client
-      run: |
-        go build -o kvstore-stress ./kvstore/cmd/stress_test/
+      # Утилиты (start/wait/restart/drift) как файл, чтобы шаги переиспользовали.
+      # Сервер персистит в ./data относительно cwd; все шаги идут из workspace-корня,
+      # поэтому рестарт восстанавливается из того же ./data.
+      - name: Write helpers
+        run: |
+          cat > soak_lib.sh <<'EOF'
+          start_server() {
+            ./kvstore-server --port "$PORT" --metrics-port "$MPORT" > "$1" 2>&1 &
+            echo $! > server.pid
+            for _ in $(seq 1 30); do
+              curl -sf "localhost:$MPORT/metrics" >/dev/null 2>&1 && return 0
+              sleep 1
+            done
+            echo "server not up"; cat "$1"; return 1
+          }
+          stop_server() { # graceful|crash
+            local pid; pid=$(cat server.pid)
+            if [ "$1" = "crash" ]; then
+              sleep 2                    # барьер: syncInterval=100ms → WAL fsync'нут
+              kill -9 "$pid" 2>/dev/null
+            else
+              kill -TERM "$pid" 2>/dev/null
+              for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+              kill -0 "$pid" 2>/dev/null && { echo "graceful shutdown ЗАВИС"; return 1; }
+            fi
+            return 0
+          }
+          drift() { # метка → в drift.log
+            { echo "=== $(date -u +%H:%M:%S) $1 ==="
+              ps -o rss= -p "$(cat server.pid)" 2>/dev/null | awk '{print "server_rss_kb="$1}'
+              curl -s "localhost:$MPORT/metrics" 2>/dev/null | grep -E "^go_goroutines |^process_resident_memory_bytes " || true
+            } >> drift.log
+          }
+          EOF
 
-    - name: Start KVStore Server
-      run: |
-        ./kvstore-server --port 6380 --metrics-port 9090 > server.log 2>&1 &
-        echo "Waiting for server to spin up..."
-        sleep 3
-        # Check if server is running
-        curl -s http://localhost:9090/metrics > /dev/null && echo "Server is healthy and metrics port is open!" || (echo "Server failed to start" && exit 1)
+      - name: Start server + seed oracle
+        run: |
+          source soak_lib.sh
+          start_server server-1.log
+          ./soak-oracle -mode seed -addr "localhost:$PORT" -n "$NKEYS"
+          drift "t0 after-seed"
 
-    - name: Run Soak Stress Test
-      run: |
-        duration="${{ github.event.inputs.duration || '5h' }}"
-        concurrency="${{ github.event.inputs.concurrency || '32' }}"
-        echo "Starting stress test with duration=$duration and concurrency=$concurrency..."
-        ./kvstore-stress -duration "$duration" -concurrency "$concurrency" -addr localhost:6380 -metrics-addr localhost:9090 2>&1 | tee stress.log
+      - name: Load phase 1
+        run: |
+          echo "phase 1: duration=$DUR concurrency=$CONC"
+          ./kvstore-stress -duration "$DUR" -concurrency "$CONC" \
+            -addr "localhost:$PORT" -metrics-addr "localhost:$MPORT" 2>&1 | tee stress-1.log
 
-    - name: Stop Server
-      if: always()
-      run: |
-        killall kvstore-server || true
+      - name: Restart + oracle verify (checkpoint A)
+        run: |
+          source soak_lib.sh
+          drift "t1 pre-restart-A"
+          stop_server "$MODE"
+          start_server server-2.log
+          drift "t1 post-restart-A"
+          echo "::group::oracle verify A"
+          ./soak-oracle -mode verify -addr "localhost:$PORT" -n "$NKEYS"
+          echo "::endgroup::"
 
-    - name: Upload Logs Artifacts
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: soak-test-logs
-        path: |
-          server.log
-          stress.log
+      - name: Load phase 2
+        run: |
+          echo "phase 2: duration=$DUR concurrency=$CONC"
+          ./kvstore-stress -duration "$DUR" -concurrency "$CONC" \
+            -addr "localhost:$PORT" -metrics-addr "localhost:$MPORT" 2>&1 | tee stress-2.log
+
+      - name: Final restart + oracle verify (checkpoint B)
+        run: |
+          source soak_lib.sh
+          drift "t2 pre-restart-B"
+          stop_server "$MODE"
+          start_server server-3.log
+          drift "t2 post-restart-B"
+          echo "::group::oracle verify B"
+          ./soak-oracle -mode verify -addr "localhost:$PORT" -n "$NKEYS"
+          echo "::endgroup::"
+
+      - name: Drift report
+        if: always()
+        run: |
+          echo "=== DRIFT (RSS / goroutines / process_rss по чекпойнтам) ==="
+          cat drift.log || true
+
+      - name: Stop server
+        if: always()
+        run: |
+          [ -f server.pid ] && kill -9 "$(cat server.pid)" 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-artifacts
+          path: |
+            server-*.log
+            stress-*.log
+            drift.log
