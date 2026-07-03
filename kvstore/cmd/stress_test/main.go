@@ -238,13 +238,30 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 			sw := protocol.NewWriter(subConn)
 			sr := protocol.NewReader(subConn)
 
-			channel := fmt.Sprintf("stress:chan:%d", subID%10) // 10 общих каналов
-			if err := sendCommand(sw, "SUBSCRIBE", channel); err != nil {
-				errorOps.Add(1)
-				return
+			// Половина подписчиков — semantic (VSIM.SUBSCRIBE регистрирует вектор в
+			// семантическом индексе → путь Add его графа, грузит аллокатор индекса
+			// конкурентно с KV-нагрузкой = регресс-страж фикса #5 dedicated-allocator).
+			// Другая половина — classic pub/sub.
+			if subID%2 == 1 {
+				sargs := []string{"VSIM.SUBSCRIBE", "5.0"}
+				srng := rand.New(rand.NewSource(int64(subID)*7 + 1))
+				for j := 0; j < dim; j++ {
+					sargs = append(sargs, strconv.FormatFloat(srng.NormFloat64(), 'f', 4, 64))
+				}
+				if err := sendCommand(sw, sargs...); err != nil {
+					errorOps.Add(1)
+					return
+				}
+			} else {
+				channel := fmt.Sprintf("stress:chan:%d", subID%10) // 10 общих каналов
+				if err := sendCommand(sw, "SUBSCRIBE", channel); err != nil {
+					errorOps.Add(1)
+					return
+				}
 			}
 
-			// Читаем подтверждение SUBSCRIBE
+			// Первый Read забирает подтверждение подписки (semantic — через writePump,
+			// classic — из буфера), дальше drain-петля читает push-сообщения.
 			if _, err := sr.Read(); err != nil {
 				errorOps.Add(1)
 				return
@@ -304,50 +321,64 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 					dice := rng.Intn(100)
 
 					var err error
-					if dice < 35 {
-						// 35% GET
-						key := fmt.Sprintf("key:%d", rng.Intn(5000))
-						err = sendCommand(w, "GET", key)
-					} else if dice < 65 {
-						// 30% VSIM.SEARCH
+					// Расширенный микс: помимо read/upsert/pub добавлены delete-churn
+					// (VSIM.DEL/DEL → tombstone+merge, #3), бинарный путь (VSIM.ADDBIN),
+					// filterFn-путь (VSIM.SEARCHFILTER PREFIX) и semantic-routing
+					// (VSIM.PUBLISH → поиск по семантич.индексу, #5).
+					switch {
+					case dice < 25: // 25% GET
+						err = sendCommand(w, "GET", fmt.Sprintf("key:%d", rng.Intn(5000)))
+					case dice < 48: // 23% VSIM.SEARCH
 						args := []string{"VSIM.SEARCH", "10"}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					} else if dice < 75 {
-						// 10% VSIM.SEARCHRANGE (B+Tree + HNSW)
+					case dice < 56: // 8% VSIM.SEARCHRANGE (B+Tree + HNSW)
 						minScore := rng.Float64() * 10
-						maxScore := minScore + 5.0
 						args := []string{"VSIM.SEARCHRANGE", "10", "benchset",
 							strconv.FormatFloat(minScore, 'f', 2, 64),
-							strconv.FormatFloat(maxScore, 'f', 2, 64)}
+							strconv.FormatFloat(minScore+5.0, 'f', 2, 64)}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					} else if dice < 85 {
-						// 10% SET + ZADD
-						idNum := rng.Intn(5000)
-						key := fmt.Sprintf("key:%d", idNum)
-						err = sendCommand(w, "SET", key, "updated_during_stress")
-						if err == nil {
+					case dice < 64: // 8% VSIM.SEARCHFILTER PREFIX (путь SearchFiltered/filterFn)
+						args := []string{"VSIM.SEARCHFILTER", "10", "PREFIX", "vec:"}
+						for j := 0; j < dim; j++ {
+							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
+						}
+						err = sendCommand(w, args...)
+					case dice < 74: // 10% VSIM.ADD (upsert-churn на 500 ключей)
+						args := []string{"VSIM.ADD", fmt.Sprintf("vec:%d", rng.Intn(500))}
+						for j := 0; j < dim; j++ {
+							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
+						}
+						err = sendCommand(w, args...)
+					case dice < 79: // 5% VSIM.ADDBIN (бинарный zero-copy путь)
+						vecF := make([]float32, dim)
+						for j := range vecF {
+							vecF[j] = rng.Float32()
+						}
+						err = sendCommand(w, "VSIM.ADDBIN", fmt.Sprintf("vec:%d", rng.Intn(500)), string(vector.SerializeVector(vecF)))
+					case dice < 86: // 7% VSIM.DEL (delete-churn → tombstone; VSIM.ADD ре-добавит)
+						err = sendCommand(w, "VSIM.DEL", fmt.Sprintf("vec:%d", rng.Intn(500)))
+					case dice < 91: // 5% SET + ZADD
+						key := fmt.Sprintf("key:%d", rng.Intn(5000))
+						if err = sendCommand(w, "SET", key, "updated_during_stress"); err == nil {
 							r.Read()
-							score := rng.Float64() * 15
-							err = sendCommand(w, "ZADD", "benchset", strconv.FormatFloat(score, 'f', 2, 64), key)
+							err = sendCommand(w, "ZADD", "benchset", strconv.FormatFloat(rng.Float64()*15, 'f', 2, 64), key)
 						}
-					} else if dice < 95 {
-						// 10% VSIM.ADD
-						key := fmt.Sprintf("vec:%d", rng.Intn(500))
-						args := []string{"VSIM.ADD", key}
+					case dice < 95: // 4% DEL (KV delete)
+						err = sendCommand(w, "DEL", fmt.Sprintf("key:%d", rng.Intn(5000)))
+					case dice < 99: // 4% VSIM.PUBLISH (semantic-routing → поиск по семантич.индексу)
+						args := []string{"VSIM.PUBLISH", "stress_semantic_msg"}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					} else {
-						// 5% PUBLISH
-						channel := fmt.Sprintf("stress:chan:%d", rng.Intn(10))
-						err = sendCommand(w, "PUBLISH", channel, "stress_message_payload_val")
+					default: // 1% PUBLISH (classic)
+						err = sendCommand(w, "PUBLISH", fmt.Sprintf("stress:chan:%d", rng.Intn(10)), "stress_message_payload_val")
 					}
 
 					if err != nil {
