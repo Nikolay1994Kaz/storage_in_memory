@@ -95,8 +95,7 @@ func BenchmarkLSH_POPCNTScan_1M(b *testing.B) {
 
 func benchmarkPOPCNTScan(b *testing.B, n int) {
 	idx := &LSHIndex{
-		hashes:       make([]uint64, n),
-		candidateBuf: make([]uint64, 0, 1024),
+		hashes: make([]uint64, n),
 	}
 	rng := rand.New(rand.NewSource(42))
 	for i := 0; i < n; i++ {
@@ -106,8 +105,9 @@ func benchmarkPOPCNTScan(b *testing.B, n int) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
+	var candidates []uint64
 	for i := 0; i < b.N; i++ {
-		candidates := idx.FindCandidates(queryHash, 10)
+		candidates = idx.FindCandidates(queryHash, 10, candidates)
 		_ = candidates
 	}
 }
@@ -259,7 +259,7 @@ func TestLSH_BasicOperations(t *testing.T) {
 	}
 
 	// Проверяем FindCandidates: threshold=0 → только точные совпадения
-	candidates := idx.FindCandidates(hash0, 0)
+	candidates := idx.FindCandidates(hash0, 0, nil)
 	found := false
 	for _, c := range candidates {
 		if c == 0 {
@@ -275,7 +275,7 @@ func TestLSH_BasicOperations(t *testing.T) {
 	if idx.hashes[0] != lshSentinel {
 		t.Fatalf("delete didn't set sentinel: got %x", idx.hashes[0])
 	}
-	candidates = idx.FindCandidates(hash0, 5)
+	candidates = idx.FindCandidates(hash0, 5, nil)
 	for _, c := range candidates {
 		if c == 0 {
 			t.Fatal("deleted vector 0 should not appear in candidates")

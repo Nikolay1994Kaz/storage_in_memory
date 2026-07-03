@@ -427,7 +427,12 @@ func main() {
 	// syncer.Stop() вызывается явно в упорядоченном shutdown перед bw.Close().
 
 	// === 5. Pub/Sub Hub (Classic + Semantic) ===
-	semanticIndex := vector.NewVectorStoreCosine(s)
+	// Выделенный аллокатор, НЕ общий с KV-store s: Graph семантического индекса
+	// аллоцирует из caches[workerID=0], и общий s → data race с KV-путём worker 0
+	// (тот же класс, что закрытая zset-alloc гонка). Все Alloc/Free индекса —
+	// в Add/Delete под vs.mu.Lock (Search лишь Resolve, не аллоцирует), поэтому
+	// выделенный 1-воркерный стор соблюдает single-writer MCache без реклеймера.
+	semanticIndex := vector.NewVectorStoreCosine(tcmalloc.NewTCMallocStore(1))
 	semanticIndex.SetHNSWParams(*hnswM, *hnswEfConstruction, *hnswEfSearch)
 	semanticIndex.SetUseLSH(*hnswUseLSH)
 	hub := pubsub.NewHub(semanticIndex)

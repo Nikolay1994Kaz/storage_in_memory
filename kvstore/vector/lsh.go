@@ -53,14 +53,6 @@ type LSHIndex struct {
 
 	// Размерность векторов.
 	dim int
-
-	// Переиспользуемый буфер для результатов поиска кандидатов.
-	// Исключает make() на горячем пути.
-	candidateBuf []uint64
-
-	// Буфер для вычисления dot product при хэшировании.
-	// Переиспользуется между вызовами ComputeHash.
-	dotBuf []float64
 }
 
 // NewLSHIndex создаёт LSH-индекс для векторов указанной размерности.
@@ -83,11 +75,9 @@ func NewLSHIndex(dim int, seed int64) *LSHIndex {
 	}
 
 	return &LSHIndex{
-		hashes:       make([]uint64, 0, 10000),
-		projections:  projections,
-		dim:          dim,
-		candidateBuf: make([]uint64, 0, 1024),
-		dotBuf:       make([]float64, lshNumBits),
+		hashes:      make([]uint64, 0, 10000),
+		projections: projections,
+		dim:         dim,
 	}
 }
 
@@ -153,23 +143,23 @@ func (idx *LSHIndex) Delete(nodeID uint32) {
 // FindCandidates ищет все ноды, чей LSH-хэш отличается от queryHash
 // не более чем на threshold бит (расстояние Хэмминга ≤ threshold).
 //
-// Возвращает слайс ID кандидатов через переиспользуемый буфер (0 аллокаций).
-//
-// ВНИМАНИЕ: возвращённый слайс валиден только до следующего вызова FindCandidates.
+// Результат пишется в dst (переиспользуемый ВЫЗЫВАЮЩИМ буфер, 0 аллокаций при
+// достаточной ёмкости). dst обязан быть per-call/per-goroutine: FindCandidates
+// зовётся под vs.mu.RLock конкурентными поисками, поэтому общий буфер на индексе
+// приводил бы к data race (одно из этой партии — исправляемый баг). Передавайте
+// свежий или локальный dst; nil допустим.
 //
 // Сложность: O(N), где N = len(hashes).
 // На каждый элемент: XOR (1 такт) + POPCNT (1 такт) + branch (1 такт) = ~1ns.
 // Для 1M элементов: ~1ms.
-func (idx *LSHIndex) FindCandidates(queryHash uint64, threshold int) []uint64 {
-	idx.candidateBuf = idx.candidateBuf[:0]
-
+func (idx *LSHIndex) FindCandidates(queryHash uint64, threshold int, dst []uint64) []uint64 {
+	dst = dst[:0]
 	for i, h := range idx.hashes {
 		if bits.OnesCount64(queryHash^h) <= threshold {
-			idx.candidateBuf = append(idx.candidateBuf, uint64(i))
+			dst = append(dst, uint64(i))
 		}
 	}
-
-	return idx.candidateBuf
+	return dst
 }
 
 // FindCandidatesCount возвращает количество кандидатов без сбора ID.
@@ -291,9 +281,9 @@ func (vs *VectorStore) searchWithLSHNoLock(query []float32, K int, threshold int
 
 	// Адаптивный threshold: если кандидатов мало — расширяем
 	currentThreshold := threshold
-	var candidates []uint64
+	var candidates []uint64 // локальный per-call буфер (общий на индексе = гонка)
 	for currentThreshold <= 32 {
-		candidates = vs.lsh.FindCandidates(queryHash, currentThreshold)
+		candidates = vs.lsh.FindCandidates(queryHash, currentThreshold, candidates)
 		if len(candidates) >= minCandidates {
 			break
 		}
