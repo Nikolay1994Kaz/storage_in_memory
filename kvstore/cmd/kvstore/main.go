@@ -567,6 +567,13 @@ func main() {
 				monitoring.RecordCommand(cmd, time.Since(startEXEC))
 				return
 			}
+			// M2 (осознанно НЕ фиксим — задокументировано в README «Isolation
+			// contract»): execQueuedTx берёт globalTxMu, но тот сериализует лишь
+			// EXEC-vs-EXEC. Обычная команда с другого соединения (в другом worker-
+			// шарде) может вклиниться МЕЖДУ командами очереди → EXEC даёт группировку
+			// и durability, но НЕ isolation. Настоящая изоляция потребовала бы
+			// глобальной сериализации всех записей на время EXEC, что убивает
+			// per-worker zero-alloc модель. Контракт сознательно сужен, а не расширен.
 			execQueuedTx(cs.TxQueue, cs.Buf.WriteArrayHeader, func(qCmd string, qCmdArgs [][]byte) {
 				startCmd := time.Now()
 				executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
