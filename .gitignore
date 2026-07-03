@@ -38,3 +38,6 @@ rust_src/
 __pycache__/
 *.pyc
 
+# Claude Code local settings (личный allowlist, не для общего репо)
+.claude/settings.local.json
+
