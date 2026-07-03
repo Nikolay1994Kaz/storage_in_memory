@@ -56,6 +56,20 @@ func unsafeString(b []byte) string {
 	return unsafe.String(&b[0], len(b))
 }
 
+// shouldSkipVecReplay решает, пропустить ли ВЕКТОРНЫЙ эффект WAL-записи при
+// recovery как уже отражённый в снапшоте graph_leveled.bin. Из snapshot.wal —
+// пропускаем, если граф загружен из бинарного снапшота; из wal_*.log — если
+// LSN ≤ vecWatermark (запись уже в снапшоте). Применяется КО ВСЕМ записям,
+// меняющим вектор: OpVSimAdd/Attrs/Del И каскадным OpDel/OpExpire (KV-DEL, что
+// также удаляет вектор) — иначе старый DEL с LSN ≤ watermark удалил бы вектор,
+// воскрешённый более поздним re-add, уже присутствующий в снапшоте.
+func shouldSkipVecReplay(entry wal.Entry, isFromSnapshot, graphLoaded bool, vecWatermark uint64) bool {
+	if isFromSnapshot {
+		return graphLoaded
+	}
+	return entry.LSN <= vecWatermark
+}
+
 func main() {
 	// CLI-флаги
 	port := flag.Int("port", 6380, "порт для клиентов")
@@ -208,14 +222,14 @@ func main() {
 			vecWatermark = lvs.SnapshotLSN()
 		}
 	}
-	// skipVec решает, пропустить ли векторную операцию как уже отражённую в снапшоте.
-	// Из snapshot.wal — пропускаем, если граф загружен из бинарного снапшота.
-	// Из wal_*.log — пропускаем, если LSN ≤ watermark (запись уже в graph_leveled.bin).
+	// nextLSN обязан быть выше vecWatermark: снапшот покрывает LSN ≤ него, новые
+	// операции не должны переиспользовать эти номера (иначе резюмируемая
+	// репликация ломается, а skipVec ошибочно пропустит свежую запись).
+	bumpLSN(vecWatermark)
+	// skipVec решает, пропустить ли ВЕКТОРНЫЙ эффект записи как уже в снапшоте
+	// (см. shouldSkipVecReplay). Применяется и к OpVSim*, и к каскадным OpDel/OpExpire.
 	skipVec := func(entry wal.Entry, isFromSnapshot bool) bool {
-		if isFromSnapshot {
-			return graphLoaded
-		}
-		return entry.LSN <= vecWatermark
+		return shouldSkipVecReplay(entry, isFromSnapshot, graphLoaded, vecWatermark)
 	}
 
 	// Шаг A: Сначала читаем и накатываем snapshot.wal (если есть)
@@ -233,7 +247,12 @@ func main() {
 			restored++
 		case wal.OpDel:
 			s.Del(0, entry.Key)
-			vecStore.Delete(entry.Key) // Также удаляем вектор при реплее DEL
+			// Векторный эффект гейтуем watermark'ом: старый DEL (LSN ≤ watermark),
+			// уже отражённый в снапшоте, не должен удалять вектор, воскрешённый
+			// более поздним re-add (который тоже в снапшоте).
+			if !skipVec(entry, isFromSnapshot) {
+				vecStore.Delete(entry.Key)
+			}
 			ttl.OnDelete(entry.Key)
 			restored++
 		case wal.OpExpire:
@@ -244,7 +263,9 @@ func main() {
 					ttl.Set(entry.Key, remaining)
 				} else {
 					s.Del(0, entry.Key)
-					vecStore.Delete(entry.Key) // Также удаляем вектор, если ключ просрочен в оффлайне
+					if !skipVec(entry, isFromSnapshot) {
+						vecStore.Delete(entry.Key) // Также удаляем вектор, если ключ просрочен в оффлайне
+					}
 					ttl.OnDelete(entry.Key)
 				}
 			}
@@ -406,7 +427,12 @@ func main() {
 	// syncer.Stop() вызывается явно в упорядоченном shutdown перед bw.Close().
 
 	// === 5. Pub/Sub Hub (Classic + Semantic) ===
-	semanticIndex := vector.NewVectorStoreCosine(s)
+	// Выделенный аллокатор, НЕ общий с KV-store s: Graph семантического индекса
+	// аллоцирует из caches[workerID=0], и общий s → data race с KV-путём worker 0
+	// (тот же класс, что закрытая zset-alloc гонка). Все Alloc/Free индекса —
+	// в Add/Delete под vs.mu.Lock (Search лишь Resolve, не аллоцирует), поэтому
+	// выделенный 1-воркерный стор соблюдает single-writer MCache без реклеймера.
+	semanticIndex := vector.NewVectorStoreCosine(tcmalloc.NewTCMallocStore(1))
 	semanticIndex.SetHNSWParams(*hnswM, *hnswEfConstruction, *hnswEfSearch)
 	semanticIndex.SetUseLSH(*hnswUseLSH)
 	hub := pubsub.NewHub(semanticIndex)
@@ -1158,14 +1184,32 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// Zero-copy cast to []float32
 		vec := vector.DeserializeVectorZeroCopy(walValue)
 
-		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
+		// Санитизация ДО записи в WAL: пустой вектор (div-by-zero → crash-loop),
+		// NaN/Inf (отрава SQ8), пустой/слишком длинный ключ. Иначе отрава
+		// переживёт рестарт через реплей.
+		if err := vector.ValidateKey(key); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if err := vector.ValidateVector(vec); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+
 		monitoring.VectorAddTotal.Inc()
 		addStart := time.Now()
+		// Add ДО bw.Write (watermark-safety, как у VSIM.DEL). Если между Write и Add
+		// сработает saveVectors (watermark=LastLSN + FlushDeltaSync), вектор с
+		// LSN ≤ watermark ещё НЕ в дельте → снапшот без него, а реплей пропустит его
+		// (LSN ≤ watermark) → потеря. Add-then-Write: незалогированный Add теряется
+		// лишь вместе с крахом (консистентно), залогированный всегда переигрывается.
+		// Заодно ошибка Add больше не отравляет WAL.
 		if err := vecStore.Add(key, vec); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
 		monitoring.VectorAddDuration.Update(time.Since(addStart).Seconds())
+		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		if cl != nil {
 			// Forward replication command in text format to replica nodes
 			// to avoid breaking existing replica replication protocols.
@@ -1201,15 +1245,26 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 			vec[i-1] = float32(f)
 		}
+		// Санитизация ДО записи в WAL (см. VSIM.ADDBIN): недоверенный вход не
+		// должен отравлять WAL/сегмент. ParseFloat пропускает NaN/Inf — ловим тут.
+		if err := vector.ValidateKey(key); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if err := vector.ValidateVector(vec); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
 		walValue := vector.SerializeVector(vec)
-		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		monitoring.VectorAddTotal.Inc()
 		addStart := time.Now()
+		// Add ДО bw.Write (watermark-safety, см. VSIM.ADDBIN).
 		if err := vecStore.Add(key, vec); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
 		monitoring.VectorAddDuration.Update(time.Since(addStart).Seconds())
+		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		if cl != nil {
 			// Формат: VSIM.ADD key 0.1 0.2 0.3 ...
 			var sb strings.Builder
@@ -1308,8 +1363,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(unsafeString(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K (must be positive integer)")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		query := make([]float32, len(args)-1)
@@ -1341,8 +1396,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(unsafeString(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K (must be positive integer)")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		if len(args[1])%4 != 0 {
@@ -1403,8 +1458,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(unsafeString(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K (must be positive integer)")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		filterField := string(args[1])
@@ -1571,8 +1626,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(unsafeString(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K (must be positive integer)")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		setName := string(args[1])
@@ -1661,8 +1716,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		K, err := strconv.Atoi(string(args[0]))
-		if err != nil || K <= 0 {
-			buf.WriteError("ERR invalid K")
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

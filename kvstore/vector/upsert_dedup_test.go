@@ -125,7 +125,7 @@ func TestMerge_DedupsByKey(t *testing.T) {
 		t.Fatalf("ожидали ≥2 сегмента в level 0, получили %d", len(segs))
 	}
 
-	merged := lvs.mergeSegmentsWithAllocator(segs, tcmalloc.NewTCMallocStore(1))
+	merged, _ := lvs.mergeSegmentsWithAllocator(segs, tcmalloc.NewTCMallocStore(1))
 	if merged == nil {
 		t.Fatal("merge вернул nil")
 	}

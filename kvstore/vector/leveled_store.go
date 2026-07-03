@@ -201,7 +201,15 @@ func searchFilterFrozen(fg frozenFilterable, cat *TenantCatalog, sa *segmentAttr
 	}
 
 	// Партиционный роутинг по каталогу.
-	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" && cat != nil && sa != nil {
+	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" {
+		// Партиционный фильтр задан — сегмент обязан выполнить его через каталог+dict.
+		// Если каталога/атрибутов нет (сегмент из смешанной истории ингеста без
+		// колоночного слоя, sa==nil), тенанта в нём нет → пусто. НЕ падать в полный
+		// обход ниже: иначе безатрибутный сегмент вернул бы ВСЕ векторы = утечка
+		// между тенантами (compile пропускает партиц-атрибут → predIdx=always-true).
+		if cat == nil || sa == nil {
+			return dst[:0]
+		}
 		dict := sa.dict[partitionAttr]
 		if dict == nil {
 			return dst[:0]
@@ -361,7 +369,12 @@ func (s *hnswSegment) SearchFilter(query []float32, K, efSearch int, partitionAt
 		return dst[:0]
 	}
 	lo, hi := -1, -1 // диапазон блока тенанта (-1 = без ограничения)
-	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" && s.cat != nil && s.attrs != nil {
+	if pv, ok := f.Eq[partitionAttr]; ok && partitionAttr != "" {
+		// см. searchFilterFrozen: партиционный фильтр на сегменте без каталога/
+		// атрибутов → пусто, НЕ полный обход (утечка между тенантами).
+		if s.cat == nil || s.attrs == nil {
+			return dst[:0]
+		}
 		dict := s.attrs.dict[partitionAttr]
 		if dict == nil {
 			return dst[:0]
@@ -547,6 +560,10 @@ type compactionResult struct {
 	epoch     uint64    // эпоха на момент GRAB
 	result    segment   // построенный сегмент (nil = failure)
 	oldSegs   []segment // для merge: сегменты для удаления из sourceLvl
+	// appliedTombstones — ключи, исключённые из merge-сегмента по tombstone.
+	// applyResult чистит их tombstones ПОСЛЕ атомарной публикации и лишь если
+	// ключа больше нет в других сегментах. nil для flush.
+	appliedTombstones map[string]struct{}
 	// flushDelta — сфлашенная дельта (taskFlushDelta): держалась searchable в
 	// lvs.flushing до этого момента. applyResult удаляет её из flushing и Close'ит
 	// ПОСЛЕ публикации сегмента (единственный owner Close на нормальном пути).
@@ -783,6 +800,12 @@ func deltaMax(dim, cfgMax int) int {
 	if cfgMax > 0 {
 		return cfgMax
 	}
+	if dim <= 0 {
+		// Defense-in-depth: ValidateVector отсекает пустой вектор до сюда, но
+		// deltaMax не должен паниковать делением на ноль ни при каком входе
+		// (напр. реплей отравленного до фикса WAL). Безопасное значение.
+		return 1
+	}
 	const maxBytes = 100 * 1024 * 1024 // 100MB лимит на дельту
 	bySize := maxBytes / (dim * 4)
 	if bySize > 50_000 {
@@ -801,6 +824,16 @@ func (lvs *LeveledVectorStore) Add(key string, vec []float32) error {
 // Атрибуты едут с данными через дельту и переживают flush/merge. Партиционный
 // атрибут (cfg.PartitionAttr) задаёт тенант-раскладку. Add — обёртка без атрибутов.
 func (lvs *LeveledVectorStore) AddWithAttrs(key string, vec []float32, attrs Attributes) error {
+	// Choke-point персистентности: и Add, и реплей WAL (OpVSimAdd/OpVSimAddAttrs)
+	// идут сюда. Санитизируем недоверенный вход до любых сайд-эффектов — ошибка
+	// вместо паники (deltaMax dim=0), тихой потери (пустой ключ = tombstone) или
+	// порчи снапшота (ключ > uint16) / SQ8-калибровки (NaN/Inf).
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
+	if err := ValidateVector(vec); err != nil {
+		return err
+	}
 	// Горячий путь держит lvs.mu лишь как RLock: несколько писателей идут
 	// параллельно, безопасность данных — на пер-шардовых локах дельты (шаг 5).
 	// Эксклюзивный Lock берут только swap дельты (compaction) и Delete/Clear.
@@ -877,31 +910,54 @@ func (lvs *LeveledVectorStore) Delete(key string) bool {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
 
-	// Если в дельте — hard delete (вектор физически исчезает).
+	// Если в дельте — hard delete (вектор физически исчезает из дельты).
 	if lvs.delta != nil && lvs.delta.Delete(key) {
-		deleteTombstone(&lvs.tombstones, key) // снять, если был ранее
+		// Но тот же ключ мог жить и в сегменте, и в сфлашиваемой дельте (upsert
+		// через flush: Add→flush→Add оставляет старую копию, новую — в дельте).
+		// Тогда ставим tombstone на неё, иначе она воскреснет при чтении/merge.
+		// Иначе — снимаем возможный прежний tombstone.
+		if lvs.keyInFlushingLocked(key) || lvs.keyPhysicallyInSegmentsLocked(key) {
+			addTombstone(&lvs.tombstones, key)
+		} else {
+			deleteTombstone(&lvs.tombstones, key)
+		}
 		return true
 	}
 
-	// В дельте нет. Проверяем, есть ли ключ в каком-либо сегменте.
-	if !lvs.keyExistsInSegmentsLocked(key) {
+	// Не в активной дельте. Уже tombstoned → уже удалён.
+	if t := lvs.tombstones.Load(); t != nil {
+		if _, ok := (*t)[key]; ok {
+			return false
+		}
+	}
+	// Ключ мог быть в сфлашиваемой дельте (flush-окно) ИЛИ в сегменте. В обоих
+	// случаях ставим tombstone: сфлашиваемую дельту мутировать НЕЛЬЗЯ (её читает
+	// build-горутина), а tombstone замаскирует ключ и в получившемся сегменте.
+	if !lvs.keyInFlushingLocked(key) && !lvs.keyPhysicallyInSegmentsLocked(key) {
 		return false
 	}
-
-	// Ключ жив в сегменте. Помечаем tombstone (сегмент иммутабелен).
 	addTombstone(&lvs.tombstones, key)
 	monitoring.VectorTombstoneTotal.Inc()
 	return true
 }
 
-// keyExistsInSegmentsLocked проверяет, жив ли ключ в каком-либо сегменте.
-// Вызывается под lvs.mu (read). Учитывает tombstones.
-func (lvs *LeveledVectorStore) keyExistsInSegmentsLocked(key string) bool {
-	if t := lvs.tombstones.Load(); t != nil {
-		if _, ok := (*t)[key]; ok {
-			return false // уже tombstoned
+// keyInFlushingLocked — есть ли живой ключ в какой-либо сфлашиваемой дельте
+// (flush-окно между swap дельты и публикацией сегмента). Только чтение
+// (Contains); мутировать flushing-дельту нельзя — её читает build-горутина.
+// Под lvs.mu.
+func (lvs *LeveledVectorStore) keyInFlushingLocked(key string) bool {
+	for _, fd := range lvs.flushing {
+		if fd.Contains(key) {
+			return true
 		}
 	}
+	return false
+}
+
+// keyPhysicallyInSegmentsLocked — есть ли ФИЗИЧЕСКАЯ копия ключа в каком-либо
+// сегменте, ИГНОРИРУЯ tombstones. Нужна для решений о самом tombstone (ставить/
+// снимать) — там учёт tombstone был бы циклом. Под lvs.mu.
+func (lvs *LeveledVectorStore) keyPhysicallyInSegmentsLocked(key string) bool {
 	for _, level := range lvs.levels {
 		for _, seg := range level {
 			if seg.HasKey(key) {
@@ -910,6 +966,49 @@ func (lvs *LeveledVectorStore) keyExistsInSegmentsLocked(key string) bool {
 		}
 	}
 	return false
+}
+
+// keyPhysicallyInOtherSegmentsLocked — как keyPhysicallyInSegmentsLocked, но
+// пропускает exclude (только что построенный merge-сегмент: он по определению
+// исключил применённые tombstone-ключи, скан по нему бесполезен и дорог). Под mu.
+func (lvs *LeveledVectorStore) keyPhysicallyInOtherSegmentsLocked(key string, exclude segment) bool {
+	for _, level := range lvs.levels {
+		for _, seg := range level {
+			if seg == exclude {
+				continue
+			}
+			if seg.HasKey(key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// clearAppliedTombstonesLocked чистит tombstones ключей, физически исчезнувших из
+// индекса после merge. Кандидаты — только ключи, исключённые (применённые) в ЭТОМ
+// merge; ключ чистится ⟺ его больше нет ни в одном другом живом сегменте (newSeg
+// его исключил, oldSegs уже удалены свапом; копия могла остаться в не-мёрдженном
+// сегменте другого уровня — тогда tombstone обязан жить). Под lvs.mu (write).
+//
+// Исправляет два бага прежнего in-merge-clearing: (#1) чистились ВСЕ ключи
+// глобального снапшота ts, включая живущие вне oldSegs → воскрешение; (#3) чистка
+// шла в merge-горутине ДО публикации — при дропе результата (epoch-mismatch/
+// rollback) свапа нет, этот метод не зовётся, tombstone сохраняется.
+func (lvs *LeveledVectorStore) clearAppliedTombstonesLocked(applied map[string]struct{}, newSeg segment) {
+	if len(applied) == 0 {
+		return
+	}
+	if lvs.tombstones.Load() == nil {
+		return
+	}
+	var toClear []string
+	for key := range applied {
+		if !lvs.keyPhysicallyInOtherSegmentsLocked(key, newSeg) {
+			toClear = append(toClear, key)
+		}
+	}
+	deleteTombstonesBatch(&lvs.tombstones, toClear)
 }
 
 // addTombstone: COW-добавление ключа. Вызывать под lvs.mu (write).
@@ -949,6 +1048,38 @@ func deleteTombstone(p *atomic.Pointer[map[string]struct{}], key string) {
 	nw := make(map[string]struct{}, len(*cur)-1)
 	for k, v := range *cur {
 		if k != key {
+			nw[k] = v
+		}
+	}
+	p.Store(&nw)
+}
+
+// deleteTombstonesBatch — COW-удаление набора ключей одним rebuild (без O(k²)
+// пересборки на каждый ключ). Удаляет лишь присутствующие. Вызывать под lvs.mu.
+func deleteTombstonesBatch(p *atomic.Pointer[map[string]struct{}], keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	cur := p.Load()
+	if cur == nil {
+		return
+	}
+	rm := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		if _, ok := (*cur)[k]; ok {
+			rm[k] = struct{}{}
+		}
+	}
+	if len(rm) == 0 {
+		return
+	}
+	if len(rm) == len(*cur) {
+		p.Store(nil)
+		return
+	}
+	nw := make(map[string]struct{}, len(*cur)-len(rm))
+	for k, v := range *cur {
+		if _, drop := rm[k]; !drop {
 			nw[k] = v
 		}
 	}
@@ -1479,6 +1610,19 @@ func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
 		lvs.delta.ForEachLive(fn)
 	}
 
+	// Сфлашиваемые дельты (flush-окно): пропускаем tombstoned (Delete в окне
+	// ставит tombstone, не мутируя дельту → живая копия там ещё есть).
+	for _, fd := range lvs.flushing {
+		fd.ForEachLive(func(key string, vec []float32) {
+			if ts != nil {
+				if _, deleted := ts[key]; deleted {
+					return
+				}
+			}
+			fn(key, vec)
+		})
+	}
+
 	// Segments: пропускаем tombstoned ключи
 	for _, level := range lvs.levels {
 		for _, seg := range level {
@@ -1552,9 +1696,20 @@ func (lvs *LeveledVectorStore) Get(key string) ([]float32, bool) {
 	}
 
 	// Tombstone check: ключ мог быть удалён из сегмента после последнего merge.
+	// Проверяем ДО flushing/сегментов: Delete в flush-окне ставит tombstone, не
+	// мутируя сфлашиваемую дельту (её читает build), поэтому живая копия там ещё
+	// есть — tombstone обязан её замаскировать.
 	if t := lvs.tombstones.Load(); t != nil {
 		if _, deleted := (*t)[key]; deleted {
 			return nil, false
+		}
+	}
+
+	// Сфлашиваемые дельты (flush-окно между swap и публикацией сегмента): новее
+	// сегментов, только чтение. Иначе Get промахивается по ключу в этом окне.
+	for _, fd := range lvs.flushing {
+		if out, ok := fd.Get(key); ok {
+			return out, true
 		}
 	}
 
@@ -1652,6 +1807,11 @@ func (lvs *LeveledVectorStore) Len() int {
 	total := 0
 	if lvs.delta != nil {
 		total += lvs.delta.Len()
+	}
+	// Сфлашиваемые дельты (flush-окно): их векторы ещё не в сегментах — без учёта
+	// Len недосчитывал бы в этом окне.
+	for _, fd := range lvs.flushing {
+		total += fd.Len()
 	}
 	for _, level := range lvs.levels {
 		for _, seg := range level {
@@ -2414,15 +2574,16 @@ func (lvs *LeveledVectorStore) startMergeGoroutine(task *compactionTask) {
 	segs := task.segs
 	go func() {
 		mergeStart := time.Now()
-		seg := lvs.mergeSegmentsWithAllocator(segs, lvs.pickMergeAllocator(sourceLvl))
+		seg, applied := lvs.mergeSegmentsWithAllocator(segs, lvs.pickMergeAllocator(sourceLvl))
 		monitoring.VectorMergeDuration.Update(time.Since(mergeStart).Seconds())
 		res := compactionResult{
-			kind:      taskMergeLevel,
-			sourceLvl: sourceLvl,
-			targetLvl: targetLvl,
-			epoch:     epoch,
-			result:    seg,
-			oldSegs:   segs,
+			kind:              taskMergeLevel,
+			sourceLvl:         sourceLvl,
+			targetLvl:         targetLvl,
+			epoch:             epoch,
+			result:            seg,
+			oldSegs:           segs,
+			appliedTombstones: applied,
 		}
 		select {
 		case lvs.resultChan <- res:
@@ -2462,22 +2623,25 @@ func (lvs *LeveledVectorStore) maybeScheduleMerges(epoch uint64) {
 		go func(segs []segment, srcLvl, tgtLvl int, e uint64) {
 			mergeStart := time.Now()
 			var seg segment
+			var applied map[string]struct{}
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						seg = nil
+						applied = nil
 					}
 				}()
-				seg = lvs.mergeSegmentsWithAllocator(segs, lvs.pickMergeAllocator(srcLvl))
+				seg, applied = lvs.mergeSegmentsWithAllocator(segs, lvs.pickMergeAllocator(srcLvl))
 			}()
 			monitoring.VectorMergeDuration.Update(time.Since(mergeStart).Seconds())
 			res := compactionResult{
-				kind:      taskMergeLevel,
-				sourceLvl: srcLvl,
-				targetLvl: tgtLvl,
-				epoch:     e,
-				result:    seg,
-				oldSegs:   segs,
+				kind:              taskMergeLevel,
+				sourceLvl:         srcLvl,
+				targetLvl:         tgtLvl,
+				epoch:             e,
+				result:            seg,
+				oldSegs:           segs,
+				appliedTombstones: applied,
 			}
 			select {
 			case lvs.resultChan <- res:
@@ -2560,6 +2724,9 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 		lvs.removeSegments(r.sourceLvl, r.oldSegs)
 		// Добавляем новый сегмент в levels[target].
 		lvs.levels[r.targetLvl] = append(lvs.levels[r.targetLvl], r.result)
+		// Чистим tombstones применённых ключей — АТОМАРНО со свапом и лишь тех,
+		// кого больше нет в других сегментах (см. clearAppliedTombstonesLocked).
+		lvs.clearAppliedTombstonesLocked(r.appliedTombstones, r.result)
 	}
 
 	// Re-check: триггерим coordinator ТОЛЬКО если есть переполнение или delta.
@@ -2775,12 +2942,13 @@ func (lvs *LeveledVectorStore) waitForBuildCompletion() {
 // Ключи из tombstone-слоя физически пропускаются — это единственный момент,
 // когда tombstones «применяются» и после merge перестают быть нужны.
 func (lvs *LeveledVectorStore) mergeSegments(segs []segment, workerID int) segment {
-	return lvs.mergeSegmentsWithAllocator(segs, lvs.buildAllocators[workerID%len(lvs.buildAllocators)])
+	seg, _ := lvs.mergeSegmentsWithAllocator(segs, lvs.buildAllocators[workerID%len(lvs.buildAllocators)])
+	return seg
 }
 
 // mergeSegmentsWithAllocator — merge с явным аллокатором (для coordinator-driven merge,
 // использует lvs.mergeAllocator, изолированный от build workers).
-func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, allocator *tcmalloc.TCMallocStore) segment {
+func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, allocator *tcmalloc.TCMallocStore) (segment, map[string]struct{}) {
 	lvs.mu.RLock()
 	dim := lvs.dim
 	// Snapshot tombstones под RLock — tombstones актуальны на момент начала merge.
@@ -2794,8 +2962,13 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 	lvs.mu.RUnlock()
 
 	if dim == 0 {
-		return nil
+		return nil, nil
 	}
+
+	// applied — ключи, исключённые из нового сегмента по tombstone. Кандидаты на
+	// очистку tombstone, но чистим их НЕ здесь, а в applyResult после атомарной
+	// публикации сегмента и только если ключа больше нет в других сегментах.
+	applied := make(map[string]struct{})
 
 	// Извлекаем векторы, пропуская tombstoned ключи, и ДЕДУПЛИЦИРУЕМ по ключу.
 	// Один ключ может жить в двух merge-входах (upsert после flush: свежая копия
@@ -2824,6 +2997,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				}
 				if ts != nil {
 					if _, deleted := ts[fg.keys.view(i)]; deleted {
+						applied[fg.keys.clone(i)] = struct{}{}
 						continue // tombstone — физически удаляем
 					}
 				}
@@ -2844,6 +3018,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				}
 				if ts != nil {
 					if _, deleted := ts[fg.keys.view(i)]; deleted {
+						applied[fg.keys.clone(i)] = struct{}{}
 						continue
 					}
 				}
@@ -2867,6 +3042,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				}
 				if ts != nil {
 					if _, deleted := ts[key]; deleted {
+						applied[key] = struct{}{}
 						continue // tombstone — физически удаляем
 					}
 				}
@@ -2880,23 +3056,20 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 	}
 
 	if len(entries) == 0 {
-		return nil
+		// Все ключи входа tombstoned. Сегмент не публикуется (applyResult сделает
+		// rollback: oldSegs остаются в levels) → ключи физически живы → tombstones
+		// НЕ чистим. Возвращаем applied=nil, чтобы clearAppliedTombstonesLocked не
+		// сработал (он и так гейтован r.result != nil).
+		return nil, nil
 	}
 
 	newSeg := lvs.buildSegmentWithAllocator(entries, dim, allocator)
 
-	// Если merge успешен — сбрасываем tombstones, которые были применены.
-	// COW: только ключи из snapshot ts удаляются; новые tombstones, добавленные
-	// за время merge, остаются нетронутыми.
-	if newSeg != nil && ts != nil {
-		lvs.mu.Lock()
-		for key := range ts {
-			deleteTombstone(&lvs.tombstones, key)
-		}
-		lvs.mu.Unlock()
-	}
-
-	return newSeg
+	// Очистку применённых tombstones делает applyResult ПОСЛЕ атомарной публикации
+	// сегмента (свап под mu.Lock) и только для ключей, отсутствующих в остальных
+	// сегментах. Внутри merge-горутины НЕ чистим: (#3) при дропе результата (epoch-
+	// mismatch/rollback) tombstone обязан сохраниться.
+	return newSeg, applied
 }
 
 // buildSegment строит сегмент из набора (key, vec) записей.
