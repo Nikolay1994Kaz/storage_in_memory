@@ -1106,8 +1106,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		for i, a := range args {
 			channels[i] = string(a)
 		}
-		hub.Subscribe(cs.Conn, channels)
-		// writePump отправляет подтверждения, не пишем в buf
+		// M1: subscribeClassic флашит cs.Buf ДО старта writePump — иначе
+		// предшествующие в том же пайплайн-батче ответы (напр. +PONG) гонятся
+		// за сокет с writePump. writePump отправляет подтверждения, не пишем в buf.
+		subscribeClassic(cs, hub, channels)
 
 	case "UNSUBSCRIBE":
 		channels := make([]string, len(args))
@@ -1265,6 +1267,9 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 			vec[i-1] = float32(f)
 		}
+		// M1: тот же two-writer, что и в classic SUBSCRIBE — флашим накопленный
+		// в пайплайне вывод ДО старта writePump (внутри SemanticSubscribe).
+		flushBeforeWritePump(cs)
 		if _, err := hub.SemanticSubscribe(cs.Conn, vec, float32(threshold)); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
@@ -1913,4 +1918,31 @@ func forbiddenInTx(cmd string) bool {
 		return true
 	}
 	return false
+}
+
+// flushBeforeWritePump сбрасывает накопленный в cs.Buf вывод на провод ДО того,
+// как вызывающий переведёт соединение в subscriber-mode и стартует writePump (M1).
+//
+// writePump — ВТОРОЙ, независимый писатель того же conn (свой protocol.Writer).
+// Пока в cs.Buf лежат ответы предыдущих команд того же пайплайн-батча (напр.
+// +PONG на пайплайненный перед SUBSCRIBE PING), они уходят клиенту конечным
+// Flush воркера (server.go), который выполняется ПАРАЛЛЕЛЬНО с writePump. Два
+// писателя в один сокет без синхронизации → кадры переставляются местами:
+// клиент, ждущий +PONG следующим ответом, получает subscribe-подтверждение и
+// десинхронизирует RESP-поток навсегда. Синхронный Flush здесь гарантирует, что
+// весь предшествующий вывод на проводе прежде, чем writePump напишет первый кадр.
+// Ошибку глотаем: сломанный conn всё равно будет переиспользован/реапнут (тот же
+// Flush повторится в конце батча / writePump упрётся в ошибку записи).
+func flushBeforeWritePump(cs *server.ConnState) {
+	_ = cs.Buf.Flush()
+}
+
+// subscribeClassic переводит соединение в classic subscriber-mode: сперва
+// флашит пайплайн-вывод (M1, см. flushBeforeWritePump), затем стартует подписку
+// (и её writePump). Порядок «флаш → Subscribe» обязателен: Subscribe пушит
+// подтверждение в writePump, который может записать его немедленно из своей
+// горутины, поэтому предшествующий вывод должен уйти на провод ДО этого.
+func subscribeClassic(cs *server.ConnState, hub *pubsub.Hub, channels []string) {
+	flushBeforeWritePump(cs)
+	hub.Subscribe(cs.Conn, channels)
 }
