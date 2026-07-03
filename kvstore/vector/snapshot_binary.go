@@ -96,7 +96,20 @@ func (vs *VectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("read magic: %w", err)
 	}
 	if !bytes.Equal(magic, magicHeader) {
-		return fmt.Errorf("magic header mismatch: invalid file version or format")
+		// Разбираем несовпадение, чтобы дать оператору внятную причину вместо
+		// «invalid file version or format». Layout magicHeader: "HNSW\x00"(5B
+		// family) + version(1B) + reserved(2B). Happy-path выше не тронут —
+		// декомпозиция только на ветке ошибки. Политика — docs/FORMAT_COMPAT.md.
+		if !bytes.Equal(magic[0:5], magicHeader[0:5]) {
+			return fmt.Errorf("snapshot: not an HNSW snapshot file (bad magic %q) — файл повреждён или это не снапшот kvstore", magic[0:5])
+		}
+		got, want := magic[5], magicHeader[5]
+		if got > want {
+			return fmt.Errorf("snapshot: format version %d is NEWER than supported %d — "+
+				"снапшот записан более новой сборкой kvstore; обновите бинарь. См. docs/FORMAT_COMPAT.md", got, want)
+		}
+		return fmt.Errorf("snapshot: format version %d is OLDER than supported %d — "+
+			"встроенного конвертера нет; пересоздайте снапшот на старой сборке. См. docs/FORMAT_COMPAT.md", got, want)
 	}
 
 	// 2. Читаем CRC32 чексумму

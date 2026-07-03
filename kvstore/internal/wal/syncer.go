@@ -62,7 +62,10 @@ func (s *Syncer) run() {
 			err := s.wal.Sync()
 			monitoring.WalWriteDuration.Update(time.Since(start).Seconds())
 			if err != nil {
-				log.Printf("WAL sync error: %v", err)
+				// Sync() уже залатчил ошибку (s.wal.Failed()!=nil) → write-путь
+				// сервера перешёл в fail-stop. Диск не может durable принять данные
+				// (ENOSPC/I/O) — оператору нужно освободить место и перезапустить.
+				log.Printf("WAL sync error — durability fail-stop engaged, writes rejected until restart: %v", err)
 			}
 
 			// Проверяем размер WAL реже — os.Stat каждые 100ms избыточен.

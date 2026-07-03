@@ -67,7 +67,17 @@ func readFileHeader(r *bufio.Reader) (baseLSN uint64, err error) {
 		return 0, fmt.Errorf("wal: bad magic %q (not a %s file)", h[0:4], fileMagic)
 	}
 	if h[4] != fileFormatVersion {
-		return 0, fmt.Errorf("wal: unsupported format version %d (expected %d)", h[4], fileFormatVersion)
+		// Внятная, actionable диагностика вместо «unsupported version N»:
+		// оператор должен сразу понять направление несовместимости и что делать.
+		// Политика и процедура миграции — docs/FORMAT_COMPAT.md.
+		if h[4] > fileFormatVersion {
+			return 0, fmt.Errorf("wal: format version %d is NEWER than supported %d — "+
+				"этот WAL записан более новой сборкой kvstore; обновите бинарь до совместимой версии "+
+				"(даунгрейд формата не поддерживается). См. docs/FORMAT_COMPAT.md", h[4], fileFormatVersion)
+		}
+		return 0, fmt.Errorf("wal: format version %d is OLDER than supported %d — "+
+			"встроенного конвертера нет; мигрируйте данные на старой сборке (снять снапшот) "+
+			"или начните с чистого data-dir. См. docs/FORMAT_COMPAT.md", h[4], fileFormatVersion)
 	}
 	return binary.LittleEndian.Uint64(h[5:fileHeaderSize]), nil
 }

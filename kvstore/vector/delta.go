@@ -74,6 +74,11 @@ type DeltaSegment struct {
 
 	live  atomic.Int64 // число ЖИВЫХ векторов (len keyIdx по всем шардам)
 	slots atomic.Int64 // число занятых слотов (len keys по всем шардам, вкл. tombstones)
+
+	// attrsPresent — хоть раз добавляли непустые атрибуты. Flush по нему решает
+	// строить колоночный слой: иначе freeze-fast-path заморозил бы граф БЕЗ attrs
+	// и SearchFilter молча выпал бы после flush (attrs были только в дельте).
+	attrsPresent atomic.Bool
 }
 
 // newDeltaShard создаёт один шард с собственным графом и аллокатором.
@@ -194,6 +199,9 @@ func (d *DeltaSegment) Append(key string, vec []float32) (becameFull bool) {
 // AppendWithAttrs — вставка с атрибутами (колоночный слой). attrs хранятся параллельно
 // keys/data в шарде и переживают flush через ExtractAll → buildSegmentAttrs.
 func (d *DeltaSegment) AppendWithAttrs(key string, vec []float32, attrs Attributes) (becameFull bool) {
+	if !attrs.empty() {
+		d.attrsPresent.Store(true)
+	}
 	s := d.shardFor(key)
 	s.mu.Lock()
 	if slot, exists := s.keyIdx[key]; exists {
@@ -247,6 +255,27 @@ func (d *DeltaSegment) Delete(key string) bool {
 	s.mu.Unlock()
 	d.live.Add(-1)
 	return true
+}
+
+// HasAttrs сообщает, добавлялись ли в дельту непустые атрибуты. Flush использует
+// это, чтобы НЕ уходить в freeze-fast-path (он роняет attrs) и построить колонки.
+func (d *DeltaSegment) HasAttrs() bool { return d.attrsPresent.Load() }
+
+// Contains сообщает, есть ли ЖИВОЙ вектор с этим ключом в дельте. O(1) по keyIdx
+// шарда под shard RLock (race-free с Append/Delete). Используется поиском:
+// активная дельта ЗАТЕНЯЕТ frozen-копии того же ключа (после upsert старая
+// копия во frozen-сегменте устарела) — их результаты отбрасываются.
+//
+// Безопасно вызывать на указателе дельты, захваченном под lvs.mu.RLock, даже
+// если параллельный flush уже swap'нул дельту: keyIdx остаётся валидной Go-map
+// (после swap в неё никто не пишет), а Close() освобождает лишь аллокаторы
+// графа, не keyIdx. Так поиск видит консистентный снимок «дельта+сегменты».
+func (d *DeltaSegment) Contains(key string) bool {
+	s := d.shardFor(key)
+	s.mu.RLock()
+	_, ok := s.keyIdx[key]
+	s.mu.RUnlock()
+	return ok
 }
 
 // Get возвращает копию живого вектора по ключу (под shard RLock).

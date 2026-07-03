@@ -608,3 +608,44 @@ func TestHub_DisconnectSlow_Concurrent(t *testing.T) {
 		t.Fatal("subscriber should be disconnected")
 	}
 }
+
+// TestHub_DisconnectSlow_RoutesThroughSingleClosePoint — страж H3 (pubsub-половина).
+//
+// disconnectSlow больше НЕ закрывает conn напрямую (это обходило учёт epoll →
+// утечка слота → DoS). Теперь он маршрутизирует закрытие через onSlowClose
+// (= Server.CloseConn → Epoll.Remove). Проверяем, что маршрут вызывается ровно
+// один раз даже при конкурентной эвикции одного подписчика.
+func TestHub_DisconnectSlow_RoutesThroughSingleClosePoint(t *testing.T) {
+	hub := NewHub(nil)
+	_, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	var mu sync.Mutex
+	var routed []net.Conn
+	hub.SetOnSlowClose(func(c net.Conn) {
+		mu.Lock()
+		routed = append(routed, c)
+		mu.Unlock()
+	})
+
+	sub := hub.Subscribe(serverConn, []string{"c"})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); hub.disconnectSlow(sub) }()
+	}
+	wg.Wait()
+
+	if hub.IsSubscriber(serverConn) {
+		t.Fatal("подписчик должен быть удалён")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(routed) != 1 {
+		t.Fatalf("H3: onSlowClose вызван %d раз, want 1 — эвикция должна идти через единую точку ровно однажды", len(routed))
+	}
+	if routed[0] != serverConn {
+		t.Fatal("H3: onSlowClose вызван не с тем соединением")
+	}
+}

@@ -51,6 +51,11 @@ var (
 	// WAL metrics
 	WalWriteDuration = metrics.NewHistogram("kvstore_wal_write_duration_seconds")
 
+	// WalFailStop — число мутаций, отклонённых durability fail-stop'ом
+	// (WAL перестал durable-писать на диск: ENOSPC / I/O error). Рост этого
+	// счётчика = БД в режиме read-only, нужен оператор (освободить диск + рестарт).
+	WalFailStop = metrics.NewCounter("kvstore_wal_fail_stop_total")
+
 	// Callbacks for memory/TCMalloc metrics
 	memUsedFunc   func() float64
 	memChunksFunc func() float64

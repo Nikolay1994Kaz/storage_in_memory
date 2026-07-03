@@ -35,6 +35,7 @@ type ConnState struct {
 	WorkerID      int
 	InTx          bool
 	TxQueue       [][][]byte // ← was [][]protocol.Value
+	TxAborted     bool       // H2: в MULTI встретилась запрещённая команда → EXEC вернёт EXECABORT
 	Authenticated bool       // true после успешной AUTH команды
 
 	// LastActivity — unix-наносекунды последней активности (приём данных).
@@ -42,6 +43,18 @@ type ConnState struct {
 	// epoll-архитектуре дедлайн на сокете не реапит молчащие conn (EpollWait не
 	// проснётся от Go-дедлайна), поэтому реапинг — по этому полю.
 	LastActivity atomic.Int64
+}
+
+// WorkerReclaimer — хук QSBR-управления памятью аллокатора (см. tcmalloc).
+//
+// Воркер сообщает «тихое» состояние (ReportQuiescent) после пробуждения из
+// epoll_wait — до обработки команд, и уходит offline (GoOffline) перед
+// блокировкой в epoll_wait, когда гарантированно не держит ни одного хендла.
+// Это позволяет аллокатору освобождать отложенные слоты не по таймеру, а по
+// кворуму quiescence (фикс UAF T2). nil = не используется.
+type WorkerReclaimer interface {
+	ReportQuiescent(workerID int)
+	GoOffline(workerID int)
 }
 
 // Handler — функция обработки RESP-команды.
@@ -87,6 +100,10 @@ type Server struct {
 	// Epoll.Remove). Обычно = hub.RemoveConn, чтобы отключение клиента чистило
 	// его подписки Pub/Sub (иначе течёт семантический вектор в HNSW). nil = нет.
 	OnDisconnect func(net.Conn)
+
+	// Reclaimer — необязательный хук QSBR-освобождения памяти аллокатора.
+	// Обычно = tcmalloc-store. nil = воркеры не рапортуют quiescence (тесты).
+	Reclaimer WorkerReclaimer
 
 	// activeConns — текущее число живых соединений (общий счётчик по всем epoll;
 	// inc в Epoll.Add, dec в Epoll.Remove). Читается acceptLoop для проверки лимита.
@@ -222,7 +239,19 @@ func (s *Server) eventLoop(w *worker) {
 		if s.stopping.Load() {
 			return
 		}
+		// QSBR: уходим offline перед блокировкой в epoll_wait. Здесь воркер
+		// гарантированно не держит ни одного хендла (все команды обработаны,
+		// значения скопированы), поэтому исключение из кворума безопасно и не
+		// даёт спящему воркеру заморозить reclaim (см. tcmalloc/reclaim.go).
+		if s.Reclaimer != nil {
+			s.Reclaimer.GoOffline(w.id)
+		}
 		states, err := w.epoll.Wait(timeoutMs)
+		// Проснулись → online: публикуем наблюдаемое поколение ДО обработки
+		// команд (до любого lock-free Get).
+		if s.Reclaimer != nil {
+			s.Reclaimer.ReportQuiescent(w.id)
+		}
 		if err != nil {
 			if s.stopping.Load() {
 				return // сервер останавливается, epoll-fd закрыт — выходим чисто
@@ -327,6 +356,39 @@ func (s *Server) closeProtoErr(w *worker, cs *ConnState) {
 	cs.Buf.WriteError("ERR Protocol error")
 	cs.Buf.Flush()
 	w.epoll.Remove(cs)
+}
+
+// CloseConn закрывает соединение по net.Conn через ЕДИНУЮ точку (Epoll.Remove):
+// декремент connCount/ActiveConnections + EpollCtl DEL + удаление из карты epoll
+// + очистка подписок (onRemove) + conn.Close().
+//
+// H3: Hub.disconnectSlow (эвикция медленного подписчика) обязан ходить сюда, а
+// не звать conn.Close() напрямую — иначе учёт epoll не чистится и слот течёт
+// навсегда → перманентный DoS при MaxConnections.
+//
+// Поиск по идентичности conn (а не по fd) — чтобы не звать socketFD на, возможно,
+// уже закрытом соединении (паника) и быть устойчивым к гонке двойного закрытия.
+// Путь редкий (эвикция) → O(N) допустим. Remove идемпотентен (M4): гейт по
+// identity в карте epoll делает повторный Remove no-op'ом без двойного
+// декремента — независимо от исхода EpollCtl DEL.
+func (s *Server) CloseConn(conn net.Conn) {
+	for _, w := range s.workers {
+		var target *ConnState
+		w.epoll.mu.RLock()
+		for _, cs := range w.epoll.connections {
+			if cs.Conn == conn {
+				target = cs
+				break
+			}
+		}
+		w.epoll.mu.RUnlock()
+		if target != nil {
+			w.epoll.Remove(target)
+			return
+		}
+	}
+	// Не найдено среди epoll (уже снято / не регистрировалось) — закрываем прямо.
+	conn.Close()
 }
 
 // Stop останавливает сервер.

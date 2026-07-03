@@ -228,7 +228,12 @@ func (h *MHeap) AllocLarge(size int) ([]byte, Handle) {
 		// Сбрасываем состояние для переиспользования
 		s.allocIndex = 1
 		s.freeStack = s.freeStack[:0]
-		// НЕ добавляем к usedBytes — эта память уже была учтена при первой аллокации
+		// T3: снова учитываем elemSize в usedBytes. FreeLarge вычел его, когда
+		// span уходил в largeFree; теперь span снова занят. Без этого reuse
+		// недосчитывал занятую large-память, а цикл free→reuse→free уводил
+		// счётчик В МИНУС → IsOOM дырявел (лимит памяти не срабатывал).
+		// Симметрично декременту во FreeLarge, под тем же h.mu.
+		h.usedBytes.Add(int64(s.elemSize))
 		return s.data[:size], MakeHandle(s.spanID, 0)
 	}
 
@@ -280,10 +285,10 @@ func (h *MHeap) FreeLarge(s *Span) {
 	s.allocIndex = 0
 	s.freeStack = s.freeStack[:0]
 	h.largeFree = append(h.largeFree, s)
-	// Вычитаем из usedBytes ПОД MUTEX.
-	// Если вычитать после Unlock — другой worker может успеть
-	// взять span из largeFree через AllocLarge (который НЕ добавляет
-	// к usedBytes для recycled span'ов) → usedBytes временно завышен → ложный OOM.
+	// Вычитаем elemSize ПОД MUTEX (in-use модель large-объектов: пока span в
+	// largeFree — не занят). Симметрично reuse-пути AllocLarge, который снова
+	// добавляет elemSize при переиспользовании span'а из largeFree (T3). Под
+	// тем же h.mu, что и reuse-путь → учёт согласован без гонки.
 	h.usedBytes.Add(-int64(s.elemSize))
 	h.mu.Unlock()
 }

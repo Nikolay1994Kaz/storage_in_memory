@@ -97,23 +97,31 @@ type TCMallocStore struct {
 	// Каждый шард с padding до 64 байт (anti false sharing).
 	shards [numStoreShards]indexShard
 
-	// ── Deferred Free (RCU-style grace period) ──────────────
+	// ── Deferred Free (QSBR — quiescent-state reclamation) ──
 	//
-	// Проблема: lock-free Get читает handle из таблицы, затем Resolve.
-	// Если Del сразу вызовет Free(handle), слот вернётся в Span.freeStack.
-	// Новый Alloc переиспользует слот → Get прочитает чужие данные.
+	// Проблема (баг T2): lock-free Get читает handle из таблицы, затем
+	// Resolve+decode из span-памяти. Если Del/overwrite освободит слот, а
+	// Alloc переиспользует его ПОКА Get ещё читает — Get прочитает чужие
+	// данные (UAF/torn-read/ложный not-found).
 	//
-	// Решение: Del НЕ вызывает Free сразу. Handle кладётся в deferCurr.
-	// Внутренняя горутина runDeferredFree (каждые 100ms)
-	// освобождает deferPrev — handles, пролежавшие ЦЕЛЫЙ цикл.
-	// За это время все in-flight Get гарантированно завершились (~200ns vs ~100ms).
+	// Старое решение — освобождать по таймеру (100ms) — НЕВЕРНО: время ≠
+	// гарантия завершения читателей. Длинная async-преемпция или STW-пауза
+	// GC переживают 100ms, а storedKey-чек ловит не все случаи (склейка
+	// старого ключа с новым значением).
 	//
-	// Аллокатор САМ управляет своим lifecycle —
-	// никакой зависимости от Syncer/WAL/внешних таймеров.
-	deferMu   sync.Mutex
-	deferCurr []Handle
-	deferPrev []Handle
-	stopCh    chan struct{} // закрыть для остановки runDeferredFree
+	// Новое решение — QSBR (как RCU в ядре Linux): слот освобождается не по
+	// таймеру, а когда КАЖДЫЙ воркер-читатель гарантированно прошёл «тихое»
+	// состояние после ретайра. Детали и доказательство — в reclaim.go.
+	//
+	// epoch        — глобальное поколение (монотонно растёт).
+	// workerEpoch  — на воркера: наблюдаемое поколение (offlineEpoch=не в кворуме).
+	// pending      — отложенные хендлы, партиями по поколению ретайра (под deferMu).
+	epoch       atomic.Uint64
+	workerEpoch []atomic.Uint64
+	deferMu     sync.Mutex
+	pending     []retireBatch
+	stopCh      chan struct{} // закрыть для остановки runDeferredFree
+	closeOnce   sync.Once     // T4: Close идемпотентен (двойной close(stopCh) = паника)
 }
 
 // NewTCMallocStore создаёт хранилище.
@@ -138,6 +146,18 @@ func NewTCMallocStore(numWorkers int) *TCMallocStore {
 		centrals: centrals,
 		caches:   caches,
 		stopCh:   make(chan struct{}),
+	}
+
+	// QSBR: поколение стартует с 1, слоты воркеров — «онлайн на поколении 1».
+	// Онлайн-старт (а не offlineEpoch=0) критичен для WAL-replay: во время
+	// восстановления воркеры ещё не запущены и не двигают свои слоты, поэтому
+	// min наблюдаемого поколения застревает на 1 → reclaimer НИЧЕГО не
+	// освобождает, пока сервер не поднялся. Это защищает lock-free чтения
+	// одиночной replay-горутины (ZAdd → store.Get), которая не рапортует QS.
+	s.epoch.Store(1)
+	s.workerEpoch = make([]atomic.Uint64, numWorkers)
+	for i := range s.workerEpoch {
+		s.workerEpoch[i].Store(1)
 	}
 
 	for i := 0; i < numStoreShards; i++ {
@@ -502,7 +522,7 @@ func (s *TCMallocStore) MaxMemory() int64 {
 }
 
 // ══════════════════════════════════════════════════
-// DEFERRED FREE (RCU-style lock-free Get)
+// DEFERRED FREE (QSBR — see reclaim.go)
 // ══════════════════════════════════════════════════
 
 // runDeferredFree — внутренняя горутина аллокатора.
@@ -518,11 +538,13 @@ func (s *TCMallocStore) runDeferredFree() {
 	for {
 		select {
 		case <-ticker.C:
-			s.FlushDeferred()
+			// QSBR-gated: освобождаем только то, что прошло кворум quiescence.
+			s.reclaim()
 		case <-s.stopCh:
-			// Последний flush: освобождаем всё что накопилось.
+			// Остановка вызывается ПОСЛЕ того, как воркеры остановлены
+			// (defer store.Close выполняется после srv.Stop) — читателей уже
+			// нет, поэтому безопасно освободить всё накопленное безусловно.
 			s.FlushDeferred()
-			s.FlushDeferred() // двойной вызов — double buffering
 			return
 		}
 	}
@@ -530,63 +552,73 @@ func (s *TCMallocStore) runDeferredFree() {
 
 // Close останавливает внутренние горутины аллокатора.
 // Вызывай при завершении работы (defer s.Close()).
+//
+// T4: идемпотентен — повторный Close (или двойной defer) не паникует
+// на close уже закрытого канала.
 func (s *TCMallocStore) Close() {
-	close(s.stopCh)
+	s.closeOnce.Do(func() {
+		close(s.stopCh)
+	})
 }
 
-// DeferFree добавляет handle в очередь отложенного освобождения.
+// DeferFree ставит handle в очередь отложенного освобождения (QSBR).
 //
-// Handle будет фактически освобождён при втором вызове FlushDeferred
-// (т.е. пролежит минимум один полный цикл — grace period ≥100ms).
+// Handle тегируется ТЕКУЩИМ поколением и будет фактически освобождён только
+// когда каждый онлайн-воркер пройдёт «тихое» состояние на более позднем
+// поколении (reclaim, см. reclaim.go). До тех пор ни один in-flight читатель,
+// наблюдавший этот handle, не может прочитать освобождённую память.
 //
 // Используется:
 //   - Del (KV store): lock-free Get может держать handle в момент удаления
 //   - B+Tree Delete: lock-free Search может держать member handle
 //   - B+Tree Insert (duplicate): старый member ещё может читаться Search'ем
 func (s *TCMallocStore) DeferFree(h Handle) {
+	g := s.epoch.Load()
 	s.deferMu.Lock()
-	s.deferCurr = append(s.deferCurr, h)
+	// Копим в партию текущего поколения (последняя, если её тег совпал).
+	if n := len(s.pending); n > 0 && s.pending[n-1].gen == g {
+		s.pending[n-1].handles = append(s.pending[n-1].handles, h)
+	} else {
+		s.pending = append(s.pending, retireBatch{gen: g, handles: []Handle{h}})
+	}
 	s.deferMu.Unlock()
 }
 
-// FlushDeferred освобождает отложенные handle'ы, пролежавшие ≥1 цикл.
+// FlushDeferred БЕЗУСЛОВНО освобождает все отложенные handle'ы, игнорируя
+// кворум QSBR.
 //
-// Вызывается внутренней горутиной каждые 100ms.
-// Get занимает ~200ns. Grace period 100ms даёт запас x500000.
+// Вызывающий ОБЯЗАН гарантировать, что параллельных lock-free читателей нет:
+//   - graceful shutdown (воркеры уже остановлены, см. runDeferredFree/Close),
+//   - тесты, детерминированно форсящие путь освобождения.
 //
-// Алгоритм двойной буферизации:
-//
-//	Вызов N:
-//	  1. Освобождаем deferPrev (handle'ы из вызова N-1, пролежали целый цикл)
-//	  2. deferPrev = deferCurr (текущие handle'ы — начинают ждать)
-//	  3. deferCurr = пустой (переиспользуем backing array от prev)
-//
-// Возвращает количество освобождённых handle'ов (для мониторинга).
+// Для штатного продакшн-пути используется reclaim() (QSBR-gated), а НЕ этот
+// метод. Возвращает количество освобождённых handle'ов.
 func (s *TCMallocStore) FlushDeferred() int {
 	s.deferMu.Lock()
-	// 1. Забираем prev (они отлежали целый цикл — безопасно освобождать)
-	toFree := s.deferPrev
-
-	// 2. Текущая очередь уходит в prev (начинает grace period)
-	s.deferPrev = s.deferCurr
-
-	// 3. Переиспользуем backing array от prev для нового curr
-	s.deferCurr = toFree[:0]
+	pending := s.pending
+	s.pending = nil
 	s.deferMu.Unlock()
 
-	// 4. Освобождаем за пределами мьютекса — не блокируем Del
-	for _, h := range toFree {
-		s.caches[0].Free(s.heap, h)
+	// Освобождаем за пределами мьютекса — не блокируем Del/DeferFree.
+	// pending теперь эксклюзивно наш: s.pending сброшен в nil.
+	n := 0
+	for _, b := range pending {
+		for _, h := range b.handles {
+			s.caches[0].Free(s.heap, h)
+			n++
+		}
 	}
-
-	return len(toFree)
+	return n
 }
 
-// DeferredQueueLen возвращает количество handle'ов ожидающих освобождения.
+// DeferredQueueLen возвращает количество handle'ов, ожидающих освобождения.
 // Для мониторинга / метрик.
 func (s *TCMallocStore) DeferredQueueLen() int {
 	s.deferMu.Lock()
-	n := len(s.deferCurr) + len(s.deferPrev)
+	n := 0
+	for _, b := range s.pending {
+		n += len(b.handles)
+	}
 	s.deferMu.Unlock()
 	return n
 }

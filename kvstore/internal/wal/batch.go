@@ -131,6 +131,13 @@ func (bw *BatchWAL) Close() error {
 	return bw.wal.Close()
 }
 
+// Failed возвращает залатченную фатальную ошибку персистентности нижележащего
+// WAL (nil если здоров). Write-путь сервера обязан отклонять мутации, когда
+// Failed()!=nil — иначе клиент получает OK на запись, которая уже потеряна.
+func (bw *BatchWAL) Failed() error {
+	return bw.wal.Failed()
+}
+
 // RawWAL возвращает нижележащий WAL.
 //
 // Используется для операций, которые BatchWAL НЕ оборачивает:
@@ -286,8 +293,12 @@ func (bw *BatchWAL) flushBatch(batch []Entry) {
 	}
 
 	// Одна запись в WAL — один mutex lock на весь batch!
+	// WriteBatch латчит фатальную ошибку внутри (bw.wal.Failed() станет !=nil),
+	// после чего write-путь сервера начнёт отклонять новые мутации (fail-stop).
+	// Этот батч уже потерян — окно fire-and-forget закрыть нельзя, но следующие
+	// записи клиенту больше не подтверждаются как durable.
 	if err := bw.wal.WriteBatch(bw.encodeBuf); err != nil {
-		log.Printf("WAL batch write failed (%d entries lost): %v", len(batch), err)
+		log.Printf("WAL batch write failed (%d entries lost) — engaging durability fail-stop, writes will be rejected: %v", len(batch), err)
 	}
 }
 

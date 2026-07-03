@@ -97,32 +97,37 @@ func (c *MCentral) ReturnSpan(s *Span) {
 
 	if s.IsFull() {
 		c.full = append(c.full, s)
+		s.inFull.Store(true)
 	} else {
 		c.partial = append(c.partial, s)
+		s.inFull.Store(false)
 	}
 }
 
-// ReturnToPartial перемещает span из full в partial.
+// notifyMaybeFull перемещает span из full в partial, если в нём освободился
+// объект (через remote-free очередь Span.Free).
 //
-// Вызывается когда в «полном» span'е освободился объект.
-// В нашей упрощённой модели Free() всегда идёт через mcache,
-// который владеет span'ом, поэтому этот метод — для корректности:
-// когда mcache отдаёт span назад после Free().
-func (c *MCentral) ReturnToPartial(s *Span) {
+// Вызывается ТОЛЬКО когда s.inFull == true (гейт в Span.Free), т.е. спан
+// действительно лежит в c.full и никто им не владеет. Это исключает опасный
+// сценарий двойного владения (append живого spanInCache-спана в partial):
+// активный у воркера спан имеет inFull == false и сюда не попадает.
+//
+// Идемпотентна: если спан уже кем-то перемещён/забран — просто чистит флаг.
+func (c *MCentral) notifyMaybeFull(s *Span) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Убираем из full (если он там есть)
 	for i, fs := range c.full {
 		if fs == s {
 			c.full[i] = c.full[len(c.full)-1]
 			c.full = c.full[:len(c.full)-1]
-			break
+			c.partial = append(c.partial, s)
+			s.inFull.Store(false)
+			return
 		}
 	}
-
-	// Добавляем в partial
-	c.partial = append(c.partial, s)
+	// Уже не в full (забран GetSpan / перемещён) — синхронизируем флаг.
+	s.inFull.Store(false)
 }
 
 // Stats возвращает статистику mcentral.

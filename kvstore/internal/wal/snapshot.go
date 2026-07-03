@@ -130,6 +130,11 @@ func (sw *SnapshotWriter) WriteSnapshot(watermarkLSN uint64, iterate func(fn fun
 		os.Remove(tmpPath)
 		return fmt.Errorf("snapshot rename: %w", err)
 	}
+	// fsync каталога: делаем rename durable. Иначе power-loss откатит замену,
+	// snapshot.wal «исчезнет», а старые WAL уже удалены в BackgroundCompact → потеря.
+	if err := FsyncDir(sw.dir); err != nil {
+		return fmt.Errorf("snapshot dir fsync: %w", err)
+	}
 
 	log.Printf("Snapshot complete: %d keys written", count)
 	return nil

@@ -76,6 +76,39 @@ type WAL struct {
 	// Стартует с 1; 0 зарезервирован под «нет LSN» (snapshot-записи).
 	// recovery ставит SetNextLSN(maxLSN+1) до приёма трафика.
 	nextLSN atomic.Uint64
+
+	// failErr латчит ПЕРВУЮ фатальную ошибку персистентности (ENOSPC, I/O error
+	// при write/flush/fsync). Однажды взведён — не снимается в рамках процесса:
+	// после первого провалившегося сброса in-memory состояние и WAL на диске уже
+	// разошлись (батч, подтверждённый клиенту через fire-and-forget, потерян),
+	// поэтому продолжать принимать записи = множить тихую потерю. Снятие только
+	// через рестарт (recovery из snapshot + чистый WAL). Хранит *error, чтобы
+	// Failed() отдавал первопричину оператору.
+	//
+	// Промышленный аналог: Redis stop-writes-on-bgsave-error (по умолчанию
+	// отклоняет записи при ошибке персистентности), Postgres — PANIC на ошибке
+	// записи WAL. Тихо подтверждать потерянные записи — durability-грех №1.
+	failErr atomic.Pointer[error]
+}
+
+// fail латчит первую фатальную ошибку записи. Повторные вызовы игнорируются
+// (CompareAndSwap), чтобы Failed() отдавал первопричину, а не последнее эхо.
+func (w *WAL) fail(err error) {
+	if err == nil {
+		return
+	}
+	e := err
+	w.failErr.CompareAndSwap(nil, &e)
+}
+
+// Failed возвращает залатченную фатальную ошибку персистентности (nil если WAL
+// здоров). Write-путь сервера ОБЯЗАН отклонять мутации, когда Failed()!=nil —
+// иначе клиент получает OK на запись, которая уже не попадёт на диск.
+func (w *WAL) Failed() error {
+	if p := w.failErr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // Open открывает или создаёт WAL-файл.
@@ -109,6 +142,23 @@ func Open(path string) (*WAL, error) {
 		}
 	}
 	return w, nil
+}
+
+// FsyncDir делает durable последний rename/create/unlink внутри директории,
+// синхронизируя саму директорию. Без этого потеря питания может откатить
+// переименование (данные файла уже на диске, но запись в каталоге — нет):
+// snapshot.wal/graph_leveled.bin «исчезнут», хотя старые WAL уже удалены → потеря.
+// Так же поступают SQLite/LMDB/PostgreSQL после атомарной замены файла.
+func FsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("fsync dir open %s: %w", dir, err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync dir %s: %w", dir, err)
+	}
+	return nil
 }
 
 // reserveLSN резервирует n подряд идущих номеров и возвращает первый из них.
@@ -155,12 +205,16 @@ func (w *WAL) Write(entry Entry) error {
 
 	// Пишем весь заголовок (8 байт) за один вызов
 	if _, err := w.writer.Write(header[:]); err != nil {
-		return fmt.Errorf("wal write header: %w", err)
+		werr := fmt.Errorf("wal write header: %w", err)
+		w.fail(werr)
+		return werr
 	}
 
 	// Пишем сами данные
 	if _, err := w.writer.Write(payload); err != nil {
-		return fmt.Errorf("wal write payload: %w", err)
+		werr := fmt.Errorf("wal write payload: %w", err)
+		w.fail(werr)
+		return werr
 	}
 
 	return nil
@@ -172,9 +226,14 @@ func (w *WAL) Sync() error {
 	defer w.mu.Unlock()
 
 	if err := w.writer.Flush(); err != nil {
+		w.fail(err)
 		return err
 	}
-	return w.file.Sync()
+	if err := w.file.Sync(); err != nil {
+		w.fail(err)
+		return err
+	}
+	return nil
 }
 
 // Rotate переключает WAL на новый файл.
@@ -220,6 +279,13 @@ func (w *WAL) Rotate(newPath string) (oldPath string, err error) {
 	// nextLSN НЕ сбрасываем — номера продолжаются сквозь ротацию.
 	if err := writeFileHeader(w.writer, walBaseLSN); err != nil {
 		return "", fmt.Errorf("wal rotate header: %w", err)
+	}
+
+	// fsync каталога: делаем durable появление нового WAL-файла. Без этого
+	// power-loss может потерять запись каталога о новом файле (его данные
+	// синкаются позже Syncer'ом, но имя в каталоге ещё не durable).
+	if err := FsyncDir(w.dir); err != nil {
+		return "", fmt.Errorf("wal rotate dir fsync: %w", err)
 	}
 
 	return oldPath, nil
@@ -474,7 +540,9 @@ func (w *WAL) WriteBatch(buf []byte) error {
 	w.mu.Unlock()
 
 	if err != nil {
-		return fmt.Errorf("wal write batch: %w", err)
+		werr := fmt.Errorf("wal write batch: %w", err)
+		w.fail(werr)
+		return werr
 	}
 	return nil
 }

@@ -75,6 +75,18 @@ make build
 ### Transactions
 `MULTI` `EXEC` `DISCARD`
 
+> **Isolation contract (read this).** `MULTI`/`EXEC` provides command **grouping and
+> pipelining** with EXECABORT on a bad queued command — it does **not** provide
+> Redis-grade isolation. Unlike single-threaded Redis, this engine executes commands
+> across per-worker shards, and the transaction lock only serializes `EXEC`-vs-`EXEC`.
+> A plain command from another connection (e.g. `SET`) can interleave *between* the
+> queued commands of an in-flight `EXEC`, so the queue is **not** isolated from
+> concurrent traffic. Do not rely on `EXEC` for atomic read-modify-write against keys
+> that other clients touch concurrently. This is a deliberate design choice: true
+> isolation would require globally serializing every write for the duration of each
+> `EXEC`, which defeats the per-worker, zero-alloc model the engine is built on.
+> Durability (WAL + fsync) is unaffected and holds.
+
 ### Pub/Sub
 `SUBSCRIBE channel` `PUBLISH channel message`
 

@@ -11,7 +11,10 @@
 //   - Google TCMalloc: https://google.github.io/tcmalloc/design.html
 package tcmalloc
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // ─── Size Classes ───────────────────────────────────────────
 //
@@ -77,14 +80,17 @@ func SizeClassForSize(size int) int {
 
 // ─── Span State ─────────────────────────────────────────────
 //
-// Span может находиться в двух состояниях:
+// Span может находиться в двух состояниях (документируют владение;
+// Alloc пишет freeStack только у владельца-mcache):
 //
 //	spanInCache   — span принадлежит конкретному mcache.
-//	                Alloc/Free вызываются ОДНИМ worker'ом → lock-free.
+//	                Alloc вызывает ОДИН worker (владелец) → freeStack lock-free.
 //
-//	spanInCentral — span лежит в MCentral (в partial или full).
-//	                Free может вызвать ЛЮБОЙ worker → нужен mutex.
-//	                При Free, если span был в full → ReturnToPartial.
+//	spanInCentral — span лежит в MCentral (в partial или full), владельца нет.
+//
+// Free() может вызвать ЛЮБОЙ worker в ЛЮБОМ состоянии (deferred-free,
+// cross-worker) → он НИКОГДА не пишет freeStack напрямую, а кладёт индекс в
+// remoteFree под mu; владелец сольёт его в freeStack при Alloc (см. Span.Free).
 const (
 	spanInCache   uint32 = 0
 	spanInCentral uint32 = 1
@@ -106,12 +112,12 @@ const (
 //
 // Ownership tracking:
 //
-//	state == spanInCache   → принадлежит mcache, lock-free доступ
-//	state == spanInCentral → лежит в mcentral, Free() берёт mu
+//	state == spanInCache   → принадлежит mcache, Alloc lock-free
+//	state == spanInCentral → лежит в mcentral, владельца нет
 //
-//	При Free() + state==spanInCentral:
-//	  1. Берём s.mu (защита freeStack от параллельных Free)
-//	  2. Если span был полон → вызываем central.ReturnToPartial(s)
+//	Free() (из любого потока) кладёт индекс в remoteFree под mu; владелец
+//	сливает remoteFree → freeStack в Alloc. Если спан был в full — Free через
+//	inFull-гейт зовёт central.notifyMaybeFull, возвращая его в partial.
 type Span struct {
 	// Память, из которой нарезаются объекты.
 	// Это slice из chunk'а mheap (НЕ отдельная аллокация).
@@ -149,14 +155,29 @@ type Span struct {
 
 	// ─── Ownership tracking ───
 	//
-	// mu защищает freeStack когда span в состоянии spanInCentral.
-	// Когда span в spanInCache — mu НЕ берётся (single-writer, lock-free).
+	// mu защищает remoteFree (и переход remoteFree → freeStack при дренаже).
+	// freeStack — приватный для владельца (Alloc): пишется под mu ТОЛЬКО во
+	// время дренажа самим владельцем, поэтому pop в Alloc остаётся lock-free.
 	//
-	// central — back-reference для вызова ReturnToPartial.
-	// Устанавливается один раз при AllocSpan и не меняется.
+	// central — back-reference на «свой» MCentral. Устанавливается один раз
+	// при AllocSpan и не меняется.
 	mu      sync.Mutex
-	state   uint32    // spanInCache или spanInCentral
+	state   uint32    // spanInCache или spanInCentral (документирует владение)
 	central *MCentral // back-reference на «свой» MCentral
+
+	// ─── Remote free queue (защита от T1) ───
+	//
+	// Free() может вызвать НЕ владелец спана (deferred-free из store.go,
+	// cross-worker Free в vector). Писать в freeStack напрямую нельзя — это
+	// гонка с lock-free Alloc() владельца → потеря обновлений → один objIndex
+	// двум ключам → тихая порча данных.
+	//
+	// Поэтому не-владелец кладёт индекс в remoteFree под mu. Владелец сливает
+	// remoteFree → freeStack в начале Alloc(), проверяя lock-free счётчик
+	// remotePend на горячем пути (дренаж происходит только когда есть что сливать).
+	remoteFree []int        // возвраты не от владельца; под mu
+	remotePend atomic.Int32 // len(remoteFree): lock-free сигнал к дренажу
+	inFull     atomic.Bool  // спан лежит в MCentral.full (гейт для notifyMaybeFull)
 }
 
 // NewSpan создаёт span над существующим блоком памяти.
@@ -186,6 +207,18 @@ func NewSpan(data []byte, elemSize, sizeClass int, central *MCentral) *Span {
 //
 // Возвращает nil, -1 если span полон.
 func (s *Span) Alloc() ([]byte, int) {
+	// Путь 0: дренаж remote-free от не-владельцев (редко).
+	// Гейт lock-free счётчиком: на горячем пути — один atomic.Load.
+	// Только владелец (этот вызов Alloc) пишет freeStack, поэтому после
+	// дренажа под mu pop ниже остаётся безопасным без лока.
+	if s.remotePend.Load() != 0 {
+		s.mu.Lock()
+		s.freeStack = append(s.freeStack, s.remoteFree...)
+		s.remoteFree = s.remoteFree[:0]
+		s.remotePend.Store(0)
+		s.mu.Unlock()
+	}
+
 	// Путь 1: переиспользуем освобождённый объект
 	if n := len(s.freeStack); n > 0 {
 		idx := s.freeStack[n-1]
@@ -208,47 +241,41 @@ func (s *Span) Alloc() ([]byte, int) {
 
 // Free возвращает объект по индексу обратно в span.
 //
-// Поведение зависит от состояния span'а:
-//
-//	state == spanInCache:
-//	  Lock-free. Вызывается только владельцем-mcache.
-//	  Просто push в freeStack.
-//
-//	state == spanInCentral:
-//	  Берёт s.mu (защита от параллельных Free из разных workers).
-//	  Если span БЫЛ полон (wasFull) → вызывает central.ReturnToPartial(s),
-//	  чтобы вернуть span в оборот.
+// Free может вызвать ЛЮБОЙ воркер/горутина, НЕ обязательно владелец спана
+// (deferred-free из store.go, cross-worker Free в vector). Поэтому индекс
+// НИКОГДА не пишется в freeStack напрямую (это гонка с lock-free Alloc()
+// владельца → порча данных, баг T1). Вместо этого — remote-free очередь:
+// кладём в remoteFree под mu, владелец сольёт её в freeStack при Alloc().
 //
 // Примечание: НЕ обнуляем память. Данные будут перезаписаны
 // при следующем Alloc+encodeInto. Обнуление стоило 10% CPU (pprof).
 func (s *Span) Free(objIndex int) {
-	if s.state == spanInCache {
-		// Span принадлежит нашему mcache → single writer, lock-free.
-		s.freeStack = append(s.freeStack, objIndex)
-		return
-	}
-
-	// Span в MCentral → нужен mutex (любой worker может вызвать Free).
 	s.mu.Lock()
-	wasFull := s.IsFull() // проверяем ДО добавления в freeStack
-	s.freeStack = append(s.freeStack, objIndex)
+	s.remoteFree = append(s.remoteFree, objIndex)
+	s.remotePend.Store(int32(len(s.remoteFree)))
 	s.mu.Unlock()
 
-	// Если span был полностью заполнен, а теперь появилось место →
-	// переводим из full в partial, чтобы другие mcache могли его получить.
-	if wasFull && s.central != nil {
-		s.central.ReturnToPartial(s)
+	// Если спан лежит в MCentral.full — вернуть его в partial: появилось место,
+	// он снова выдаваем. Гейт inFull держит путь lock-free, пока спан активен
+	// у владельца (обычный случай — владелец сольёт remoteFree сам).
+	if s.central != nil && s.inFull.Load() {
+		s.central.notifyMaybeFull(s)
 	}
 }
 
 // IsFull возвращает true если в span нет свободных объектов.
+//
+// Учитывает ещё не слитую remote-free очередь (remotePend, atomic) — иначе
+// спан с возвращёнными, но не дренированными слотами ошибочно считался бы
+// полным и застревал в MCentral.full.
 func (s *Span) IsFull() bool {
-	return len(s.freeStack) == 0 && s.allocIndex >= s.capacity
+	return len(s.freeStack) == 0 && s.remotePend.Load() == 0 && s.allocIndex >= s.capacity
 }
 
-// FreeCount возвращает количество доступных для аллокации объектов.
+// FreeCount возвращает количество доступных для аллокации объектов
+// (freeStack + ещё не слитая remote-free очередь + непройденный bump-хвост).
 func (s *Span) FreeCount() int {
-	return len(s.freeStack) + (s.capacity - s.allocIndex)
+	return len(s.freeStack) + int(s.remotePend.Load()) + (s.capacity - s.allocIndex)
 }
 
 // ─── Handle ─────────────────────────────────────────────────

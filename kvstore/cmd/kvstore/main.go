@@ -198,6 +198,26 @@ func main() {
 		}
 	}
 
+	// vecWatermark — LSN, до которого векторный снапшот (graph_leveled.bin) уже
+	// содержит все операции. Реплей wal_*.log пропускает векторные записи с
+	// LSN ≤ watermark — иначе операции из окна «ротация WAL → запись снапшота»
+	// накатились бы поверх снапшота, дублируя векторы при каждом рестарте.
+	var vecWatermark uint64
+	if graphLoaded {
+		if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+			vecWatermark = lvs.SnapshotLSN()
+		}
+	}
+	// skipVec решает, пропустить ли векторную операцию как уже отражённую в снапшоте.
+	// Из snapshot.wal — пропускаем, если граф загружен из бинарного снапшота.
+	// Из wal_*.log — пропускаем, если LSN ≤ watermark (запись уже в graph_leveled.bin).
+	skipVec := func(entry wal.Entry, isFromSnapshot bool) bool {
+		if isFromSnapshot {
+			return graphLoaded
+		}
+		return entry.LSN <= vecWatermark
+	}
+
 	// Шаг A: Сначала читаем и накатываем snapshot.wal (если есть)
 	snapshotPath := filepath.Join(dataDir, "snapshot.wal")
 	snapWatermark, snapshotEntries, err := wal.ReadFile(snapshotPath)
@@ -233,8 +253,9 @@ func main() {
 			ttl.Remove(entry.Key)
 			restored++
 		case wal.OpVSimAdd:
-			// Если граф загружен из бинарного снапшота, мы пропускаем векторные операции из snapshot.wal
-			if isFromSnapshot && graphLoaded {
+			// Пропускаем, если операция уже в снапшоте (snapshot.wal при graphLoaded
+			// или wal_*.log с LSN ≤ watermark) — иначе дубль вектора после рестарта.
+			if skipVec(entry, isFromSnapshot) {
 				return
 			}
 			vec := vector.DeserializeVector(entry.Value)
@@ -246,7 +267,7 @@ func main() {
 		case wal.OpVSimAddAttrs:
 			// Вектор + атрибуты (P0-4): attrs/tenant восстанавливаются через
 			// AddWithAttrs, а не теряются как при голом Add.
-			if isFromSnapshot && graphLoaded {
+			if skipVec(entry, isFromSnapshot) {
 				return
 			}
 			vec, attrs, err := vector.DeserializeVectorWithAttrs(entry.Value)
@@ -265,7 +286,7 @@ func main() {
 			vecRestored++
 			restored++
 		case wal.OpVSimDel:
-			if isFromSnapshot && graphLoaded {
+			if skipVec(entry, isFromSnapshot) {
 				return
 			}
 			vecStore.Delete(entry.Key)
@@ -330,11 +351,11 @@ func main() {
 	ttl.SetEvictor(&compositeEvictor{kv: s, vec: vecStore, wal: bw})
 
 	// === 4. Syncer ===
-	// iterateAll — обход только KV данных для snapshot.wal (векторы хранятся отдельно)
+	// iterateAll — переснимает ВСЁ KV-состояние, живущее только в реплее WAL,
+	// для snapshot.wal (векторы хранятся отдельно). Компакция удаляет старые
+	// WAL, поэтому всё, что не попадёт сюда, теряется после рестарта.
 	iterateAll := func(fn func(op byte, key string, value []byte)) {
-		s.ForEach(func(key string, value []byte) {
-			fn(wal.OpSet, key, value)
-		})
+		snapshotIterate(s, ttl, zsetReg, fn)
 	}
 
 	// saveVectors — сохраняет LeveledVectorStore в graph_leveled.bin.
@@ -343,6 +364,11 @@ func main() {
 	saveVectors := func() error {
 		// Приводим к *LeveledVectorStore для вызова FlushDeltaSync.
 		if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+			// Watermark ДО FlushDeltaSync: любая векторная операция с LSN ≤ него
+			// уже присвоила LSN, значит вектор был в дельте/сегментах и попадёт в
+			// снапшот через FlushDeltaSync. Recovery пропустит такие WAL-записи —
+			// иначе окно «ротация → снапшот» дублировало бы векторы при рестарте.
+			lvs.SetSnapshotWatermark(rawWAL.LastLSN())
 			lvs.FlushDeltaSync()
 		}
 		graphPath := filepath.Join(dataDir, "graph_leveled.bin")
@@ -368,7 +394,12 @@ func main() {
 			return err
 		}
 		f.Close()
-		return os.Rename(tmpPath, graphPath)
+		if err := os.Rename(tmpPath, graphPath); err != nil {
+			return err
+		}
+		// fsync каталога: делаем rename graph_leveled.bin durable (иначе power-loss
+		// откатит замену снапшота при уже удалённых старых WAL).
+		return wal.FsyncDir(dataDir)
 	}
 
 	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, iterateAll, saveVectors)
@@ -501,6 +532,8 @@ func main() {
 		case "MULTI":
 			start := time.Now()
 			cs.InTx = true
+			cs.TxQueue = nil
+			cs.TxAborted = false
 			cs.Buf.WriteSimpleString("OK")
 			monitoring.RecordCommand(cmd, time.Since(start))
 			return
@@ -513,6 +546,7 @@ func main() {
 			}
 			cs.InTx = false
 			cs.TxQueue = nil
+			cs.TxAborted = false
 			cs.Buf.WriteSimpleString("OK")
 			monitoring.RecordCommand(cmd, time.Since(start))
 			return
@@ -523,16 +557,28 @@ func main() {
 				monitoring.RecordCommand(cmd, time.Since(startEXEC))
 				return
 			}
-			globalTxMu.Lock()
-			cs.Buf.WriteArrayHeader(len(cs.TxQueue))
-			for _, queuedArgs := range cs.TxQueue {
-				qCmd := strings.ToUpper(string(queuedArgs[0]))
-				qCmdArgs := queuedArgs[1:]
+			// H2: если в очередь попала запрещённая команда — вся транзакция
+			// отменяется (как EXECABORT в Redis). Не выполняем ничего.
+			if cs.TxAborted {
+				cs.Buf.WriteError("EXECABORT Transaction discarded because of previous errors.")
+				cs.InTx = false
+				cs.TxQueue = nil
+				cs.TxAborted = false
+				monitoring.RecordCommand(cmd, time.Since(startEXEC))
+				return
+			}
+			// M2 (осознанно НЕ фиксим — задокументировано в README «Isolation
+			// contract»): execQueuedTx берёт globalTxMu, но тот сериализует лишь
+			// EXEC-vs-EXEC. Обычная команда с другого соединения (в другом worker-
+			// шарде) может вклиниться МЕЖДУ командами очереди → EXEC даёт группировку
+			// и durability, но НЕ isolation. Настоящая изоляция потребовала бы
+			// глобальной сериализации всех записей на время EXEC, что убивает
+			// per-worker zero-alloc модель. Контракт сознательно сужен, а не расширен.
+			execQueuedTx(cs.TxQueue, cs.Buf.WriteArrayHeader, func(qCmd string, qCmdArgs [][]byte) {
 				startCmd := time.Now()
 				executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
 				monitoring.RecordCommand(qCmd, time.Since(startCmd))
-			}
-			globalTxMu.Unlock()
+			})
 			cs.InTx = false
 			cs.TxQueue = nil
 			monitoring.RecordCommand(cmd, time.Since(startEXEC))
@@ -540,13 +586,7 @@ func main() {
 		}
 
 		if cs.InTx {
-			// Копируем args — ring buffer будет перезаписан!
-			argsCopy := make([][]byte, len(args))
-			for i, a := range args {
-				argsCopy[i] = append([]byte(nil), a...)
-			}
-			cs.TxQueue = append(cs.TxQueue, argsCopy)
-			cs.Buf.WriteSimpleString("QUEUED")
+			queueTxCommand(cs, args, cmd)
 			return
 		}
 
@@ -569,6 +609,11 @@ func main() {
 	// Отключение клиента чистит его подписки Pub/Sub (classic + semantic-вектор в
 	// HNSW). Без этого хука вектор течёт в индекс навсегда, а writePump висит.
 	srv.OnDisconnect = hub.RemoveConn
+	// H3: медленный подписчик отключается через единую точку учёта epoll.
+	hub.SetOnSlowClose(srv.CloseConn)
+	// T2 (QSBR): воркеры рапортуют quiescence аллокатору — deferred-free слоты
+	// освобождаются по кворуму «тихих» состояний, а не по таймеру (фикс UAF).
+	srv.Reclaimer = s
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
 	if *tlsCert != "" && *tlsKey != "" {
@@ -645,6 +690,21 @@ func writeValue(buf *server.ConnBuf, v protocol.Value) {
 		}
 	case 0:
 		// пустой ответ (SUBSCRIBE — writePump сам отправляет)
+	}
+}
+
+// setClearTTL снимает прежний TTL с ключа при голом SET (без EX) — семантика
+// Redis без KEEPTTL: перезапись значения сбрасывает срок жизни, иначе новое
+// значение умрёт по старому таймеру.
+//
+// OpPersist пишется в WAL ТОЛЬКО если TTL реально был (ttl.Remove вернул true) —
+// без спама WAL на каждый SET и с durability: при реплее/компакции прежний
+// OpExpire не воскресит удалённый TTL (реплей: OpSet(new) → OpPersist(снять)).
+//
+// Вынесено из inline-обработчика SET для тестируемости.
+func setClearTTL(ttl *store.TTLManager, bw *wal.BatchWAL, key string) {
+	if ttl.Remove(key) {
+		bw.Write(wal.Entry{Op: wal.OpPersist, Key: key})
 	}
 }
 
@@ -725,6 +785,23 @@ func isMemoryGrowingCmd(cmd string) bool {
 	return false
 }
 
+// isWriteCmd сообщает, мутирует ли команда состояние и потому требует durable
+// записи в WAL. Используется durability fail-stop гейтом: при сломанном WAL
+// (ENOSPC/I/O error) ВСЕ такие команды отклоняются — включая удаляющие
+// (DEL/VSIM.DEL/ZREM/EXPIRE/PERSIST), потому что удаление тоже надо записать в
+// лог, иначе оно «воскреснет» после рестарта. Это отличается от OOM-гейта
+// (isMemoryGrowingCmd), где удаления РАЗРЕШЕНЫ — там цель освободить память,
+// а здесь диск не может принять вообще ничего. Чтение (GET/…) не затронуто.
+func isWriteCmd(cmd string) bool {
+	switch cmd {
+	case "SET", "DEL", "EXPIRE", "PERSIST",
+		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.DEL",
+		"ZADD", "ZREM", "AI.INGEST":
+		return true
+	}
+	return false
+}
+
 // arg — helper: безопасное получение string из args.
 func arg(args [][]byte, i int) string {
 	if i >= len(args) {
@@ -776,6 +853,20 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		monitoring.OomEvents.Inc()
 		buf.WriteError("OOM command not allowed when used memory > 'maxmemory'")
 		return
+	}
+
+	// Durability fail-stop: если WAL перестал durable-писать на диск (ENOSPC,
+	// I/O error), мы больше не можем честно подтверждать мутации. Отклоняем ВСЕ
+	// пишущие команды — включая удаляющие (в отличие от OOM-гейта выше), т.к. на
+	// полном диске нельзя записать даже удаление. Чтение остаётся доступным,
+	// чтобы клиенты могли снять данные. Аналог Redis stop-writes-on-bgsave-error:
+	// лучше явная ошибка, чем тихая потеря уже подтверждённой записи.
+	if isWriteCmd(cmd) {
+		if err := bw.Failed(); err != nil {
+			monitoring.WalFailStop.Inc()
+			buf.WriteError("WAL persistence failed, writes are blocked (durability fail-stop): " + err.Error())
+			return
+		}
 	}
 
 	// WASM.* команды обслуживает compute-шов (за build-tag experimental). В прод-
@@ -870,6 +961,11 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			binary.BigEndian.PutUint64(b[:], uint64(expiresAt.UnixNano()))
 			bw.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: b[:]})
 			ttl.Set(key, dur)
+		} else {
+			// Голый SET (без EX) снимает прежний TTL — семантика Redis без
+			// KEEPTTL. Иначе новое значение унаследует старый таймер и умрёт
+			// неожиданно. OpPersist пишется для durability (реплей/компакция).
+			setClearTTL(ttl, bw, key)
 		}
 
 		buf.WriteSimpleString("OK")
@@ -1010,8 +1106,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		for i, a := range args {
 			channels[i] = string(a)
 		}
-		hub.Subscribe(cs.Conn, channels)
-		// writePump отправляет подтверждения, не пишем в buf
+		// M1: subscribeClassic флашит cs.Buf ДО старта writePump — иначе
+		// предшествующие в том же пайплайн-батче ответы (напр. +PONG) гонятся
+		// за сокет с writePump. writePump отправляет подтверждения, не пишем в buf.
+		subscribeClassic(cs, hub, channels)
 
 	case "UNSUBSCRIBE":
 		channels := make([]string, len(args))
@@ -1169,6 +1267,9 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 			vec[i-1] = float32(f)
 		}
+		// M1: тот же two-writer, что и в classic SUBSCRIBE — флашим накопленный
+		// в пайплайне вывод ДО старта writePump (внутри SemanticSubscribe).
+		flushBeforeWritePump(cs)
 		if _, err := hub.SemanticSubscribe(cs.Conn, vec, float32(threshold)); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
@@ -1723,4 +1824,125 @@ func SendVectorToNode(addr, key string, vec []float32) error {
 	}
 
 	return nil
+}
+
+// snapshotIterate переснимает всё KV-состояние, живущее только в реплее WAL,
+// в snapshot.wal при компакции. Вынесено из iterateAll ради тестируемости
+// (стражи S1/S2): компакция удаляет старые WAL, поэтому всё, что не попадёт
+// сюда, теряется после рестарта.
+//
+//   - обычные KV-ключи → OpSet;
+//   - внутренние __zidx-ключи ПРОПУСКАЕМ — zset перестраивается из реестра
+//     через OpZAdd (S2). Иначе split-brain: __zidx выживает как OpSet, а
+//     дерево нет; к тому же при реплее __zidx (OpSet) ДО OpZAdd ранний return
+//     ZAdd (oldScore==score) не вставил бы member в дерево;
+//   - TTL → OpExpire с абсолютным временем смерти (S1): иначе после компакции
+//     ключи с TTL становятся бессмертными (correctness + утечка памяти);
+//   - zset-деревья → OpZAdd (score+member) (S2): реплей восстанавливает И
+//     дерево, И __zidx-обратный индекс.
+func snapshotIterate(
+	s *tcmalloc.TCMallocStore,
+	ttl *store.TTLManager,
+	zsetReg *zset.ZSetRegistry,
+	fn func(op byte, key string, value []byte),
+) {
+	s.ForEach(func(key string, value []byte) {
+		if strings.HasPrefix(key, "__zidx:") {
+			return
+		}
+		fn(wal.OpSet, key, value)
+	})
+
+	ttl.ForEach(func(key string, expiresAtUnixNano int64) {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(expiresAtUnixNano))
+		fn(wal.OpExpire, key, b[:])
+	})
+
+	zsetReg.ForEachSet(func(setName string) {
+		zsetReg.ForEach(setName, func(score float64, member string) {
+			fn(wal.OpZAdd, setName, zset.EncodeZAddValue(score, member))
+		})
+	})
+}
+
+// execQueuedTx выполняет очередь команд MULTI/EXEC под globalTxMu.
+//
+// H1: defer Unlock ОБЯЗАТЕЛЕН. Если run (executeCommand) паникует на битой
+// команде в очереди, её ловит recover в handleConn — но Unlock без defer был
+// бы пропущен → globalTxMu залочен НАВСЕГДА → EXEC всех соединений виснут,
+// воркеры застревают по одному. defer освобождает мьютекс на разворачивании
+// паники, после чего она уходит в recover (соединение закрывается).
+func execQueuedTx(queue [][][]byte, writeHeader func(int), run func(qCmd string, qCmdArgs [][]byte)) {
+	globalTxMu.Lock()
+	defer globalTxMu.Unlock()
+
+	writeHeader(len(queue))
+	for _, queuedArgs := range queue {
+		qCmd := strings.ToUpper(string(queuedArgs[0]))
+		run(qCmd, queuedArgs[1:])
+	}
+}
+
+// queueTxCommand ставит команду в очередь транзакции ИЛИ отклоняет её (H2).
+//
+// Pub/sub subscribe-команды (forbiddenInTx) переводят соединение в subscriber-
+// mode и пишут ответы мимо cs.Buf → внутри EXEC это укоротило бы обещанный
+// ArrayHeader(N) → RESP-десинк соединения навсегда. Такую команду НЕ ставим в
+// очередь, а помечаем транзакцию на отмену (cs.TxAborted) — как EXECABORT в
+// Redis: последующий EXEC ничего не выполнит и вернёт ошибку.
+func queueTxCommand(cs *server.ConnState, args [][]byte, cmd string) {
+	if forbiddenInTx(cmd) {
+		cs.TxAborted = true
+		cs.Buf.WriteError("ERR " + cmd + " is not allowed in transactions")
+		return
+	}
+	// Копируем args — ring buffer будет перезаписан!
+	argsCopy := make([][]byte, len(args))
+	for i, a := range args {
+		argsCopy[i] = append([]byte(nil), a...)
+	}
+	cs.TxQueue = append(cs.TxQueue, argsCopy)
+	cs.Buf.WriteSimpleString("QUEUED")
+}
+
+// forbiddenInTx — команды, недопустимые внутри MULTI/EXEC (H2).
+//
+// Pub/sub subscribe-команды переводят соединение в subscriber-mode: запускают
+// writePump (второй писатель в сокет) и шлют ответы через pub/sub-канал, а не в
+// cs.Buf. Внутри EXEC это ломает RESP-кадр (обещанный ArrayHeader(N) получает
+// меньше элементов) и рвёт соединение. Redis тоже запрещает их в транзакции.
+func forbiddenInTx(cmd string) bool {
+	switch cmd {
+	case "SUBSCRIBE", "UNSUBSCRIBE", "VSIM.SUBSCRIBE", "VSIM.UNSUBSCRIBE":
+		return true
+	}
+	return false
+}
+
+// flushBeforeWritePump сбрасывает накопленный в cs.Buf вывод на провод ДО того,
+// как вызывающий переведёт соединение в subscriber-mode и стартует writePump (M1).
+//
+// writePump — ВТОРОЙ, независимый писатель того же conn (свой protocol.Writer).
+// Пока в cs.Buf лежат ответы предыдущих команд того же пайплайн-батча (напр.
+// +PONG на пайплайненный перед SUBSCRIBE PING), они уходят клиенту конечным
+// Flush воркера (server.go), который выполняется ПАРАЛЛЕЛЬНО с writePump. Два
+// писателя в один сокет без синхронизации → кадры переставляются местами:
+// клиент, ждущий +PONG следующим ответом, получает subscribe-подтверждение и
+// десинхронизирует RESP-поток навсегда. Синхронный Flush здесь гарантирует, что
+// весь предшествующий вывод на проводе прежде, чем writePump напишет первый кадр.
+// Ошибку глотаем: сломанный conn всё равно будет переиспользован/реапнут (тот же
+// Flush повторится в конце батча / writePump упрётся в ошибку записи).
+func flushBeforeWritePump(cs *server.ConnState) {
+	_ = cs.Buf.Flush()
+}
+
+// subscribeClassic переводит соединение в classic subscriber-mode: сперва
+// флашит пайплайн-вывод (M1, см. flushBeforeWritePump), затем стартует подписку
+// (и её writePump). Порядок «флаш → Subscribe» обязателен: Subscribe пушит
+// подтверждение в writePump, который может записать его немедленно из своей
+// горутины, поэтому предшествующий вывод должен уйти на провод ДО этого.
+func subscribeClassic(cs *server.ConnState, hub *pubsub.Hub, channels []string) {
+	flushBeforeWritePump(cs)
+	hub.Subscribe(cs.Conn, channels)
 }
