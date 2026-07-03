@@ -56,6 +56,20 @@ func unsafeString(b []byte) string {
 	return unsafe.String(&b[0], len(b))
 }
 
+// shouldSkipVecReplay решает, пропустить ли ВЕКТОРНЫЙ эффект WAL-записи при
+// recovery как уже отражённый в снапшоте graph_leveled.bin. Из snapshot.wal —
+// пропускаем, если граф загружен из бинарного снапшота; из wal_*.log — если
+// LSN ≤ vecWatermark (запись уже в снапшоте). Применяется КО ВСЕМ записям,
+// меняющим вектор: OpVSimAdd/Attrs/Del И каскадным OpDel/OpExpire (KV-DEL, что
+// также удаляет вектор) — иначе старый DEL с LSN ≤ watermark удалил бы вектор,
+// воскрешённый более поздним re-add, уже присутствующий в снапшоте.
+func shouldSkipVecReplay(entry wal.Entry, isFromSnapshot, graphLoaded bool, vecWatermark uint64) bool {
+	if isFromSnapshot {
+		return graphLoaded
+	}
+	return entry.LSN <= vecWatermark
+}
+
 func main() {
 	// CLI-флаги
 	port := flag.Int("port", 6380, "порт для клиентов")
@@ -208,14 +222,14 @@ func main() {
 			vecWatermark = lvs.SnapshotLSN()
 		}
 	}
-	// skipVec решает, пропустить ли векторную операцию как уже отражённую в снапшоте.
-	// Из snapshot.wal — пропускаем, если граф загружен из бинарного снапшота.
-	// Из wal_*.log — пропускаем, если LSN ≤ watermark (запись уже в graph_leveled.bin).
+	// nextLSN обязан быть выше vecWatermark: снапшот покрывает LSN ≤ него, новые
+	// операции не должны переиспользовать эти номера (иначе резюмируемая
+	// репликация ломается, а skipVec ошибочно пропустит свежую запись).
+	bumpLSN(vecWatermark)
+	// skipVec решает, пропустить ли ВЕКТОРНЫЙ эффект записи как уже в снапшоте
+	// (см. shouldSkipVecReplay). Применяется и к OpVSim*, и к каскадным OpDel/OpExpire.
 	skipVec := func(entry wal.Entry, isFromSnapshot bool) bool {
-		if isFromSnapshot {
-			return graphLoaded
-		}
-		return entry.LSN <= vecWatermark
+		return shouldSkipVecReplay(entry, isFromSnapshot, graphLoaded, vecWatermark)
 	}
 
 	// Шаг A: Сначала читаем и накатываем snapshot.wal (если есть)
@@ -233,7 +247,12 @@ func main() {
 			restored++
 		case wal.OpDel:
 			s.Del(0, entry.Key)
-			vecStore.Delete(entry.Key) // Также удаляем вектор при реплее DEL
+			// Векторный эффект гейтуем watermark'ом: старый DEL (LSN ≤ watermark),
+			// уже отражённый в снапшоте, не должен удалять вектор, воскрешённый
+			// более поздним re-add (который тоже в снапшоте).
+			if !skipVec(entry, isFromSnapshot) {
+				vecStore.Delete(entry.Key)
+			}
 			ttl.OnDelete(entry.Key)
 			restored++
 		case wal.OpExpire:
@@ -244,7 +263,9 @@ func main() {
 					ttl.Set(entry.Key, remaining)
 				} else {
 					s.Del(0, entry.Key)
-					vecStore.Delete(entry.Key) // Также удаляем вектор, если ключ просрочен в оффлайне
+					if !skipVec(entry, isFromSnapshot) {
+						vecStore.Delete(entry.Key) // Также удаляем вектор, если ключ просрочен в оффлайне
+					}
 					ttl.OnDelete(entry.Key)
 				}
 			}
@@ -1170,14 +1191,20 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 
-		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		monitoring.VectorAddTotal.Inc()
 		addStart := time.Now()
+		// Add ДО bw.Write (watermark-safety, как у VSIM.DEL). Если между Write и Add
+		// сработает saveVectors (watermark=LastLSN + FlushDeltaSync), вектор с
+		// LSN ≤ watermark ещё НЕ в дельте → снапшот без него, а реплей пропустит его
+		// (LSN ≤ watermark) → потеря. Add-then-Write: незалогированный Add теряется
+		// лишь вместе с крахом (консистентно), залогированный всегда переигрывается.
+		// Заодно ошибка Add больше не отравляет WAL.
 		if err := vecStore.Add(key, vec); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
 		monitoring.VectorAddDuration.Update(time.Since(addStart).Seconds())
+		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		if cl != nil {
 			// Forward replication command in text format to replica nodes
 			// to avoid breaking existing replica replication protocols.
@@ -1224,14 +1251,15 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		walValue := vector.SerializeVector(vec)
-		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		monitoring.VectorAddTotal.Inc()
 		addStart := time.Now()
+		// Add ДО bw.Write (watermark-safety, см. VSIM.ADDBIN).
 		if err := vecStore.Add(key, vec); err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
 		monitoring.VectorAddDuration.Update(time.Since(addStart).Seconds())
+		bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
 		if cl != nil {
 			// Формат: VSIM.ADD key 0.1 0.2 0.3 ...
 			var sb strings.Builder
