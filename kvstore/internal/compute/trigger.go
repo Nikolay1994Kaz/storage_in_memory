@@ -2,7 +2,7 @@ package compute
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"sync"
 )
@@ -56,8 +56,8 @@ func (tm *TriggerManager) AddTrigger(event TriggerEvent, pattern, moduleName, fu
 	}
 
 	tm.triggers = append(tm.triggers, trigger)
-	log.Printf("[wasm] Trigger added: %s on %s '%s' → %s.%s",
-		trigger.ID, event, pattern, moduleName, funcName)
+	slog.Info("wasm: trigger added",
+		"id", trigger.ID, "event", event, "pattern", pattern, "module", moduleName, "func", funcName)
 
 	return trigger.ID
 }
@@ -70,7 +70,7 @@ func (tm *TriggerManager) RemoveTrigger(id string) bool {
 	for i, t := range tm.triggers {
 		if t.ID == id {
 			tm.triggers = append(tm.triggers[:i], tm.triggers[i+1:]...)
-			log.Printf("[wasm] Trigger removed: %s", id)
+			slog.Info("wasm: trigger removed", "id", id)
 			return true
 		}
 	}
@@ -125,7 +125,7 @@ func (tm *TriggerManager) Fire(event TriggerEvent, key string, workerID int) {
 		}
 
 		if err != nil {
-			log.Printf("[wasm] Trigger %s error: %v", t.ID, err)
+			slog.Error("wasm: trigger error", "id", t.ID, "err", err)
 		}
 	}
 }

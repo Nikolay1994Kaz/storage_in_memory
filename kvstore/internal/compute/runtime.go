@@ -3,12 +3,14 @@ package compute
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"kvstore/kvstore/internal/logging"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -93,7 +95,7 @@ func NewEngine() *Engine {
 
 	// Host-функции регистрируются один раз (до WASI)
 	if _, err := e.registerHostFunctions(ctx); err != nil {
-		log.Fatalf("[wasm] Failed to register host functions: %v", err)
+		logging.Fatalf("[wasm] failed to register host functions: %v", err)
 	}
 
 	// WASI нужен для Go-модулей (GOOS=wasip1)
@@ -135,14 +137,14 @@ func (e *Engine) LoadModule(name string, wasmBytes []byte) error {
 	if IsReactorModule(compiled) {
 		tier := TierBudget // по умолчанию — с рециклингом (безопасно для стороннего кода)
 		if err := e.WorkerLocal.WarmUpFromBytes(name, wasmBytes, tier); err != nil {
-			log.Printf("[wasm] Worker-local warmup failed for '%s': %v (fallback to per-call)", name, err)
+			slog.Warn("wasm: worker-local warmup failed, fallback to per-call", "module", name, "err", err)
 		} else {
-			log.Printf("[wasm] Module '%s' loaded as Reactor (worker-local, tier=%d)", name, tier)
+			slog.Info("wasm: module loaded as Reactor (worker-local)", "module", name, "tier", tier)
 			return nil
 		}
 	}
 
-	log.Printf("[wasm] Module '%s' loaded as Command (per-call instantiation)", name)
+	slog.Info("wasm: module loaded as Command (per-call instantiation)", "module", name)
 	return nil
 }
 
@@ -163,7 +165,7 @@ func (e *Engine) DropModule(name string) error {
 
 	mod.Compiled.Close(context.Background())
 	delete(e.modules, name)
-	log.Printf("[wasm] Module '%s' dropped", name)
+	slog.Info("wasm: module dropped", "module", name)
 	return nil
 }
 

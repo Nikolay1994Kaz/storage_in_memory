@@ -2,7 +2,7 @@ package pubsub
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -225,7 +225,7 @@ func (h *Hub) Publish(channel string, message string) int {
 		case sub.ch <- msg:
 			delivered++
 		default:
-			log.Printf("Pub/Sub: slow subscriber disconnected")
+			slog.Warn("pub/sub: slow subscriber disconnected")
 			h.disconnectSlow(sub)
 		}
 	}
@@ -381,7 +381,7 @@ func (h *Hub) SemanticPublish(queryVec []float32, message string) int {
 		case t.sub.ch <- msg:
 			delivered++
 		default:
-			log.Printf("Semantic Pub/Sub: slow subscriber disconnected")
+			slog.Warn("semantic pub/sub: slow subscriber disconnected")
 			h.disconnectSlow(t.sub)
 		}
 	}
@@ -596,7 +596,7 @@ func (s *Subscriber) writePump() {
 	// процесс — падает только доставка этому одному подписчику.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Pub/Sub: writePump panic recovered: %v", r)
+			slog.Error("pub/sub: writePump panic recovered", "panic", r)
 		}
 	}()
 

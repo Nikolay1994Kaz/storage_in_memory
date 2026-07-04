@@ -3,7 +3,7 @@ package compute
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,7 +51,7 @@ func SaveModule(dataDir, name string, wasmBytes []byte) error {
 		return fmt.Errorf("save module %s: %w", name, err)
 	}
 
-	log.Printf("[wasm] Module '%s' saved to disk (%d bytes)", name, len(wasmBytes))
+	slog.Info("wasm: module saved to disk", "module", name, "bytes", len(wasmBytes))
 	return nil
 }
 
@@ -100,7 +100,7 @@ func SaveTriggers(dataDir string, tm *TriggerManager) error {
 		return fmt.Errorf("save triggers: %w", err)
 	}
 
-	log.Printf("[wasm] Saved %d triggers to disk", len(configs))
+	slog.Info("wasm: triggers saved to disk", "count", len(configs))
 	return nil
 }
 
@@ -131,12 +131,12 @@ func LoadAll(dataDir string, engine *Engine, tm *TriggerManager) error {
 
 		wasmBytes, err := os.ReadFile(path)
 		if err != nil {
-			log.Printf("[wasm] WARNING: cannot read %s: %v", path, err)
+			slog.Warn("wasm: cannot read module file", "path", path, "err", err)
 			continue // Пропускаем битый файл, не ломаем весь старт
 		}
 
 		if err := engine.LoadModule(name, wasmBytes); err != nil {
-			log.Printf("[wasm] WARNING: cannot load module %s: %v", name, err)
+			slog.Warn("wasm: cannot load module", "module", name, "err", err)
 			continue
 		}
 		moduleCount++
@@ -150,7 +150,7 @@ func LoadAll(dataDir string, engine *Engine, tm *TriggerManager) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Нет файла триггеров — это нормально (модули есть, триггеры ещё не настроены)
-			log.Printf("[wasm] Restored %d modules, 0 triggers", moduleCount)
+			slog.Info("wasm: restored from disk", "modules", moduleCount, "triggers", 0)
 			return nil
 		}
 		return fmt.Errorf("read triggers.json: %w", err)
@@ -166,6 +166,6 @@ func LoadAll(dataDir string, engine *Engine, tm *TriggerManager) error {
 		triggerCount++
 	}
 
-	log.Printf("[wasm] Restored %d modules, %d triggers", moduleCount, triggerCount)
+	slog.Info("wasm: restored from disk", "modules", moduleCount, "triggers", triggerCount)
 	return nil
 }

@@ -3,7 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"hash/crc32"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -298,7 +298,7 @@ func (bw *BatchWAL) flushBatch(batch []Entry) {
 	// Этот батч уже потерян — окно fire-and-forget закрыть нельзя, но следующие
 	// записи клиенту больше не подтверждаются как durable.
 	if err := bw.wal.WriteBatch(bw.encodeBuf); err != nil {
-		log.Printf("WAL batch write failed (%d entries lost) — engaging durability fail-stop, writes will be rejected: %v", len(batch), err)
+		slog.Error("WAL batch write failed — engaging durability fail-stop, writes will be rejected", "entriesLost", len(batch), "err", err)
 	}
 }
 

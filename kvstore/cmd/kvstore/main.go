@@ -10,7 +10,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -26,6 +26,7 @@ import (
 
 	"kvstore/kvstore/internal/ai"
 	"kvstore/kvstore/internal/btree"
+	"kvstore/kvstore/internal/logging"
 	"kvstore/kvstore/internal/monitoring"
 	"kvstore/kvstore/internal/protocol"
 	"kvstore/kvstore/internal/pubsub"
@@ -100,6 +101,8 @@ func main() {
 	shipInterval := flag.Duration("ship-interval", time.Second, "период доставки WAL-хвоста; RPO при аварии ≈ этот интервал + время загрузки")
 	shipRetain := flag.Int("ship-retain", 3, "сколько последних restore-точек (манифестов) хранить на удалённом хранилище")
 	shipRestore := flag.Bool("ship-restore", false, "перед стартом восстановить каталог данных из -ship-url (каталог не должен содержать прежнего состояния)")
+	logLevel := flag.String("log-level", "info", "уровень логирования: debug | info | warn | error")
+	logFormat := flag.String("log-format", "text", "формат логов: text (человекочитаемый) | json (для агрегаторов)")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
 	flag.Parse()
 
@@ -107,17 +110,21 @@ func main() {
 		fmt.Println(version)
 		os.Exit(0)
 	}
-	log.Printf("KVStore version %s", version)
+
+	// Настраиваем структурный логгер (slog) до первой лог-строки: уровень и
+	// формат управляются флагами, всё остальное логируется через slog-дефолт.
+	logging.Setup(*logLevel, *logFormat)
+
+	slog.Info("KVStore starting", "version", version)
 
 	// Разрешение пароля AUTH из (в порядке приоритета): файл → env → флаг.
 	// Файл/env предпочтительнее флага — секрет не попадает в ps/history/proc.
 	authPassword, err := resolveAuthPassword(*requirePass, *requirePassFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "requirepass: %v\n", err)
-		os.Exit(1)
+		logging.Fatalf("requirepass: %v", err)
 	}
 	if authPassword != "" && *requirePassFile == "" && os.Getenv("KVSTORE_REQUIREPASS") == "" {
-		log.Println("WARNING: пароль задан через флаг -requirepass — он виден в списке процессов; " +
+		slog.Warn("пароль задан через флаг -requirepass — он виден в списке процессов; " +
 			"для прода используйте -requirepass-file или env KVSTORE_REQUIREPASS")
 	}
 	// Предвычисляем SHA-256 пароля один раз: на AUTH сравниваем дайджесты
@@ -149,7 +156,7 @@ func main() {
 	// Лимит памяти
 	if *maxMemoryMB > 0 {
 		s.SetMaxMemory(int64(*maxMemoryMB) * 1024 * 1024)
-		log.Printf("Max memory: %d MB", *maxMemoryMB)
+		slog.Info("max memory configured", "MB", *maxMemoryMB)
 	}
 
 	os.MkdirAll(dataDir, 0755)
@@ -162,19 +169,20 @@ func main() {
 		var err error
 		shipRemote, err = ship.OpenRemote(*shipURL)
 		if err != nil {
-			log.Fatalf("ship: %v", err)
+			logging.Fatalf("ship: %v", err)
 		}
 	}
 	if *shipRestore {
 		if shipRemote == nil {
-			log.Fatalf("ship: -ship-restore требует -ship-url")
+			logging.Fatalf("ship: -ship-restore требует -ship-url")
 		}
 		sum, err := ship.Restore(context.Background(), shipRemote, dataDir)
 		if err != nil {
-			log.Fatalf("ship: restore failed: %v", err)
+			logging.Fatalf("ship: restore failed: %v", err)
 		}
-		log.Printf("ship: восстановлено из манифеста gen=%d: snapshot=%v graph=%v wal-файлов=%d (%.1f MB)",
-			sum.Gen, sum.Snapshot, sum.Graph, sum.WALFiles, float64(sum.Bytes)/(1024*1024))
+		slog.Info("ship: восстановлено из манифеста",
+			"gen", sum.Gen, "snapshot", sum.Snapshot, "graph", sum.Graph,
+			"wal_files", sum.WALFiles, "mb", fmt.Sprintf("%.1f", float64(sum.Bytes)/(1024*1024)))
 	}
 
 	// === 1. TTL Manager ===
@@ -225,13 +233,13 @@ func main() {
 	graphLoaded := false
 
 	if _, err := os.Stat(graphPath); err == nil {
-		log.Printf("Loading leveled vector store from binary snapshot %s...", graphPath)
+		slog.Info("loading leveled vector store from binary snapshot", "path", graphPath)
 		f, err := os.Open(graphPath)
 		if err == nil {
 			if err := vecStore.LoadBinary(f); err != nil {
-				log.Printf("WARNING: failed to load vector snapshot: %v. Will rebuild from WAL.", err)
+				slog.Warn("failed to load vector snapshot, will rebuild from WAL", "err", err)
 			} else {
-				log.Printf("Leveled vector store loaded successfully from snapshot!")
+				slog.Info("leveled vector store loaded from snapshot")
 				graphLoaded = true
 			}
 			f.Close()
@@ -276,7 +284,7 @@ func main() {
 	snapshotPath := filepath.Join(dataDir, "snapshot.wal")
 	snapWatermark, snapshotEntries, err := wal.ReadFile(snapshotPath)
 	if err != nil {
-		log.Fatalf("Failed to read snapshot.wal: %v", err)
+		logging.Fatalf("failed to read snapshot.wal: %v", err)
 	}
 	bumpLSN(snapWatermark) // watermark: snapshot покрывает состояние до этого LSN
 
@@ -321,7 +329,7 @@ func main() {
 			}
 			vec := vector.DeserializeVector(entry.Value)
 			if err := vecStore.Add(entry.Key, vec); err != nil {
-				log.Printf("WARNING: failed to restore vector %s: %v", entry.Key, err)
+				slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
 			}
 			vecRestored++
 			restored++
@@ -333,16 +341,16 @@ func main() {
 			}
 			vec, attrs, err := vector.DeserializeVectorWithAttrs(entry.Value)
 			if err != nil {
-				log.Printf("WARNING: failed to decode vector+attrs %s: %v", entry.Key, err)
+				slog.Warn("failed to decode vector+attrs", "key", entry.Key, "err", err)
 				return
 			}
 			if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
 				if err := lvs.AddWithAttrs(entry.Key, vec, attrs); err != nil {
-					log.Printf("WARNING: failed to restore vector+attrs %s: %v", entry.Key, err)
+					slog.Warn("failed to restore vector+attrs", "key", entry.Key, "err", err)
 				}
 			} else if err := vecStore.Add(entry.Key, vec); err != nil {
 				// Индекс без attr-слоя — восстанавливаем хотя бы вектор.
-				log.Printf("WARNING: failed to restore vector %s: %v", entry.Key, err)
+				slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
 			}
 			vecRestored++
 			restored++
@@ -376,7 +384,7 @@ func main() {
 	for _, path := range matches {
 		_, logEntries, err := wal.ReadFile(path)
 		if err != nil {
-			log.Fatalf("Failed to read WAL log %s: %v", path, err)
+			logging.Fatalf("failed to read WAL log %s: %v", path, err)
 		}
 		for _, entry := range logEntries {
 			bumpLSN(entry.LSN)
@@ -385,14 +393,14 @@ func main() {
 	}
 
 	if restored > 0 {
-		log.Printf("Restored %d operations from WAL (%d vectors)", restored, vecRestored)
+		slog.Info("restored from WAL", "operations", restored, "vectors", vecRestored)
 	}
 
 	// === 3. WAL ===
 	walPath := filepath.Join(dataDir, fmt.Sprintf("wal_%s.log", time.Now().Format("20060102_150405")))
 	rawWAL, err := wal.Open(walPath)
 	if err != nil {
-		log.Fatalf("Failed to open WAL: %v", err)
+		logging.Fatalf("failed to open WAL: %v", err)
 	}
 
 	// Выставляем счётчик LSN ДО того, как flusher начнёт присваивать номера
@@ -479,7 +487,7 @@ func main() {
 		})
 		monitoring.InitShipMetrics(shipper.LagBytes, shipper.LastSuccessUnixNano)
 		shipper.Start()
-		log.Printf("WAL-shipping включён: %s (интервал %v, retain %d)", *shipURL, *shipInterval, *shipRetain)
+		slog.Info("WAL-shipping включён", "url", *shipURL, "interval", *shipInterval, "retain", *shipRetain)
 	}
 	// shipper.Stop() вызывается явно ПОСЛЕ bw.Close() в shutdown: финальный тик
 	// дошипливает уже-fsyncнутый хвост WAL → graceful shutdown даёт RPO=0 и удалённо.
@@ -505,7 +513,7 @@ func main() {
 		var err error
 		cl, err = newClusterRouter(addr, *port+1, *clusterSlotStart, *clusterSlotEnd, s, vecStore, ttl)
 		if err != nil {
-			log.Fatalf("Failed to start cluster: %v", err)
+			logging.Fatalf("failed to start cluster: %v", err)
 		}
 		defer cl.StopGossip()
 	}
@@ -530,10 +538,10 @@ func main() {
 
 	aiClient = ai.NewClient(*ollamaURL, "nomic-embed-text", "gemma4:e2b")
 	if err := aiClient.Ping(context.Background()); err != nil {
-		log.Printf("WARNING: Ollama not available (%v), AI commands disabled", err)
+		slog.Warn("Ollama not available, AI commands disabled", "err", err)
 		aiClient = nil
 	} else {
-		log.Println("Ollama connected: nomic-embed-text + gemma4:e2b")
+		slog.Info("Ollama connected", "embed", "nomic-embed-text", "chat", "gemma4:e2b")
 
 		// Подключаем AI к WASM Engine — WASM-модули получают доступ к Ollama.
 		// В прод-сборке (без experimental) SetAI — no-op.
@@ -700,30 +708,28 @@ func main() {
 	if *tlsCert != "" && *tlsKey != "" {
 		cfg, err := buildServerTLSConfig(*tlsCert, *tlsKey, *tlsMinVersion, *tlsClientCA)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "TLS: %v\n", err)
-			os.Exit(1)
+			logging.Fatalf("TLS: %v", err)
 		}
 		srv.TLSConfig = cfg
 		if *tlsClientCA != "" {
-			log.Println("TLS: mTLS включён — требуется клиентский сертификат, подписанный указанным CA")
+			slog.Info("TLS: mTLS включён — требуется клиентский сертификат, подписанный указанным CA")
 		}
 	}
 
 	if err := srv.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to start: %v\n", err)
-		os.Exit(1)
+		logging.Fatalf("failed to start: %v", err)
 	}
 
 	// Снапшот загружен и listener поднят — помечаем процесс готовым (/ready → 200).
 	monitoring.SetReady(true)
 
-	log.Println("KVStore is running. Press Ctrl+C to stop.")
+	slog.Info("KVStore is running, press Ctrl+C to stop")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Println("Shutting down...")
+	slog.Info("shutting down")
 	monitoring.SetReady(false) // /ready → 503: оркестратор уводит трафик до остановки
 
 	// Graceful shutdown в строгом порядке. Цель — не потерять ни одной
@@ -742,15 +748,15 @@ func main() {
 	}
 	syncer.Stop()
 	if err := bw.Close(); err != nil {
-		log.Printf("WAL close error: %v", err)
+		slog.Error("WAL close error", "err", err)
 	}
 	// 6. Финальный тик шиппера ПОСЛЕ bw.Close(): последний батч WAL уже на
 	// диске, поэтому штатная остановка оставляет удалённую копию с RPO=0.
 	if shipper != nil {
 		shipper.Stop()
-		log.Println("WAL-shipping: финальная доставка завершена.")
+		slog.Info("WAL-shipping: финальная доставка завершена")
 	}
-	log.Println("Shutdown complete: WAL flushed and fsynced.")
+	slog.Info("shutdown complete: WAL flushed and fsynced")
 }
 
 // writeValue — helper для записи protocol.Value в ConnBuf.

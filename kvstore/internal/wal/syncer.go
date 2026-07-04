@@ -1,7 +1,7 @@
 package wal
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -65,7 +65,7 @@ func (s *Syncer) run() {
 				// Sync() уже залатчил ошибку (s.wal.Failed()!=nil) → write-путь
 				// сервера перешёл в fail-stop. Диск не может durable принять данные
 				// (ENOSPC/I/O) — оператору нужно освободить место и перезапустить.
-				log.Printf("WAL sync error — durability fail-stop engaged, writes rejected until restart: %v", err)
+				slog.Error("WAL sync error — durability fail-stop engaged, writes rejected until restart", "err", err)
 			}
 
 			// Проверяем размер WAL реже — os.Stat каждые 100ms избыточен.
@@ -94,9 +94,9 @@ func (s *Syncer) checkWALSize() {
 	}
 
 	if info.Size() > MaxWALSize {
-		log.Printf("WAL size %.1f MB > %.1f MB limit — starting auto-compact",
-			float64(info.Size())/(1024*1024),
-			float64(MaxWALSize)/(1024*1024))
+		slog.Info("WAL size over limit — starting auto-compact",
+			"sizeMB", float64(info.Size())/(1024*1024),
+			"limitMB", float64(MaxWALSize)/(1024*1024))
 
 		s.compacting.Store(true)
 		go func() {
@@ -105,7 +105,7 @@ func (s *Syncer) checkWALSize() {
 			defer s.compacting.Store(false)
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("WAL compact panic: %v", r)
+					slog.Error("WAL compact panic", "panic", r)
 				}
 			}()
 			BackgroundCompact(s.wal, s.dir, s.iterate, s.saveVectors)

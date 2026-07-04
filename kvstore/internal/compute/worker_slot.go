@@ -3,7 +3,7 @@ package compute
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"runtime"
 	"time"
 
@@ -116,7 +116,7 @@ func (wle *WorkerLocalEngine) WarmUpFromBytes(name string, wasmBytes []byte, tie
 	}
 
 	wle.modules[name] = slots
-	log.Printf("[wasm] Worker-local: module '%s' warmed up (%d instances, tier=%d)", name, wle.numWorkers, tier)
+	slog.Info("wasm: module warmed up (worker-local)", "module", name, "instances", wle.numWorkers, "tier", tier)
 	return nil
 }
 
@@ -220,10 +220,10 @@ func (wle *WorkerLocalEngine) Exec(workerID int, moduleName, funcName string, ke
 	if slot.memoryBudget > 0 {
 		currentPages := slot.memory.Size() / 65536 // Size() в байтах, делим на 64KB
 		if currentPages > slot.memoryBudget {
-			log.Printf("[wasm] Worker %d module '%s': memory %d pages > budget %d, recycling",
-				workerID, moduleName, currentPages, slot.memoryBudget)
+			slog.Warn("wasm: memory over budget, recycling",
+				"worker", workerID, "module", moduleName, "pages", currentPages, "budget", slot.memoryBudget)
 			if err := wle.recycleSlot(slot); err != nil {
-				log.Printf("[wasm] Recycle error: %v", err)
+				slog.Error("wasm: recycle error", "err", err)
 			}
 		}
 	}
@@ -270,7 +270,7 @@ func (wle *WorkerLocalEngine) DropModule(name string) {
 		}
 	}
 	delete(wle.modules, name)
-	log.Printf("[wasm] Worker-local: module '%s' dropped (%d instances closed)", name, len(slots))
+	slog.Info("wasm: module dropped (worker-local)", "module", name, "instancesClosed", len(slots))
 }
 
 // Close закрывает все модули и worker-local runtime.

@@ -2,7 +2,7 @@ package monitoring
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -235,9 +235,9 @@ func StartHttpServer(port int) {
 	}
 
 	go func() {
-		log.Printf("Starting HTTP server on :%d (/metrics, /health, /ready)", port)
+		slog.Info("starting metrics HTTP server", "port", port, "endpoints", "/metrics,/health,/ready")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Metrics HTTP server error: %v", err)
+			slog.Error("metrics HTTP server error", "err", err)
 		}
 	}()
 }

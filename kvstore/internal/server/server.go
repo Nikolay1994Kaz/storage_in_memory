@@ -3,7 +3,7 @@ package server
 import (
 	"crypto/tls"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"runtime"
 	"sync"
@@ -140,7 +140,7 @@ func (s *Server) Start() error {
 	// TLS прозрачно шифрует на уровне listener, conn.Read/Write те же.
 	if s.TLSConfig != nil {
 		s.listener = tls.NewListener(s.listener, s.TLSConfig)
-		log.Println("TLS enabled")
+		slog.Info("TLS enabled")
 	}
 
 	numWorkers := runtime.NumCPU()
@@ -161,7 +161,7 @@ func (s *Server) Start() error {
 
 	go s.acceptLoop()
 
-	log.Printf("Server listening on %s (epoll mode, %d workers)", s.addr, numWorkers)
+	slog.Info("server listening", "addr", s.addr, "mode", "epoll", "workers", numWorkers)
 	return nil
 }
 
@@ -179,7 +179,7 @@ func (s *Server) acceptLoop() {
 			if s.stopping.Load() {
 				return // штатная остановка: listener закрыт
 			}
-			log.Printf("Accept error: %v", err)
+			slog.Error("accept error", "err", err)
 			return
 		}
 
@@ -204,7 +204,7 @@ func (s *Server) acceptLoop() {
 		cs.LastActivity.Store(time.Now().UnixNano())
 
 		if err := w.epoll.Add(cs); err != nil {
-			log.Printf("Epoll Add error (worker %d): %v", w.id, err)
+			slog.Error("epoll add error", "worker", w.id, "err", err)
 			conn.Close()
 			continue
 		}
@@ -256,7 +256,7 @@ func (s *Server) eventLoop(w *worker) {
 			if s.stopping.Load() {
 				return // сервер останавливается, epoll-fd закрыт — выходим чисто
 			}
-			log.Printf("Worker %d: epoll wait error: %v", w.id, err)
+			slog.Error("epoll wait error", "worker", w.id, "err", err)
 			continue
 		}
 
@@ -291,7 +291,7 @@ func (s *Server) handleConn(w *worker, cs *ConnState) {
 	// (а с ним весь процесс). Закрываем только это соединение и живём дальше.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Worker %d: recovered panic on connection, closing it: %v", w.id, r)
+			slog.Error("recovered panic on connection, closing it", "worker", w.id, "panic", r)
 			w.epoll.Remove(cs)
 		}
 	}()
@@ -414,7 +414,7 @@ func (s *Server) Stop() error {
 	select {
 	case <-done:
 	case <-time.After(drainTimeout):
-		log.Println("Server.Stop: drain timeout — продолжаем остановку")
+		slog.Warn("server stop: drain timeout — продолжаем остановку")
 	}
 
 	// Воркеры вышли (или таймаут) — теперь безопасно закрыть epoll-fd и соединения.

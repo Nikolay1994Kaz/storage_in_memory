@@ -2,9 +2,11 @@ package compute
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"math"
 	"time"
+
+	"kvstore/kvstore/internal/logging"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -27,7 +29,7 @@ func (e *Engine) registerHostFunctions(ctx context.Context) (api.Module, error) 
 func (e *Engine) registerHostFunctionsOn(rt wazero.Runtime) {
 	ctx := context.Background()
 	if _, err := e.buildHostModule(rt).Instantiate(ctx); err != nil {
-		log.Fatalf("[wasm] Failed to register host functions on worker-local runtime: %v", err)
+		logging.Fatalf("[wasm] failed to register host functions on worker-local runtime: %v", err)
 	}
 }
 
@@ -99,7 +101,7 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			writeFunc := func() {
 				if e.StoreSetWithWAL != nil {
 					if err := e.StoreSetWithWAL(workerID, string(keyCopy), valCopy); err != nil {
-						log.Printf("[wasm] kv_set WAL error: %v", err)
+						slog.Error("wasm: kv_set WAL error", "err", err)
 					}
 				} else {
 					e.StoreSet(workerID, string(keyCopy), valCopy)
@@ -132,7 +134,7 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			// BUG FIX: Используем StoreDelWithWAL для durability.
 			if e.StoreDelWithWAL != nil {
 				if err := e.StoreDelWithWAL(workerID, string(key)); err != nil {
-					log.Printf("[wasm] kv_del WAL error: %v", err)
+					slog.Error("wasm: kv_del WAL error", "err", err)
 					stack[0] = 0
 					return
 				}
@@ -225,7 +227,7 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			if !ok {
 				return
 			}
-			log.Printf("[wasm] %s", string(msg))
+			slog.Info("wasm module log", "msg", string(msg))
 		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{}).
 		Export("log_info").
 
@@ -239,7 +241,7 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 			if !ok {
 				return
 			}
-			log.Printf("[wasm:ERROR] %s", string(msg))
+			slog.Error("wasm module log", "msg", string(msg))
 		}), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{}).
 		Export("log_error").
 
@@ -357,7 +359,7 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 
 			embedding, err := e.AIEmbed(aiCtx, string(text))
 			if err != nil {
-				log.Printf("[wasm] ai_embed error: %v", err)
+				slog.Error("wasm: ai_embed error", "err", err)
 				stack[0] = 0
 				return
 			}
@@ -399,7 +401,7 @@ func (e *Engine) buildHostModule(rt wazero.Runtime) wazero.HostModuleBuilder {
 
 			response, err := e.AIChat(aiCtx, string(prompt))
 			if err != nil {
-				log.Printf("[wasm] ai_chat error: %v", err)
+				slog.Error("wasm: ai_chat error", "err", err)
 				stack[0] = 0
 				return
 			}

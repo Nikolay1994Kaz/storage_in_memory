@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -128,12 +128,12 @@ func (s *Shipper) tickLogged() {
 	if err := s.Tick(context.Background()); err != nil {
 		shipErrorsInc()
 		if !s.errState.Swap(true) {
-			log.Printf("ship: доставка не удалась (повтор каждый тик): %v", err)
+			slog.Error("ship: доставка не удалась (повтор каждый тик)", "err", err)
 		}
 		return
 	}
 	if s.errState.Swap(false) {
-		log.Printf("ship: доставка восстановлена")
+		slog.Info("ship: доставка восстановлена")
 	}
 }
 
@@ -218,7 +218,7 @@ func (s *Shipper) Tick(ctx context.Context) error {
 	if snapChanged || graphChanged {
 		if err := s.retention(ctx); err != nil {
 			// Незавершённый ретеншн = лишние объекты, не потеря данных.
-			log.Printf("ship: ретеншн не завершён (продолжим при следующей компакции): %v", err)
+			slog.Warn("ship: ретеншн не завершён (продолжим при следующей компакции)", "err", err)
 		}
 	}
 	return nil
@@ -242,7 +242,7 @@ func (s *Shipper) loadState(ctx context.Context) error {
 		s.wals[w.Name] = &w
 	}
 	s.published = true
-	log.Printf("ship: продолжаем с манифеста gen=%d (%d WAL-файлов)", m.Gen, len(m.WALs))
+	slog.Info("ship: продолжаем с удалённого манифеста", "gen", m.Gen, "wal_files", len(m.WALs))
 	return nil
 }
 

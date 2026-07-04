@@ -5,7 +5,7 @@ package cluster
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"time"
@@ -95,7 +95,7 @@ func (cs *ClusterState) applyNodeInfo(info NodeInfo) bool {
 		// Новая нода! Добавляем.
 		node = NewNode(info.ID, info.Addr, info.GossipPort)
 		cs.Nodes[info.ID] = node
-		log.Printf("[gossip] Discovered new node: %s (%s)", info.ID, info.Addr)
+		slog.Info("gossip: discovered new node", "id", info.ID, "addr", info.Addr)
 	}
 
 	// Обновляем адрес и порт (могли измениться)
@@ -146,7 +146,7 @@ func (c *Cluster) StartGossip() error {
 		return fmt.Errorf("gossip listen: %w", err)
 	}
 
-	log.Printf("[gossip] Listening on %s", addr)
+	slog.Info("gossip: listening", "addr", addr)
 
 	// Сохраняем listener чтобы потом закрыть
 	c.gossipListener = listener
@@ -195,7 +195,7 @@ func (c *Cluster) StopGossip() {
 
 	// Ждём завершения всех горутин
 	c.wg.Wait()
-	log.Println("[gossip] Stopped")
+	slog.Info("gossip: stopped")
 }
 
 // ============================================================
@@ -224,7 +224,7 @@ func (c *Cluster) handleGossipConn(conn net.Conn) {
 		node.LastPong = time.Now()
 		// Если нода была PFAIL/FAIL — восстанавливаем
 		if node.State != NodeOnline {
-			log.Printf("[gossip] Node %s (%s) is back ONLINE", node.ID, node.Addr)
+			slog.Info("gossip: node back ONLINE", "id", node.ID, "addr", node.Addr)
 			node.State = NodeOnline
 		}
 	}
@@ -326,7 +326,7 @@ func (c *Cluster) pingRandomNode() {
 	if node, ok := c.State.Nodes[pong.Sender.ID]; ok {
 		node.LastPong = time.Now()
 		if node.State != NodeOnline {
-			log.Printf("[gossip] Node %s (%s) is back ONLINE", node.ID, node.Addr)
+			slog.Info("gossip: node back ONLINE", "id", node.ID, "addr", node.Addr)
 			node.State = NodeOnline
 		}
 	}
@@ -419,8 +419,7 @@ func (c *Cluster) checkNodeHealth() {
 
 		switch {
 		case since > failTimeout && node.State != NodeFail:
-			log.Printf("[gossip] Node %s (%s) → FAIL (no pong for %v)",
-				node.ID, node.Addr, since.Round(time.Second))
+			slog.Error("gossip: node marked FAIL", "id", node.ID, "addr", node.Addr, "noPongFor", since.Round(time.Second))
 			node.State = NodeFail
 
 			// Leader Election: если мастер упал и я его реплика → промоутим
@@ -429,8 +428,7 @@ func (c *Cluster) checkNodeHealth() {
 			}
 
 		case since > pfailTimeout && node.State == NodeOnline:
-			log.Printf("[gossip] Node %s (%s) → PFAIL (no pong for %v)",
-				node.ID, node.Addr, since.Round(time.Second))
+			slog.Warn("gossip: node marked PFAIL", "id", node.ID, "addr", node.Addr, "noPongFor", since.Round(time.Second))
 			node.State = NodePFail
 		}
 	}
@@ -440,7 +438,7 @@ func (c *Cluster) checkNodeHealth() {
 // Вызывается когда мастер в состоянии FAIL.
 // ВАЖНО: вызывается под mu.Lock() из checkNodeHealth.
 func (c *Cluster) promoteToMaster(deadMaster *Node) {
-	log.Printf("[election] Master %s is FAIL — promoting self to master!", deadMaster.ID)
+	slog.Info("election: master is FAIL, promoting self to master", "masterID", deadMaster.ID)
 
 	// 1. Меняем роль
 	c.State.Self.Role = RoleMaster
@@ -463,7 +461,7 @@ func (c *Cluster) promoteToMaster(deadMaster *Node) {
 		}
 	}
 
-	log.Printf("[election] Promoted! Now master with %d slots", count)
+	slog.Info("election: promoted, now master", "slots", count)
 }
 
 // extractHost вытаскивает хост из "127.0.0.1:6380" → "127.0.0.1"
