@@ -15,6 +15,11 @@ High-performance in-memory key-value store with built-in vector search, WASM com
 - **AUTH + TLS** — optional password authentication and encrypted connections
 - **Cluster** — hash-slot sharding, gossip protocol, live migration (experimental)
 
+The RESP command surface is deliberately small and **frozen**: the KV/state layer
+is a payload layer for the vector engine, not a Redis replacement. The full
+command manifest, gate semantics, and the unfreeze policy live in
+[docs/COMMANDS.md](docs/COMMANDS.md).
+
 ## Quick Start
 
 ### Docker Compose (recommended)
