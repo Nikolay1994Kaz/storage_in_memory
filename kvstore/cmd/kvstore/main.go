@@ -180,6 +180,16 @@ func main() {
 		monitoring.SetVectorStateProvider(leveledStatsAdapter{lvs: lvs})
 	}
 
+	// HTTP-сервер метрик/здоровья поднимаем ДО реплея WAL. Восстановление после
+	// многочасовой нагрузки может занять минуты; без раннего слушателя процесс не
+	// отвечает ни на /health, ни на /metrics всё это время — оркестратор (или
+	// soak-хелпер) посчитал бы его мёртвым и убил посреди recovery. /health отдаёт
+	// 200 сразу (порт открыт), а /ready держит 503 до SetReady(true) ниже — трафик
+	// не пойдёт, пока снапшот+WAL не накатаны и listener не поднят.
+	if *metricsPort > 0 {
+		monitoring.StartHttpServer(*metricsPort)
+	}
+
 	// === 2.5. Инициализация sorted sets (ZSet) ===
 	zsetReg := zset.New(s)
 
@@ -623,10 +633,7 @@ func main() {
 		monitoring.RecordCommand(cmd, time.Since(start))
 	}
 
-	// Запуск HTTP-сервера метрик VictoriaMetrics
-	if *metricsPort > 0 {
-		monitoring.StartHttpServer(*metricsPort)
-	}
+	// HTTP-сервер метрик уже поднят до реплея WAL (см. выше по коду).
 
 	// === 8. Сервер ===
 	listenAddr := fmt.Sprintf(":%d", *port)

@@ -31,6 +31,10 @@ on:
         description: 'Число контрольных ключей oracle'
         required: true
         default: '500'
+      sample_interval:
+        description: 'Интервал сэмплинга дрейфа RSS/vector-стора внутри фазы, сек'
+        required: true
+        default: '300'
 
 jobs:
   soak:
@@ -44,6 +48,7 @@ jobs:
       CONC: ${{ github.event.inputs.concurrency || '32' }}
       MODE: ${{ github.event.inputs.restart_mode || 'graceful' }}
       NKEYS: ${{ github.event.inputs.oracle_keys || '500' }}
+      SAMPLE: ${{ github.event.inputs.sample_interval || '300' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -70,11 +75,16 @@ jobs:
             # путь #2 по-настоящему, а не только предикатный фильтр.
             ./kvstore-server --port "$PORT" --metrics-port "$MPORT" --partition-attr tenant > "$1" 2>&1 &
             echo $! > server.pid
-            for _ in $(seq 1 30); do
-              curl -sf "localhost:$MPORT/metrics" >/dev/null 2>&1 && return 0
+            # Ждём /ready (не /metrics): порт открывается ДО реплея WAL, а готовность
+            # выставляется только после снапшот+WAL+listener. На рестарте после
+            # многочасовой нагрузки recovery легко превышает 30с — ждём до 10 минут,
+            # но падаем сразу, если процесс умер (не крутим таймаут впустую).
+            for _ in $(seq 1 600); do
+              kill -0 "$(cat server.pid)" 2>/dev/null || { echo "server процесс умер при старте"; cat "$1"; return 1; }
+              [ "$(curl -s -o /dev/null -w '%{http_code}' "localhost:$MPORT/ready" 2>/dev/null)" = "200" ] && return 0
               sleep 1
             done
-            echo "server not up"; cat "$1"; return 1
+            echo "server not ready за 600с"; cat "$1"; return 1
           }
           stop_server() { # graceful|crash
             local pid; pid=$(cat server.pid)
@@ -91,8 +101,31 @@ jobs:
           drift() { # метка → в drift.log
             { echo "=== $(date -u +%H:%M:%S) $1 ==="
               ps -o rss= -p "$(cat server.pid)" 2>/dev/null | awk '{print "server_rss_kb="$1}'
-              curl -s "localhost:$MPORT/metrics" 2>/dev/null | grep -E "^go_goroutines |^process_resident_memory_bytes " || true
+              # Разводим гипотезу RSS-дрейфа: живой рабочий набор мал, а RSS растёт.
+              #  • process_resident_memory_bytes — полный RSS процесса.
+              #  • go_memstats_sys_bytes / heap_inuse — сколько держит Go-куча;
+              #    (RSS − go_sys) ≈ off-heap tcmalloc/mmap → это наш аллокатор.
+              #  • vector_total_vectors / delta_len — размер ЖИВОГО набора.
+              #  • vector_tombstones / segments{level} — накопление НЕживого
+              #    (deletes на скомпакченном + несмёрженные сегменты) = гл. подозреваемый.
+              #  • vector_allocator_bytes / data_bytes — что аллокатор реально держит
+              #    под графы/соседей и под float32-slab'ы.
+              # Сопоставление этих рядов во времени скажет: копятся tombstones/сегменты
+              # или это retention аллокатора без роста живого набора.
+              curl -s "localhost:$MPORT/metrics" 2>/dev/null | grep -E \
+                "^go_goroutines |^process_resident_memory_bytes |^go_memstats_sys_bytes |^go_memstats_heap_inuse_bytes |^kvstore_vector_total_vectors |^kvstore_vector_delta_len |^kvstore_vector_tombstones |^kvstore_vector_allocator_bytes |^kvstore_vector_data_bytes |^kvstore_vector_segments" || true
             } >> drift.log
+          }
+          # Фоновый сэмплер дрейфа: пишет drift() каждые SAMPLE секунд, пока жив.
+          # Нужен, чтобы видеть ТРЕНД внутри фазы нагрузки, а не только по 3 точкам
+          # рестарта (2 точки тренд не задают — именно этого не хватило прошлому прогону).
+          start_drift_sampler() { # $1=метка
+            ( while true; do sleep "${SAMPLE:-300}"; drift "$1"; done ) &
+            echo $! > sampler.pid
+          }
+          stop_drift_sampler() {
+            [ -f sampler.pid ] && kill "$(cat sampler.pid)" 2>/dev/null || true
+            rm -f sampler.pid
           }
           EOF
 
@@ -105,9 +138,12 @@ jobs:
 
       - name: Load phase 1
         run: |
-          echo "phase 1: duration=$DUR concurrency=$CONC"
+          source soak_lib.sh
+          echo "phase 1: duration=$DUR concurrency=$CONC sample=${SAMPLE}s"
+          start_drift_sampler "sample phase1"
           ./kvstore-stress -duration "$DUR" -concurrency "$CONC" \
             -addr "localhost:$PORT" -metrics-addr "localhost:$MPORT" 2>&1 | tee stress-1.log
+          stop_drift_sampler
 
       - name: Restart + oracle verify (checkpoint A)
         run: |
@@ -122,9 +158,12 @@ jobs:
 
       - name: Load phase 2
         run: |
-          echo "phase 2: duration=$DUR concurrency=$CONC"
+          source soak_lib.sh
+          echo "phase 2: duration=$DUR concurrency=$CONC sample=${SAMPLE}s"
+          start_drift_sampler "sample phase2"
           ./kvstore-stress -duration "$DUR" -concurrency "$CONC" \
             -addr "localhost:$PORT" -metrics-addr "localhost:$MPORT" 2>&1 | tee stress-2.log
+          stop_drift_sampler
 
       - name: Final restart + oracle verify (checkpoint B)
         run: |
