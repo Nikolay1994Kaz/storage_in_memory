@@ -56,6 +56,13 @@ var (
 	// счётчика = БД в режиме read-only, нужен оператор (освободить диск + рестарт).
 	WalFailStop = metrics.NewCounter("kvstore_wal_fail_stop_total")
 
+	// WAL-shipping (внешняя durability, -ship-url). Ошибки доставки НЕ блокируют
+	// запись (async-контракт) — поэтому за ростом ShipErrors и отставанием
+	// last-success/lag (см. InitShipMetrics) обязан следить алёрт, это
+	// единственный сигнал, что удалённая копия отстаёт.
+	ShipErrors = metrics.NewCounter("kvstore_ship_errors_total")
+	ShipBytes  = metrics.NewCounter("kvstore_ship_uploaded_bytes_total")
+
 	// Callbacks for memory/TCMalloc metrics
 	memUsedFunc   func() float64
 	memChunksFunc func() float64
@@ -93,6 +100,19 @@ func InitMemoryMetrics(used, chunks, spans, limit func() float64) {
 			return memLimitFunc()
 		}
 		return 0
+	})
+}
+
+// InitShipMetrics регистрирует gauge-метрики WAL-shipping'а. lagBytes —
+// недоставленный хвост WAL в байтах; lastSuccessUnixNano — время последней
+// успешной публикации манифеста (0 = ещё не было). Возраст restore-точки
+// считается на стороне алёрта: time() - kvstore_ship_last_success_timestamp_seconds.
+func InitShipMetrics(lagBytes func() int64, lastSuccessUnixNano func() int64) {
+	metrics.NewGauge("kvstore_ship_lag_bytes", func() float64 {
+		return float64(lagBytes())
+	})
+	metrics.NewGauge("kvstore_ship_last_success_timestamp_seconds", func() float64 {
+		return float64(lastSuccessUnixNano()) / 1e9
 	})
 }
 

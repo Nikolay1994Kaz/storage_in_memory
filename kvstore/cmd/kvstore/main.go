@@ -30,6 +30,7 @@ import (
 	"kvstore/kvstore/internal/protocol"
 	"kvstore/kvstore/internal/pubsub"
 	"kvstore/kvstore/internal/server"
+	"kvstore/kvstore/internal/ship"
 	"kvstore/kvstore/internal/store"
 	"kvstore/kvstore/internal/store/tcmalloc"
 	"kvstore/kvstore/internal/store/zset"
@@ -95,6 +96,10 @@ func main() {
 	hnswUseSQ := flag.Bool("hnsw-use-sq", false, "Enable Scalar Quantization (int8) for frozen segments (dim<=256). 4x memory compression, ~96% recall, higher QPS via L3 cache locality")
 	compactionWorkers := flag.Int("compaction-workers", 0, "Number of parallel segment build workers (0 = auto NumCPU/2 clamped 2-8). Build Pool: insert does not block during heavy L2 compaction")
 	partitionAttr := flag.String("partition-attr", "", "Categorical attribute name for tenant-contiguous layout (enables VSIM.FILTER tenant routing via columnar SearchFilter). Empty = no partition; attrs still filterable, just no tenant block-routing")
+	shipURL := flag.String("ship-url", "", "continuous WAL-shipping на удалённое хранилище: file:///abs/path или s3://bucket/prefix?endpoint=...&region=... (S3-креды из env KVSTORE_S3_ACCESS_KEY/SECRET_KEY или AWS_*). Пусто = выключено")
+	shipInterval := flag.Duration("ship-interval", time.Second, "период доставки WAL-хвоста; RPO при аварии ≈ этот интервал + время загрузки")
+	shipRetain := flag.Int("ship-retain", 3, "сколько последних restore-точек (манифестов) хранить на удалённом хранилище")
+	shipRestore := flag.Bool("ship-restore", false, "перед стартом восстановить каталог данных из -ship-url (каталог не должен содержать прежнего состояния)")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
 	flag.Parse()
 
@@ -149,6 +154,29 @@ func main() {
 
 	os.MkdirAll(dataDir, 0755)
 
+	// === WAL-shipping: remote + restore (до загрузки снапшотов/реплея) ===
+	// Remote открываем ДО recovery: битый -ship-url должен уронить процесс
+	// сразу и громко, а не после минут реплея.
+	var shipRemote ship.Remote
+	if *shipURL != "" {
+		var err error
+		shipRemote, err = ship.OpenRemote(*shipURL)
+		if err != nil {
+			log.Fatalf("ship: %v", err)
+		}
+	}
+	if *shipRestore {
+		if shipRemote == nil {
+			log.Fatalf("ship: -ship-restore требует -ship-url")
+		}
+		sum, err := ship.Restore(context.Background(), shipRemote, dataDir)
+		if err != nil {
+			log.Fatalf("ship: restore failed: %v", err)
+		}
+		log.Printf("ship: восстановлено из манифеста gen=%d: snapshot=%v graph=%v wal-файлов=%d (%.1f MB)",
+			sum.Gen, sum.Snapshot, sum.Graph, sum.WALFiles, float64(sum.Bytes)/(1024*1024))
+	}
+
 	// === 1. TTL Manager ===
 	// Инициализация перенесена после WAL (строка ниже), потому что
 	// CompositeEvictor при TTL-expire записывает OpVSimDel в WAL.
@@ -178,6 +206,16 @@ func main() {
 	// Provider вызывается только при scrape /metrics — 0 overhead на hot path.
 	if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
 		monitoring.SetVectorStateProvider(leveledStatsAdapter{lvs: lvs})
+	}
+
+	// HTTP-сервер метрик/здоровья поднимаем ДО реплея WAL. Восстановление после
+	// многочасовой нагрузки может занять минуты; без раннего слушателя процесс не
+	// отвечает ни на /health, ни на /metrics всё это время — оркестратор (или
+	// soak-хелпер) посчитал бы его мёртвым и убил посреди recovery. /health отдаёт
+	// 200 сразу (порт открыт), а /ready держит 503 до SetReady(true) ниже — трафик
+	// не пойдёт, пока снапшот+WAL не накатаны и listener не поднят.
+	if *metricsPort > 0 {
+		monitoring.StartHttpServer(*metricsPort)
 	}
 
 	// === 2.5. Инициализация sorted sets (ZSet) ===
@@ -428,6 +466,24 @@ func main() {
 	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, iterateAll, saveVectors)
 	// syncer.Stop() вызывается явно в упорядоченном shutdown перед bw.Close().
 
+	// === 4.5. WAL-shipping (continuous, async) ===
+	// Шиппер работает поверх каталога данных (append-only WAL + иммутабельные
+	// снапшоты) и не трогает write-путь: ошибки доставки не блокируют запись —
+	// это внешняя durability с RPO ≈ ship-interval, наблюдаемая через метрики
+	// kvstore_ship_* (за отставанием обязан следить алёрт).
+	var shipper *ship.Shipper
+	if shipRemote != nil {
+		shipper = ship.New(shipRemote, dataDir, ship.Options{
+			Interval:        *shipInterval,
+			RetainManifests: *shipRetain,
+		})
+		monitoring.InitShipMetrics(shipper.LagBytes, shipper.LastSuccessUnixNano)
+		shipper.Start()
+		log.Printf("WAL-shipping включён: %s (интервал %v, retain %d)", *shipURL, *shipInterval, *shipRetain)
+	}
+	// shipper.Stop() вызывается явно ПОСЛЕ bw.Close() в shutdown: финальный тик
+	// дошипливает уже-fsyncнутый хвост WAL → graceful shutdown даёт RPO=0 и удалённо.
+
 	// === 5. Pub/Sub Hub (Classic + Semantic) ===
 	// Выделенный аллокатор, НЕ общий с KV-store s: Graph семантического индекса
 	// аллоцирует из caches[workerID=0], и общий s → data race с KV-путём worker 0
@@ -623,10 +679,7 @@ func main() {
 		monitoring.RecordCommand(cmd, time.Since(start))
 	}
 
-	// Запуск HTTP-сервера метрик VictoriaMetrics
-	if *metricsPort > 0 {
-		monitoring.StartHttpServer(*metricsPort)
-	}
+	// HTTP-сервер метрик уже поднят до реплея WAL (см. выше по коду).
 
 	// === 8. Сервер ===
 	listenAddr := fmt.Sprintf(":%d", *port)
@@ -690,6 +743,12 @@ func main() {
 	syncer.Stop()
 	if err := bw.Close(); err != nil {
 		log.Printf("WAL close error: %v", err)
+	}
+	// 6. Финальный тик шиппера ПОСЛЕ bw.Close(): последний батч WAL уже на
+	// диске, поэтому штатная остановка оставляет удалённую копию с RPO=0.
+	if shipper != nil {
+		shipper.Stop()
+		log.Println("WAL-shipping: финальная доставка завершена.")
 	}
 	log.Println("Shutdown complete: WAL flushed and fsynced.")
 }
