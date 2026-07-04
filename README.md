@@ -7,6 +7,7 @@ High-performance in-memory key-value store with built-in vector search, WASM com
 - **TCMalloc-style allocator** — per-worker MCache, lock-free GET, zero GC pressure
 - **Epoll networking** — per-worker event loops, zero-alloc RESP parser, greedy drain
 - **WAL + Snapshots** — CRC32-protected, batch writes, crash recovery
+- **WAL-shipping** — continuous async replication of WAL+snapshots to S3/MinIO or a mounted dir (Litestream-style); restore on any machine with `-ship-restore` (see [docs/BACKUP.md](docs/BACKUP.md))
 - **TTL** — 256-shard heap with lazy + active expiration
 - **Pub/Sub** — back-pressure, sync.Pool, per-subscriber goroutines
 - **Vector Search (HNSW)** — arena-based graph, bitset visited, DotProduct optimization
@@ -65,20 +66,20 @@ make build
 | `--tls-cert` | `""` | Path to TLS certificate (PEM) |
 | `--tls-key` | `""` | Path to TLS private key (PEM) |
 | `--ollama-url` | `http://localhost:11434` | Ollama API URL |
+| `--ship-url` | `""` | Continuous WAL-shipping target: `file:///path` or `s3://bucket/prefix?endpoint=...` (creds via env, see [docs/BACKUP.md](docs/BACKUP.md)) |
+| `--ship-interval` | `1s` | Shipping period (≈ crash RPO) |
+| `--ship-retain` | `3` | Restore points kept on the remote |
+| `--ship-restore` | `false` | Restore data dir from `--ship-url` before start |
 | `--cluster` | `false` | Enable cluster mode |
 | `--slot-start` | `0` | Cluster slot range start |
 | `--slot-end` | `16383` | Cluster slot range end |
 
 ## Supported Commands
 
-### Core
-`PING` `SET key value` `GET key` `DEL key` `KEYS pattern` `DBSIZE` `FLUSHDB` `INFO`
-
-### TTL
-`EXPIRE key seconds` `TTL key`
-
-### Transactions
-`MULTI` `EXEC` `DISCARD`
+The full command manifest (syntax, replies, gate semantics, WAL ops) lives in
+[docs/COMMANDS.md](docs/COMMANDS.md) — the surface is deliberately small and frozen.
+Families: KV/TTL (`SET`/`GET`/`DEL`/`EXPIRE`/…), transactions (`MULTI`/`EXEC`/`DISCARD`),
+Pub/Sub, sorted sets (`ZADD`/…), vector search (`VSIM.*`), AI/RAG (`AI.*`).
 
 > **Isolation contract (read this).** `MULTI`/`EXEC` provides command **grouping and
 > pipelining** with EXECABORT on a bad queued command — it does **not** provide
@@ -91,18 +92,6 @@ make build
 > isolation would require globally serializing every write for the duration of each
 > `EXEC`, which defeats the per-worker, zero-alloc model the engine is built on.
 > Durability (WAL + fsync) is unaffected and holds.
-
-### Pub/Sub
-`SUBSCRIBE channel` `PUBLISH channel message`
-
-### Vector Search
-`VSIM.ADD key dim v1 v2 ...` `VSIM.DEL key` `VSIM.SEARCH dim K v1 v2 ...` `VSIM.INFO`
-
-### AI (requires Ollama)
-`AI.INGEST key "text"` `AI.ASK "question"` `AI.STATUS`
-
-### WASM Compute
-`WASM.LOAD name <bytes>` `WASM.EXEC name func [args]` `WASM.TRIGGER.ADD` `WASM.MODULES`
 
 ## Architecture
 
