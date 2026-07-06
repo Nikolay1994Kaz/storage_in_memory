@@ -721,10 +721,15 @@ func (g *Graph) Delete(id uint64) bool {
 		}
 		for level := 0; level <= n.Level; level++ {
 			nNeighbors := g.getNeighbors(n.NeighborsHandle, level)
-			cleaned := removeID(append([]uint64{}, nNeighbors...), id)
-			if len(cleaned) != len(nNeighbors) {
-				g.setNeighbors(n.NeighborsHandle, level, cleaned)
+			if !containsID(nNeighbors, id) {
+				continue
 			}
+			// nNeighbors — view прямо в память аллокатора; removeID сдвигает
+			// элементы на месте, setNeighbors лишь обновляет счётчик длины.
+			// Ноль аллокаций: раньше здесь копировался список соседей КАЖДОЙ
+			// ноды графа на КАЖДЫЙ Delete (основной churn upsert-пути дельты).
+			cleaned := removeID(nNeighbors, id)
+			g.setNeighbors(n.NeighborsHandle, level, cleaned)
 		}
 	}
 
