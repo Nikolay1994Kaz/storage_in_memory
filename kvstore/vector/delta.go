@@ -81,6 +81,15 @@ type DeltaSegment struct {
 	attrsPresent atomic.Bool
 }
 
+// deltaInitSlots — стартовая ёмкость slab/keys шарда. НЕ преаллоцируем на весь
+// capHint (при deltaMax=50000/dim128 это 32MB slab + ~45MB maps на ПУСТОЙ шард):
+// дельту часто флашат маленькой (форс-компакцией/снапшотом), и свежий сегмент
+// платил бы ~100MB апфронт за 1-2 вектора → гигантский churn (см. soak-профиль).
+// Растём через append амортизированно; чтения и рост под одним shard.mu взаимно
+// исключены, а долгоживущих ссылок в slab между RLock-секциями нет (ExtractAll
+// снимает срезы уже после swap, когда в дельту не пишут) → реаллокация безопасна.
+const deltaInitSlots = 1024
+
 // newDeltaShard создаёт один шард с собственным графом и аллокатором.
 func newDeltaShard(dim, capHint int, distFn DistanceFunc, m, efC int) *deltaShard {
 	alloc := tcmalloc.NewTCMallocStore(1)
@@ -96,14 +105,17 @@ func newDeltaShard(dim, capHint int, distFn DistanceFunc, m, efC int) *deltaShar
 		g.pruneBufIDs = make([]uint64, 0, g.M0+1)
 		g.insertBuf = make([]uint64, 0, g.M0+1)
 	}
+	// Стартовая ёмкость: min(capHint, deltaInitSlots). Мелкие шарды (высокий
+	// nShards) сохраняют точный capHint; крупные стартуют малыми и растут.
+	init := min(capHint, deltaInitSlots)
 	return &deltaShard{
-		data:    make([]float32, 0, capHint*dim),
-		keys:    make([]string, 0, capHint),
-		keyIdx:  make(map[string]int, capHint),
+		data:    make([]float32, 0, init*dim),
+		keys:    make([]string, 0, init),
+		keyIdx:  make(map[string]int),
 		idx:     g,
 		alloc:   alloc,
-		nodeKey: make(map[uint32]string, capHint),
-		keyNode: make(map[string]uint32, capHint),
+		nodeKey: make(map[uint32]string),
+		keyNode: make(map[string]uint32),
 	}
 }
 
