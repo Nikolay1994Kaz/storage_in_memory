@@ -2067,6 +2067,11 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 
 // LoadBinary восстанавливает состояние из ридера.
 // После загрузки delta пуста — новые Add() идут туда, WAL replay добавит недостающие.
+//
+// Всё-или-ничего: payload целиком читается в локальные переменные и сверяется
+// CRC, и только потом коммитится в lvs. При любой ошибке (bit-rot, усечённый
+// файл) стор остаётся ровно в прежнем состоянии — иначе recovery реплеил бы WAL
+// поверх наполовину загруженных сегментов (тихо-неконсистентная база).
 func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
@@ -2091,22 +2096,24 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: unsupported snapshot version %d", version)
 	}
 
+	// ── Фаза чтения: только локальные переменные, lvs не трогаем до коммита. ──
+
 	// Читаем snapshotTime
 	var u8 [8]byte
 	if _, err := io.ReadFull(r, u8[:]); err != nil {
 		return fmt.Errorf("leveled: read snapshotTime: %w", err)
 	}
-	lvs.snapshotTime = int64(binary.LittleEndian.Uint64(u8[:]))
+	snapTime := int64(binary.LittleEndian.Uint64(u8[:]))
 
 	// LSN-watermark (v6+): recovery пропустит векторные WAL-записи с LSN ≤ этого.
 	// Старые снапшоты (v≤5) без поля → watermark 0 (реплей всех записей, как раньше;
 	// дедуп #1 удержит корректность).
-	lvs.snapshotLSN = 0
+	var snapLSN uint64
 	if version >= 6 {
 		if _, err := io.ReadFull(r, u8[:]); err != nil {
 			return fmt.Errorf("leveled: read snapshotLSN: %w", err)
 		}
-		lvs.snapshotLSN = binary.LittleEndian.Uint64(u8[:])
+		snapLSN = binary.LittleEndian.Uint64(u8[:])
 	}
 
 	// Читаем dim
@@ -2114,7 +2121,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	if _, err := io.ReadFull(r, u4[:]); err != nil {
 		return fmt.Errorf("leveled: read dim: %w", err)
 	}
-	lvs.dim = int(binary.LittleEndian.Uint32(u4[:]))
+	dim := int(binary.LittleEndian.Uint32(u4[:]))
 
 	// Читаем nLevels
 	var nLevelsBuf [1]byte
@@ -2122,11 +2129,19 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: read nLevels: %w", err)
 	}
 	nLevels := int(nLevelsBuf[0])
-
-	// Сбрасываем текущие уровни
-	for i := range lvs.levels {
-		lvs.levels[i] = nil
+	if nLevels > maxLevels {
+		return fmt.Errorf("leveled: nLevels=%d превышает maxLevels=%d (повреждён заголовок?)", nLevels, maxLevels)
 	}
+
+	// stagedSeg — сегмент, прочитанный, но ещё не закоммиченный в lvs.levels.
+	// frozen/frozenSQ читаются сразу (обычная Go-память — при abort подберёт GC);
+	// hnsw откладывается сырыми entries: buildSegment аллоцирует из tcmalloc-арен,
+	// строим его только после успешного CRC (заодно не жжём CPU на битом файле).
+	type stagedSeg struct {
+		seg     segment
+		entries []DeltaEntry
+	}
+	var staged [maxLevels][]stagedSeg
 
 	// Восстанавливаем каждый уровень
 	for lyr := 0; lyr < nLevels; lyr++ {
@@ -2137,7 +2152,6 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		if nSegs == 0 {
 			continue
 		}
-		lvs.levels[lyr] = make([]segment, 0, nSegs)
 
 		for si := 0; si < nSegs; si++ {
 			var stBuf [1]byte
@@ -2158,7 +2172,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 						return fmt.Errorf("leveled: read frozenMeta[%d][%d]: %w", lyr, si, err)
 					}
 				}
-				lvs.levels[lyr] = append(lvs.levels[lyr], seg)
+				staged[lyr] = append(staged[lyr], stagedSeg{seg: seg})
 
 			case segTypeFrozenSQ8:
 				fg, err := ReadFrozenGraphSQ(r, lvs.cfg.Metric)
@@ -2171,7 +2185,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 						return fmt.Errorf("leveled: read frozenSQMeta[%d][%d]: %w", lyr, si, err)
 					}
 				}
-				lvs.levels[lyr] = append(lvs.levels[lyr], seg)
+				staged[lyr] = append(staged[lyr], stagedSeg{seg: seg})
 
 			case segTypeHNSWFlat:
 				if _, err := io.ReadFull(r, u4[:]); err != nil {
@@ -2194,9 +2208,9 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 						}
 						key = string(kb)
 					}
-					vec := make([]float32, lvs.dim)
-					if lvs.dim > 0 {
-						vb := unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), lvs.dim*4)
+					vec := make([]float32, dim)
+					if dim > 0 {
+						vb := unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), dim*4)
 						if _, err := io.ReadFull(r, vb); err != nil {
 							return fmt.Errorf("leveled: read vec[%d][%d][%d]: %w", lyr, si, vi, err)
 						}
@@ -2213,10 +2227,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 				}
 
 				if len(entries) > 0 {
-					seg := lvs.buildSegment(entries, lvs.dim, 0)
-					if seg != nil {
-						lvs.levels[lyr] = append(lvs.levels[lyr], seg)
-					}
+					staged[lyr] = append(staged[lyr], stagedSeg{entries: entries})
 				}
 
 			default:
@@ -2228,13 +2239,14 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	// Tombstones (v4+): восстанавливаем множество удалённых-но-не-вырезанных ключей.
 	// Без этого удаления, сделанные до снапшота, «воскресают» после рестарта (P0-1).
 	// Старые снапшоты (v<4) секции не имеют → мапа остаётся пустой (прежнее поведение).
+	var tomb map[string]struct{}
 	if version >= 4 {
 		if _, err := io.ReadFull(r, u4[:]); err != nil {
 			return fmt.Errorf("leveled: read nTombstones: %w", err)
 		}
 		tcount := int(binary.LittleEndian.Uint32(u4[:]))
 		if tcount > 0 {
-			tomb := make(map[string]struct{}, tcount)
+			tomb = make(map[string]struct{}, tcount)
 			var tklen [2]byte
 			for i := 0; i < tcount; i++ {
 				if _, err := io.ReadFull(r, tklen[:]); err != nil {
@@ -2247,7 +2259,6 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 				}
 				tomb[string(kb)] = struct{}{}
 			}
-			lvs.tombstones.Store(&tomb)
 		}
 	}
 
@@ -2264,13 +2275,42 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		}
 	}
 
+	// ── Фаза коммита: payload целиком валиден, ошибок ниже нет. ──
+
+	lvs.snapshotTime = snapTime
+	lvs.snapshotLSN = snapLSN
+	lvs.dim = dim
+
+	for i := range lvs.levels {
+		lvs.levels[i] = nil
+	}
+	for lyr := range staged {
+		if len(staged[lyr]) == 0 {
+			continue
+		}
+		lvs.levels[lyr] = make([]segment, 0, len(staged[lyr]))
+		for _, ss := range staged[lyr] {
+			seg := ss.seg
+			if seg == nil {
+				seg = lvs.buildSegment(ss.entries, dim, 0)
+			}
+			if seg != nil {
+				lvs.levels[lyr] = append(lvs.levels[lyr], seg)
+			}
+		}
+	}
+
+	if tomb != nil {
+		lvs.tombstones.Store(&tomb)
+	}
+
 	// Инициализируем пустую дельту (новые Add() пойдут сюда)
 	if lvs.delta != nil {
 		lvs.delta.Close() // освободить аллокатор старой дельты
 	}
-	if lvs.dim > 0 {
-		max := deltaMax(lvs.dim, lvs.cfg.DeltaMax)
-		lvs.delta = NewDeltaSegmentSharded(lvs.dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
+	if dim > 0 {
+		max := deltaMax(dim, lvs.cfg.DeltaMax)
+		lvs.delta = NewDeltaSegmentSharded(dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
 	}
 
 	return nil
