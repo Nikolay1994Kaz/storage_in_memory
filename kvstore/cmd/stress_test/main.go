@@ -93,6 +93,67 @@ func main() {
 	fmt.Printf("%s%s================================================================%s\n", ColorBold, ColorGreen, ColorReset)
 }
 
+// latCollector — потокобезопасный сборщик латентностей с двумя выходами:
+//   - скользящее окно: мониторинг-горутина забирает его раз в logInterval и
+//     печатает перцентили ЗА ИНТЕРВАЛ. Это линза «дрейф p99 во времени» —
+//     глобальный агрегат за многочасовую фазу размазывает медленную деградацию
+//     (рост tombstones/сегментов) до невидимости;
+//   - reservoir-сэмпл (алгоритм R) для финального отчёта: память ограничена
+//     reservoirCap независимо от длительности фазы (раньше latencies копился
+//     безгранично — сотни МБ клиентской памяти за 2.5ч).
+type latCollector struct {
+	mu        sync.Mutex
+	window    []time.Duration
+	reservoir []time.Duration
+	seen      int64
+	rng       *rand.Rand
+}
+
+const reservoirCap = 1 << 20
+
+func newLatCollector() *latCollector {
+	return &latCollector{
+		reservoir: make([]time.Duration, 0, 4096),
+		rng:       rand.New(rand.NewSource(1)),
+	}
+}
+
+func (lc *latCollector) add(d time.Duration) {
+	lc.mu.Lock()
+	lc.window = append(lc.window, d)
+	lc.seen++
+	if len(lc.reservoir) < reservoirCap {
+		lc.reservoir = append(lc.reservoir, d)
+	} else if j := lc.rng.Int63n(lc.seen); j < reservoirCap {
+		lc.reservoir[j] = d
+	}
+	lc.mu.Unlock()
+}
+
+// swapWindow отдаёт накопленное окно и начинает новое.
+func (lc *latCollector) swapWindow() []time.Duration {
+	lc.mu.Lock()
+	w := lc.window
+	lc.window = make([]time.Duration, 0, len(w)+len(w)/4)
+	lc.mu.Unlock()
+	return w
+}
+
+func (lc *latCollector) finalSample() (sample []time.Duration, seen int64) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return append([]time.Duration(nil), lc.reservoir...), lc.seen
+}
+
+// percentiles сортирует lat на месте и возвращает p50/p95/p99 (0 при пустом входе).
+func percentiles(lat []time.Duration) (p50, p95, p99 time.Duration) {
+	if len(lat) == 0 {
+		return
+	}
+	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+	return lat[len(lat)*50/100], lat[len(lat)*95/100], lat[len(lat)*99/100]
+}
+
 func sendCommand(w *protocol.Writer, args ...string) error {
 	arr := make([]protocol.Value, len(args))
 	for i, a := range args {
@@ -212,9 +273,8 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 		wg           sync.WaitGroup
 		completedOps atomic.Int64
 		errorOps     atomic.Int64
-		latencies    []time.Duration
-		mu           sync.Mutex
 	)
+	lc := newLatCollector()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -307,14 +367,10 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 			w := protocol.NewWriter(conn)
 			r := protocol.NewReader(conn)
 			rng := rand.New(rand.NewSource(int64(workerID * 999)))
-			localLatencies := make([]time.Duration, 0, 1000)
 
 			for {
 				select {
 				case <-ctx.Done():
-					mu.Lock()
-					latencies = append(latencies, localLatencies...)
-					mu.Unlock()
 					return
 				default:
 					reqStart := time.Now()
@@ -323,18 +379,20 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 					var err error
 					// Расширенный микс: помимо read/upsert/pub добавлены delete-churn
 					// (VSIM.DEL/DEL → tombstone+merge, #3), бинарный путь (VSIM.ADDBIN),
-					// filterFn-путь (VSIM.SEARCHFILTER PREFIX) и semantic-routing
-					// (VSIM.PUBLISH → поиск по семантич.индексу, #5).
+					// filterFn-путь (VSIM.SEARCHFILTER PREFIX), semantic-routing
+					// (VSIM.PUBLISH → поиск по семантич.индексу, #5), zset-удаления
+					// (ZREM → btree delete/borrow/leaf-merge) и TTL-churn
+					// (SET EX/EXPIRE → active-expiry на монотонных часах).
 					switch {
-					case dice < 25: // 25% GET
+					case dice < 22: // 22% GET
 						err = sendCommand(w, "GET", fmt.Sprintf("key:%d", rng.Intn(5000)))
-					case dice < 45: // 20% VSIM.SEARCH
+					case dice < 42: // 20% VSIM.SEARCH
 						args := []string{"VSIM.SEARCH", "10"}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					case dice < 48: // 3% tenant ADDATTR/FILTER (колоночный attr/tenant-слой, путь #2)
+					case dice < 45: // 3% tenant ADDATTR/FILTER (колоночный attr/tenant-слой, путь #2)
 						tn := fmt.Sprintf("t%d", rng.Intn(3))
 						if rng.Intn(2) == 0 {
 							args := []string{"VSIM.ADDATTR", fmt.Sprintf("tn:%d", rng.Intn(300)), "CAT", "tenant", tn, "VEC"}
@@ -349,7 +407,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 							}
 							err = sendCommand(w, args...)
 						}
-					case dice < 56: // 8% VSIM.SEARCHRANGE (B+Tree + HNSW)
+					case dice < 53: // 8% VSIM.SEARCHRANGE (B+Tree + HNSW)
 						minScore := rng.Float64() * 10
 						args := []string{"VSIM.SEARCHRANGE", "10", "benchset",
 							strconv.FormatFloat(minScore, 'f', 2, 64),
@@ -358,33 +416,43 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					case dice < 64: // 8% VSIM.SEARCHFILTER PREFIX (путь SearchFiltered/filterFn)
+					case dice < 60: // 7% VSIM.SEARCHFILTER PREFIX (путь SearchFiltered/filterFn)
 						args := []string{"VSIM.SEARCHFILTER", "10", "PREFIX", "vec:"}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					case dice < 74: // 10% VSIM.ADD (upsert-churn на 500 ключей)
+					case dice < 70: // 10% VSIM.ADD (upsert-churn на 500 ключей)
 						args := []string{"VSIM.ADD", fmt.Sprintf("vec:%d", rng.Intn(500))}
 						for j := 0; j < dim; j++ {
 							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
 						}
 						err = sendCommand(w, args...)
-					case dice < 79: // 5% VSIM.ADDBIN (бинарный zero-copy путь)
+					case dice < 75: // 5% VSIM.ADDBIN (бинарный zero-copy путь)
 						vecF := make([]float32, dim)
 						for j := range vecF {
 							vecF[j] = rng.Float32()
 						}
 						err = sendCommand(w, "VSIM.ADDBIN", fmt.Sprintf("vec:%d", rng.Intn(500)), string(vector.SerializeVector(vecF)))
-					case dice < 86: // 7% VSIM.DEL (delete-churn → tombstone; VSIM.ADD ре-добавит)
+					case dice < 82: // 7% VSIM.DEL (delete-churn → tombstone; VSIM.ADD ре-добавит)
 						err = sendCommand(w, "VSIM.DEL", fmt.Sprintf("vec:%d", rng.Intn(500)))
-					case dice < 91: // 5% SET + ZADD
+					case dice < 87: // 5% SET + ZADD
 						key := fmt.Sprintf("key:%d", rng.Intn(5000))
 						if err = sendCommand(w, "SET", key, "updated_during_stress"); err == nil {
 							r.Read()
 							err = sendCommand(w, "ZADD", "benchset", strconv.FormatFloat(rng.Float64()*15, 'f', 2, 64), key)
 						}
-					case dice < 95: // 4% DEL (KV delete)
+					case dice < 90: // 3% ZREM (btree delete → borrow/leaf-merge под конкурентным Search)
+						err = sendCommand(w, "ZREM", "benchset", fmt.Sprintf("key:%d", rng.Intn(5000)))
+					case dice < 92: // 2% TTL-churn (SET EX / EXPIRE → active-expiry, монотонные дедлайны)
+						key := fmt.Sprintf("ttl:%d", rng.Intn(2000))
+						ttlSec := strconv.Itoa(1 + rng.Intn(30))
+						if rng.Intn(2) == 0 {
+							err = sendCommand(w, "SET", key, "ttl_payload", "EX", ttlSec)
+						} else {
+							err = sendCommand(w, "EXPIRE", key, ttlSec)
+						}
+					case dice < 95: // 3% DEL (KV delete)
 						err = sendCommand(w, "DEL", fmt.Sprintf("key:%d", rng.Intn(5000)))
 					case dice < 99: // 4% VSIM.PUBLISH (semantic-routing → поиск по семантич.индексу)
 						args := []string{"VSIM.PUBLISH", "stress_semantic_msg"}
@@ -407,7 +475,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 						continue
 					}
 
-					localLatencies = append(localLatencies, time.Since(reqStart))
+					lc.add(time.Since(reqStart))
 					completedOps.Add(1)
 				}
 			}
@@ -449,13 +517,18 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 				memMB := memBytes / 1024 / 1024
 				vecCount := getVectorCount(addr)
 
-				fmt.Printf("  ⏱️  [%s] Прогресс: %s/%s | Текущий RPS: %s%.0f%s | Ошибок: %s%d%s | Память: %.2f MB | Векторов: %d\n",
+				// Перцентили ЗА ИНТЕРВАЛ (не кумулятивные): их дрейф от тика к
+				// тику — и есть линза «латентность деградирует со временем».
+				wp50, wp95, wp99 := percentiles(lc.swapWindow())
+
+				fmt.Printf("  ⏱️  [%s] Прогресс: %s/%s | Текущий RPS: %s%.0f%s | Ошибок: %s%d%s | Память: %.2f MB | Векторов: %d | окно p50=%v p95=%v p99=%v\n",
 					time.Now().Format("15:04:05"),
 					elapsed.Round(time.Second),
 					testDuration,
 					ColorCyan, rps, ColorReset,
 					GetErrorColor(errorOps.Load()), errorOps.Load(), ColorReset,
 					memMB, vecCount,
+					wp50.Round(time.Microsecond), wp95.Round(time.Microsecond), wp99.Round(time.Microsecond),
 				)
 
 				if elapsed >= testDuration {
@@ -473,18 +546,14 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 	total := completedOps.Load()
 	errors := errorOps.Load()
 
-	// Считаем перцентили латентности
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	p50 := time.Duration(0)
-	p95 := time.Duration(0)
-	p99 := time.Duration(0)
-	if len(latencies) > 0 {
-		p50 = latencies[len(latencies)*50/100]
-		p95 = latencies[len(latencies)*95/100]
-		p99 = latencies[len(latencies)*99/100]
-	}
+	// Финальные перцентили — по reservoir-сэмплу (равномерная выборка всей фазы).
+	sample, seen := lc.finalSample()
+	p50, p95, p99 := percentiles(sample)
 
 	fmt.Printf("\n  📊 %sРезультаты стресс-теста под нагрузкой:%s\n", ColorBold, ColorReset)
+	if seen > int64(len(sample)) {
+		fmt.Printf("    - Перцентили по reservoir-сэмплу %d из %d измерений\n", len(sample), seen)
+	}
 	fmt.Printf("    - Всего успешных транзакций:  %s%d%s\n", ColorGreen, total, ColorReset)
 	fmt.Printf("    - Ошибок / падений системы:  %s%d%s\n",
 		GetErrorColor(errors), errors, ColorReset)

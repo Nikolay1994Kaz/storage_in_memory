@@ -47,6 +47,7 @@ func main() {
 	mode := flag.String("mode", "", "seed | verify")
 	n := flag.Int("n", 200, "число контрольных ключей")
 	rngSeed := flag.Int64("rngseed", 42, "seed для детерминированных векторов")
+	kvOnly := flag.Bool("kv-only", false, "verify: только KV-инварианты. Для CRC-дрилла: graph_leveled.bin намеренно бит, векторы после rebuild-from-WAL легитимно неполны (старые вектор-операции вырезаны компакцией), а KV обязан пережить через snapshot.wal+WAL")
 	flag.Parse()
 
 	if *mode != "seed" && *mode != "verify" {
@@ -70,7 +71,7 @@ func main() {
 			os.Exit(2)
 		}
 	case "verify":
-		if err := verify(w, r, *n, *rngSeed); err != nil {
+		if err := verify(w, r, *n, *rngSeed, *kvOnly); err != nil {
 			fmt.Fprintf(os.Stderr, "verify: %v\n", err)
 			os.Exit(1)
 		}
@@ -163,7 +164,7 @@ func searchHasKey(w *protocol.Writer, r *protocol.Reader, key string, i int, rs 
 	return false, nil
 }
 
-func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error {
+func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64, kvOnly bool) error {
 	var kvLost, kvResurrect, vecLost, vecResurrect, badVal, vecMiss int
 	for i := 0; i < n; i++ {
 		kvKey := kvNS + strconv.Itoa(i)
@@ -175,6 +176,20 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error 
 			return err
 		}
 		isNil := g.Typ == '$' && g.Num == -1
+
+		if deleted {
+			if !isNil {
+				kvResurrect++ // удалённый KV воскрес
+			}
+		} else if isNil {
+			kvLost++ // живой KV потерян
+		} else if g.Str != "val:"+strconv.Itoa(i) {
+			badVal++ // живой KV с неверным значением
+		}
+		if kvOnly {
+			continue // векторная часть намеренно пропускается (CRC-дрилл)
+		}
+
 		hasVec, err := searchHasKey(w, r, vecKey, i, rngSeed)
 		if err != nil {
 			return err
@@ -191,18 +206,10 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error 
 		exists := ex.Num == 1
 
 		if deleted {
-			if !isNil {
-				kvResurrect++ // удалённый KV воскрес
-			}
 			if exists || hasVec {
 				vecResurrect++ // удалённый вектор воскрес
 			}
 		} else {
-			if isNil {
-				kvLost++ // живой KV потерян
-			} else if g.Str != "val:"+strconv.Itoa(i) {
-				badVal++ // живой KV с неверным значением
-			}
 			switch {
 			case !exists:
 				vecLost++ // живой вектор реально потерян (durability)
@@ -210,6 +217,17 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error 
 				vecMiss++ // вектор есть, но self-query top-10 его не нашёл (recall/связность графа)
 			}
 		}
+	}
+
+	if kvOnly {
+		bugs := kvLost + kvResurrect + badVal
+		fmt.Printf("[oracle verify kv-only] n=%d | KV lost=%d resurrect=%d badval=%d\n",
+			n, kvLost, kvResurrect, badVal)
+		if bugs > 0 {
+			return fmt.Errorf("ORACLE FAIL (kv-only): %d нарушений", bugs)
+		}
+		fmt.Println("[oracle verify kv-only] OK — KV пережил рестарт с битым вектор-снапшотом")
+		return nil
 	}
 
 	// Тенант-изоляция: VSIM.FILTER EQ tenant=t0 не должен вернуть ключи t1.

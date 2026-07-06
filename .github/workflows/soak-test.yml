@@ -73,7 +73,9 @@ jobs:
             # --partition-attr tenant включает tenant-роутинг колоночного слоя,
             # чтобы нагрузка (VSIM.ADDATTR/FILTER) и oracle (tenant-изоляция) били
             # путь #2 по-настоящему, а не только предикатный фильтр.
-            ./kvstore-server --port "$PORT" --metrics-port "$MPORT" --partition-attr tenant > "$1" 2>&1 &
+            # -pprof: при обнаружении дрейфа heap/goroutine-профиль снимается сразу
+            # с живого процесса (localhost:MPORT/debug/pprof/), без перезапуска.
+            ./kvstore-server --port "$PORT" --metrics-port "$MPORT" --partition-attr tenant --pprof > "$1" 2>&1 &
             echo $! > server.pid
             # Ждём /ready (не /metrics): порт открывается ДО реплея WAL, а готовность
             # выставляется только после снапшот+WAL+listener. На рестарте после
@@ -112,8 +114,12 @@ jobs:
               #    под графы/соседей и под float32-slab'ы.
               # Сопоставление этих рядов во времени скажет: копятся tombstones/сегменты
               # или это retention аллокатора без роста живого набора.
+              #  • flush_delta_total — регресс-страж flush-storm (2577 flush/6мин был
+              #    симптомом): счётчик обязан расти умеренно, рывок = буря вернулась.
+              #  • compaction/rollback, oom_events, wal_fail_stop, ship_errors/bytes,
+              #    active_connections — дешёвые «ничего не тлеет?» ряды.
               curl -s "localhost:$MPORT/metrics" 2>/dev/null | grep -E \
-                "^go_goroutines |^process_resident_memory_bytes |^go_memstats_sys_bytes |^go_memstats_heap_inuse_bytes |^kvstore_vector_total_vectors |^kvstore_vector_delta_len |^kvstore_vector_tombstones |^kvstore_vector_allocator_bytes |^kvstore_vector_data_bytes |^kvstore_vector_segments" || true
+                "^go_goroutines |^process_resident_memory_bytes |^go_memstats_sys_bytes |^go_memstats_heap_inuse_bytes |^kvstore_vector_total_vectors |^kvstore_vector_delta_len |^kvstore_vector_tombstones |^kvstore_vector_allocator_bytes |^kvstore_vector_data_bytes |^kvstore_vector_segments|^kvstore_vector_flush_delta_total |^kvstore_vector_compaction_total |^kvstore_vector_compaction_rollback_total |^kvstore_oom_events_total |^kvstore_wal_fail_stop_total |^kvstore_ship_errors_total |^kvstore_ship_uploaded_bytes_total |^kvstore_network_active_connections " || true
             } >> drift.log
           }
           # Фоновый сэмплер дрейфа: пишет drift() каждые SAMPLE секунд, пока жив.
