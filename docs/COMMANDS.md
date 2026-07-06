@@ -144,6 +144,7 @@ bad keys are rejected so poison never survives via replay), and all `Add`s happe
 | `VSIM.ADDBIN` | `VSIM.ADDBIN key <float32-LE bytes>` | `+OK` |
 | `VSIM.ADDATTR` | `VSIM.ADDATTR key [CAT k v]… [NUM k v]… VEC v1 … vN` | `+OK` — columnar attr/tenant ingest; WAL: `OpVSimAddAttrs` |
 | `VSIM.DEL` | `VSIM.DEL key` | `:1` / `:0` |
+| `VSIM.EXISTS` | `VSIM.EXISTS key` | `:1` / `:0` — direct point lookup (delta/tombstones/segments), bypasses ANN; used by the soak durability oracle to separate real loss from recall miss |
 | `VSIM.SEARCH` | `VSIM.SEARCH K v1 … vN` | flat array `key, dist, …` |
 | `VSIM.SEARCHBIN` | `VSIM.SEARCHBIN K <float32-LE bytes>` | flat array |
 | `VSIM.FILTER` | `VSIM.FILTER K [EQ attr val]… [RANGE attr lo hi]… VEC v1 … vN` | flat array — columnar filter (+tenant routing via `-partition-attr`) |

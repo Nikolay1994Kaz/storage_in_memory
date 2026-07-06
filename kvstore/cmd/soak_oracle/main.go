@@ -164,7 +164,7 @@ func searchHasKey(w *protocol.Writer, r *protocol.Reader, key string, i int, rs 
 }
 
 func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error {
-	var kvLost, kvResurrect, vecLost, vecResurrect, badVal int
+	var kvLost, kvResurrect, vecLost, vecResurrect, badVal, vecMiss int
 	for i := 0; i < n; i++ {
 		kvKey := kvNS + strconv.Itoa(i)
 		vecKey := vecNS + strconv.Itoa(i)
@@ -179,12 +179,22 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error 
 		if err != nil {
 			return err
 		}
+		// Прямой existence-чек мимо ANN: разносит «вектор реально потерян»
+		// (durability-баг) от «граф не нашёл присутствующий вектор» (recall).
+		ex, err := cmd(w, r, "VSIM.EXISTS", vecKey)
+		if err != nil {
+			return err
+		}
+		if ex.Typ != ':' {
+			return fmt.Errorf("VSIM.EXISTS: ждали integer, got typ=%q str=%q", ex.Typ, ex.Str)
+		}
+		exists := ex.Num == 1
 
 		if deleted {
 			if !isNil {
 				kvResurrect++ // удалённый KV воскрес
 			}
-			if hasVec {
+			if exists || hasVec {
 				vecResurrect++ // удалённый вектор воскрес
 			}
 		} else {
@@ -193,8 +203,11 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error 
 			} else if g.Str != "val:"+strconv.Itoa(i) {
 				badVal++ // живой KV с неверным значением
 			}
-			if !hasVec {
-				vecLost++ // живой вектор потерян
+			switch {
+			case !exists:
+				vecLost++ // живой вектор реально потерян (durability)
+			case !hasVec:
+				vecMiss++ // вектор есть, но self-query top-10 его не нашёл (recall/связность графа)
 			}
 		}
 	}
@@ -219,8 +232,13 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64) error 
 	}
 
 	bugs := kvLost + kvResurrect + vecLost + vecResurrect + badVal + tnLeak
-	fmt.Printf("[oracle verify] n=%d | KV lost=%d resurrect=%d badval=%d | VEC lost=%d resurrect=%d | tenant-leak=%d\n",
-		n, kvLost, kvResurrect, badVal, vecLost, vecResurrect, tnLeak)
+	fmt.Printf("[oracle verify] n=%d | KV lost=%d resurrect=%d badval=%d | VEC lost=%d resurrect=%d searchmiss=%d | tenant-leak=%d\n",
+		n, kvLost, kvResurrect, badVal, vecLost, vecResurrect, vecMiss, tnLeak)
+	if vecMiss > 0 {
+		// Не durability-нарушение (вектор на месте), но self-query top-10 обязан
+		// находить точку с dist=0 — сигнал деградации recall/связности графа.
+		fmt.Printf("[oracle verify] WARN: %d векторов есть в сторе (VSIM.EXISTS=1), но не найдены self-query поиском\n", vecMiss)
+	}
 	if bugs > 0 {
 		return fmt.Errorf("ORACLE FAIL: %d нарушений (durability/tombstone/tenant-изоляция)", bugs)
 	}

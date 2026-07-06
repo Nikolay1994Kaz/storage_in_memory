@@ -1455,6 +1455,28 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteInt(0)
 		}
 
+	case "VSIM.EXISTS":
+		// Прямой existence-чек мимо ANN-поиска: точечный Get по дельте/tombstones/
+		// сегментам. Нужен оракулу durability (soak), чтобы разносить «вектор
+		// реально потерян» от «recall-промах графа»: VSIM.SEARCH аппроксимативен
+		// и может не найти даже присутствующий вектор.
+		if len(args) < 1 {
+			buf.WriteError("ERR usage: VSIM.EXISTS <key>")
+			return
+		}
+		key := string(args[0])
+		if cl != nil && !cl.IsReplica() {
+			if moved := cl.CheckKey(key); moved != nil {
+				writeValue(buf, *moved)
+				return
+			}
+		}
+		if _, ok := vecStore.Get(key); ok {
+			buf.WriteInt(1)
+		} else {
+			buf.WriteInt(0)
+		}
+
 	// === Semantic Pub/Sub (Vector-routed) ===
 	case "VSIM.SUBSCRIBE":
 		// Формат: VSIM.SUBSCRIBE <threshold> <v1> <v2> ... <vN>

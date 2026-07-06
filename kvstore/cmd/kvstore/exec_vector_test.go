@@ -59,6 +59,18 @@ func TestExec_DelAlsoRemovesVector(t *testing.T) {
 	e.wantInt(e.do("VSIM.DEL", "k"), 0)
 }
 
+// VSIM.EXISTS — прямой existence-чек мимо ANN (для durability-оракула).
+func TestExec_VsimExists(t *testing.T) {
+	e := newExecEnv(t)
+	e.do("VSIM.ADD", "a", "1", "0", "0")
+
+	e.wantInt(e.do("VSIM.EXISTS", "a"), 1)     // есть
+	e.wantInt(e.do("VSIM.EXISTS", "ghost"), 0) // не было
+	e.do("VSIM.DEL", "a")
+	e.wantInt(e.do("VSIM.EXISTS", "a"), 0)      // удалён — не воскрес
+	e.wantErrPrefix(e.do("VSIM.EXISTS"), "ERR") // без ключа
+}
+
 func TestExec_VsimErrors(t *testing.T) {
 	e := newExecEnv(t)
 	e.wantErrPrefix(e.do("VSIM.ADD", "onlykey"), "ERR")        // нет компонент
