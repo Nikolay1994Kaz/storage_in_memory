@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -208,7 +209,7 @@ func readyHandler(w http.ResponseWriter, _ *http.Request) {
 
 // httpHandler собирает mux метрик + health-проб. Вынесено отдельно, чтобы
 // тестировать пробы через httptest без поднятия реального сокета.
-func httpHandler() http.Handler {
+func httpHandler(enablePprof bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metrics.WritePrometheus(w, true)
@@ -220,18 +221,30 @@ func httpHandler() http.Handler {
 	// Readiness.
 	mux.HandleFunc("/ready", readyHandler)
 	mux.HandleFunc("/readyz", readyHandler)
+	// Профилировщик (net/http/pprof) — только когда явно включён флагом -pprof.
+	// heap/goroutine/allocs для диагностики утечек под нагрузкой (soak). Выключен
+	// по умолчанию: эндпоинты /debug/pprof/* не должны торчать в проде.
+	if enablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		slog.Warn("pprof включён — эндпоинты /debug/pprof/* открыты; не для прод-окружения")
+	}
 	return mux
 }
 
 // StartHttpServer runs the HTTP metrics+health server on the given port.
-func StartHttpServer(port int) {
+// enablePprof регистрирует /debug/pprof/* для диагностики (soak/утечки).
+func StartHttpServer(port int, enablePprof bool) {
 	if port <= 0 {
 		return
 	}
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: httpHandler(),
+		Handler: httpHandler(enablePprof),
 	}
 
 	go func() {

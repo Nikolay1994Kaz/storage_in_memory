@@ -8,7 +8,7 @@ import (
 
 // TestHealth_Liveness — /health и алиасы всегда 200 (процесс жив).
 func TestHealth_Liveness(t *testing.T) {
-	h := httpHandler()
+	h := httpHandler(false)
 	for _, path := range []string{"/health", "/healthz", "/livez"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
@@ -21,7 +21,7 @@ func TestHealth_Liveness(t *testing.T) {
 // TestHealth_Readiness — /ready отражает флаг готовности: 503 до SetReady(true),
 // 200 после. Это позволяет оркестратору не слать трафик в непрогретый процесс.
 func TestHealth_Readiness(t *testing.T) {
-	h := httpHandler()
+	h := httpHandler(false)
 
 	SetReady(false)
 	defer SetReady(false) // не протекаем состоянием в другие тесты

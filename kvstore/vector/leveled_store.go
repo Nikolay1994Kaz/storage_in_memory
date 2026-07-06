@@ -643,11 +643,10 @@ type LeveledVectorStore struct {
 	// closeOnce — защита от двойного close(done) в Close().
 	closeOnce sync.Once
 
-	// flushCond + flushPending — механизм ожидания FlushDeltaSync.
-	// FlushDeltaSync ставит флаг и шлёт сигнал coordinator'у, затем ждёт cond.
-	// buildWorker после publish delta-segment сбрасывает флаг и будит cond.
-	flushCond    *sync.Cond
-	flushPending atomic.Bool
+	// flushCond — механизм ожидания FlushDeltaSync. FlushDeltaSync форсит swap
+	// pre-call дельты и ждёт по членству в flushing; applyResult/empty-path будят
+	// cond безусловно при снятии дельты с flushing (см. FlushDeltaSync).
+	flushCond *sync.Cond
 
 	// buildWorkerIDCounter — раздаёт уникальные workerID для параллельных buildSegment.
 	// TCMallocStore.Alloc(workerID, ...) шардирует по workerID; конкурентный доступ
@@ -2410,15 +2409,9 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 		// Убираем из flushing и закрываем сразу.
 		lvs.removeFlushing(oldDelta)
 		oldDelta.Close()
-		// entries пуст — пробудим FlushDeltaSync если ожидает.
+		// Дельта снята с flushing → будим FlushDeltaSync (ждёт по членству).
 		lvs.mu.Lock()
-		if lvs.flushPending.Load() && lvs.inFlightBuilds.Load() == 0 {
-			deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
-			if deltaEmpty {
-				lvs.flushPending.Store(false)
-				lvs.flushCond.Broadcast()
-			}
-		}
+		lvs.flushCond.Broadcast()
 		lvs.mu.Unlock()
 	}
 
@@ -2669,15 +2662,9 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 			if r.flushDelta != nil {
 				r.flushDelta.Close()
 			}
-			remaining := lvs.inFlightBuilds.Add(-1)
-			// Broadcast только когда последний build завершился и delta пуста.
-			if lvs.flushPending.Load() && remaining == 0 {
-				deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
-				if deltaEmpty {
-					lvs.flushPending.Store(false)
-					lvs.flushCond.Broadcast()
-				}
-			}
+			lvs.inFlightBuilds.Add(-1)
+			// Дельта снята с flushing → будим FlushDeltaSync (ждёт по членству).
+			lvs.flushCond.Broadcast()
 		} else {
 			lvs.mergeInFlight[r.sourceLvl] = false
 		}
@@ -2686,8 +2673,7 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 
 	switch r.kind {
 	case taskFlushDelta:
-		// remaining — кол-во delta-build горутин ПОСЛЕ декремента.
-		remaining := lvs.inFlightBuilds.Add(-1)
+		lvs.inFlightBuilds.Add(-1)
 		if r.result != nil {
 			lvs.levels[0] = append(lvs.levels[0], r.result)
 		} else {
@@ -2702,16 +2688,10 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 		if r.flushDelta != nil {
 			r.flushDelta.Close()
 		}
-		// Broadcast только когда ЭТО последний build И delta пуста.
-		// Без этой проверки: первый же completed build сбрасывает flushPending=false,
-		// последующие 49 builds не будут broadcastить → FlushDeltaSync висит вечно.
-		if lvs.flushPending.Load() && remaining == 0 {
-			deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
-			if deltaEmpty {
-				lvs.flushPending.Store(false)
-				lvs.flushCond.Broadcast()
-			}
-		}
+		// Дельта снята с flushing и сегмент опубликован → будим FlushDeltaSync
+		// (он перепроверит членство pre-call набора в flushing). Безусловно: waiter
+		// сам решает, все ли его дельты опубликованы — здесь гейта быть не должно.
+		lvs.flushCond.Broadcast()
 
 	case taskMergeLevel:
 		lvs.mergeInFlight[r.sourceLvl] = false
@@ -2736,18 +2716,15 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 		// После merge target-уровень мог переполниться → каскад.
 		needsWork = len(lvs.levels[r.targetLvl]) >= lvs.cfg.Fanout
 	}
-	// Delta не пуста → нужен новый flush (применимо к обоим видам задач).
-	// БАГ если пропустить: когда последний build (remaining=0) завершается
-	// при non-empty delta, нет ни broadcast ни triggerCompact → FlushDeltaSync висит.
 	if !needsWork {
-		// Re-flush дельты ТОЛЬКО если она полна (обычный режим; safety на случай
-		// пропущенного Add-триггера) ИЛИ ждёт sync-flush (FlushDeltaSync).
-		// Иначе под нагрузкой (фоновый build + непрерывная запись) applyResult
-		// флашил бы остаток дельты после каждого build → дельта дробится на сотни
-		// крошечных сегментов и QPS падает из-за фан-аута.
-		deltaNonEmpty := lvs.delta != nil && lvs.delta.Len() > 0
-		deltaFull := lvs.delta != nil && lvs.delta.Full()
-		needsWork = deltaFull || (lvs.flushPending.Load() && deltaNonEmpty)
+		// Re-flush дельты ТОЛЬКО когда она реально ПОЛНА (обычный режим; safety на
+		// случай пропущенного Add-триггера). Прежде здесь была ветка
+		// `flushPending && deltaNonEmpty` — она заставляла applyResult гнать flush
+		// остатка дельты после КАЖДОГО build во время FlushDeltaSync → flush-storm
+		// (тысячи flush по 1-2 вектора, каждый — свежий дельта-сегмент, сотни ГБ
+		// churn). FlushDeltaSync теперь сам форсит нужный swap и ждёт по членству в
+		// flushing, поэтому eager-re-flush остатка здесь больше не нужен.
+		needsWork = lvs.delta != nil && lvs.delta.Full()
 	}
 	if needsWork {
 		lvs.triggerCompact()
@@ -2844,18 +2821,15 @@ func (lvs *LeveledVectorStore) buildWorker() {
 				monitoring.VectorCompactionRollbackTotal.Inc()
 			}
 			// Декремент счётчика DOPO применения результата.
-			remaining := lvs.inFlightBuilds.Add(-1)
-			// Broadcast только когда ЭТО последний build И delta пуста.
-			if lvs.flushPending.Load() && remaining == 0 {
-				deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
-				if deltaEmpty {
-					lvs.flushPending.Store(false)
-					lvs.flushCond.Broadcast()
-				}
-			}
+			lvs.inFlightBuilds.Add(-1)
+			// Дельта снята с flushing → будим FlushDeltaSync (ждёт по членству).
+			lvs.flushCond.Broadcast()
 			overflow := len(lvs.levels[0]) >= lvs.cfg.Fanout
-			// Delta накопилась пока шли builds — запускаем следующий flush.
-			needsFlush := !overflow && lvs.delta != nil && lvs.delta.Len() > 0
+			// Re-flush ТОЛЬКО когда дельта реально полна (без flushPending-шторма,
+			// как в applyResult). Примечание: этот путь (buildQueue/buildWorker)
+			// сейчас не активен — enqueueTask не вызывается; держим консистентным на
+			// случай будущего включения пула.
+			needsFlush := !overflow && lvs.delta != nil && lvs.delta.Full()
 			lvs.mu.Unlock()
 			if overflow || needsFlush {
 				lvs.triggerCompact()
@@ -2864,25 +2838,45 @@ func (lvs *LeveledVectorStore) buildWorker() {
 	}
 }
 
-// FlushDeltaSync ждёт пока delta пуста И нет активного delta-flush build.
-//
-// Гарантия: после возврата все векторы, добавленные до вызова FlushDeltaSync,
+// FlushDeltaSync гарантирует: после возврата все векторы, добавленные ДО вызова,
 // находятся в опубликованных сегментах (levels[]). Merge goroutines (L1→L2 и т.д.)
-// НЕ ждём — они продолжают работать в фоне.
+// НЕ ждём — они работают в фоне.
 //
-// Реализация: cond-based (sync.Cond), НЕ spin-loop.
-// Spin-loop создавал busy-loop coordinator'а: triggerCompact() заполнял compactCh
-// быстрее, чем coordinator обрабатывал resultChan → applyResult() не вызывался →
-// deltaFlushInFlight никогда не сбрасывался → livelock.
+// ВАЖНО (fix flush-storm): ждём публикации лишь PRE-CALL набора дельт, а НЕ полного
+// опустошения дельты. Прежняя реализация крутилась пока delta не станет ПУСТОЙ И
+// inFlightBuilds==0 в один момент — под непрерывной конкурентной записью это
+// никогда не сходилось: applyResult пере-триггерил flush на каждом build'е, дельта
+// флашилась тысячи раз по 1-2 вектора, каждый flush аллоцировал свежий
+// дельта-сегмент → сотни ГБ churn (см. soak-профиль 06.07). Контракт требует лишь
+// «pre-call векторы в сегментах»; их держат:
+//   - target: дельта на момент входа (форсим один swap, ждём её сегмент);
+//   - pending: дельты, уже находящиеся в flushing на входе (их builds в полёте).
 //
-// flushCond.Broadcast() вызывается из applyResult() при завершении delta-flush build
-// и из Close() при graceful shutdown. FlushDeltaSync пробуждается и перепроверяет.
+// Векторы, добавленные писателями ПОСЛЕ swap, попадают в НОВУЮ дельту — в набор не
+// входят, их не ждём (они durable в WAL, уедут в следующий снапшот). Это и убивает
+// шторм: конечный набор ожидания вместо гонки за движущейся пустотой.
+//
+// flushCond.Broadcast() вызывается из applyResult() при снятии дельты с flushing и
+// из Close() при graceful shutdown; FlushDeltaSync пробуждается и перепроверяет.
 func (lvs *LeveledVectorStore) FlushDeltaSync() {
-	// Один начальный сигнал — достаточно для запуска delta-flush goroutine.
-	lvs.triggerCompact()
-
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
+
+	// Pre-call набор: текущая непустая дельта + уже флашащиеся дельты.
+	var target *DeltaSegment
+	if lvs.delta != nil && lvs.delta.Len() > 0 {
+		target = lvs.delta
+	}
+	pending := append([]*DeltaSegment(nil), lvs.flushing...)
+
+	inFlushing := func(d *DeltaSegment) bool {
+		for _, f := range lvs.flushing {
+			if f == d {
+				return true
+			}
+		}
+		return false
+	}
 
 	for {
 		// Shutdown: coordinator уже вышел, ждать некому.
@@ -2892,20 +2886,26 @@ func (lvs *LeveledVectorStore) FlushDeltaSync() {
 		default:
 		}
 
-		deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
-		// Ждём пока: delta пуста И нет in-flight delta-flush builds.
-		if deltaEmpty && lvs.inFlightBuilds.Load() == 0 {
-			// Все векторы в сегментах. Сбрасываем flushPending: иначе applyResult
-			// продолжит eager-флашить дельту после следующих Add (фрагментация).
-			lvs.flushPending.Store(false)
-			// Триггерим merges (L0→L1→L2 cascade).
+		// target опубликован, когда он больше не активная дельта И снят с flushing.
+		targetDone := target == nil || (lvs.delta != target && !inFlushing(target))
+		pendingDone := true
+		for _, d := range pending {
+			if inFlushing(d) {
+				pendingDone = false
+				break
+			}
+		}
+		if targetDone && pendingDone {
+			// Всё pre-call — в сегментах. Толкнём каскад merge (L0→L1→L2).
 			lvs.triggerCompact()
 			return
 		}
 
-		// Пометить: мы ждём. applyResult() увидит флаг и сделает Broadcast.
-		lvs.flushPending.Store(true)
-		lvs.triggerCompact()
+		// Форсим swap target'а — но ТОЛЬКО пока он ещё активная дельта. После swap
+		// повторный триггер флашил бы уже НОВЫЕ дельты = прежний шторм.
+		if target != nil && lvs.delta == target {
+			lvs.triggerCompact()
+		}
 		lvs.flushCond.Wait()
 	}
 }

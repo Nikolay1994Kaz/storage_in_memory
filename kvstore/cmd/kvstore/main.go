@@ -103,6 +103,7 @@ func main() {
 	shipRestore := flag.Bool("ship-restore", false, "перед стартом восстановить каталог данных из -ship-url (каталог не должен содержать прежнего состояния)")
 	logLevel := flag.String("log-level", "info", "уровень логирования: debug | info | warn | error")
 	logFormat := flag.String("log-format", "text", "формат логов: text (человекочитаемый) | json (для агрегаторов)")
+	enablePprof := flag.Bool("pprof", false, "включить /debug/pprof/* на metrics-порту для диагностики утечек/профилирования (НЕ для прода)")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
 	flag.Parse()
 
@@ -223,7 +224,7 @@ func main() {
 	// 200 сразу (порт открыт), а /ready держит 503 до SetReady(true) ниже — трафик
 	// не пойдёт, пока снапшот+WAL не накатаны и listener не поднят.
 	if *metricsPort > 0 {
-		monitoring.StartHttpServer(*metricsPort)
+		monitoring.StartHttpServer(*metricsPort, *enablePprof)
 	}
 
 	// === 2.5. Инициализация sorted sets (ZSet) ===
