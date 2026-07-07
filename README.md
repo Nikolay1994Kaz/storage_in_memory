@@ -10,11 +10,12 @@ High-performance in-memory key-value store with built-in vector search, WASM com
 - **WAL-shipping** — continuous async replication of WAL+snapshots to S3/MinIO or a mounted dir (Litestream-style); restore on any machine with `-ship-restore` (see [docs/BACKUP.md](docs/BACKUP.md))
 - **TTL** — 256-shard heap with lazy + active expiration
 - **Pub/Sub** — back-pressure, sync.Pool, per-subscriber goroutines
-- **Vector Search (HNSW)** — arena-based graph, bitset visited, DotProduct optimization
-- **WASM Compute** — Reactor pattern (worker-local slots) + Command modules
+- **Vector Search (HNSW)** — arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization
 - **AI Integration** — Ollama embeddings, async ingestion, RAG queries
-- **AUTH + TLS** — optional password authentication and encrypted connections
-- **Cluster** — hash-slot sharding, gossip protocol, live migration (experimental)
+- **AUTH + TLS/mTLS** — constant-time password auth, encrypted connections, optional client-cert verification
+- **Observability** — Prometheus `/metrics`, `/health`, `/ready`; structured logging (slog, text/JSON); Grafana stack in `docker-compose.yml`
+- **WASM Compute** *(experimental, behind a build tag)* — Reactor pattern (worker-local slots) + Command modules
+- **Cluster** *(experimental, behind a build tag)* — hash-slot sharding, gossip protocol, live migration
 
 The RESP command surface is deliberately small and **frozen**: the KV/state layer
 is a payload layer for the vector engine, not a Redis replacement. The full
@@ -58,21 +59,27 @@ make build
 
 ## CLI Flags
 
+The most commonly used flags (run `./kvstore-server --help` for the full list,
+including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
+
 | Flag | Default | Description |
 |---|---|---|
 | `--port` | `6380` | Listen port |
-| `--maxmemory` | `0` | Memory limit in MB (0 = unlimited) |
-| `--requirepass` | `""` | AUTH password (empty = no auth) |
-| `--tls-cert` | `""` | Path to TLS certificate (PEM) |
-| `--tls-key` | `""` | Path to TLS private key (PEM) |
+| `--metrics-port` | `9090` | HTTP port for `/metrics`, `/health`, `/ready` |
+| `--maxmemory` | `0` | Memory limit in MB (0 = unlimited); writes are rejected above the limit |
+| `--max-connections` | `10000` | Cap on concurrent connections (0 = unlimited) |
+| `--idle-timeout` | `5m` | Close connections idle longer than this (pub/sub subscribers are exempt); 0 = off |
+| `--write-timeout` | `30s` | Max time to flush a response to a slow reader; 0 = off |
+| `--requirepass` / `--requirepass-file` | `""` | AUTH password inline or from a file (empty = no auth) |
+| `--tls-cert` / `--tls-key` | `""` | TLS certificate and private key (PEM) |
+| `--tls-client-ca` | `""` | CA for client-certificate verification (mTLS) |
 | `--ollama-url` | `http://localhost:11434` | Ollama API URL |
 | `--ship-url` | `""` | Continuous WAL-shipping target: `file:///path` or `s3://bucket/prefix?endpoint=...` (creds via env, see [docs/BACKUP.md](docs/BACKUP.md)) |
 | `--ship-interval` | `1s` | Shipping period (≈ crash RPO) |
 | `--ship-retain` | `3` | Restore points kept on the remote |
 | `--ship-restore` | `false` | Restore data dir from `--ship-url` before start |
-| `--cluster` | `false` | Enable cluster mode |
-| `--slot-start` | `0` | Cluster slot range start |
-| `--slot-end` | `16383` | Cluster slot range end |
+| `--log-level` / `--log-format` | `info` / `text` | Structured logging level and format (`text`/`json`) |
+| `--pprof` | `false` | Expose `/debug/pprof/*` on the metrics port — **never in production** |
 
 ## Supported Commands
 
@@ -115,7 +122,25 @@ Pub/Sub, sorted sets (`ZADD`/…), vector search (`VSIM.*`), AI/RAG (`AI.*`).
 └──────────────┴─────────┴────────┴───────────┘
 ```
 
+## Status & Scope
+
+- **Single-node by design.** Durability and disaster recovery come from WAL +
+  snapshots + continuous WAL-shipping (restore on any machine), not from
+  replicas. Cluster mode exists behind a build tag and is not production-ready.
+- **ANN search is approximate.** HNSW recall is high (≈0.98 on real embedding
+  datasets at default settings) but not 1.0; under heavy churn a small fraction
+  of stored vectors may temporarily miss from top-K results. `VSIM.EXISTS`
+  gives an exact existence check.
+- **Experimental gates.** WASM compute and cluster mode are compiled out of the
+  default build (`experimental` build tag) — their surfaces are not hardened to
+  the same bar as the core.
+- **Validated by soak testing**: multi-hour runs at ~6k RPS mixed load with
+  graceful/crash restarts, ship-restore and corrupted-snapshot drills.
+
 ## WASM Modules
+
+> WASM compute is **experimental** and excluded from the default build — compile
+> the server with the `experimental` build tag to enable it.
 
 Pre-compiled example modules are in `kvstore/examples/fraud_scorer/`.
 
@@ -133,9 +158,10 @@ tinygo build -o fraud_scorer_reactor.wasm -target=wasi -buildmode=c-shared \
 ## Testing
 
 ```bash
-make test         # Run all tests
-make bench        # Run benchmarks
-make vet          # Static analysis
+go test -short ./...   # Fast run — heavy benchmarks/soak tests are gated off (~30s)
+make test              # Run all tests
+make bench             # Run benchmarks
+make vet               # Static analysis
 ```
 
 ## Project Structure
@@ -145,17 +171,23 @@ kvstore/
 ├── cmd/kvstore/          # Entry point (main.go)
 ├── internal/
 │   ├── server/           # Epoll server, ConnBuf, Handler
-│   ├── store/            # TTL manager
+│   ├── store/            # KV store, TTL manager
 │   │   └── tcmalloc/     # TCMalloc-style allocator (MCache, MCentral, MHeap)
 │   ├── wal/              # Write-Ahead Log, snapshots, batch writer
-│   ├── pubsub/           # Pub/Sub hub
+│   ├── ship/             # Continuous WAL-shipping (file://, s3://) + restore
+│   ├── pubsub/           # Pub/Sub hub (classic + semantic)
+│   ├── btree/            # Sorted-set backing structure
 │   ├── compute/          # WASM engine (wazero), triggers, worker slots
 │   ├── ai/               # Ollama client, async worker
-│   ├── cluster/          # Hash slots, gossip, replication
+│   ├── cluster/          # Hash slots, gossip, replication (experimental)
+│   ├── logging/          # slog setup (levels, text/JSON)
+│   ├── monitoring/       # Prometheus-style metrics
 │   └── protocol/         # RESP parser and writer
-├── vector/               # HNSW graph, distance functions, arena allocator
-├── examples/             # WASM module examples
-└── docs/                 # Benchmarks, optimization logs
+├── vector/               # HNSW graph, SQ8, tenant/attr filtering, arena allocator
+└── examples/             # WASM module examples
+docs/                     # Command manifest, backup guide, benchmarks
+monitoring/               # Grafana/VictoriaMetrics provisioning for the local stack
+scripts/                  # Soak-test harness
 ```
 
 ## License

@@ -78,6 +78,8 @@ services:
       - ./monitoring/grafana/provisioning/dashboards/kvstore_dashboard.json:/etc/grafana/provisioning/dashboards/kvstore_dashboard.json
       - grafana-data:/var/lib/grafana
     environment:
+      # Локальный дев-стенд: дефолтный пароль + анонимный админ.
+      # НЕ выставлять порт 3000 за пределы localhost с этими настройками.
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
