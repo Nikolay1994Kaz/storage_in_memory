@@ -44,14 +44,15 @@ func tnKey(t, i int) string { return fmt.Sprintf("oracle:tn:t%d:%d", t, i) }
 
 func main() {
 	addr := flag.String("addr", "localhost:6380", "адрес сервера")
-	mode := flag.String("mode", "", "seed | verify")
+	mode := flag.String("mode", "", "seed | verify | diag")
 	n := flag.Int("n", 200, "число контрольных ключей")
 	rngSeed := flag.Int64("rngseed", 42, "seed для детерминированных векторов")
+	diagKeys := flag.String("keys", "", "diag: ключи oracle:vec:* через запятую (из WARN verify)")
 	kvOnly := flag.Bool("kv-only", false, "verify: только KV-инварианты. Для CRC-дрилла: graph_leveled.bin намеренно бит, векторы после rebuild-from-WAL легитимно неполны (старые вектор-операции вырезаны компакцией), а KV обязан пережить через snapshot.wal+WAL")
 	flag.Parse()
 
-	if *mode != "seed" && *mode != "verify" {
-		fmt.Fprintln(os.Stderr, "usage: soak_oracle -mode seed|verify [-addr] [-n] [-rngseed]")
+	if *mode != "seed" && *mode != "verify" && *mode != "diag" {
+		fmt.Fprintln(os.Stderr, "usage: soak_oracle -mode seed|verify|diag [-addr] [-n] [-rngseed] [-keys]")
 		os.Exit(2)
 	}
 
@@ -75,7 +76,76 @@ func main() {
 			fmt.Fprintf(os.Stderr, "verify: %v\n", err)
 			os.Exit(1)
 		}
+	case "diag":
+		if err := diag(w, r, *diagKeys, *rngSeed); err != nil {
+			fmt.Fprintf(os.Stderr, "diag: %v\n", err)
+			os.Exit(2)
+		}
 	}
+}
+
+// diag разносит searchmiss-ключи по классам: «recall-хвост» (находится при
+// K↑) vs «недостижимость» (не находится ни при каком K — обход графа до
+// вершины не доходит; фильтрованный поиск по префиксу сужает выдачу до
+// oracle-ключей и проверяет то же на filtered-пути).
+func diag(w *protocol.Writer, r *protocol.Reader, keysCSV string, rngSeed int64) error {
+	if keysCSV == "" {
+		return fmt.Errorf("нужен -keys oracle:vec:1,oracle:vec:2,... (из WARN verify)")
+	}
+	for _, key := range strings.Split(keysCSV, ",") {
+		key = strings.TrimSpace(key)
+		i, err := strconv.Atoi(strings.TrimPrefix(key, vecNS))
+		if err != nil {
+			return fmt.Errorf("ключ %q: не oracle:vec:<i>", key)
+		}
+		ex, err := cmd(w, r, "VSIM.EXISTS", key)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s exists=%d", key, ex.Num)
+		// Лестница K: если находится при большем K — recall-хвост, не бага.
+		for _, K := range []int{10, 100, 500, 5000} {
+			args := append([]string{"VSIM.SEARCH", strconv.Itoa(K)}, vecFor(rngSeed, i)...)
+			v, err := cmd(w, r, args...)
+			if err != nil {
+				return err
+			}
+			rank := -1
+			var dist string
+			for j := 0; j < len(v.Array); j += 2 {
+				if v.Array[j].Str == key {
+					rank = j / 2
+					dist = v.Array[j+1].Str
+					break
+				}
+			}
+			if rank >= 0 {
+				fmt.Printf(" | K=%d rank=%d dist=%s", K, rank, dist)
+			} else {
+				fmt.Printf(" | K=%d MISS(got %d)", K, len(v.Array)/2)
+			}
+		}
+		// Фильтрованный путь: выдача сужена до oracle:vec:* — если и тут MISS
+		// при малом K, вершина недостижима и на filtered-обходе.
+		args := append([]string{"VSIM.SEARCHFILTER", "10", "PREFIX", vecNS}, vecFor(rngSeed, i)...)
+		v, err := cmd(w, r, args...)
+		if err != nil {
+			return err
+		}
+		rank := -1
+		for j := 0; j < len(v.Array); j += 2 {
+			if v.Array[j].Str == key {
+				rank = j / 2
+				break
+			}
+		}
+		if rank >= 0 {
+			fmt.Printf(" | PREFIX rank=%d\n", rank)
+		} else {
+			fmt.Printf(" | PREFIX MISS\n")
+		}
+	}
+	return nil
 }
 
 // vecFor — детерминированный вектор для ключа i (одинаков в seed и verify).
@@ -166,6 +236,7 @@ func searchHasKey(w *protocol.Writer, r *protocol.Reader, key string, i int, rs 
 
 func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64, kvOnly bool) error {
 	var kvLost, kvResurrect, vecLost, vecResurrect, badVal, vecMiss int
+	var missKeys []string // конкретные ключи searchmiss — для диагностики достижимости
 	for i := 0; i < n; i++ {
 		kvKey := kvNS + strconv.Itoa(i)
 		vecKey := vecNS + strconv.Itoa(i)
@@ -215,6 +286,7 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64, kvOnly
 				vecLost++ // живой вектор реально потерян (durability)
 			case !hasVec:
 				vecMiss++ // вектор есть, но self-query top-10 его не нашёл (recall/связность графа)
+				missKeys = append(missKeys, vecKey)
 			}
 		}
 	}
@@ -255,7 +327,10 @@ func verify(w *protocol.Writer, r *protocol.Reader, n int, rngSeed int64, kvOnly
 	if vecMiss > 0 {
 		// Не durability-нарушение (вектор на месте), но self-query top-10 обязан
 		// находить точку с dist=0 — сигнал деградации recall/связности графа.
-		fmt.Printf("[oracle verify] WARN: %d векторов есть в сторе (VSIM.EXISTS=1), но не найдены self-query поиском\n", vecMiss)
+		// Ключи печатаем: промахи в soak детерминированны, без ключей диагностика
+		// достижимости невозможна (какой сегмент, находится ли при K↑).
+		fmt.Printf("[oracle verify] WARN: %d векторов есть в сторе (VSIM.EXISTS=1), но не найдены self-query поиском: %s\n",
+			vecMiss, strings.Join(missKeys, " "))
 	}
 	if bugs > 0 {
 		return fmt.Errorf("ORACLE FAIL: %d нарушений (durability/tombstone/tenant-изоляция)", bugs)

@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"io"
 	"math"
+	"math/rand"
 	"runtime"
 	"slices"
 	"strings"
@@ -3254,11 +3255,44 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 		g.insertBuf = make([]uint64, 0, g.M0+1)
 	}
 
-	keys := make(map[uint64]string, n)
-	for _, e := range entries {
-		idx := g.Insert(e.Vec)
-		keys[uint64(idx)] = e.Key
+	// Порядок ВСТАВКИ в граф перемешиваем (детерминированно по n): entries к этому
+	// моменту блочно отсортированы (тенант-сорт выше; у клиента — батчи похожих
+	// данных), а HNSW-построение деградирует на блочном порядке мультимодальных
+	// данных: блоки разных распределений не образуют кросс-рёбер, и у части вершин
+	// раннего блока beam-поиск позже не находит даже точное совпадение (soak
+	// searchmiss 7/400 детерминированно; форензика 07.2026: miss 8/1007 при
+	// блочном порядке vs 0/1007 при перемешанном на том же наборе). Раскладка
+	// данных ОСТАЁТСЯ отсортированной — каталог тенантов и колоночные атрибуты
+	// адресуют позицию в entries; граф переупорядочивается при freeze через pos.
+	// Для hnswSegment (без freeze) порядок не трогаем: там graph id — источник
+	// адресации, перестановка ломала бы каталог.
+	willFreeze := lvs.cfg.UseSQ || dim <= csrDimThreshold
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
 	}
+	var pos []uint32
+	if willFreeze && n > 1 {
+		rand.New(rand.NewSource(0x5eed<<32|int64(n))).Shuffle(n, func(a, b int) {
+			order[a], order[b] = order[b], order[a]
+		})
+		pos = make([]uint32, n)
+	}
+
+	keys := make(map[uint64]string, n)
+	for _, ei := range order {
+		idx := g.Insert(entries[ei].Vec)
+		if pos != nil {
+			pos[idx] = uint32(ei)
+		}
+		keys[uint64(idx)] = entries[ei].Key
+	}
+
+	// Repair-pass: детерминированная гарантия self-findability при рабочем
+	// efSearch. Шафл выше снимает систематическую порядкозависимость, repair
+	// добивает вероятностный хвост мультимодальной геометрии (см.
+	// Graph.RepairReachability). Фоновый билд — бюджет CPU есть.
+	g.RepairReachability(lvs.cfg.EfSearch)
 
 	// Выбор формата сегмента (frozen uint32 neighbor IDs — потолка n нет):
 	//   UseSQ=true → SQ8-frozen для ЛЮБОЙ размерности. На dim>256 это и есть решение
@@ -3266,14 +3300,14 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 	//   UseSQ=false → float32-frozen только при dim ≤ csrDimThreshold (там CSR даёт
 	//     +QPS за счёт cache-locality); иначе обычный hnswSegment.
 	if lvs.cfg.UseSQ {
-		fg := FreezeGraphSQ(g, lvs.cfg.Metric, keys)
+		fg := FreezeGraphSQOrdered(g, lvs.cfg.Metric, keys, pos)
 		if fg == nil {
 			return nil
 		}
 		return &frozenSQSegment{fg: fg, cat: cat, attrs: attrs}
 	}
 	if dim <= csrDimThreshold {
-		fg := FreezeGraph(g, lvs.cfg.Distance, keys)
+		fg := FreezeGraphOrdered(g, lvs.cfg.Distance, keys, pos)
 		if fg == nil {
 			return nil
 		}

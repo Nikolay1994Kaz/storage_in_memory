@@ -91,43 +91,68 @@ type FrozenGraph struct {
 // Принимает keys: map[internal_id] → user_key.
 // Выполняется фоновым воркером — не блокирует запросы.
 func FreezeGraph(g *Graph, distFn DistanceFunc, keys map[uint64]string) *FrozenGraph {
+	return FreezeGraphOrdered(g, distFn, keys, nil)
+}
+
+// FreezeGraphOrdered — FreezeGraph с переупорядочиванием нод: pos[i] задаёт
+// позицию graph-ноды i в frozen-раскладке (nil = identity, pos[i]=i).
+//
+// Нужен buildSegment: граф строится в ПЕРЕМЕШАННОМ порядке вставки (HNSW
+// деградирует на блочно-отсортированных entries — см. searchmiss-форензику в
+// buildSegmentWithAllocator), а frozen-раскладка обязана совпадать с порядком
+// entries: каталог тенантов и колоночные атрибуты адресуют frozen id как
+// позицию в отсортированных entries.
+func FreezeGraphOrdered(g *Graph, distFn DistanceFunc, keys map[uint64]string, pos []uint32) *FrozenGraph {
 	n := len(g.nodes)
 	if n == 0 {
 		return nil
 	}
 	dim := g.arena.dim
 
-	// 1. Flat vector slab
+	at := func(i int) int {
+		if pos == nil {
+			return i
+		}
+		return int(pos[i])
+	}
+
+	// 1. Flat vector slab (на frozen-позициях)
 	data := make([]float32, n*dim)
 	nodeKeys := make([]string, n)
 	for i := 0; i < n; i++ {
 		if !g.nodes[i].Alive {
 			continue
 		}
-		copy(data[i*dim:(i+1)*dim], g.arena.Get(g.nodes[i].VectorOffset))
-		nodeKeys[i] = keys[uint64(i)]
+		p := at(i)
+		copy(data[p*dim:(p+1)*dim], g.arena.Get(g.nodes[i].VectorOffset))
+		nodeKeys[p] = keys[uint64(i)]
 	}
 
-	// 2. Строим CSR для каждого слоя от 0 до maxLevel
+	// 2. Строим CSR для каждого слоя от 0 до maxLevel: степени и смежность
+	// считаются в graph-нумерации, раскладываются по frozen-позициям.
 	layers := make([]FlatLayer, g.maxLevel+1)
+	deg := make([]uint32, n)
 	for lyr := 0; lyr <= g.maxLevel; lyr++ {
-		offs := make([]uint32, n+1)
+		clear(deg)
 		for i := 0; i < n; i++ {
 			if !g.nodes[i].Alive || g.nodes[i].Level < lyr {
-				offs[i+1] = offs[i]
 				continue
 			}
-			ns := g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)
-			offs[i+1] = offs[i] + uint32(len(ns))
+			deg[at(i)] = uint32(len(g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)))
+		}
+		offs := make([]uint32, n+1)
+		for p := 0; p < n; p++ {
+			offs[p+1] = offs[p] + deg[p]
 		}
 		neigh := make([]uint32, offs[n])
 		for i := 0; i < n; i++ {
 			if !g.nodes[i].Alive || g.nodes[i].Level < lyr {
 				continue
 			}
+			p := at(i)
 			ns := g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)
 			for j, nb := range ns {
-				neigh[int(offs[i])+j] = uint32(nb)
+				neigh[int(offs[p])+j] = uint32(at(int(nb)))
 			}
 		}
 		layers[lyr] = FlatLayer{neigh: neigh, offs: offs}
@@ -137,7 +162,7 @@ func FreezeGraph(g *Graph, distFn DistanceFunc, keys map[uint64]string) *FrozenG
 		data:         data,
 		layers:       layers,
 		keys:         buildInternedKeys(nodeKeys),
-		entryPointID: uint32(g.entryPointID),
+		entryPointID: uint32(at(int(g.entryPointID))),
 		maxLevel:     g.maxLevel,
 		n:            n,
 		dim:          dim,

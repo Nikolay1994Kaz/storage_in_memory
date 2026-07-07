@@ -3,6 +3,7 @@ package vector
 import (
 	"math"
 	"math/rand"
+	"runtime"
 	"slices"
 	"sync"
 	"unsafe"
@@ -617,6 +618,13 @@ func (g *Graph) pruneNeighborsFromList(node *Node, level int, maxCount int, neig
 // «избыточные» рёбра в одном направлении и сохраняет дальние мосты → граф лучше
 // навигируется → выше recall при том же efSearch.
 //
+// Осознанно БЕЗ keepPrunedConnections (флаг добора из Алг.4): замер на
+// soak-форензике (searchmiss-диагностика 07.2026, двухоболочечные данные
+// gaussian+uniform) показал, что добор до M УХУДШАЕТ достижимость слабых
+// вершин (miss 8→23 на n=1127): списки забиваются почти-дублирующими
+// рёбрами, вытесняя мосты. Правильный рычаг для порядкозависимых патологий —
+// перемешивание порядка вставки в buildSegment (см. leveled_store.go).
+//
 // Работает in-place: переставляет выбранных в начало items и возвращает префикс.
 // Zero-alloc. Стоимость: до O(M·len(items)) доп. вычислений дистанции на build.
 func (g *Graph) selectNeighborsHeuristic(items []item, M int) []item {
@@ -788,6 +796,170 @@ func containsID(s []uint64, val uint64) bool {
 		}
 	}
 	return false
+}
+
+// RepairReachability верифицирует beam-достижимость каждой живой вершины и
+// чинит потерянные. Вызывается ПОСЛЕ полной сборки графа (buildSegment), до
+// freeze; граф в этот момент принадлежит одному воркеру.
+//
+// Зачем: HNSW не гарантирует, что построенный граф найдёт каждую вершину при
+// рабочем efSearch. На мультимодальных данных (несколько «оболочек» разных
+// распределений — например разные модели эмбеддингов у разных тенантов) beam
+// self-query засасывается в чужой плотный кластер, и вершина без обратного
+// ребра из этого кластера не находится даже при dist=0 (soak searchmiss,
+// форензика 07.2026). Перемешивание порядка вставки снимает систематику
+// (7/400 → 1/400), остаток — вероятностный хвост геометрии. Repair добивает
+// его детерминированно: verify — параллельный self-query каждой вершины при
+// ef; починка — brute-поиск истинных ближайших соседей потерянной вершины и
+// принудительное обратное ребро от них (замещая самое дальнее при переполнении
+// M0). Ближайший сосед по построению попадает в beam первым кандидатом →
+// вершина гарантированно достижима, если достижим сам сосед (недостижимые
+// соседи чинятся в том же цикле; до 3 раундов).
+//
+// Стоимость: verify = n self-query при ef (параллельно по ядрам, только
+// чтение) — сопоставимо с половиной стоимости сборки; починка — O(потерянных
+// × n × dim), потерянных единицы. Возвращает число вершин, потребовавших
+// починки.
+func (g *Graph) RepairReachability(ef int) int {
+	n := len(g.nodes)
+	if n == 0 {
+		return 0
+	}
+	if ef <= 0 {
+		ef = 100
+	}
+	if n <= ef {
+		return 0 // beam покрывает весь граф — недостижимость невозможна
+	}
+
+	const verifyK = 10 // как рабочий top-K; containment-чек терпим к дубликатам
+
+	selfFound := func(id uint64) bool {
+		res := g.Search(g.arena.Get(g.nodes[id].VectorOffset), verifyK, ef)
+		for _, r := range res {
+			if r.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Verify: параллельный self-query (Search只 читает — nodes/arena immutable
+	// на этом этапе, searchState из sync.Pool).
+	nw := runtime.NumCPU()
+	if nw > 8 {
+		nw = 8
+	}
+	chunk := (n + nw - 1) / nw
+	var mu sync.Mutex
+	var lost []uint64
+	var wg sync.WaitGroup
+	for w := 0; w < nw; w++ {
+		lo := w * chunk
+		hi := lo + chunk
+		if hi > n {
+			hi = n
+		}
+		if lo >= hi {
+			break
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			var local []uint64
+			for id := lo; id < hi; id++ {
+				if !g.nodes[id].Alive {
+					continue
+				}
+				if !selfFound(uint64(id)) {
+					local = append(local, uint64(id))
+				}
+			}
+			if len(local) > 0 {
+				mu.Lock()
+				lost = append(lost, local...)
+				mu.Unlock()
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
+	if len(lost) == 0 {
+		return 0
+	}
+	repaired := len(lost)
+
+	const backLinks = 3 // от скольких истинных NN провести обратное ребро
+	for round := 0; round < 3 && len(lost) > 0; round++ {
+		for _, id := range lost {
+			vec := g.arena.Get(g.nodes[id].VectorOffset)
+			// Brute top-backLinks по живым вершинам.
+			type cand struct {
+				id uint64
+				d  float32
+			}
+			var best [backLinks]cand
+			cnt := 0
+			for j := 0; j < n; j++ {
+				if uint64(j) == id || !g.nodes[j].Alive {
+					continue
+				}
+				d := g.Distance(vec, g.arena.Get(g.nodes[j].VectorOffset))
+				if cnt < backLinks {
+					best[cnt] = cand{uint64(j), d}
+					cnt++
+					continue
+				}
+				worst := 0
+				for b := 1; b < backLinks; b++ {
+					if best[b].d > best[worst].d {
+						worst = b
+					}
+				}
+				if d < best[worst].d {
+					best[worst] = cand{uint64(j), d}
+				}
+			}
+			for b := 0; b < cnt; b++ {
+				g.forceEdgeL0(best[b].id, id)
+			}
+		}
+		var still []uint64
+		for _, id := range lost {
+			if !selfFound(id) {
+				still = append(still, id)
+			}
+		}
+		lost = still
+	}
+	return repaired
+}
+
+// forceEdgeL0 гарантирует ребро from→to на слое 0: добавляет при свободном
+// месте, иначе замещает самое дальнее (repair-инструмент, вне hot-path).
+func (g *Graph) forceEdgeL0(from, to uint64) {
+	node := &g.nodes[from]
+	ns := g.getNeighbors(node.NeighborsHandle, 0)
+	for _, nb := range ns {
+		if nb == to {
+			return
+		}
+	}
+	buf := make([]uint64, len(ns), len(ns)+1)
+	copy(buf, ns)
+	if len(buf) < g.M0 {
+		buf = append(buf, to)
+	} else {
+		fromVec := g.arena.Get(node.VectorOffset)
+		worst, worstD := 0, float32(-1)
+		for i, nb := range buf {
+			d := g.Distance(fromVec, g.arena.Get(g.nodes[nb].VectorOffset))
+			if d > worstD {
+				worstD, worst = d, i
+			}
+		}
+		buf[worst] = to
+	}
+	g.setNeighbors(node.NeighborsHandle, 0, buf)
 }
 
 // SearchResult — один результат поиска.

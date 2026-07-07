@@ -53,14 +53,28 @@ type FrozenGraphSQ struct {
 // Два прохода: (1) вычислить per-dim min/max, (2) квантовать.
 // metric задаёт ADC-режим обхода и каноническую distFn для rerank.
 func FreezeGraphSQ(g *Graph, metric Metric, keys map[uint64]string) *FrozenGraphSQ {
+	return FreezeGraphSQOrdered(g, metric, keys, nil)
+}
+
+// FreezeGraphSQOrdered — FreezeGraphSQ с переупорядочиванием нод: pos[i] задаёт
+// позицию graph-ноды i в frozen-раскладке (nil = identity). См. FreezeGraphOrdered.
+func FreezeGraphSQOrdered(g *Graph, metric Metric, keys map[uint64]string, pos []uint32) *FrozenGraphSQ {
 	n := len(g.nodes)
 	if n == 0 {
 		return nil
 	}
 	dim := g.arena.dim
 
-	// ── Pass 1: вычислить per-dim min/max, копируя векторы во временный float32 slab.
-	// Делаем это одним проходом — float32 уже горячие при копировании из arena.
+	at := func(i int) int {
+		if pos == nil {
+			return i
+		}
+		return int(pos[i])
+	}
+
+	// ── Pass 1: вычислить per-dim min/max, копируя векторы во временный float32 slab
+	// (на frozen-позициях). Делаем это одним проходом — float32 уже горячие при
+	// копировании из arena.
 	data := make([]float32, n*dim)
 	nodeKeys := make([]string, n)
 	minDim := make([]float32, dim)
@@ -74,12 +88,13 @@ func FreezeGraphSQ(g *Graph, metric Metric, keys map[uint64]string) *FrozenGraph
 		if !g.nodes[i].Alive {
 			continue
 		}
+		p := at(i)
 		vec := g.arena.Get(g.nodes[i].VectorOffset)
-		copy(data[i*dim:(i+1)*dim], vec)
-		nodeKeys[i] = keys[uint64(i)]
+		copy(data[p*dim:(p+1)*dim], vec)
+		nodeKeys[p] = keys[uint64(i)]
 		// Обновляем min/max per-dim
 		for d := 0; d < dim; d++ {
-			v := data[i*dim+d]
+			v := data[p*dim+d]
 			if v < minDim[d] {
 				minDim[d] = v
 			}
@@ -102,13 +117,13 @@ func FreezeGraphSQ(g *Graph, metric Metric, keys map[uint64]string) *FrozenGraph
 		}
 	}
 
-	// ── Pass 2: квантовать data → codes.
+	// ── Pass 2: квантовать data → codes (по frozen-позициям).
 	codes := make([]uint8, n*dim)
 	for i := 0; i < n; i++ {
 		if !g.nodes[i].Alive {
 			continue // оставляем нули в codes для мёртвых нод
 		}
-		base := i * dim
+		base := at(i) * dim
 		for d := 0; d < dim; d++ {
 			if sqScale[d] == 0 {
 				codes[base+d] = 0
@@ -127,26 +142,31 @@ func FreezeGraphSQ(g *Graph, metric Metric, keys map[uint64]string) *FrozenGraph
 		}
 	}
 
-	// ── CSR слои (идентично FreezeGraph).
+	// ── CSR слои (идентично FreezeGraphOrdered: смежность в graph-нумерации,
+	// раскладка по frozen-позициям).
 	layers := make([]FlatLayer, g.maxLevel+1)
+	deg := make([]uint32, n)
 	for lyr := 0; lyr <= g.maxLevel; lyr++ {
-		offs := make([]uint32, n+1)
+		clear(deg)
 		for i := 0; i < n; i++ {
 			if !g.nodes[i].Alive || g.nodes[i].Level < lyr {
-				offs[i+1] = offs[i]
 				continue
 			}
-			ns := g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)
-			offs[i+1] = offs[i] + uint32(len(ns))
+			deg[at(i)] = uint32(len(g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)))
+		}
+		offs := make([]uint32, n+1)
+		for p := 0; p < n; p++ {
+			offs[p+1] = offs[p] + deg[p]
 		}
 		neigh := make([]uint32, offs[n])
 		for i := 0; i < n; i++ {
 			if !g.nodes[i].Alive || g.nodes[i].Level < lyr {
 				continue
 			}
+			p := at(i)
 			ns := g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)
 			for j, nb := range ns {
-				neigh[int(offs[i])+j] = uint32(nb)
+				neigh[int(offs[p])+j] = uint32(at(int(nb)))
 			}
 		}
 		layers[lyr] = FlatLayer{neigh: neigh, offs: offs}
@@ -158,7 +178,7 @@ func FreezeGraphSQ(g *Graph, metric Metric, keys map[uint64]string) *FrozenGraph
 		sqScale:      sqScale,
 		layers:       layers,
 		keys:         buildInternedKeys(nodeKeys),
-		entryPointID: uint32(g.entryPointID),
+		entryPointID: uint32(at(int(g.entryPointID))),
 		maxLevel:     g.maxLevel,
 		n:            n,
 		dim:          dim,
