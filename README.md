@@ -90,6 +90,7 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 | `--bind` | `127.0.0.1` | Listen interface for both the data port and the metrics port. Localhost-only by default — to accept remote connections set `--bind 0.0.0.0` **and configure AUTH (+TLS)** |
 | `--port` | `6380` | Listen port |
 | `--metrics-port` | `9090` | HTTP port for `/metrics`, `/health`, `/ready` |
+| `--data-dir` | `data` | Directory for WAL and snapshots (a relative path is resolved against the working directory) |
 | `--maxmemory` | `0` | Memory limit in MB (0 = unlimited); writes are rejected above the limit |
 | `--max-connections` | `10000` | Cap on concurrent connections (0 = unlimited) |
 | `--idle-timeout` | `5m` | Close connections idle longer than this (pub/sub subscribers are exempt); 0 = off |

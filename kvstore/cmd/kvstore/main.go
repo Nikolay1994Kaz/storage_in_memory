@@ -39,10 +39,12 @@ import (
 	"kvstore/kvstore/vector"
 )
 
-const (
-	dataDir      = "data"
-	syncInterval = 100 * time.Millisecond
-)
+const syncInterval = 100 * time.Millisecond
+
+// dataDir — каталог для WAL/снапшотов. Дефолт "data" (относительно рабочего
+// каталога), переопределяется флагом -data-dir. var, а не const: присваивается
+// один раз в main() сразу после flag.Parse(), до любого использования.
+var dataDir = "data"
 
 // version — версия сборки. Дефолт "dev" для локальных прогонов; в релизных
 // сборках проставляется через -ldflags "-X main.version=$(git describe ...)"
@@ -105,8 +107,11 @@ func main() {
 	logLevel := flag.String("log-level", "info", "уровень логирования: debug | info | warn | error")
 	logFormat := flag.String("log-format", "text", "формат логов: text (человекочитаемый) | json (для агрегаторов)")
 	enablePprof := flag.Bool("pprof", false, "включить /debug/pprof/* на metrics-порту для диагностики утечек/профилирования (НЕ для прода)")
+	dataDirFlag := flag.String("data-dir", "data", "каталог для WAL и снапшотов (относительный путь считается от рабочего каталога)")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
 	flag.Parse()
+
+	dataDir = *dataDirFlag
 
 	if *showVersion {
 		fmt.Println(version)
