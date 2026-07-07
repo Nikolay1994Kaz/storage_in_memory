@@ -46,6 +46,21 @@ redis-cli -p 6380
 > AI.ASK "What is Go?"
 ```
 
+Then take the guided tour — real embeddings, tenant/attribute filtering, one
+short Go file: [`kvstore/examples/quickstart`](kvstore/examples/quickstart/).
+
+### Prebuilt binaries
+
+Static Linux binaries (amd64/arm64, no dependencies) are published on the
+[Releases page](https://github.com/Nikolay1994Kaz/storage_in_memory/releases):
+
+```bash
+tar xzf kvstore-server_*_linux_amd64.tar.gz
+./kvstore-server --port 6380
+```
+
+Linux only — the network layer is built on epoll.
+
 ### Build from source
 
 ```bash
@@ -128,6 +143,21 @@ Pub/Sub, sorted sets (`ZADD`/…), vector search (`VSIM.*`), AI/RAG (`AI.*`).
 │  Search      │  Engine │ Worker │  (gossip) │
 └──────────────┴─────────┴────────┴───────────┘
 ```
+
+## Benchmarks
+
+Measured on standard ANN datasets and real OpenAI embeddings, including
+same-machine head-to-head runs against hnswlib — full tables, methodology and
+honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
+
+- **High-dim (GIST-960, target path):** SQ8 beats hnswlib float32 **2.5–2.7×**
+  in multithreaded QPS at equal recall, with 4× less vector memory.
+- **Real embeddings (dbpedia ada-002, 1536-dim):** recall@10 0.977 (SQ8) /
+  0.984 (fp32); SQ8 gives ~2.3× QPS and 3.7× less memory.
+- **Multi-tenant filtered search:** tenant-routed queries are **5.8×–28 620×**
+  faster than post-filtering a full graph traversal, at recall 1.0.
+- **Low-dim float32 (SIFT-1M):** hnswlib is ~3× faster — the honest cost of an
+  LSM design that supports concurrent writes, deletes and crash recovery.
 
 ## Status & Scope
 
