@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -540,22 +541,26 @@ func main() {
 	defer wasm.Close()
 
 	// === 8. AI Engine (Ollama) ===
-	var aiClient *ai.Client
-	var aiWorker *ai.Worker
+	// Ollama — ОПЦИОНАЛЬНЫЙ слой: ядро (VSIM.*/KV/pubsub) работает без неё,
+	// embeddings можно приносить свои (BYO). Подключение НЕ одноразовое:
+	// в `docker compose --profile ai` сервер стартует раньше, чем ollama-init
+	// скачает модели, поэтому при недоступности на старте пингуем в фоне и
+	// включаем AI.* в тот момент, когда Ollama поднялась, — без рестарта.
+	// Публикация через atomic.Pointer: handler читает клиента/воркера из
+	// нескольких epoll-горутин, а включает их фоновая горутина-пингер.
+	ollamaClient := ai.NewClient(*ollamaURL, "nomic-embed-text", "gemma4:e2b")
+	var aiClientRef atomic.Pointer[ai.Client]
+	var aiWorkerRef atomic.Pointer[ai.Worker]
 
-	aiClient = ai.NewClient(*ollamaURL, "nomic-embed-text", "gemma4:e2b")
-	if err := aiClient.Ping(context.Background()); err != nil {
-		slog.Warn("Ollama not available, AI commands disabled", "err", err)
-		aiClient = nil
-	} else {
-		slog.Info("Ollama connected", "embed", "nomic-embed-text", "chat", "gemma4:e2b")
+	// WASM-мостик навешиваем сразу: Embed/Chat — обычные HTTP-вызовы, до
+	// поднятия Ollama они просто вернут ошибку (в прод-сборке SetAI — no-op).
+	wasm.SetAI(ollamaClient.Embed, ollamaClient.Chat)
 
-		// Подключаем AI к WASM Engine — WASM-модули получают доступ к Ollama.
-		// В прод-сборке (без experimental) SetAI — no-op.
-		wasm.SetAI(aiClient.Embed, aiClient.Chat)
-
+	// enableAI вызывается РОВНО один раз: либо здесь (Ollama уже доступна),
+	// либо из горутины-пингера ниже.
+	enableAI := func() {
 		// Background Worker: асинхронный embedding с PubSub-нотификациями
-		aiWorker = ai.NewWorker(aiClient, 256)
+		aiWorker := ai.NewWorker(ollamaClient, 256)
 		aiWorker.VecStoreAdd = func(key string, vec []float32) error {
 			// WAL: без этого AI-проиндексированные векторы терялись при рестарте.
 			// Записываем сериализованный вектор — при восстановлении OpVSimAdd
@@ -571,8 +576,42 @@ func main() {
 			hub.Publish(channel, message)
 		}
 		aiWorker.Start(2) // 2 горутины (Ollama сама батчит)
-		// aiWorker.Stop() вызывается явно в упорядоченном shutdown до bw.Close()
+		// Stop() вызывается явно в упорядоченном shutdown до bw.Close()
 		// (AI-воркер пишет OpVSimAdd в WAL-канал).
+		aiWorkerRef.Store(aiWorker)
+		aiClientRef.Store(ollamaClient) // публикуем клиента ПОСЛЕ воркера: гейт единый
+		slog.Info("Ollama connected, AI commands enabled", "embed", "nomic-embed-text", "chat", "gemma4:e2b")
+	}
+
+	aiPingerStop := make(chan struct{})
+	aiPingerDone := make(chan struct{})
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	pingErr := ollamaClient.Ping(pingCtx)
+	pingCancel()
+	if pingErr == nil {
+		enableAI()
+		close(aiPingerDone)
+	} else {
+		slog.Warn("Ollama not available, AI commands disabled; will keep retrying in background", "err", pingErr)
+		go func() {
+			defer close(aiPingerDone)
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-aiPingerStop:
+					return
+				case <-ticker.C:
+					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					err := ollamaClient.Ping(ctx)
+					cancel()
+					if err == nil {
+						enableAI()
+						return
+					}
+				}
+			}
+		}()
 	}
 
 	// ═══════════════════════════════════════════════════
@@ -675,7 +714,7 @@ func main() {
 			// per-worker zero-alloc модель. Контракт сознательно сужен, а не расширен.
 			execQueuedTx(cs.TxQueue, cs.Buf.WriteArrayHeader, func(qCmd string, qCmdArgs [][]byte) {
 				startCmd := time.Now()
-				executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClientRef.Load(), aiWorkerRef.Load(), iterateAll, saveVectors, cs, qCmd, qCmdArgs)
 				monitoring.RecordCommand(qCmd, time.Since(startCmd))
 			})
 			cs.InTx = false
@@ -690,7 +729,7 @@ func main() {
 		}
 
 		start := time.Now()
-		executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClient, aiWorker, iterateAll, saveVectors, cs, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClientRef.Load(), aiWorkerRef.Load(), iterateAll, saveVectors, cs, cmd, cmdArgs)
 		monitoring.RecordCommand(cmd, time.Since(start))
 	}
 
@@ -756,13 +795,18 @@ func main() {
 	//                      in-flight обработчиков (их bw.Write уже в канале).
 	//   2. ttl.Stop()   — глушим TTL-эвиктор (пишет OpVSimDel в WAL-канал).
 	//   3. aiWorker     — глушим AI-воркер (пишет OpVSimAdd в WAL-канал).
+	//      Перед этим останавливаем пингер и ДОЖИДАЕМСЯ его выхода: иначе он
+	//      может включить воркер параллельно с shutdown (воркер без Stop →
+	//      запись в закрытый WAL-канал).
 	//   4. syncer.Stop()— останавливаем периодический fsync/compaction.
 	//   5. bw.Close()   — дренаж WAL-канала + flush + fsync последнего батча.
 	// Только после (1)-(4) закрываем канал в (5): все писатели уже заглушены.
 	srv.Stop()
 	ttl.Stop()
-	if aiWorker != nil {
-		aiWorker.Stop()
+	close(aiPingerStop)
+	<-aiPingerDone
+	if w := aiWorkerRef.Load(); w != nil {
+		w.Stop()
 	}
 	syncer.Stop()
 	if err := bw.Close(); err != nil {
@@ -1972,7 +2016,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	// === AI Commands ===
 	case "AI.EMBED":
 		if aiClient == nil {
-			buf.WriteError("ERR Ollama not available")
+			buf.WriteError("ERR Ollama not available — AI.* is an optional layer; start Ollama (docker compose --profile ai up, or --ollama-url), the server picks it up automatically")
 			return
 		}
 		if len(args) < 1 {
@@ -1993,7 +2037,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 
 	case "AI.SEARCH":
 		if aiClient == nil {
-			buf.WriteError("ERR Ollama not available")
+			buf.WriteError("ERR Ollama not available — AI.* is an optional layer; start Ollama (docker compose --profile ai up, or --ollama-url), the server picks it up automatically")
 			return
 		}
 		if len(args) < 2 {
@@ -2028,7 +2072,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 
 	case "AI.ASK":
 		if aiClient == nil {
-			buf.WriteError("ERR Ollama not available")
+			buf.WriteError("ERR Ollama not available — AI.* is an optional layer; start Ollama (docker compose --profile ai up, or --ollama-url), the server picks it up automatically")
 			return
 		}
 		if len(args) < 1 {
@@ -2036,7 +2080,11 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		question := string(args[0])
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// 90с, а не 30с: первый AI.ASK после старта грузит chat-модель (~7GB)
+		// в память Ollama — холодный вызов не укладывался в 30с и отваливался.
+		// Прогретый ~13с. Цена: команда держит epoll-worker до 90с — приемлемо
+		// для демо-слоя AI.*, ядро (VSIM.*/KV) этим путём не ходит.
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
 		// RAG Step 1: вопрос → embedding
@@ -2081,7 +2129,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 
 	case "AI.INGEST":
 		if aiWorker == nil {
-			buf.WriteError("ERR Ollama not available")
+			buf.WriteError("ERR Ollama not available — AI.* is an optional layer; start Ollama (docker compose --profile ai up, or --ollama-url), the server picks it up automatically")
 			return
 		}
 		if len(args) < 2 {

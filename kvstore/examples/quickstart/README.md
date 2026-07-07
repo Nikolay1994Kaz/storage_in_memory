@@ -16,11 +16,13 @@ query returns different results once scoped.
 ## Run
 
 ```bash
-# 1. Build + start the server and Ollama (the embedding model is pulled
-#    automatically). --build rebuilds from the current sources so you never run
-#    a cached image that predates a command like VSIM.ADDATTR; naming the
-#    `kvstore` service skips the optional metrics stack (Grafana/VictoriaMetrics).
-docker compose up -d --build kvstore
+# 1. Build + start the server and Ollama (the `ai` profile; the embedding model
+#    is pulled automatically). This tour only needs embeddings, so
+#    OLLAMA_SKIP_CHAT_MODEL=1 skips the ~7GB chat model used by AI.ASK.
+#    --build rebuilds from the current sources so you never run a cached image
+#    that predates a command like VSIM.ADDATTR. The server picks Ollama up in
+#    the background — no ordering or restart concerns.
+OLLAMA_SKIP_CHAT_MODEL=1 docker compose --profile ai up -d --build
 
 # 2. Run the example
 go run ./kvstore/examples/quickstart

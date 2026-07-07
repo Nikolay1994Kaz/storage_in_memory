@@ -161,7 +161,13 @@ zset B+Tree with HNSW; `DEL`/TTL expiry atomically covers both stores; `AI.ASK`
 joins vector search with KV documents. These joins are only cheap and consistent
 because there is one process, one WAL, one memory space.
 
-## Demand-driven tier — `AI.*` (requires `-ollama`)
+## Demand-driven tier — `AI.*` (optional, requires a reachable Ollama)
+
+`AI.*` is an optional RAG demo layer, **off by default** — the engine itself is
+BYO-embeddings (`VSIM.ADD*`). Enable it by pointing `--ollama-url` at a running
+Ollama (in Docker: `docker compose --profile ai up`). The server pings Ollama in
+the background and enables `AI.*` the moment it comes up — startup order doesn't
+matter and no restart is needed.
 
 | Command | Syntax | Reply |
 |---|---|---|
@@ -170,7 +176,10 @@ because there is one process, one WAL, one memory space.
 | `AI.ASK` | `AI.ASK question` | bulk — RAG: embed → vector top-3 → KV docs → LLM |
 | `AI.INGEST` | `AI.INGEST key text` | `+QUEUED` — async embed+store; OOM- and WAL-gated |
 
-Without Ollama configured all `AI.*` reply `ERR Ollama not available`.
+Until Ollama is reachable all `AI.*` reply `ERR Ollama not available …` (with a
+hint how to enable). `AI.ASK` additionally needs the chat model pulled
+(`gemma4:e2b`, ~7GB); the first call after startup loads it into memory and may
+take tens of seconds (command deadline 90s, warm calls ~13s).
 
 ## Experimental tier (build-tag gated)
 

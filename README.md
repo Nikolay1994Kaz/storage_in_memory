@@ -1,14 +1,16 @@
 # KVStore
 
 Single-node in-memory **vector search engine** (HNSW) speaking the RESP protocol,
-with a small frozen KV/TTL/Pub-Sub payload layer around it, WAL-based durability
-with continuous shipping to S3, and built-in RAG via Ollama. Not a Redis
-replacement — the KV surface exists to serve the vector core.
+with a small frozen KV/TTL/Pub-Sub payload layer around it and WAL-based durability
+with continuous shipping to S3. Bring your own embeddings — vectors go in via
+`VSIM.ADD` from any provider; an optional RAG demo layer (`AI.*` via Ollama) is
+available behind a Docker profile. Not a Redis replacement — the KV surface
+exists to serve the vector core.
 
 ## Features
 
 - **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization
-- **AI / RAG** — Ollama embeddings, async ingestion, semantic queries (`AI.INGEST` / `AI.ASK`)
+- **AI / RAG** *(optional, off by default)* — Ollama embeddings, async ingestion, semantic queries (`AI.INGEST` / `AI.ASK`); the engine itself is BYO-embeddings
 - **WAL + Snapshots** — CRC32-protected, batch writes, crash recovery
 - **WAL-shipping** — continuous async replication of WAL+snapshots to S3/MinIO or a mounted dir (Litestream-style); restore on any machine with `-ship-restore` (see [docs/BACKUP.md](docs/BACKUP.md))
 - **TCMalloc-style allocator** — per-worker MCache, lock-free GET, zero GC pressure
@@ -27,9 +29,32 @@ command manifest, gate semantics, and the unfreeze policy live in
 
 ## Quick Start
 
-### Docker Compose (recommended)
+### One binary
 
-Full stack — kvstore + Ollama + automatic model download:
+Static Linux binaries (amd64/arm64, zero dependencies, ~13MB) are published on
+the [Releases page](https://github.com/Nikolay1994Kaz/storage_in_memory/releases):
+
+```bash
+tar xzf kvstore-server_*_linux_amd64.tar.gz
+./kvstore-server --port 6380
+```
+
+Linux only — the network layer is built on epoll.
+
+The engine is **BYO-embeddings**: it takes pre-computed vectors over RESP from
+any embedding provider (OpenAI, Ollama, sentence-transformers, …):
+
+```bash
+redis-cli -p 6380
+> VSIM.ADD doc:1 0.12 0.90 0.31
+> VSIM.ADD doc:2 0.85 0.05 0.48
+> VSIM.SEARCH 2 0.10 0.88 0.30
+> SET hello world
+```
+
+### Docker Compose — server + metrics
+
+kvstore plus the Grafana/VictoriaMetrics observability stack:
 
 ```bash
 git clone https://github.com/Nikolay1994Kaz/storage_in_memory.git
@@ -39,29 +64,35 @@ docker compose up -d --build     # or: make up
 
 `--build` rebuilds the image from the current sources, so a `git pull` never
 leaves you on a cached binary that lacks newer commands. That's it — KVStore is
-on `localhost:6380`, Ollama on `localhost:11434`.
+on `localhost:6380`, Grafana on `localhost:3000`.
+
+### Optional: RAG demo (Ollama)
+
+The `AI.*` commands (`AI.EMBED` / `AI.INGEST` / `AI.SEARCH` / `AI.ASK`) are a
+self-contained RAG demo on top of the engine — they are the only part that
+talks to Ollama, and they are **off by default**. Enable with the `ai` profile:
+
+```bash
+docker compose --profile ai up -d --build     # or: make up-ai
+```
+
+The first run downloads models: `nomic-embed-text` (~0.3GB, embeddings) and
+`gemma4:e2b` (~7GB, the chat model behind `AI.ASK`). Embeddings only:
+`OLLAMA_SKIP_CHAT_MODEL=1 docker compose --profile ai up -d --build`.
 
 ```bash
 redis-cli -p 6380
-> SET hello world
-> AI.INGEST doc:1 "Go is a statically typed language"
+> AI.INGEST doc:1 "Go is a statically typed language"   # async: returns QUEUED
 > AI.ASK "What is Go?"
 ```
 
+Notes: `AI.INGEST` indexes asynchronously (subscribe to `ai:indexed` for
+completion); the first `AI.ASK` after startup loads the 7GB model into memory
+and may take tens of seconds. The server detects Ollama in the background — no
+restart needed, in whatever order the containers come up.
+
 Then take the guided tour — real embeddings, tenant/attribute filtering, one
 short Go file: [`kvstore/examples/quickstart`](kvstore/examples/quickstart/).
-
-### Prebuilt binaries
-
-Static Linux binaries (amd64/arm64, no dependencies) are published on the
-[Releases page](https://github.com/Nikolay1994Kaz/storage_in_memory/releases):
-
-```bash
-tar xzf kvstore-server_*_linux_amd64.tar.gz
-./kvstore-server --port 6380
-```
-
-Linux only — the network layer is built on epoll.
 
 ### Build from source
 
@@ -98,7 +129,7 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 | `--requirepass` / `--requirepass-file` | `""` | AUTH password inline or from a file (empty = no auth) |
 | `--tls-cert` / `--tls-key` | `""` | TLS certificate and private key (PEM) |
 | `--tls-client-ca` | `""` | CA for client-certificate verification (mTLS) |
-| `--ollama-url` | `http://localhost:11434` | Ollama API URL |
+| `--ollama-url` | `http://localhost:11434` | Ollama API URL for the optional `AI.*` layer; the server pings it in the background and enables `AI.*` whenever Ollama comes up (no restart needed) |
 | `--ship-url` | `""` | Continuous WAL-shipping target: `file:///path` or `s3://bucket/prefix?endpoint=...` (creds via env, see [docs/BACKUP.md](docs/BACKUP.md)) |
 | `--ship-interval` | `1s` | Shipping period (≈ crash RPO) |
 | `--ship-retain` | `3` | Restore points kept on the remote |
@@ -111,7 +142,8 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 The full command manifest (syntax, replies, gate semantics, WAL ops) lives in
 [docs/COMMANDS.md](docs/COMMANDS.md) — the surface is deliberately small and frozen.
 Families: KV/TTL (`SET`/`GET`/`DEL`/`EXPIRE`/…), transactions (`MULTI`/`EXEC`/`DISCARD`),
-Pub/Sub, sorted sets (`ZADD`/…), vector search (`VSIM.*`), AI/RAG (`AI.*`).
+Pub/Sub, sorted sets (`ZADD`/…), vector search (`VSIM.*`), AI/RAG (`AI.*`,
+optional — requires a reachable Ollama).
 
 > **Isolation contract (read this).** `MULTI`/`EXEC` provides command **grouping and
 > pipelining** with EXECABORT on a bad queued command — it does **not** provide

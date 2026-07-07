@@ -54,14 +54,22 @@ clean:
 docker-build:
 	docker build --build-arg VERSION=$(VERSION) -t kvstore:latest .
 
-# Полный стек: kvstore + Ollama + auto-pull модели.
+# Стек по умолчанию: kvstore + метрики (Grafana/VictoriaMetrics), БЕЗ Ollama.
 # --build: всегда собираем образ из текущих исходников, иначе docker поднимет
 # закэшированный бинарь и после git pull потеряются новые команды.
 up:
 	docker compose up -d --build
 
+# То же + опциональный RAG-слой (Ollama, профиль ai): AI.EMBED/INGEST/SEARCH/ASK.
+# Первый запуск качает модели (~0.3GB embeddings + ~7GB chat для AI.ASK;
+# только embeddings: OLLAMA_SKIP_CHAT_MODEL=1 make up-ai).
+up-ai:
+	docker compose --profile ai up -d --build
+
+# --profile ai, чтобы down гасил и Ollama-контейнеры, если они были подняты
+# (без активного профиля compose их не видит); лишний профиль безвреден.
 down:
-	docker compose down
+	docker compose --profile ai down
 
 logs:
 	docker compose logs -f kvstore

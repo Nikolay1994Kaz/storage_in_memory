@@ -40,7 +40,10 @@ func NewClient(baseURL, embedModel, chatModel string) *Client {
 	return &Client{
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second, // embedding ~50ms, chat ~1-5s, запас на тяжёлые промпты
+			// Страховочный потолок; реальные дедлайны задают per-request контексты
+			// вызывающих (embed 15с, AI.ASK 90с). 120с > 90с, чтобы клиентский
+			// таймаут не срезал холодный chat-вызов (первая загрузка модели ~7GB).
+			Timeout: 120 * time.Second,
 		},
 		embedModel: embedModel,
 		chatModel:  chatModel,
