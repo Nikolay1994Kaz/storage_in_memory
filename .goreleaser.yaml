@@ -1,0 +1,52 @@
+# Релизная сборка: goreleaser собирает бинарники на тег v* (см.
+# .github/workflows/release.yml). Только Linux — сетевой слой сидит на epoll
+# (internal/server/epoll.go), darwin/windows не собираются принципиально.
+# Локальная проверка без публикации: goreleaser release --snapshot --clean
+version: 2
+
+project_name: kvstore
+
+builds:
+  - id: kvstore-server
+    binary: kvstore-server
+    main: ./kvstore/cmd/kvstore
+    env:
+      # Без cgo: статический бинарь, кросс-компиляция arm64 без тулчейна
+      # (проверено soak-стендом, см. docs/BACKUP.md про переносимость данных).
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      # Тот же контракт версии, что в Makefile: -X main.version.
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}-server_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - docs/COMMANDS.md
+      - docs/BACKUP.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs"
+      - "^chore"
+      - "^test"
+
+release:
+  draft: false
+  # footer дописывается к автоген-ченджлогу релиза.
+  footer: |
+    ---
+    Binaries are static (CGO_ENABLED=0), Linux only — the server is built on epoll.
+    Quick start: `./kvstore-server --port 6380`, then `redis-cli -p 6380`.

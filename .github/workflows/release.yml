@@ -1,0 +1,39 @@
+name: Release
+
+# Релиз на git-тег v*: прогоняем короткие тесты (гейт), затем goreleaser
+# собирает статические linux-бинарники (amd64/arm64) и публикует GitHub Release
+# с архивами и checksums. Конфиг сборки — .goreleaser.yaml.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: GoReleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Полная история нужна goreleaser для ченджлога между тегами.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Гейт: не выпускаем релиз с красными тестами. Полный CI (race/experimental)
+      # уже прошёл на push в master; здесь — быстрый смоук на всякий случай.
+      - name: Test (short)
+        run: go test -short -timeout 10m ./kvstore/...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
