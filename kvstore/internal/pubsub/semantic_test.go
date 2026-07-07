@@ -62,31 +62,49 @@ func TestSemanticHub_SubscribeAndPublish(t *testing.T) {
 		t.Fatalf("SemanticSubscribe: %v", err)
 	}
 
-	// Публикация похожего вектора (близко к ML)
+	// Конкурентный читатель. net.Pipe небуферизован: writePump подписчика
+	// блокируется на Flush, пока кто-то не читает. Без фонового читателя канал
+	// переполнялся бы и подписчика отключали как «медленного» (в проде это
+	// корректно — защита от нечитающего клиента, но здесь моделируем нормального
+	// клиента). Копим прочитанное под мьютексом.
+	var mu sync.Mutex
+	var got []byte
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, err := clientConn.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				got = append(got, buf[:n]...)
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Публикация похожего вектора (близко к ML) — должен быть доставлен.
 	queryVec := []float32{0.95, 0.1, 0.05, 0.05}
 	delivered := hub.SemanticPublish(queryVec, "GPT-5 released!")
 	if delivered != 1 {
 		t.Fatalf("SemanticPublish similar: delivered %d, want 1", delivered)
 	}
 
-	// Ждём и читаем данные (bufio flush через множественные отправки)
-	for i := 0; i < 150; i++ {
-		hub.SemanticPublish(queryVec, "padding")
-	}
-
-	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 16384)
-	n, err := clientConn.Read(buf)
-	if err != nil {
-		t.Fatalf("client read: %v", err)
-	}
-
-	resp := string(buf[:n])
-	if !strings.Contains(resp, "semantic-message") {
-		t.Fatalf("response should contain 'semantic-message', got %d bytes", n)
-	}
-	if !strings.Contains(resp, "GPT-5 released!") {
-		t.Fatalf("response should contain 'GPT-5 released!'")
+	// Ждём доставки кадра клиенту (Flush writePump асинхронен) — polling с таймаутом.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		resp := string(got)
+		mu.Unlock()
+		if strings.Contains(resp, "semantic-message") && strings.Contains(resp, "GPT-5 released!") {
+			return // успех: оба маркера доставлены
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("message not delivered within timeout; got %q", resp)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
