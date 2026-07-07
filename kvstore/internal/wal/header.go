@@ -64,7 +64,14 @@ func readFileHeader(r *bufio.Reader) (baseLSN uint64, err error) {
 		return 0, fmt.Errorf("wal read header: %w", err)
 	}
 	if !bytes.Equal(h[0:4], fileMagic[:]) {
-		return 0, fmt.Errorf("wal: bad magic %q (not a %s file)", h[0:4], fileMagic)
+		// В отличие от несовпадения версии, здесь направление неизвестно: без
+		// магии нельзя отличить «файл записан сборкой до введения заголовка»
+		// от «это вообще не наш файл / повреждение». Говорим оператору оба
+		// варианта и что делать — иначе он видит голый hex и рестарт-луп.
+		return 0, fmt.Errorf("wal: bad magic %q (not a %s file) — "+
+			"файл повреждён или записан старой сборкой kvstore (до введения заголовка формата); "+
+			"восстановитесь из бэкапа/шиппинга (docs/BACKUP.md) или удалите data-dir, если данные не нужны. "+
+			"См. docs/FORMAT_COMPAT.md", h[0:4], fileMagic)
 	}
 	if h[4] != fileFormatVersion {
 		// Внятная, actionable диагностика вместо «unsupported version N»:

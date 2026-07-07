@@ -101,7 +101,10 @@ func (vs *VectorStore) LoadBinary(r io.Reader) error {
 		// family) + version(1B) + reserved(2B). Happy-path выше не тронут —
 		// декомпозиция только на ветке ошибки. Политика — docs/FORMAT_COMPAT.md.
 		if !bytes.Equal(magic[0:5], magicHeader[0:5]) {
-			return fmt.Errorf("snapshot: not an HNSW snapshot file (bad magic %q) — файл повреждён или это не снапшот kvstore", magic[0:5])
+			return fmt.Errorf("snapshot: not an HNSW snapshot file (bad magic %q) — "+
+				"файл повреждён, записан старой сборкой kvstore (до введения заголовка) или это не снапшот; "+
+				"восстановитесь из бэкапа/шиппинга (docs/BACKUP.md) или удалите файл, если данные не нужны. "+
+				"См. docs/FORMAT_COMPAT.md", magic[0:5])
 		}
 		got, want := magic[5], magicHeader[5]
 		if got > want {
