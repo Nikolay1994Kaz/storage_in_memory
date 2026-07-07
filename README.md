@@ -1,21 +1,24 @@
 # KVStore
 
-High-performance in-memory key-value store with built-in vector search, WASM compute, and AI integration.
+Single-node in-memory **vector search engine** (HNSW) speaking the RESP protocol,
+with a small frozen KV/TTL/Pub-Sub payload layer around it, WAL-based durability
+with continuous shipping to S3, and built-in RAG via Ollama. Not a Redis
+replacement — the KV surface exists to serve the vector core.
 
 ## Features
 
-- **TCMalloc-style allocator** — per-worker MCache, lock-free GET, zero GC pressure
-- **Epoll networking** — per-worker event loops, zero-alloc RESP parser, greedy drain
+- **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization
+- **AI / RAG** — Ollama embeddings, async ingestion, semantic queries (`AI.INGEST` / `AI.ASK`)
 - **WAL + Snapshots** — CRC32-protected, batch writes, crash recovery
 - **WAL-shipping** — continuous async replication of WAL+snapshots to S3/MinIO or a mounted dir (Litestream-style); restore on any machine with `-ship-restore` (see [docs/BACKUP.md](docs/BACKUP.md))
+- **TCMalloc-style allocator** — per-worker MCache, lock-free GET, zero GC pressure
+- **Epoll networking** — per-worker event loops, zero-alloc RESP parser, greedy drain
 - **TTL** — 256-shard heap with lazy + active expiration
 - **Pub/Sub** — back-pressure, sync.Pool, per-subscriber goroutines
-- **Vector Search (HNSW)** — arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization
-- **AI Integration** — Ollama embeddings, async ingestion, RAG queries
 - **AUTH + TLS/mTLS** — constant-time password auth, encrypted connections, optional client-cert verification
 - **Observability** — Prometheus `/metrics`, `/health`, `/ready`; structured logging (slog, text/JSON); Grafana stack in `docker-compose.yml`
-- **WASM Compute** *(experimental, behind a build tag)* — Reactor pattern (worker-local slots) + Command modules
-- **Cluster** *(experimental, behind a build tag)* — hash-slot sharding, gossip protocol, live migration
+- **WASM Compute** *(experimental, behind a build tag, not in the default build)* — Reactor pattern (worker-local slots) + Command modules
+- **Cluster** *(experimental, behind a build tag, not in the default build)* — hash-slot sharding, gossip protocol, live migration
 
 The RESP command surface is deliberately small and **frozen**: the KV/state layer
 is a payload layer for the vector engine, not a Redis replacement. The full
