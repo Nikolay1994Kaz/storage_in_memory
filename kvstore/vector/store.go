@@ -12,7 +12,15 @@ import (
 	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
-// VectorStore — обёртка над HNSW-графом для интеграции с Molten.
+// VectorStore — лёгкий одно-графовый векторный индекс: тонкая обёртка над HNSW
+// (Graph) с маппингом string-ключ ↔ internal ID. НЕ legacy: в проде используется
+// SemanticHub'ом pub/sub (cmd/kvstore/main.go) как эфемерный индекс паттернов
+// подписок — маленький, без durability, живёт в памяти процесса.
+//
+// Движок данных VSIM.* — LeveledVectorStore (leveled_store.go): сегменты, LSM,
+// снапшоты, фильтры/тенанты. Для новой функциональности data-path расширяйте его;
+// сюда добавляйте только то, что нужно семантическому pub/sub.
+// Общая семантика интерфейса закреплена TestVectorIndex_Conformance.
 type VectorStore struct {
 	graph *Graph
 

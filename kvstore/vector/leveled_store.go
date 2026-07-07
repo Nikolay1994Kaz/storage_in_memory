@@ -1604,28 +1604,51 @@ func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
 		ts = *t
 	}
 
-	// Delta (tombstones дельты обработаны внутри; пер-шардовые RLock)
-	if lvs.delta != nil {
-		lvs.delta.ForEachLive(fn)
+	// Дедуп upsert-копий: ключ, переписанный после flush, живёт в 2+ источниках
+	// (delta + сегмент, либо два сегмента). Обходим источники СВЕЖЕЕ-ПЕРВЫМ
+	// (зеркально провенанс-рангу search) и отдаём только первую встреченную
+	// копию — иначе потребитель (репликация full-sync) применил бы новую версию,
+	// а затем перезатёр её устаревшей. seen под RLock: view-строки frozen-арен
+	// живы, пока живы сегменты. Память O(живых ключей) — ForEach и так O(N).
+	seen := make(map[string]struct{}, 256)
+	shadowed := func(key string) bool {
+		if _, dup := seen[key]; dup {
+			return true
+		}
+		seen[key] = struct{}{}
+		return false
 	}
 
-	// Сфлашиваемые дельты (flush-окно): пропускаем tombstoned (Delete в окне
-	// ставит tombstone, не мутируя дельту → живая копия там ещё есть).
-	for _, fd := range lvs.flushing {
-		fd.ForEachLive(func(key string, vec []float32) {
+	// Delta (tombstones дельты обработаны внутри; пер-шардовые RLock)
+	if lvs.delta != nil {
+		lvs.delta.ForEachLive(func(key string, vec []float32) {
+			if !shadowed(key) {
+				fn(key, vec)
+			}
+		})
+	}
+
+	// Сфлашиваемые дельты (flush-окно): в обратном порядке (позже добавленная
+	// свежее); пропускаем tombstoned (Delete в окне ставит tombstone, не мутируя
+	// дельту → живая копия там ещё есть).
+	for fi := len(lvs.flushing) - 1; fi >= 0; fi-- {
+		lvs.flushing[fi].ForEachLive(func(key string, vec []float32) {
 			if ts != nil {
 				if _, deleted := ts[key]; deleted {
 					return
 				}
 			}
-			fn(key, vec)
+			if !shadowed(key) {
+				fn(key, vec)
+			}
 		})
 	}
 
-	// Segments: пропускаем tombstoned ключи
+	// Segments свежее-первым (уровень 0 → max, внутри уровня с конца):
+	// пропускаем tombstoned и затенённые ключи.
 	for _, level := range lvs.levels {
-		for _, seg := range level {
-			switch s := seg.(type) {
+		for pos := len(level) - 1; pos >= 0; pos-- {
+			switch s := level[pos].(type) {
 			case *frozenSegment:
 				fg := s.fg
 				for i := 0; i < fg.n; i++ {
@@ -1636,6 +1659,9 @@ func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
 						if _, deleted := ts[fg.keys.view(i)]; deleted {
 							continue
 						}
+					}
+					if shadowed(fg.keys.view(i)) {
+						continue
 					}
 					fn(fg.keys.clone(i), fg.data[i*fg.dim:(i+1)*fg.dim])
 				}
@@ -1651,6 +1677,9 @@ func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
 						if _, deleted := ts[fg.keys.view(i)]; deleted {
 							continue
 						}
+					}
+					if shadowed(fg.keys.view(i)) {
+						continue
 					}
 					// Деквантование int8 → float32
 					base := i * dim
@@ -1669,6 +1698,9 @@ func (lvs *LeveledVectorStore) ForEach(fn func(key string, vec []float32)) {
 						if _, deleted := ts[key]; deleted {
 							continue
 						}
+					}
+					if shadowed(key) {
+						continue
 					}
 					node := &s.g.nodes[id]
 					if node.Alive {
@@ -1706,15 +1738,21 @@ func (lvs *LeveledVectorStore) Get(key string) ([]float32, bool) {
 
 	// Сфлашиваемые дельты (flush-окно между swap и публикацией сегмента): новее
 	// сегментов, только чтение. Иначе Get промахивается по ключу в этом окне.
-	for _, fd := range lvs.flushing {
-		if out, ok := fd.Get(key); ok {
+	// В обратном порядке — позже добавленная flushing-дельта свежее (провенанс,
+	// зеркально memtable-порядку search): upsert-копии затеняются правильно.
+	for i := len(lvs.flushing) - 1; i >= 0; i-- {
+		if out, ok := lvs.flushing[i].Get(key); ok {
 			return out, true
 		}
 	}
 
-	// Сканирование сегментов
+	// Сканирование сегментов СВЕЖЕЕ-ПЕРВЫМ, зеркально провенанс-рангу search
+	// (rank = lvl<<40 - pos): уровень 0 свежее уровня 1, внутри уровня больший
+	// индекс свежее. Иначе после upsert-через-flush (две frozen-копии ключа)
+	// Get возвращал бы устаревшую копию из более раннего сегмента.
 	for _, level := range lvs.levels {
-		for _, seg := range level {
+		for pos := len(level) - 1; pos >= 0; pos-- {
+			seg := level[pos]
 			switch s := seg.(type) {
 			case *frozenSegment:
 				fg := s.fg
@@ -1768,6 +1806,11 @@ func (lvs *LeveledVectorStore) Info() (count, dim, maxLevel int) {
 	if lvs.delta != nil {
 		count += lvs.delta.Len()
 	}
+	// Сфлашиваемые дельты (flush-окно): их векторы ещё не в сегментах — без них
+	// count недосчитывал бы в этом окне (тот же фикс, что в Len).
+	for _, fd := range lvs.flushing {
+		count += fd.Len()
+	}
 	maxLevel = 0
 	for i, level := range lvs.levels {
 		for _, seg := range level {
@@ -1775,6 +1818,18 @@ func (lvs *LeveledVectorStore) Info() (count, dim, maxLevel int) {
 			if i > maxLevel {
 				maxLevel = i
 			}
+		}
+	}
+	// Tombstones маскируют удалённые ключи, физически ещё живущие в сегментах:
+	// без вычета Delete не уменьшал бы count до компакции (юзер-видимо через
+	// VSIM.INFO). Вычет точен для ключей с одной физической копией; ключ,
+	// апсерченный через flush (2+ копии) и затем удалённый, до merge даёт
+	// временный overcount — count никогда не ЗАнижается. Clamp — страховка
+	// инварианта «tombstone ⇒ есть физическая копия».
+	if t := lvs.tombstones.Load(); t != nil {
+		count -= len(*t)
+		if count < 0 {
+			count = 0
 		}
 	}
 	return count, lvs.dim, maxLevel
