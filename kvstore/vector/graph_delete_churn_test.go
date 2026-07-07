@@ -39,4 +39,3 @@ func BenchmarkGraphDeleteUpsertChurn(b *testing.B) {
 		ids[slot] = uint64(g.Insert(vecs[slot]))
 	}
 }
-

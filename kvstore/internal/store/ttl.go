@@ -80,8 +80,8 @@ type TTLManager struct {
 	// (граница WAL), чтобы истечение не зависело от скачков системных часов.
 	// В проде — реальные часы; тесты подменяют оба, чтобы детерминированно
 	// смоделировать NTP-скачок (см. ttl_monotonic_test.go).
-	monoClock func() int64       // монотонные нс с момента старта (see monoNow)
-	wallClock func() time.Time   // абсолютное wall-clock время (для ForEach→WAL)
+	monoClock func() int64     // монотонные нс с момента старта (see monoNow)
+	wallClock func() time.Time // абсолютное wall-clock время (для ForEach→WAL)
 }
 
 func NewTTLManager(store Evictor) *TTLManager {

@@ -14,9 +14,9 @@ import (
 // KEEPTTL). До фикса ttl оставался → новое значение умирало по старому таймеру.
 //
 // Проверяем ОБА эффекта setClearTTL (вызывается в else-ветке SET-обработчика):
-//   1. runtime: TTL снят;
-//   2. durability: OpPersist записан в WAL (иначе прежний OpExpire воскресит TTL
-//      при реплее/компакции) — но ТОЛЬКО когда TTL реально был (без WAL-спама).
+//  1. runtime: TTL снят;
+//  2. durability: OpPersist записан в WAL (иначе прежний OpExpire воскресит TTL
+//     при реплее/компакции) — но ТОЛЬКО когда TTL реально был (без WAL-спама).
 func TestSetClearsTTL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.wal")
