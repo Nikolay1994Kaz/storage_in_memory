@@ -1,5 +1,8 @@
 # KVStore
 
+[![CI](https://github.com/Nikolay1994Kaz/storage_in_memory/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Nikolay1994Kaz/storage_in_memory/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Nikolay1994Kaz/storage_in_memory)](https://github.com/Nikolay1994Kaz/storage_in_memory/releases)
+
 Single-node in-memory **vector search engine** (HNSW) speaking the RESP protocol,
 with a small frozen KV/TTL/Pub-Sub payload layer around it and WAL-based durability
 with continuous shipping to S3. Bring your own embeddings — vectors go in via
