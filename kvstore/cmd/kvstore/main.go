@@ -699,6 +699,11 @@ func main() {
 	// Отключение клиента чистит его подписки Pub/Sub (classic + semantic-вектор в
 	// HNSW). Без этого хука вектор течёт в индекс навсегда, а writePump висит.
 	srv.OnDisconnect = hub.RemoveConn
+	// Подписчик после SUBSCRIBE легитимно молчит (получает только push'и), а
+	// idle-реапер считает активностью лишь приём данных — без эксемпта он рвал бы
+	// подписчиков ровно через idle-timeout (Redis тоже не применяет timeout к
+	// CLIENT_PUBSUB). Мёртвых peer'ов ловят TCP keepalive и ошибка writePump.
+	srv.IdleExempt = hub.IsSubscriber
 	// H3: медленный подписчик отключается через единую точку учёта epoll.
 	hub.SetOnSlowClose(srv.CloseConn)
 	// T2 (QSBR): воркеры рапортуют quiescence аллокатору — deferred-free слоты

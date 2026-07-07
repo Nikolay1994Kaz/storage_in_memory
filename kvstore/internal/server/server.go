@@ -101,6 +101,13 @@ type Server struct {
 	// его подписки Pub/Sub (иначе течёт семантический вектор в HNSW). nil = нет.
 	OnDisconnect func(net.Conn)
 
+	// IdleExempt — предикат освобождения соединения от idle-реапа. Обычно =
+	// hub.IsSubscriber: pub/sub-подписчик после SUBSCRIBE легитимно молчит
+	// (LastActivity обновляется только на приём, push-выдача её не трогает),
+	// и без эксемпта реапер рвал бы его через IdleTimeout даже при активной
+	// доставке. nil = реапятся все неактивные (как раньше).
+	IdleExempt func(net.Conn) bool
+
 	// Reclaimer — необязательный хук QSBR-освобождения памяти аллокатора.
 	// Обычно = tcmalloc-store. nil = воркеры не рапортуют quiescence (тесты).
 	Reclaimer WorkerReclaimer
@@ -265,7 +272,7 @@ func (s *Server) eventLoop(w *worker) {
 		}
 
 		if s.IdleTimeout > 0 {
-			w.epoll.reapIdle(s.IdleTimeout)
+			w.epoll.reapIdle(s.IdleTimeout, s.IdleExempt)
 		}
 	}
 }

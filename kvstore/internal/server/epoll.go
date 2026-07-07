@@ -189,7 +189,16 @@ func (e *Epoll) Wait(timeoutMs int) ([]*ConnState, error) {
 // reapIdle закрывает соединения, неактивные дольше timeout. Вызывается воркером
 // после каждого Wait. Сбор stale идёт под RLock, само закрытие (Remove берёт
 // Lock) — вне него, чтобы не словить рекурсивный лок.
-func (e *Epoll) reapIdle(timeout time.Duration) {
+//
+// exempt (nil = нет) освобождает соединение от реапа. Нужен pub/sub-подписчикам:
+// LastActivity обновляется только на ПРИЁМ данных, а подписчик после SUBSCRIBE
+// легитимно молчит вечно (только получает push'и через writePump) — без эксемпта
+// реапер убивал бы его ровно через IdleTimeout даже при живой push-доставке
+// (Redis так же не применяет timeout к клиентам CLIENT_PUBSUB). Мёртвых peer'ов
+// среди exempt ловят TCP keepalive и ошибка записи writePump (disconnectSlow).
+// Вызывается вне e.mu — та же дисциплина, что onRemove: никаких чужих локов под
+// локом epoll.
+func (e *Epoll) reapIdle(timeout time.Duration, exempt func(net.Conn) bool) {
 	cutoff := time.Now().Add(-timeout).UnixNano()
 
 	e.mu.RLock()
@@ -202,6 +211,9 @@ func (e *Epoll) reapIdle(timeout time.Duration) {
 	e.mu.RUnlock()
 
 	for _, cs := range stale {
+		if exempt != nil && exempt(cs.Conn) {
+			continue
+		}
 		e.Remove(cs)
 		monitoring.IdleReaped.Inc()
 	}

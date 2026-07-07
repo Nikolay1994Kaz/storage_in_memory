@@ -261,6 +261,73 @@ func getVectorCount(addr string) int {
 	return 0
 }
 
+// runSubscriberSession — одна pub/sub-сессия подписчика: connect → subscribe →
+// drain push'ей до обрыва или отмены ctx. Возвращает true при чистом завершении
+// (ctx отменён), false при ошибке (вызывающий цикл сделает паузу и реконнект).
+//
+// Нечётные subID — semantic (VSIM.SUBSCRIBE регистрирует вектор в семантическом
+// индексе → путь Add его графа, грузит аллокатор индекса конкурентно с
+// KV-нагрузкой = регресс-страж фикса #5 dedicated-allocator), чётные — classic.
+func runSubscriberSession(ctx context.Context, addr string, subID, dim int,
+	completedOps, errorOps *atomic.Int64) bool {
+
+	subConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		fmt.Printf("    [Подписчик %d] Ошибка подключения: %v\n", subID, err)
+		errorOps.Add(1)
+		return false
+	}
+	defer subConn.Close()
+
+	sw := protocol.NewWriter(subConn)
+	sr := protocol.NewReader(subConn)
+
+	if subID%2 == 1 {
+		sargs := []string{"VSIM.SUBSCRIBE", "5.0"}
+		srng := rand.New(rand.NewSource(int64(subID)*7 + 1))
+		for j := 0; j < dim; j++ {
+			sargs = append(sargs, strconv.FormatFloat(srng.NormFloat64(), 'f', 4, 64))
+		}
+		if err := sendCommand(sw, sargs...); err != nil {
+			errorOps.Add(1)
+			return false
+		}
+	} else {
+		channel := fmt.Sprintf("stress:chan:%d", subID%10) // 10 общих каналов
+		if err := sendCommand(sw, "SUBSCRIBE", channel); err != nil {
+			errorOps.Add(1)
+			return false
+		}
+	}
+
+	// Первый Read забирает подтверждение подписки (semantic — через writePump,
+	// classic — из буфера), дальше drain-петля читает push-сообщения.
+	if _, err := sr.Read(); err != nil {
+		errorOps.Add(1)
+		return false
+	}
+
+	// Прерываем блокирующий Read при завершении контекста
+	go func() {
+		<-ctx.Done()
+		subConn.Close()
+	}()
+
+	for {
+		_, err := sr.Read()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return true
+			default:
+			}
+			errorOps.Add(1)
+			return false
+		}
+		completedOps.Add(1)
+	}
+}
+
 // ==========================================
 // ФАЗА 2 & 3: Смешанный стресс-тест + Горячий своп движка
 // ==========================================
@@ -282,69 +349,22 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 	// ─── 1. Запуск подписчиков (Subscribers) ───
 	const numSubscribers = 8
 	fmt.Printf("  📡 Запуск %d параллельных подписчиков Pub/Sub...\n", numSubscribers)
+	// Каждый подписчик — реконнект-петля: обрыв соединения считается ошибкой,
+	// но подписчик переподключается и продолжает дренировать push'и. Без этого
+	// один обрыв (как реап подписчиков до фикса IdleExempt) молча снимал всю
+	// pub/sub-нагрузку на остаток фазы — дыра покрытия soak.
 	for i := 0; i < numSubscribers; i++ {
 		wg.Add(1)
 		go func(subID int) {
 			defer wg.Done()
 
-			subConn, err := net.Dial("tcp", addr)
-			if err != nil {
-				fmt.Printf("    [Подписчик %d] Ошибка подключения: %v\n", subID, err)
-				errorOps.Add(1)
-				return
-			}
-			defer subConn.Close()
-
-			sw := protocol.NewWriter(subConn)
-			sr := protocol.NewReader(subConn)
-
-			// Половина подписчиков — semantic (VSIM.SUBSCRIBE регистрирует вектор в
-			// семантическом индексе → путь Add его графа, грузит аллокатор индекса
-			// конкурентно с KV-нагрузкой = регресс-страж фикса #5 dedicated-allocator).
-			// Другая половина — classic pub/sub.
-			if subID%2 == 1 {
-				sargs := []string{"VSIM.SUBSCRIBE", "5.0"}
-				srng := rand.New(rand.NewSource(int64(subID)*7 + 1))
-				for j := 0; j < dim; j++ {
-					sargs = append(sargs, strconv.FormatFloat(srng.NormFloat64(), 'f', 4, 64))
-				}
-				if err := sendCommand(sw, sargs...); err != nil {
-					errorOps.Add(1)
-					return
-				}
-			} else {
-				channel := fmt.Sprintf("stress:chan:%d", subID%10) // 10 общих каналов
-				if err := sendCommand(sw, "SUBSCRIBE", channel); err != nil {
-					errorOps.Add(1)
-					return
-				}
-			}
-
-			// Первый Read забирает подтверждение подписки (semantic — через writePump,
-			// classic — из буфера), дальше drain-петля читает push-сообщения.
-			if _, err := sr.Read(); err != nil {
-				errorOps.Add(1)
-				return
-			}
-
-			// Прерываем блокирующий Read при завершении контекста
-			go func() {
-				<-ctx.Done()
-				subConn.Close()
-			}()
-
-			for {
-				_, err := sr.Read()
-				if err != nil {
+			for ctx.Err() == nil {
+				if !runSubscriberSession(ctx, addr, subID, dim, &completedOps, &errorOps) {
 					select {
+					case <-time.After(time.Second): // пауза перед реконнектом
 					case <-ctx.Done():
-						return
-					default:
 					}
-					errorOps.Add(1)
-					return
 				}
-				completedOps.Add(1)
 			}
 		}(i)
 	}
