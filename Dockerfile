@@ -52,4 +52,6 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -qO- http://127.0.0.1:9090/health >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["./kvstore-server"]
-CMD ["--port", "6380"]
+# 0.0.0.0 внутри контейнера: без него published-порты (-p) не достучатся до
+# сервера, который по умолчанию слушает только 127.0.0.1.
+CMD ["--bind", "0.0.0.0", "--port", "6380"]

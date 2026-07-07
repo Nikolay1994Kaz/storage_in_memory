@@ -3,8 +3,10 @@ package monitoring
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -235,20 +237,22 @@ func httpHandler(enablePprof bool) http.Handler {
 	return mux
 }
 
-// StartHttpServer runs the HTTP metrics+health server on the given port.
+// StartHttpServer runs the HTTP metrics+health server on the given bind+port.
+// bindHost наследует -bind основного сервера: metrics/pprof не должны быть
+// открыты шире, чем data-порт (pprof наружу = DoS/утечка внутренностей).
 // enablePprof регистрирует /debug/pprof/* для диагностики (soak/утечки).
-func StartHttpServer(port int, enablePprof bool) {
+func StartHttpServer(bindHost string, port int, enablePprof bool) {
 	if port <= 0 {
 		return
 	}
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
+		Addr:    net.JoinHostPort(bindHost, strconv.Itoa(port)),
 		Handler: httpHandler(enablePprof),
 	}
 
 	go func() {
-		slog.Info("starting metrics HTTP server", "port", port, "endpoints", "/metrics,/health,/ready")
+		slog.Info("starting metrics HTTP server", "addr", server.Addr, "endpoints", "/metrics,/health,/ready")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("metrics HTTP server error", "err", err)
 		}

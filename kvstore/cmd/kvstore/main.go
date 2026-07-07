@@ -75,6 +75,7 @@ func shouldSkipVecReplay(entry wal.Entry, isFromSnapshot, graphLoaded bool, vecW
 func main() {
 	// CLI-флаги
 	port := flag.Int("port", 6380, "порт для клиентов")
+	bindAddr := flag.String("bind", "127.0.0.1", "интерфейс для listen (клиенты и метрики). По умолчанию только localhost; для доступа извне укажите -bind 0.0.0.0 и настройте AUTH (+TLS)")
 	maxMemoryMB := flag.Int("maxmemory", 0, "лимит памяти в МБ (0 = без лимита)")
 	clusterEnabled := flag.Bool("cluster", false, "включить кластерный режим")
 	clusterSlotStart := flag.Int("slot-start", 0, "начало диапазона слотов")
@@ -224,7 +225,7 @@ func main() {
 	// 200 сразу (порт открыт), а /ready держит 503 до SetReady(true) ниже — трафик
 	// не пойдёт, пока снапшот+WAL не накатаны и listener не поднят.
 	if *metricsPort > 0 {
-		monitoring.StartHttpServer(*metricsPort, *enablePprof)
+		monitoring.StartHttpServer(*bindAddr, *metricsPort, *enablePprof)
 	}
 
 	// === 2.5. Инициализация sorted sets (ZSet) ===
@@ -691,7 +692,13 @@ func main() {
 	// HTTP-сервер метрик уже поднят до реплея WAL (см. выше по коду).
 
 	// === 8. Сервер ===
-	listenAddr := fmt.Sprintf(":%d", *port)
+	// Дефолт 127.0.0.1 — защита от «поднял попробовать и открыл в интернет»
+	// (история раннего Redis до protected mode). Наружу — только явным -bind.
+	if !isLoopbackBind(*bindAddr) && !authEnabled {
+		slog.Warn("сервер слушает не-loopback интерфейс БЕЗ пароля — любой, кто дотянется до порта, получит полный доступ; " +
+			"настройте -requirepass-file/KVSTORE_REQUIREPASS (и желательно TLS) или верните -bind 127.0.0.1")
+	}
+	listenAddr := net.JoinHostPort(*bindAddr, strconv.Itoa(*port))
 	srv := server.NewServer(listenAddr, handler)
 	srv.IdleTimeout = *idleTimeout
 	srv.WriteTimeout = *writeTimeout
@@ -869,6 +876,16 @@ func resolveAuthPassword(flagVal, fileVal string) (string, error) {
 		return env, nil
 	}
 	return flagVal, nil
+}
+
+// isLoopbackBind сообщает, ограничен ли -bind локальной машиной. Пустая строка
+// означает все интерфейсы (семантика net.Listen), поэтому считается открытой.
+func isLoopbackBind(bind string) bool {
+	if bind == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(bind)
+	return ip != nil && ip.IsLoopback()
 }
 
 // isMemoryGrowingCmd сообщает, увеличивает ли команда использование памяти.

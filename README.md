@@ -55,6 +55,9 @@ make build
 # With AUTH + TLS
 ./kvstore-server --port 6380 --requirepass "s3cret" \
   --tls-cert cert.pem --tls-key key.pem
+
+# Accept remote connections (localhost-only by default; requires AUTH in practice)
+./kvstore-server --bind 0.0.0.0 --port 6380 --requirepass-file /etc/kvstore/pass
 ```
 
 ## CLI Flags
@@ -64,6 +67,7 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 
 | Flag | Default | Description |
 |---|---|---|
+| `--bind` | `127.0.0.1` | Listen interface for both the data port and the metrics port. Localhost-only by default — to accept remote connections set `--bind 0.0.0.0` **and configure AUTH (+TLS)** |
 | `--port` | `6380` | Listen port |
 | `--metrics-port` | `9090` | HTTP port for `/metrics`, `/health`, `/ready` |
 | `--maxmemory` | `0` | Memory limit in MB (0 = unlimited); writes are rejected above the limit |
