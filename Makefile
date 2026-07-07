@@ -54,9 +54,11 @@ clean:
 docker-build:
 	docker build --build-arg VERSION=$(VERSION) -t kvstore:latest .
 
-# Полный стек: kvstore + Ollama + auto-pull модели
+# Полный стек: kvstore + Ollama + auto-pull модели.
+# --build: всегда собираем образ из текущих исходников, иначе docker поднимет
+# закэшированный бинарь и после git pull потеряются новые команды.
 up:
-	docker compose up -d
+	docker compose up -d --build
 
 down:
 	docker compose down

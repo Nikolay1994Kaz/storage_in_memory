@@ -34,10 +34,12 @@ Full stack — kvstore + Ollama + automatic model download:
 ```bash
 git clone https://github.com/Nikolay1994Kaz/storage_in_memory.git
 cd storage_in_memory
-docker compose up -d     # or: make up
+docker compose up -d --build     # or: make up
 ```
 
-That's it. KVStore is on `localhost:6380`, Ollama on `localhost:11434`.
+`--build` rebuilds the image from the current sources, so a `git pull` never
+leaves you on a cached binary that lacks newer commands. That's it — KVStore is
+on `localhost:6380`, Ollama on `localhost:11434`.
 
 ```bash
 redis-cli -p 6380

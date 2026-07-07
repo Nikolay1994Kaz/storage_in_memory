@@ -16,8 +16,11 @@ query returns different results once scoped.
 ## Run
 
 ```bash
-# 1. Start the stack (server + Ollama; the embedding model is pulled automatically)
-docker compose up -d
+# 1. Build + start the server and Ollama (the embedding model is pulled
+#    automatically). --build rebuilds from the current sources so you never run
+#    a cached image that predates a command like VSIM.ADDATTR; naming the
+#    `kvstore` service skips the optional metrics stack (Grafana/VictoriaMetrics).
+docker compose up -d --build kvstore
 
 # 2. Run the example
 go run ./kvstore/examples/quickstart
