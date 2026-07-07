@@ -41,3 +41,11 @@ __pycache__/
 # Claude Code local settings (личный allowlist, не для общего репо)
 .claude/settings.local.json
 
+
+# Рабочая директория экспериментов/soak-прогонов (бинарники, логи, данные стендов)
+/scratch/
+
+# Локальные сборки вспомогательных бинарников в корне (go build -o ...)
+/soak_oracle
+/stress_test
+/searchload
