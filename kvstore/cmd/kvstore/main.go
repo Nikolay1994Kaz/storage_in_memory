@@ -102,6 +102,7 @@ func main() {
 	compactionWorkers := flag.Int("compaction-workers", 0, "Number of parallel segment build workers (0 = auto NumCPU/2 clamped 2-8). Build Pool: insert does not block during heavy L2 compaction")
 	deltaShards := flag.Int("delta-shards", 1, "число шардов дельты для конкурентных вставок (1 = один граф, freeze-on-flush; >1 = ~2.4× insert @4 / ~4.25× @12 ценой search-штрафа ∝ доле дельты). См. step_profit_test.go:TestStep5_ShardedAddScaling")
 	partitionAttr := flag.String("partition-attr", "", "Categorical attribute name for tenant-contiguous layout (enables VSIM.FILTER tenant routing via columnar SearchFilter). Empty = no partition; attrs still filterable, just no tenant block-routing")
+	idleConsolidate := flag.Duration("idle-consolidate", 60*time.Second, "затишье записей, после которого индекс консолидируется в один сегмент (флаш остатка дельты + merge всех уровней). Закрывает bulk-load→read: суб-fanout сегменты иначе не мержатся, search в разы медленнее. Guard: пропуск, если крупнейший сегмент уже ≥90% данных. 0 = выключено")
 	shipURL := flag.String("ship-url", "", "continuous WAL-shipping на удалённое хранилище: file:///abs/path или s3://bucket/prefix?endpoint=...&region=... (S3-креды из env KVSTORE_S3_ACCESS_KEY/SECRET_KEY или AWS_*). Пусто = выключено")
 	shipInterval := flag.Duration("ship-interval", time.Second, "период доставки WAL-хвоста; RPO при аварии ≈ этот интервал + время загрузки")
 	shipRetain := flag.Int("ship-retain", 3, "сколько последних restore-точек (манифестов) хранить на удалённом хранилище")
@@ -214,6 +215,8 @@ func main() {
 		NumBuilders:    *compactionWorkers,
 		PartitionAttr:  *partitionAttr,
 		DeltaShards:    *deltaShards,
+
+		IdleConsolidateAfter: *idleConsolidate,
 	})
 	// LSH не применяется в LeveledVectorStore, вызов no-op через type assertion:
 	if lsh, ok := vecStore.(interface{ SetUseLSH(bool) }); ok {

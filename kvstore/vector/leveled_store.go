@@ -550,6 +550,15 @@ type LeveledConfig struct {
 	// IndexBrute, иначе IndexGraph. 0 = DefaultBruteThreshold. Действует только
 	// при TenantOf != nil или PartitionAttr != "".
 	BruteThreshold int
+
+	// IdleConsolidateAfter — затишье мутаций (Add/Delete), после которого фон
+	// консолидирует индекс: остаток дельты флашится, все сегменты мержатся в один.
+	// Закрывает сценарий bulk-load→read: суб-fanout остаток (<Fanout сегментов на
+	// уровне) обычным каскадом не мержится никогда, а search платит за каждый
+	// сегмент отдельным полным обходом графа. Guard от рестройки-шторма: если
+	// крупнейший сегмент уже держит ≥90% векторов, полный rebuild ради хвоста не
+	// запускается (мелочь дочистит fanout-каскад). 0 = выключено.
+	IdleConsolidateAfter time.Duration
 }
 
 // compactionResult — результат build/merge goroutine, передаётся через resultChan.
@@ -691,6 +700,16 @@ type LeveledVectorStore struct {
 	// mergeInFlight — флаги "идёт merge на уровне" (по одному merge на уровень одновременно).
 	mergeInFlight [maxLevels]bool
 
+	// lastMutation — UnixNano последней мутации данных (Add/Delete/Clear/LoadBinary).
+	// Источник истины для idle-детекта консолидации (IdleConsolidateAfter).
+	lastMutation atomic.Int64
+
+	// consolidateInFlight — идёт idle-консолидация (merge ВСЕХ сегментов в один).
+	// Взаимоисключение с обычными merge: maybeScheduleMerges пропускается, пока
+	// флаг взведён — иначе одни и те же сегменты уехали бы в два параллельных
+	// merge и оба результата опубликовались (дубли данных). Под lvs.mu.
+	consolidateInFlight bool
+
 	// deltaFlushInFlight — true пока delta-flush goroutine не вернула результат.
 	// Только один delta-flush одновременно (один buildAllocators[0] → нет TCMalloc race).
 	deltaFlushInFlight bool
@@ -756,6 +775,9 @@ func NewLeveledVectorStore(cfg LeveledConfig) *LeveledVectorStore {
 		buildSem:    make(chan struct{}, numBuilders),
 	}
 	lvs.flushCond = sync.NewCond(&lvs.mu)
+	// Точка отсчёта затишья — старт стора: после рестарта/LoadBinary консолидация
+	// не стартует раньше полного окна IdleConsolidateAfter.
+	lvs.lastMutation.Store(time.Now().UnixNano())
 
 	// Per-worker изолированные аллокаторы для параллельных buildSegment.
 	// TCMallocStore НЕ потокобезопасен через общий MCentral/MHeap — каждый
@@ -852,6 +874,7 @@ func (lvs *LeveledVectorStore) AddWithAttrs(key string, vec []float32, attrs Att
 	}
 
 	becameFull := lvs.delta.AppendWithAttrs(key, vec, attrs)
+	lvs.touchMutation()
 
 	// Если ключ ранее был удалён (есть в tombstones) — снимаем tombstone,
 	// иначе Delete(key) после Add(key,...) вновь удалит живой вектор.
@@ -909,6 +932,7 @@ func (lvs *LeveledVectorStore) removeTombstone(key string) {
 func (lvs *LeveledVectorStore) Delete(key string) bool {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
+	lvs.touchMutation()
 
 	// Если в дельте — hard delete (вектор физически исчезает из дельты).
 	if lvs.delta != nil && lvs.delta.Delete(key) {
@@ -1106,6 +1130,12 @@ func (lvs *LeveledVectorStore) Clear() {
 	// applyResult по epoch-mismatch, когда горутина завершится (нет UAF, нет утечки).
 	lvs.flushing = nil
 	lvs.tombstones.Store(nil)
+	lvs.touchMutation()
+}
+
+// touchMutation отмечает момент последней мутации данных (idle-детект консолидации).
+func (lvs *LeveledVectorStore) touchMutation() {
+	lvs.lastMutation.Store(time.Now().UnixNano())
 }
 
 // FlushDelta принудительно флашит дельту (async — для graceful shutdown).
@@ -2369,6 +2399,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		lvs.delta = NewDeltaSegmentSharded(dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
 	}
 
+	lvs.touchMutation()
 	return nil
 }
 
@@ -2382,8 +2413,9 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 type taskKind int
 
 const (
-	taskFlushDelta taskKind = iota // flush delta → новый L0 сегмент
-	taskMergeLevel                 // merge N сегментов уровня L → сегмент уровня L+1
+	taskFlushDelta  taskKind = iota // flush delta → новый L0 сегмент
+	taskMergeLevel                  // merge N сегментов уровня L → сегмент уровня L+1
+	taskConsolidate                 // idle-консолидация: merge ВСЕХ сегментов всех уровней в один
 )
 
 // compactionTask — единица работы. Создаётся coordinator'ом (GRAB под lock),
@@ -2432,6 +2464,15 @@ func (lvs *LeveledVectorStore) triggerCompact() {
 // Старые сегменты НЕ убираются из levels[] пока merge не завершён (нет дыр для search).
 // mergeInFlight[L] = true → merge уровня L в работе (новый не запускаем).
 func (lvs *LeveledVectorStore) compactWorker() {
+	// Idle-детект: тик = четверть окна затишья → консолидация стартует с
+	// запаздыванием не более 25% от IdleConsolidateAfter. nil-канал (фича
+	// выключена) в select блокируется вечно — ветка мертва без оверхеда.
+	var idleC <-chan time.Time
+	if lvs.cfg.IdleConsolidateAfter > 0 {
+		t := time.NewTicker(lvs.cfg.IdleConsolidateAfter / 4)
+		defer t.Stop()
+		idleC = t.C
+	}
 	for {
 		select {
 		case <-lvs.done:
@@ -2444,8 +2485,121 @@ func (lvs *LeveledVectorStore) compactWorker() {
 		case r := <-lvs.resultChan:
 			// Результат от build/merge goroutine → атомарно применить.
 			lvs.applyResult(r)
+
+		case <-idleC:
+			// Затишье мутаций → флаш остатка дельты, затем консолидация сегментов.
+			lvs.handleIdleTick()
 		}
 	}
+}
+
+// handleIdleTick — idle-консолидация (IdleConsolidateAfter). Вызывается только
+// из compactWorker (тот же goroutine, что и handleCompactSignal/applyResult —
+// вся координация однопоточна, флаги in-flight гоняться не могут).
+//
+// Последовательность (по тику за шаг, без ожиданий внутри):
+//  1. Есть остаток дельты (не Full — сам не сфлашится никогда) → штатный flush
+//     через triggerCompact; консолидация подождёт следующего тика.
+//  2. Дельта пуста, работ в полёте нет, сегментов >1 и крупнейший держит <90%
+//     данных → merge всех сегментов всех уровней в один.
+func (lvs *LeveledVectorStore) handleIdleTick() {
+	if time.Now().UnixNano()-lvs.lastMutation.Load() < int64(lvs.cfg.IdleConsolidateAfter) {
+		return
+	}
+
+	lvs.mu.Lock()
+	epoch := lvs.compactionEpoch.Load()
+
+	if lvs.delta != nil && lvs.delta.Len() > 0 {
+		lvs.mu.Unlock()
+		lvs.triggerCompact() // handleCompactSignal сфлашит непустую дельту
+		return
+	}
+	// Ждём тишины и в компакционной машинерии: параллельная консолидация с
+	// flush/merge либо дублировала бы данные, либо мержила снапшот без хвоста.
+	if lvs.consolidateInFlight || lvs.deltaFlushInFlight || lvs.inFlightBuilds.Load() > 0 || lvs.anyMergeInFlightLocked() {
+		lvs.mu.Unlock()
+		return
+	}
+
+	// Собираем сегменты СТАРШИЕ→МЛАДШИЕ (уровни сверху вниз, внутри уровня — по
+	// созданию): дедуп в mergeSegments оставляет ПОСЛЕДНЮЮ копию ключа, порядок
+	// oldest→newest обязателен для корректного upsert (как в maybeScheduleMerges).
+	var toMerge []segment
+	highest := 0
+	for lyr := maxLevels - 1; lyr >= 0; lyr-- {
+		if len(lvs.levels[lyr]) > 0 && highest == 0 {
+			highest = lyr
+		}
+		toMerge = append(toMerge, lvs.levels[lyr]...)
+	}
+	if len(toMerge) <= 1 {
+		lvs.mu.Unlock()
+		return
+	}
+	// Guard от рестройки-шторма: почти всё уже в одном сегменте → полный rebuild
+	// ради хвоста не окупается (капля в 1k векторов после паузы пересобирала бы
+	// миллионный индекс). Хвост мелких L0 дочистит обычный fanout-каскад.
+	total, largest := 0, 0
+	for _, s := range toMerge {
+		n := s.Len()
+		total += n
+		if n > largest {
+			largest = n
+		}
+	}
+	if total == 0 || largest*10 >= total*9 {
+		lvs.mu.Unlock()
+		return
+	}
+
+	lvs.consolidateInFlight = true
+	targetLvl := highest + 1
+	if targetLvl >= maxLevels {
+		targetLvl = maxLevels - 1
+	}
+	lvs.mu.Unlock()
+
+	// Merge-горутина — зеркало maybeScheduleMerges. mergeAllocators[0] свободен:
+	// консолидация стартует только при полном отсутствии merge в полёте, а новые
+	// merge блокируются consolidateInFlight.
+	go func(segs []segment, tgtLvl int, e uint64) {
+		mergeStart := time.Now()
+		var seg segment
+		var applied map[string]struct{}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					seg = nil
+					applied = nil
+				}
+			}()
+			seg, applied = lvs.mergeSegmentsWithAllocator(segs, lvs.mergeAllocators[0])
+		}()
+		monitoring.VectorMergeDuration.Update(time.Since(mergeStart).Seconds())
+		res := compactionResult{
+			kind:              taskConsolidate,
+			targetLvl:         tgtLvl,
+			epoch:             e,
+			result:            seg,
+			oldSegs:           segs,
+			appliedTombstones: applied,
+		}
+		select {
+		case lvs.resultChan <- res:
+		case <-lvs.done:
+		}
+	}(toMerge, targetLvl, epoch)
+}
+
+// anyMergeInFlightLocked — как anyMergeInFlight, но caller уже держит lvs.mu.
+func (lvs *LeveledVectorStore) anyMergeInFlightLocked() bool {
+	for i := 0; i < maxLevels; i++ {
+		if lvs.mergeInFlight[i] {
+			return true
+		}
+	}
+	return false
 }
 
 // handleCompactSignal — обработка сигнала compactCh.
@@ -2699,6 +2853,12 @@ func (lvs *LeveledVectorStore) maybeScheduleMerges(epoch uint64) {
 func (lvs *LeveledVectorStore) maybeScheduleMergesLocked(epoch uint64) {
 	fanout := lvs.cfg.Fanout
 
+	// Идёт консолидация — она уже мержит ВСЕ сегменты; параллельный merge тех же
+	// сегментов опубликовал бы данные дважды (дубли в памяти под дедупом поиска).
+	if lvs.consolidateInFlight {
+		return
+	}
+
 	for lyr := 0; lyr < maxLevels-1; lyr++ {
 		if lvs.mergeInFlight[lyr] {
 			continue // merge этого уровня уже в работе
@@ -2771,6 +2931,8 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 			lvs.inFlightBuilds.Add(-1)
 			// Дельта снята с flushing → будим FlushDeltaSync (ждёт по членству).
 			lvs.flushCond.Broadcast()
+		} else if r.kind == taskConsolidate {
+			lvs.consolidateInFlight = false
 		} else {
 			lvs.mergeInFlight[r.sourceLvl] = false
 		}
@@ -2812,6 +2974,20 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 		lvs.levels[r.targetLvl] = append(lvs.levels[r.targetLvl], r.result)
 		// Чистим tombstones применённых ключей — АТОМАРНО со свапом и лишь тех,
 		// кого больше нет в других сегментах (см. clearAppliedTombstonesLocked).
+		lvs.clearAppliedTombstonesLocked(r.appliedTombstones, r.result)
+
+	case taskConsolidate:
+		lvs.consolidateInFlight = false
+		if r.result == nil {
+			monitoring.VectorCompactionRollbackTotal.Inc()
+			return
+		}
+		// oldSegs пришли со ВСЕХ уровней — чистим каждый (removeSegments фильтрует
+		// по identity, лишние элементы в toRemove безвредны).
+		for lyr := range lvs.levels {
+			lvs.removeSegments(lyr, r.oldSegs)
+		}
+		lvs.levels[r.targetLvl] = append(lvs.levels[r.targetLvl], r.result)
 		lvs.clearAppliedTombstonesLocked(r.appliedTombstones, r.result)
 	}
 
@@ -3020,12 +3196,7 @@ func (lvs *LeveledVectorStore) FlushDeltaSync() {
 func (lvs *LeveledVectorStore) anyMergeInFlight() bool {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
-	for i := 0; i < maxLevels; i++ {
-		if lvs.mergeInFlight[i] {
-			return true
-		}
-	}
-	return false
+	return lvs.anyMergeInFlightLocked()
 }
 
 // waitForBuildCompletion — не используется, оставлен для совместимости.
