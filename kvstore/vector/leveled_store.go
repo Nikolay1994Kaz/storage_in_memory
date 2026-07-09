@@ -2685,9 +2685,19 @@ func (lvs *LeveledVectorStore) startMergeGoroutine(task *compactionTask) {
 // По одному merge на уровень одновременно (mergeInFlight[L]). Сегменты НЕ убираются
 // из levels[] — старые остаются видимы для search до замены.
 func (lvs *LeveledVectorStore) maybeScheduleMerges(epoch uint64) {
-	fanout := lvs.cfg.Fanout
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
+	lvs.maybeScheduleMergesLocked(epoch)
+}
+
+// maybeScheduleMergesLocked — тело maybeScheduleMerges; caller держит lvs.mu.
+// Вызывается напрямую из applyResult: каскад merge пинается БЕЗ triggerCompact,
+// т.к. сигнал заставил бы handleCompactSignal сначала забрать текущую дельту,
+// какой бы маленькой она ни была → при живом потоке вставок это
+// самоподдерживающийся флаш-шторм (e2e 09.07: 424 микросегмента по ~140
+// векторов на 60k вставок, пока долгий merge держал mergeInFlight[0]).
+func (lvs *LeveledVectorStore) maybeScheduleMergesLocked(epoch uint64) {
+	fanout := lvs.cfg.Fanout
 
 	for lyr := 0; lyr < maxLevels-1; lyr++ {
 		if lvs.mergeInFlight[lyr] {
@@ -2805,33 +2815,24 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 		lvs.clearAppliedTombstonesLocked(r.appliedTombstones, r.result)
 	}
 
-	// Re-check: триггерим coordinator ТОЛЬКО если есть переполнение или delta.
-	// Безусловный triggerCompact → busy-loop.
-	needsWork := false
-	switch r.kind {
-	case taskFlushDelta:
-		// Опубликованный L0-сегмент мог переполнить уровень. Без этой проверки
-		// сценарий bulk-load→тишина оставлял fanout L0-сегментов несмёрженными
-		// навсегда (merge пинался только СЛЕДУЮЩИМ flush либо FlushDeltaSync),
-		// а search по фрагментированному индексу в разы дороже.
-		needsWork = len(lvs.levels[0]) >= lvs.cfg.Fanout
-	case taskMergeLevel:
-		// После merge target-уровень мог переполниться → каскад. Source тоже:
-		// при ≥2×fanout сегментах первые fanout смёржены, остаток иначе застрянет.
-		needsWork = len(lvs.levels[r.targetLvl]) >= lvs.cfg.Fanout ||
-			len(lvs.levels[r.sourceLvl]) >= lvs.cfg.Fanout
-	}
-	if !needsWork {
-		// Re-flush дельты ТОЛЬКО когда она реально ПОЛНА (обычный режим; safety на
-		// случай пропущенного Add-триггера). Прежде здесь была ветка
-		// `flushPending && deltaNonEmpty` — она заставляла applyResult гнать flush
-		// остатка дельты после КАЖДОГО build во время FlushDeltaSync → flush-storm
-		// (тысячи flush по 1-2 вектора, каждый — свежий дельта-сегмент, сотни ГБ
-		// churn). FlushDeltaSync теперь сам форсит нужный swap и ждёт по членству в
-		// flushing, поэтому eager-re-flush остатка здесь больше не нужен.
-		needsWork = lvs.delta != nil && lvs.delta.Full()
-	}
-	if needsWork {
+	// Re-check каскада — ПРЯМЫМ вызовом под уже удержанным mu, НЕ через
+	// triggerCompact: любой сигнал заставляет handleCompactSignal сначала
+	// забрать текущую дельту (какой бы маленькой она ни была) → при живом
+	// потоке вставок post-flush сигнал становится самоподдерживающимся
+	// флаш-штормом (микросегменты по ~сотне векторов, e2e 09.07). Прямой вызов
+	// планирует только merge переполненных уровней и дельту не трогает.
+	// Закрывает и bulk-load→тишина: последний flush, публикующий fanout-ный L0,
+	// сам ставит merge (раньше каскад пинался только СЛЕДУЮЩИМ flush).
+	lvs.maybeScheduleMergesLocked(r.epoch)
+
+	// Сигнал (с забором дельты) — ТОЛЬКО когда она реально ПОЛНА (safety на
+	// случай пропущенного Add-триггера). Прежде здесь была ветка
+	// `flushPending && deltaNonEmpty` — она заставляла applyResult гнать flush
+	// остатка дельты после КАЖДОГО build во время FlushDeltaSync → flush-storm
+	// (тысячи flush по 1-2 вектора, каждый — свежий дельта-сегмент, сотни ГБ
+	// churn). FlushDeltaSync теперь сам форсит нужный swap и ждёт по членству в
+	// flushing, поэтому eager-re-flush остатка здесь больше не нужен.
+	if lvs.delta != nil && lvs.delta.Full() {
 		lvs.triggerCompact()
 	}
 }
