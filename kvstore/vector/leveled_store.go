@@ -2808,9 +2808,18 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 	// Re-check: триггерим coordinator ТОЛЬКО если есть переполнение или delta.
 	// Безусловный triggerCompact → busy-loop.
 	needsWork := false
-	if r.kind == taskMergeLevel {
-		// После merge target-уровень мог переполниться → каскад.
-		needsWork = len(lvs.levels[r.targetLvl]) >= lvs.cfg.Fanout
+	switch r.kind {
+	case taskFlushDelta:
+		// Опубликованный L0-сегмент мог переполнить уровень. Без этой проверки
+		// сценарий bulk-load→тишина оставлял fanout L0-сегментов несмёрженными
+		// навсегда (merge пинался только СЛЕДУЮЩИМ flush либо FlushDeltaSync),
+		// а search по фрагментированному индексу в разы дороже.
+		needsWork = len(lvs.levels[0]) >= lvs.cfg.Fanout
+	case taskMergeLevel:
+		// После merge target-уровень мог переполниться → каскад. Source тоже:
+		// при ≥2×fanout сегментах первые fanout смёржены, остаток иначе застрянет.
+		needsWork = len(lvs.levels[r.targetLvl]) >= lvs.cfg.Fanout ||
+			len(lvs.levels[r.sourceLvl]) >= lvs.cfg.Fanout
 	}
 	if !needsWork {
 		// Re-flush дельты ТОЛЬКО когда она реально ПОЛНА (обычный режим; safety на
