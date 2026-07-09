@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -24,14 +25,45 @@ func main() {
 	k := flag.Int("k", 10, "K")
 	dur := flag.Duration("d", 5*time.Second, "длительность")
 	useBin := flag.Bool("bin", false, "VSIM.SEARCHBIN (бинарный протокол)")
+	file := flag.String("file", "", "raw float32 LE файл с реальными запросами (N*dim); пусто = случайные векторы (на высоких dim случайные ВРУТ — HNSW вырождается в брутфорс)")
 	flag.Parse()
+
+	// Реальные запросы из файла: на dim>>100 случайные равномерные векторы дают
+	// мусорные QPS-числа (все расстояния ~равны), для валидного замера нужен
+	// настоящий датасет.
+	var fileVecs [][]float32
+	if *file != "" {
+		raw, err := os.ReadFile(*file)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "read:", err)
+			os.Exit(1)
+		}
+		vecBytes := *dim * 4
+		n := len(raw) / vecBytes
+		if n > 256 {
+			n = 256
+		}
+		fileVecs = make([][]float32, n)
+		for i := range fileVecs {
+			v := make([]float32, *dim)
+			for d := range v {
+				v[d] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*vecBytes+d*4:]))
+			}
+			fileVecs[i] = v
+		}
+	}
 
 	// Предгенерим пул готовых RESP-команд (текст или бинарь).
 	pool := make([][]protocol.Value, 256)
 	for i := range pool {
-		vec := make([]float32, *dim)
-		for d := range vec {
-			vec[d] = rand.Float32()
+		var vec []float32
+		if fileVecs != nil {
+			vec = fileVecs[i%len(fileVecs)]
+		} else {
+			vec = make([]float32, *dim)
+			for d := range vec {
+				vec[d] = rand.Float32()
+			}
 		}
 		if *useBin {
 			b := make([]byte, *dim*4)
