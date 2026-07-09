@@ -188,6 +188,11 @@ Measured on standard ANN datasets and real OpenAI embeddings, including
 same-machine head-to-head runs against hnswlib — full tables, methodology and
 honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
 
+- **End-to-end through the server (RESP, real query vectors):**
+  **10 093 QPS** @ recall@10 0.9994 on MNIST-784 (SQ8) and **3 535 QPS** @
+  0.9902 on dbpedia-1536; ingest up to **5 324 vec/s** over the wire with
+  sharded delta. After bulk loads the index consolidates back to peak shape
+  automatically (`-idle-consolidate`).
 - **High-dim (GIST-960, target path):** SQ8 beats hnswlib float32 **2.5–2.7×**
   in multithreaded QPS at equal recall, with 4× less vector memory.
 - **Real embeddings (dbpedia ada-002, 1536-dim):** recall@10 0.977 (SQ8) /
@@ -202,8 +207,8 @@ honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
 - **Single-node by design.** Durability and disaster recovery come from WAL +
   snapshots + continuous WAL-shipping (restore on any machine), not from
   replicas. Cluster mode exists behind a build tag and is not production-ready.
-- **ANN search is approximate.** HNSW recall is high (≈0.98 on real embedding
-  datasets at default settings) but not 1.0; under heavy churn a small fraction
+- **ANN search is approximate.** HNSW recall is high (0.99 end-to-end on real
+  embedding datasets at default settings) but not 1.0; under heavy churn a small fraction
   of stored vectors may temporarily miss from top-K results. `VSIM.EXISTS`
   gives an exact existence check.
 - **Experimental gates.** WASM compute and cluster mode are compiled out of the

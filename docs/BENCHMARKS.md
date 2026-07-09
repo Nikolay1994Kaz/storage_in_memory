@@ -19,6 +19,56 @@ sets, never training vectors. Head-to-head comparisons are **iso-recall**
 
 ---
 
+## End-to-end through the server (RESP)
+
+The sections below this one measure the engine in-process. This section
+measures the whole product: a real `kvstore-server` process, vectors inserted
+over the wire (`VSIM.ADDBIN`), searched over the wire (`VSIM.SEARCHBIN`) with
+real held-out query vectors, recall against the official ground truth.
+12 client connections, server-default `efSearch=100`, M=32, efC=400.
+Same laptop as everything else.
+
+Insert rate over RESP (12 connections):
+
+| Dataset | single delta graph | `-delta-shards 12` |
+|---|---|---|
+| MNIST-784 (fp32) | 976 vec/s | **5 324 vec/s** |
+| dbpedia 1536-dim (SQ8) | — | **2 725 vec/s** |
+
+Search over RESP (12 connections, consolidated index):
+
+| Dataset | mode | QPS | recall@10 |
+|---|---|---|---|
+| MNIST-784, 60k | float32 | 5 743 | 0.9998 |
+| MNIST-784, 60k | **SQ8** | **10 093** | 0.9994 |
+| dbpedia-openai-100k, 1536-dim | **SQ8** | **3 535** | 0.9902 |
+
+Mixed workload (12 insert + 12 search connections simultaneously, MNIST,
+sharded delta): **2 762 inserts/s + 431 QPS** sustained — sharding trades
+~8% search for 3× ingest under contention.
+
+Notes, honestly:
+
+- Search numbers are for a **consolidated index** — the steady state. After a
+  bulk load the server reaches it by itself: the LSM merge cascade plus idle
+  consolidation (`-idle-consolidate`, default 60 s of write silence) collapse
+  all segments into one, no manual command. On this laptop: ~2 min after
+  60k×784, ~10 min after 100k×1536.
+- **Transient window.** For the first ~1–2 minutes right after a bulk load,
+  while flushed deltas are still being built into segments, search runs slow
+  (down to ~34 QPS on 100k×1536 worst case). Writes, recall and durability are
+  unaffected — only search speed, only until the builds finish. Steady
+  trickle-write workloads never enter this state.
+- RESP + epoll cost ~10–20% vs the in-process harness. Pipelining
+  (`insertload -pipeline`) buys +52% ingest on a single connection; at 12
+  connections the server is CPU-bound and pipelining adds nothing.
+
+Load tools: `cmd/insertload`, `cmd/searchload` (raw float32 LE files; use real
+query vectors — random queries lie on high-dim data, degenerating HNSW to
+brute force).
+
+---
+
 ## 1. Real embeddings — dbpedia-openai-100k (ada-002, 1536-dim, cosine)
 
 The closest dataset to the target workload: real OpenAI `text-embedding-ada-002`
@@ -133,6 +183,11 @@ the ceiling when memory bandwidth is not the constraint:
 
 Test: `TestStep6_CurrentStateQPS` (`kvstore/vector/step_profit_test.go`).
 
+Note: this harness searches a multi-segment index. End-to-end through the
+server on a fully consolidated single segment measures *higher* — 10 093 QPS
+@ 0.9994 at the same ef=100 (see the end-to-end section above) — segment
+count, not protocol, is the dominant QPS factor.
+
 ---
 
 ## Caveats, all in one place
@@ -144,7 +199,8 @@ Test: `TestStep6_CurrentStateQPS` (`kvstore/vector/step_profit_test.go`).
   concurrent writers, but bulk build speed is a known, accepted gap.
 - **Filtered-search wins assume a consolidated index** (few segments). Heavy
   recent-write churn fragments tenant blocks across segments until merge
-  catches up.
+  catches up; idle consolidation (`-idle-consolidate`) restores the
+  consolidated shape automatically after write lulls.
 - **SQ8 recall ceiling** ≈0.94 on the hardest dataset (GIST@M16); real
   transformer embeddings measure higher (0.977 on dbpedia@M32).
 - **ANN is approximate**: under churn a small fraction of stored vectors can
