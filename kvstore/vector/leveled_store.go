@@ -505,6 +505,18 @@ type LeveledConfig struct {
 	// Fanout — кол-во сегментов одного уровня до merge в следующий.
 	Fanout int
 
+	// MergeBatchMax — макс сегментов, забираемых ОДНИМ merge с уровня
+	// (batch-merge). Freeze-per-shard публикует nShards мини-сегментов за флаш;
+	// каскад ровно по Fanout штук проигрывает продюсеру гонку (e2e 10.07:
+	// 111 мини в L0 к концу bulk-load) и пере-rebuild'ит каждый вектор на
+	// каждом уровне пирамиды. Батч-заход забирает весь накопившийся префикс
+	// уровня до этого капа: та же линейная стоимость на вектор, но одним
+	// rebuild'ом — заходов кратно меньше, fan-out поиска падает скачком.
+	// Кап ограничивает пик памяти/длительность одного merge (fp32-копии всех
+	// входных векторов + построение графа). 0 = 8×Fanout; значения < Fanout
+	// поднимаются до Fanout.
+	MergeBatchMax int
+
 	// M — параметр M HNSW (число соседей). 0 = default из NewGraph.
 	M int
 
@@ -579,10 +591,10 @@ type LeveledConfig struct {
 // Значение (не указатель) — channel receive создаёт happens-before для всех полей.
 type compactionResult struct {
 	kind      taskKind
-	sourceLvl int       // для merge: уровень источник
-	targetLvl int       // куда добавлен результат
-	epoch     uint64    // эпоха на момент GRAB
-	result    segment   // построенный сегмент (nil = failure)
+	sourceLvl int     // для merge: уровень источник
+	targetLvl int     // куда добавлен результат
+	epoch     uint64  // эпоха на момент GRAB
+	result    segment // построенный сегмент (nil = failure)
 	// results — мини-сегменты freeze-per-shard (taskFlushDelta, шардированная
 	// дельта): каждый шард заморожен отдельным сегментом, applyResult публикует
 	// ВСЕ атомарно под одним Lock вместе со снятием дельты с flushing. Взаимно
@@ -751,6 +763,11 @@ type LeveledVectorStore struct {
 func NewLeveledVectorStore(cfg LeveledConfig) *LeveledVectorStore {
 	if cfg.Fanout <= 0 {
 		cfg.Fanout = defaultFanout
+	}
+	if cfg.MergeBatchMax <= 0 {
+		cfg.MergeBatchMax = 8 * cfg.Fanout
+	} else if cfg.MergeBatchMax < cfg.Fanout {
+		cfg.MergeBatchMax = cfg.Fanout
 	}
 	if cfg.EfConstruction <= 0 {
 		cfg.EfConstruction = 200
@@ -3019,10 +3036,18 @@ func (lvs *LeveledVectorStore) maybeScheduleMergesLocked(epoch uint64) {
 		if lvs.compactionEpoch.Load() != epoch {
 			break // Clear() — стоп
 		}
-		// Берём ПЕРВЫЕ fanout сегментов для merge (copy slice header — не удаляем из levels).
-		// Старые сегменты останутся в levels[lyr] до applyResult.
-		toMerge := make([]segment, fanout)
-		copy(toMerge, lvs.levels[lyr][:fanout])
+		// Batch-merge: берём ВЕСЬ накопившийся префикс уровня до капа, а не ровно
+		// fanout (см. LeveledConfig.MergeBatchMax — почему каскад по fanout штук
+		// проигрывает freeze-per-shard гонку). Префикс = oldest→newest порядок,
+		// обязательный для дедупа upsert в mergeSegmentsWithAllocator. Сегменты НЕ
+		// удаляются из levels (copy slice header) — старые видимы для search до
+		// applyResult.
+		batch := len(lvs.levels[lyr])
+		if batch > lvs.cfg.MergeBatchMax {
+			batch = lvs.cfg.MergeBatchMax
+		}
+		toMerge := make([]segment, batch)
+		copy(toMerge, lvs.levels[lyr][:batch])
 
 		lvs.mergeInFlight[lyr] = true
 		sourceLvl := lyr
@@ -3404,7 +3429,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 	// Извлекаем векторы, пропуская tombstoned ключи, и ДЕДУПЛИЦИРУЕМ по ключу.
 	// Один ключ может жить в двух merge-входах (upsert после flush: свежая копия
 	// уехала в новый сегмент, старая осталась в прежнем; оба попадают в один merge).
-	// segs идут oldest→newest (caller берёт levels[lyr][:fanout] в порядке создания),
+	// segs идут oldest→newest (caller берёт префикс levels[lyr][:batch] в порядке создания),
 	// поэтому более поздняя запись СВЕЖЕЕ и перезаписывает раннюю — так stale-копия
 	// физически выметается из индекса (иначе она осталась бы дублем ВНУТРИ сегмента,
 	// который провенанс-дедуп поиска уже не различит — одинаковый ранг).
