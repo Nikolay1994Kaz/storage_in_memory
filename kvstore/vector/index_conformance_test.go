@@ -53,6 +53,26 @@ func conformanceImpls() []indexImpl {
 				idx.(*LeveledVectorStore).FlushDeltaSync()
 			},
 		},
+		{
+			// Шардированная дельта: flush идёт через freeze-per-shard (каждый
+			// шард → свой fp32-мини-сегмент в L0). Контракт обязан совпадать
+			// с одношардовым Leveled: та же семантика Add/Get/Delete/Search/
+			// Save/Load при другом внутреннем пути публикации. fp32 (не SQ):
+			// конформанс сверяет Get побайтно, квантование бы шумело.
+			name: "LeveledVectorStore/sharded-freeze",
+			make: func(t *testing.T) VectorIndex {
+				lvs := NewLeveledVectorStore(LeveledConfig{
+					DeltaMax:    64,
+					DeltaShards: 4,
+					Distance:    EuclideanDistance,
+				})
+				t.Cleanup(lvs.Close)
+				return lvs
+			},
+			syncForSave: func(idx VectorIndex) {
+				idx.(*LeveledVectorStore).FlushDeltaSync()
+			},
+		},
 	}
 }
 

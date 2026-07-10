@@ -31,9 +31,12 @@ import (
 // пер-шардовым shard.mu (Append/Delete → Lock, Search/Get → RLock). Порядок
 // захвата всегда lvs.mu → shard.mu, поэтому дедлоков нет.
 //
-// idx шарда — только для поиска: при flush он отбрасывается (Close), сегмент
-// строится из slab. Freeze-on-flush (заморозка графа без rebuild) применим
-// только при nShards==1 — при шардинге flush всегда rebuild из merged slab.
+// idx шарда — не только для поиска: при flush чистых векторов (без attrs/tenant)
+// каждый шард замораживается СВОИМ FreezeGraphSQ/FreezeGraph в мини-сегмент L0
+// (freeze-per-shard, без rebuild — миллисекунды vs десятки секунд, см.
+// freeze_pershard_profit_test.go); merge-каскад склеивает мини фоном. Только
+// когда freeze неприменим (attrs/tenant требуют пересортировки, fp32 dim>256),
+// flush идёт через rebuild из slab, а idx отбрасывается.
 // =============================================================================
 
 // DeltaEntry — ключ + вектор в дельте.
@@ -182,7 +185,27 @@ func (d *DeltaSegment) Graph() *Graph { return d.shards[0].idx }
 // FreezeKeys возвращает map[node_id]→key для FreezeGraph/FreezeGraphSQ.
 // Валидно только при nShards==1.
 func (d *DeltaSegment) FreezeKeys() map[uint64]string {
-	s := d.shards[0]
+	return d.ShardFreezeKeys(0)
+}
+
+// ─── Per-shard аксессоры для freeze-per-shard (заморозка шардированной дельты
+// в nShards мини-сегментов без rebuild). Вызывать ПОСЛЕ swap: дельта immutable,
+// в графы и nodeKey никто не пишет → чтение без shard.mu безопасно (как
+// Graph/FreezeKeys выше — тот же контракт, что у freeze-пути S1). ───
+
+// ShardCount возвращает число шардов дельты.
+func (d *DeltaSegment) ShardCount() int { return d.nShards }
+
+// ShardLiveLen возвращает число ЖИВЫХ векторов шарда i (без tombstones).
+// Пустые шарды (хэш-дисбаланс на маленькой дельте) freeze пропускает.
+func (d *DeltaSegment) ShardLiveLen(i int) int { return len(d.shards[i].keyIdx) }
+
+// ShardGraph возвращает HNSW-граф шарда i для FreezeGraph/FreezeGraphSQ.
+func (d *DeltaSegment) ShardGraph(i int) *Graph { return d.shards[i].idx }
+
+// ShardFreezeKeys возвращает map[node_id]→key шарда i для FreezeGraph/FreezeGraphSQ.
+func (d *DeltaSegment) ShardFreezeKeys(i int) map[uint64]string {
+	s := d.shards[i]
 	m := make(map[uint64]string, len(s.nodeKey))
 	for gid, key := range s.nodeKey {
 		m[uint64(gid)] = key

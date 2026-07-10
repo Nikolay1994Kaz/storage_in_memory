@@ -540,10 +540,11 @@ type LeveledConfig struct {
 	NumBuilders int
 
 	// DeltaShards — число шардов дельты для конкурентных вставок (шаг 5).
-	// 0/1 = один граф (прежнее поведение, freeze-on-flush применим).
-	// >1 = ключи роутятся hash%N в независимые шарды со своими локами →
-	// Add масштабируется по числу писателей. При шардинге flush идёт через
-	// rebuild из slab (freeze-on-flush требует единого графа).
+	// 0/1 = один граф (прежнее поведение). >1 = ключи роутятся hash%N в
+	// независимые шарды со своими локами → Add масштабируется по числу
+	// писателей. Flush чистых векторов идёт через freeze-per-shard (каждый
+	// шард → свой мини-сегмент L0, без rebuild); attrs/tenant/fp32 dim>256
+	// флашатся rebuild'ом из slab.
 	DeltaShards int
 
 	// TenantOf — если задана, включает тенант-локальную раскладку (Вещь 1):
@@ -582,7 +583,13 @@ type compactionResult struct {
 	targetLvl int       // куда добавлен результат
 	epoch     uint64    // эпоха на момент GRAB
 	result    segment   // построенный сегмент (nil = failure)
-	oldSegs   []segment // для merge: сегменты для удаления из sourceLvl
+	// results — мини-сегменты freeze-per-shard (taskFlushDelta, шардированная
+	// дельта): каждый шард заморожен отдельным сегментом, applyResult публикует
+	// ВСЕ атомарно под одним Lock вместе со снятием дельты с flushing. Взаимно
+	// исключен с result (обычный flush/freeze кладёт один сегмент в result).
+	// Пустой при result==nil = failure (all-or-nothing, как у result).
+	results []segment
+	oldSegs []segment // для merge: сегменты для удаления из sourceLvl
 	// appliedTombstones — ключи, исключённые из merge-сегмента по tombstone.
 	// applyResult чистит их tombstones ПОСЛЕ атомарной публикации и лишь если
 	// ключа больше нет в других сегментах. nil для flush.
@@ -2653,19 +2660,34 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 
 	monitoring.VectorFlushDeltaTotal.Inc()
 	if oldDelta.Len() > 0 {
-		// Freeze-on-flush требует единого графа → только при одношардовой дельте.
-		// При шардинге (DeltaShards>1) единого графа нет → rebuild из merged slab.
-		// Тенант-режим (TenantOf != nil) требует rebuild для сортировки entries по
-		// тенанту → freeze-on-flush (заморозка инкрементального графа как есть)
+		// Freeze-on-flush: графы дельты УЖЕ построены инкрементально при Add —
+		// замораживаем их напрямую (SQ8 при UseSQ — любой dim; иначе CSR float32
+		// при dim ≤ порога), без повторной сборки HNSW (нет double-build).
+		// Тенант-режим (TenantOf/PartitionAttr) и атрибуты требуют rebuild для
+		// сортировки/колонок → freeze (заморозка инкрементального графа как есть)
 		// несовместим: он сохранил бы временной порядок вставки, а не тенант-порядок.
-		if lvs.cfg.TenantOf == nil && lvs.cfg.PartitionAttr == "" && !oldDelta.Sharded() && !oldDelta.HasAttrs() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold) {
-			// Freeze-on-flush: граф дельты УЖЕ построен инкрементально при Add —
-			// замораживаем его напрямую (SQ8 при UseSQ — любой dim; иначе CSR float32),
-			// без повторной сборки HNSW (нет double-build). Close аллокатора — внутри
+		canFreeze := lvs.cfg.TenantOf == nil && lvs.cfg.PartitionAttr == "" &&
+			!oldDelta.HasAttrs() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold)
+		switch {
+		case canFreeze && !oldDelta.Sharded():
+			// Один шард → один граф → один сегмент. Close аллокатора — внутри
 			// горутины ПОСЛЕ freeze (freeze копирует в Go-память).
 			lvs.startFreezeDeltaGoroutine(oldDelta, epoch)
-		} else {
-			// dim > порога: frozen-CSR не применим → rebuild в hnswSegment из slab.
+		case canFreeze:
+			// Freeze-per-shard: каждый из nShards графов замораживается СВОИМ
+			// сегментом → nShards мини-сегментов публикуются атомарно в L0, а
+			// merge-каскад склеивает их фоном. Это схлопывает flushing-состояние
+			// за миллисекунды вместо десятков секунд rebuild'а (563-2738×, см.
+			// freeze_pershard_profit_test.go) → дорогие fp32-графы исчезают из
+			// переходного состояния, бэклог не копится, кап swap'ов не срабатывает.
+			// RepairReachability тут НЕ зовём: verify стоит ~полсборки (см.
+			// graph.go), а достижимость мини = достижимость тех же графов, по
+			// которым поиск ходил в дельте только что; первый же merge пере-
+			// строит с шафлом+repair (buildSegmentWithAllocator).
+			lvs.startFreezeShardsGoroutine(oldDelta, epoch)
+		default:
+			// Freeze неприменим (attrs/tenant: нужна пересортировка entries;
+			// fp32 dim>порога: frozen-CSR не применим) → rebuild из slab.
 			// entries ссылаются на slab oldDelta (не на граф) → oldDelta должна жить до
 			// конца build → Close откладывается в applyResult (после публикации сегмента),
 			// а не сразу после ExtractAll (иначе UAF по slab при конкурентном Search).
@@ -2832,6 +2854,94 @@ func (lvs *LeveledVectorStore) startFreezeDeltaGoroutine(oldDelta *DeltaSegment,
 	}()
 }
 
+// startFreezeShardsGoroutine — freeze-per-shard: замораживает КАЖДЫЙ шард
+// шардированной дельты его собственным FreezeGraphSQ/FreezeGraph → nShards
+// мини-сегментов (миллисекунды vs десятки секунд rebuild). Мини публикуются
+// applyResult'ом атомарно (results) вместе со снятием дельты с flushing;
+// merge-каскад склеивает их фоном (mergeSegments перестраивает с шафлом+repair).
+//
+// Семантика отказа — all-or-nothing, как у build: если хоть один непустой шард
+// не заморозился (panic/nil), НИЧЕГО не публикуем (results=nil → rollback,
+// частичная публикация потеряла бы данные шарда молча; WAL реплеит на рестарте).
+// Пустые шарды (хэш-дисбаланс на маленькой дельте) пропускаются — это не отказ.
+//
+// Контракты как у startFreezeDeltaGoroutine: inFlightBuilds.Add(1) синхронно ДО
+// горутины; buildSem занимаем ОДИН слот на весь freeze (предохранитель при
+// перегрузе — freeze конкурирует за CPU наравне с builds, см. 17663b6); после
+// swap дельта immutable → чтение графов/nodeKey без shard.mu безопасно; freeze
+// копирует в Go-память → Close дельты (аллокаторов) в applyResult после публикации.
+func (lvs *LeveledVectorStore) startFreezeShardsGoroutine(oldDelta *DeltaSegment, epoch uint64) {
+	lvs.inFlightBuilds.Add(1)
+	go func() {
+		select {
+		case lvs.buildSem <- struct{}{}:
+			defer func() { <-lvs.buildSem }()
+		case <-lvs.done:
+			// Shutdown: coordinator уже вышел → Close сами (единственный owner).
+			lvs.removeFlushing(oldDelta)
+			oldDelta.Close()
+			res := compactionResult{kind: taskFlushDelta, epoch: epoch, result: nil}
+			select {
+			case lvs.resultChan <- res:
+			default:
+				lvs.inFlightBuilds.Add(-1)
+			}
+			return
+		}
+
+		nShards := oldDelta.ShardCount()
+		minis := make([]segment, nShards) // [i] = мини шарда i; nil = пустой шард
+		failed := atomic.Bool{}
+		var wg sync.WaitGroup
+		for i := 0; i < nShards; i++ {
+			if oldDelta.ShardLiveLen(i) == 0 {
+				continue // пустой шард — нечего замораживать (не отказ)
+			}
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						failed.Store(true) // паника шарда → rollback всего flush
+					}
+				}()
+				keys := oldDelta.ShardFreezeKeys(i)
+				g := oldDelta.ShardGraph(i)
+				if lvs.cfg.UseSQ {
+					if fg := FreezeGraphSQ(g, lvs.cfg.Metric, keys); fg != nil {
+						minis[i] = &frozenSQSegment{fg: fg}
+						return
+					}
+				} else {
+					if fg := FreezeGraph(g, lvs.cfg.Distance, keys); fg != nil {
+						minis[i] = &frozenSegment{fg: fg}
+						return
+					}
+				}
+				failed.Store(true) // непустой шард дал nil-freeze → rollback
+			}(i)
+		}
+		wg.Wait()
+
+		var results []segment
+		if !failed.Load() {
+			for _, m := range minis {
+				if m != nil {
+					results = append(results, m)
+				}
+			}
+		}
+		res := compactionResult{kind: taskFlushDelta, epoch: epoch, results: results, flushDelta: oldDelta}
+		select {
+		case lvs.resultChan <- res:
+		case <-lvs.done:
+			lvs.removeFlushing(oldDelta)
+			oldDelta.Close()
+			lvs.inFlightBuilds.Add(-1)
+		}
+	}()
+}
+
 // startMergeGoroutine запускает goroutine для BUILD merge-сегмента.
 // Результат возвращается через resultChan. Сегменты НЕ удаляются из levels
 // до получения результата (applyResult).
@@ -2982,7 +3092,11 @@ func (lvs *LeveledVectorStore) applyResult(r compactionResult) {
 	switch r.kind {
 	case taskFlushDelta:
 		lvs.inFlightBuilds.Add(-1)
-		if r.result != nil {
+		if len(r.results) > 0 {
+			// Freeze-per-shard: все мини-сегменты шардов публикуются ОДНИМ append
+			// под этим же Lock — search никогда не видит «половину дельты».
+			lvs.levels[0] = append(lvs.levels[0], r.results...)
+		} else if r.result != nil {
 			lvs.levels[0] = append(lvs.levels[0], r.result)
 		} else {
 			monitoring.VectorCompactionRollbackTotal.Inc()
