@@ -52,6 +52,19 @@ const (
 	// defaultFanout — сколько сегментов одного уровня сливается в следующий.
 	defaultFanout = 4
 
+	// flushingBacklogCap — swap дельты откладывается, пока flushing держит ≥ N
+	// дельт: каждая flushing-дельта — nShards fp32-графов с ef-полом на каждый
+	// запрос (brownout 09.07: 5-6 flushing × 12 шардов ≈ 70 графов, 70% CPU).
+	// Дельта копит дальше (Append растёт за maxSize) → флаши реже и крупнее.
+	// Повтор swap гарантирован: applyResult каждого build ре-триггерит compact,
+	// пока delta.Full(); FlushDeltaSync ре-триггерит на каждом пробуждении.
+	flushingBacklogCap = 2
+
+	// deltaHardGrowthFactor — предел роста дельты сверх maxSize: при N×maxSize
+	// свапаем несмотря на flushingBacklogCap, чтобы один build (и пиковая память
+	// его аллокатора) не разрастался безгранично при перегрузе вставками.
+	deltaHardGrowthFactor = 4
+
 	// maxLevels — максимальное число уровней LSM-иерархии.
 	maxLevels = 8
 
@@ -2615,6 +2628,18 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 		lvs.maybeScheduleMerges(epoch)
 		return
 	}
+	// Кап flushing-бэклога: очередной swap при полном бэклоге лишь плодит
+	// fp32-графы, которые каждый поиск обходит с ef-полом. Дельта копит дальше;
+	// swap повторится с applyResult ближайшего build (re-check delta.Full()) или
+	// со следующего пробуждения FlushDeltaSync. Жёсткий предел роста — гарантия,
+	// что при перегрузе вставками build остаётся ограниченного размера.
+	if len(lvs.flushing) >= flushingBacklogCap &&
+		lvs.delta.Len() < deltaHardGrowthFactor*lvs.delta.MaxSize() {
+		lvs.mu.Unlock()
+		monitoring.VectorFlushSwapDeferredTotal.Inc()
+		lvs.maybeScheduleMerges(epoch)
+		return
+	}
 	oldDelta := lvs.delta
 	// dim захватываем ПОД локом: build-горутина иначе читает lvs.dim без синхронизации,
 	// а Clear() пишет lvs.dim=0 (pre-existing data race, обнажён Clear-during-build).
@@ -2859,12 +2884,27 @@ func (lvs *LeveledVectorStore) maybeScheduleMergesLocked(epoch uint64) {
 		return
 	}
 
+	// Приоритет флаш-builds над merge (brownout после bulk-load, e2e 09.07):
+	// каждая flushing-дельта — это nShards fp32-графов, которые КАЖДЫЙ поиск
+	// обходит с ef-полом (70% CPU окна brownout — именно этот поиск). Merge
+	// работает над frozen-сегментами, уже дешёвыми для поиска, и может подождать —
+	// CPU отдаём builds, ликвидирующим дорогое состояние. Отложенный merge не
+	// теряется: applyResult последнего build вызывает нас же, когда flushing пуст.
+	deferMerges := len(lvs.flushing) > 0 || lvs.inFlightBuilds.Load() > 0
+
 	for lyr := 0; lyr < maxLevels-1; lyr++ {
 		if lvs.mergeInFlight[lyr] {
 			continue // merge этого уровня уже в работе
 		}
 		if len(lvs.levels[lyr]) < fanout {
 			continue // уровень не переполнен — продолжаем проверять выше (L1 может быть переполнен без L0)
+		}
+		// Предохранитель от голодания: под непрерывным insert-потоком flushing не
+		// пустеет никогда — уровень, разросшийся до 2×fanout, мержим несмотря на
+		// builds, иначе fanout поиска по уровню растёт без границы.
+		if deferMerges && len(lvs.levels[lyr]) < 2*fanout {
+			monitoring.VectorMergeDeferredTotal.Inc()
+			continue
 		}
 		if lvs.compactionEpoch.Load() != epoch {
 			break // Clear() — стоп

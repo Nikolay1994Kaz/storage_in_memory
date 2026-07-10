@@ -72,6 +72,14 @@ var (
 
 	// VectorFlushDeltaTotal — счётчик flush'ей дельты в сегмент.
 	VectorFlushDeltaTotal = metrics.NewCounter("kvstore_vector_flush_delta_total")
+
+	// VectorMergeDeferredTotal — merge отложен из-за flush-builds в полёте
+	// (приоритет ликвидации flushing-состояния, дорогого для поиска).
+	VectorMergeDeferredTotal = metrics.NewCounter("kvstore_vector_merge_deferred_total")
+
+	// VectorFlushSwapDeferredTotal — swap дельты отложен из-за полного
+	// flushing-бэклога (дельта копит дальше, флаши реже и крупнее).
+	VectorFlushSwapDeferredTotal = metrics.NewCounter("kvstore_vector_flush_swap_deferred_total")
 )
 
 // ── State gauges (callback, вычисляются на scrape — 0 overhead на hot path) ───
