@@ -51,6 +51,11 @@ type FrozenGraphSQ struct {
 	// metric — метрика как данные: brute-путям нужно отличать cosine от dot
 	// (у обеих dotMode=true), чтобы выбрать fused-ядро. См. sqBruteDist.
 	metric Metric
+
+	// zeroQ — нулевой query [dim] для cosine-ветки sqBruteDist (|approx|² через
+	// sq8EuclidImpl). Аллоцируется один раз при freeze/load, read-only → безопасен
+	// для конкурентных поисков; nil для остальных метрик.
+	zeroQ []float32
 }
 
 // FreezeGraphSQ конвертирует *Graph → *FrozenGraphSQ (SQ8 CSR layout).
@@ -189,7 +194,16 @@ func FreezeGraphSQOrdered(g *Graph, metric Metric, keys map[uint64]string, pos [
 		distFn:       metric.DistanceFunc(),
 		dotMode:      metric.IsDot(),
 		metric:       metric,
+		zeroQ:        makeZeroQ(metric, dim),
 	}
+}
+
+// makeZeroQ — нулевой query для cosine-ветки sqBruteDist (nil для прочих метрик).
+func makeZeroQ(metric Metric, dim int) []float32 {
+	if metric != MetricCosine {
+		return nil
+	}
+	return make([]float32, dim)
 }
 
 // Len возвращает число нод в графе.
@@ -225,7 +239,10 @@ func (fg *FrozenGraphSQ) sqBruteDist(query []float32) func(codes []uint8) float3
 			return func([]uint8) float32 { return 1 }
 		}
 		invQNorm := 1 / float32(math.Sqrt(float64(qNorm2)))
-		zeroQ := make([]float32, fg.dim) // 1 alloc на вызов (вместо буфера декванта)
+		zeroQ := fg.zeroQ
+		if zeroQ == nil { // fg собран вручную (тесты) — аллоцируем на вызов
+			zeroQ = make([]float32, fg.dim)
+		}
 		return func(cs []uint8) float32 {
 			dot := sq8DotImpl(query, cs, fg.sqMin, fg.sqScale)
 			normB2 := sq8EuclidImpl(zeroQ, cs, fg.sqMin, fg.sqScale)
@@ -320,25 +337,22 @@ func (fg *FrozenGraphSQ) MemoryBytes() int {
 // =============================================================================
 
 // frozenSQSearchState — pool-able буфер для FrozenGraphSQ.Search.
-// Дополнительно к frozenSearchState хранит:
-//   - resIDs []uint32 — node-ID каждого результата (для rerank по codes)
-//   - rerankBuf []float32 — буфер для деквантования одного вектора
+// Дополнительно к frozenSearchState хранит resIDs []uint32 — node-ID каждого
+// результата (для rerank по codes).
 type frozenSQSearchState struct {
-	visited   []uint64         // bitset
-	cands     []frozenCandItem // minHeap кандидатов
-	res       []FrozenResult   // maxHeap результатов
-	resIDs    []uint32         // node-ID для каждого res[i] (parallel массив)
-	rerankBuf []float32        // деквантование buffer [dim]
+	visited []uint64         // bitset
+	cands   []frozenCandItem // minHeap кандидатов
+	res     []FrozenResult   // maxHeap результатов
+	resIDs  []uint32         // node-ID для каждого res[i] (parallel массив)
 }
 
 var frozenSQSearchPool = sync.Pool{
 	New: func() any {
 		return &frozenSQSearchState{
-			visited:   make([]uint64, 0, 512),
-			cands:     make([]frozenCandItem, 0, 128),
-			res:       make([]FrozenResult, 0, 128),
-			resIDs:    make([]uint32, 0, 128),
-			rerankBuf: make([]float32, 0, 256),
+			visited: make([]uint64, 0, 512),
+			cands:   make([]frozenCandItem, 0, 128),
+			res:     make([]FrozenResult, 0, 128),
+			resIDs:  make([]uint32, 0, 128),
 		}
 	},
 }
@@ -378,7 +392,6 @@ func (fg *FrozenGraphSQ) searchWithIdx(query []float32, K, efSearch int, dst []F
 	}
 
 	dim := fg.dim
-	distFn := fg.distFn
 
 	// ── Фаза 1: greedyClosest (0 аллок, int8 ADC distance) ──
 	ep := fg.entryPointID
@@ -428,11 +441,6 @@ func (fg *FrozenGraphSQ) searchWithIdx(query []float32, K, efSearch int, dst []F
 	}
 	if cap(st.resIDs) < efSearch+1 {
 		st.resIDs = make([]uint32, 0, efSearch+1)
-	}
-	if cap(st.rerankBuf) < dim {
-		st.rerankBuf = make([]float32, dim)
-	} else {
-		st.rerankBuf = st.rerankBuf[:dim]
 	}
 
 	setVisited := func(id uint32) { st.visited[id/64] |= 1 << (id % 64) }
@@ -553,20 +561,15 @@ func (fg *FrozenGraphSQ) searchWithIdx(query []float32, K, efSearch int, dst []F
 		}
 	}
 
-	// ── Фаза 3: RERANK — деквантовать каждого кандидата + точный float32 distance ──
-	// Деквантование: approx[d] = sqMin[d] + float32(code) * sqScale[d].
-	// Rerank переупорядочивает top-candidates по точному расстоянию к деквантованным
+	// ── Фаза 3: RERANK — точный distance каждого кандидата fused ADC-ядром ──
+	// Семантика прежняя (≡ скалярный деквант + distFn, см. sqBruteDist): rerank
+	// переупорядочивает top-candidates по точному расстоянию к деквантованным
 	// векторам. Это сохраняет recall: ADC-noise влияет на traversal, но финальный
 	// порядок кандидатов определяется более точно.
+	rerankDist := fg.sqBruteDist(query)
 	for i := range st.res {
-		id := st.resIDs[i]
-		base := int(id) * dim
-		// Деквантование в rerankBuf
-		for d := 0; d < dim; d++ {
-			st.rerankBuf[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
-		}
-		// Точный float32 distance
-		st.res[i].Dist = distFn(query, st.rerankBuf)
+		base := int(st.resIDs[i]) * dim
+		st.res[i].Dist = rerankDist(fg.codes[base : base+dim])
 	}
 
 	// Сортируем по точному расстоянию, берём top-K
@@ -713,6 +716,7 @@ func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 		distFn:       metric.DistanceFunc(),
 		dotMode:      metric.IsDot(),
 		metric:       metric,
+		zeroQ:        makeZeroQ(metric, dim),
 	}
 
 	// sqMin
