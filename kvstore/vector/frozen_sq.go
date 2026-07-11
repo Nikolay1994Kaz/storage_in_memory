@@ -47,6 +47,10 @@ type FrozenGraphSQ struct {
 	// dotMode: true если distFn = dot product (1-dot), false если euclidean (L2²).
 	// Определяет какую SQ8-distance использовать в traversal.
 	dotMode bool
+
+	// metric — метрика как данные: brute-путям нужно отличать cosine от dot
+	// (у обеих dotMode=true), чтобы выбрать fused-ядро. См. sqBruteDist.
+	metric Metric
 }
 
 // FreezeGraphSQ конвертирует *Graph → *FrozenGraphSQ (SQ8 CSR layout).
@@ -184,22 +188,73 @@ func FreezeGraphSQOrdered(g *Graph, metric Metric, keys map[uint64]string, pos [
 		dim:          dim,
 		distFn:       metric.DistanceFunc(),
 		dotMode:      metric.IsDot(),
+		metric:       metric,
 	}
 }
 
 // Len возвращает число нод в графе.
 func (fg *FrozenGraphSQ) Len() int { return fg.n }
 
+// sqBruteDist возвращает функцию точной дистанции по кодам одного вектора для
+// brute-путей. Семантика ≡ прежнему «скалярный деквант в buf + distFn» (та же
+// точность, что rerank-фаза), но через fused AVX2 ADC-ядра — деквант и дистанция
+// одним SIMD-проходом (микробенч 11.07: euclid/dot 9–11.6×, cosine 5–6.8×):
+//   - euclid: sq8EuclidImpl ≡ деквант+EuclideanDistance
+//   - dot:    1−sq8DotImpl ≡ деквант+DotProductDistance
+//   - cosine: два прохода существующими ядрами — dot = sq8DotImpl,
+//     |approx|² = sq8EuclidImpl(нулевой query) = Σ approx²; codes после первого
+//     прохода горячие в L1. Нормировка по |query| предвычислена на вызов, поэтому
+//     скоры совпадают с CosineDistance(query, деквант) — сравнимость с rerank и
+//     fp32-путями сохранена.
+//
+// Неизвестная метрика → прежний скалярный путь (fallback, поведение не меняется).
+func (fg *FrozenGraphSQ) sqBruteDist(query []float32) func(codes []uint8) float32 {
+	switch fg.metric {
+	case MetricEuclidean:
+		return func(cs []uint8) float32 {
+			return sq8EuclidImpl(query, cs, fg.sqMin, fg.sqScale)
+		}
+	case MetricDot:
+		return func(cs []uint8) float32 {
+			return 1 - sq8DotImpl(query, cs, fg.sqMin, fg.sqScale)
+		}
+	case MetricCosine:
+		qNorm2 := dotProductImpl(query, query)
+		if qNorm2 == 0 {
+			// CosineDistance при нулевом query → 1 для любого вектора.
+			return func([]uint8) float32 { return 1 }
+		}
+		invQNorm := 1 / float32(math.Sqrt(float64(qNorm2)))
+		zeroQ := make([]float32, fg.dim) // 1 alloc на вызов (вместо буфера декванта)
+		return func(cs []uint8) float32 {
+			dot := sq8DotImpl(query, cs, fg.sqMin, fg.sqScale)
+			normB2 := sq8EuclidImpl(zeroQ, cs, fg.sqMin, fg.sqScale)
+			if normB2 == 0 {
+				return 1
+			}
+			return 1 - dot*invQNorm/float32(math.Sqrt(float64(normB2)))
+		}
+	default:
+		buf := make([]float32, fg.dim)
+		return func(cs []uint8) float32 {
+			for d := range cs {
+				buf[d] = fg.sqMin[d] + float32(cs[d])*fg.sqScale[d]
+			}
+			return fg.distFn(query, buf)
+		}
+	}
+}
+
 // bruteRange — точный top-K по непрерывному диапазону [start,end) (нижний режим #7
-// для SQ8-сегмента). Каждый вектор диапазона деквантуется (sqMin+code·sqScale) и
-// меряется точной distFn — это та же точность, что у rerank-фазы Search, но
-// исчерпывающе по блоку (recall=1.0 при SQ-точности). filterFn применяется к ключам.
+// для SQ8-сегмента). Дистанция — fused ADC (см. sqBruteDist) с той же точностью,
+// что у rerank-фазы Search, но исчерпывающе по блоку (recall=1.0 при SQ-точности).
+// filterFn применяется к ключам.
 func (fg *FrozenGraphSQ) bruteRange(query []float32, K, start, end int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
 	if K <= 0 || start >= end {
 		return dst[:0]
 	}
 	top := dst[:0]
-	buf := make([]float32, fg.dim) // деквант-буфер (1 alloc на вызов)
+	dist := fg.sqBruteDist(query)
 	for i := start; i < end; i++ {
 		key := fg.keys.view(i)
 		if key == "" {
@@ -209,10 +264,7 @@ func (fg *FrozenGraphSQ) bruteRange(query []float32, K, start, end int, dst []Fr
 			continue
 		}
 		base := i * fg.dim
-		for d := 0; d < fg.dim; d++ {
-			buf[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
-		}
-		top = insertTopK(top, K, key, fg.distFn(query, buf))
+		top = insertTopK(top, K, key, dist(fg.codes[base:base+fg.dim]))
 	}
 	return top
 }
@@ -229,7 +281,7 @@ func (fg *FrozenGraphSQ) bruteRangeAttr(query []float32, K, start, end int, dst 
 		return dst[:0]
 	}
 	top := dst[:0]
-	buf := make([]float32, fg.dim) // деквант-буфер (1 alloc на вызов)
+	dist := fg.sqBruteDist(query)
 	for i := start; i < end; i++ {
 		if predIdx != nil && !predIdx(i) {
 			continue
@@ -239,10 +291,7 @@ func (fg *FrozenGraphSQ) bruteRangeAttr(query []float32, K, start, end int, dst 
 			continue
 		}
 		base := i * fg.dim
-		for d := 0; d < fg.dim; d++ {
-			buf[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
-		}
-		top = insertTopK(top, K, key, fg.distFn(query, buf))
+		top = insertTopK(top, K, key, dist(fg.codes[base:base+fg.dim]))
 	}
 	return top
 }
@@ -663,6 +712,7 @@ func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 		entryPointID: entryPointID,
 		distFn:       metric.DistanceFunc(),
 		dotMode:      metric.IsDot(),
+		metric:       metric,
 	}
 
 	// sqMin
