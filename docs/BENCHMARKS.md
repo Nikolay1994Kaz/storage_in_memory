@@ -43,9 +43,12 @@ Search over RESP (12 connections, consolidated index):
 | MNIST-784, 60k | **SQ8** | **10 093** | 0.9994 |
 | dbpedia-openai-100k, 1536-dim | **SQ8** | **3 535** | 0.9902 |
 
-Mixed workload (12 insert + 12 search connections simultaneously, MNIST,
-sharded delta): **2 762 inserts/s + 431 QPS** sustained — sharding trades
-~8% search for 3× ingest under contention.
+Mixed workload (12 insert + 12 search connections simultaneously,
+dbpedia-1536 100k, SQ8): **673 inserts/s** sustained while search holds a
+**750–800 QPS** floor for the whole load, then converges to **3 544 QPS @
+recall@10 0.9900** once ingest stops — matching the consolidated canon above.
+SIFT-60k smoke under the same protocol: search floor ~2 350 QPS during
+ingest, terminal 13.5–15.5k QPS, zero errors.
 
 Notes, honestly:
 
@@ -54,11 +57,16 @@ Notes, honestly:
   consolidation (`-idle-consolidate`, default 60 s of write silence) collapse
   all segments into one, no manual command. On this laptop: ~2 min after
   60k×784, ~10 min after 100k×1536.
-- **Transient window.** For the first ~1–2 minutes right after a bulk load,
-  while flushed deltas are still being built into segments, search runs slow
-  (down to ~34 QPS on 100k×1536 worst case). Writes, recall and durability are
-  unaffected — only search speed, only until the builds finish. Steady
-  trickle-write workloads never enter this state.
+- **No search brownout during loads.** Delta shards freeze into mini-segments
+  in milliseconds (instead of a minutes-long graph rebuild on the flush path),
+  and merges consume whole level prefixes in one pass (batched L0 merge), so
+  search never degrades to scanning dozens of transient graphs. Measured floor
+  while 100k×1536 loads under concurrent search: **750–800 QPS** (earlier
+  builds dipped to ~34 QPS in this state). One honest limit remains: under
+  *continuous saturating* search load, full consolidation to the terminal
+  single-segment shape takes a long tail — the final large merge is
+  single-threaded and competes with search for cores. In write silence, idle
+  consolidation reaches terminal shape in minutes.
 - RESP + epoll cost ~10–20% vs the in-process harness. Pipelining
   (`insertload -pipeline`) buys +52% ingest on a single connection; at 12
   connections the server is CPU-bound and pipelining adds nothing.
@@ -193,10 +201,13 @@ count, not protocol, is the dominant QPS factor.
 ## Caveats, all in one place
 
 - **Laptop hardware, thermal throttling** — absolute QPS conservative, ratios reliable.
-- **Insert path is single-threaded per segment build**: ~3 000 vec/s (SIFT-128
+- **Background segment builds are single-threaded**: ~3 000 vec/s (SIFT-128
   fp32), ~700 vec/s (GIST-960 SQ8) on this machine vs hnswlib's parallel build
-  at ~7 800 vec/s. Sharded delta ingest (`DeltaShards`) recovers ~4× under
-  concurrent writers, but bulk build speed is a known, accepted gap.
+  at ~7 800 vec/s. The flush path itself no longer rebuilds (per-shard freeze,
+  milliseconds), and sharded delta ingest (`DeltaShards`) recovers ~4× under
+  concurrent writers — but merge/build speed vs a parallel builder is a known,
+  accepted gap, and it is why time-to-peak-QPS under continuous saturating
+  read load is long (see the end-to-end section).
 - **Filtered-search wins assume a consolidated index** (few segments). Heavy
   recent-write churn fragments tenant blocks across segments until merge
   catches up; idle consolidation (`-idle-consolidate`) restores the

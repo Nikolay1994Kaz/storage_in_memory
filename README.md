@@ -12,7 +12,7 @@ exists to serve the vector core.
 
 ## Features
 
-- **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization
+- **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization; non-blocking bulk ingest (per-shard delta freeze + batched LSM merges)
 - **AI / RAG** *(optional, off by default)* — Ollama embeddings, async ingestion, semantic queries (`AI.INGEST` / `AI.ASK`); the engine itself is BYO-embeddings
 - **WAL + Snapshots** — CRC32-protected, batch writes, crash recovery
 - **WAL-shipping** — continuous async replication of WAL+snapshots to S3/MinIO or a mounted dir (Litestream-style); restore on any machine with `-ship-restore` (see [docs/BACKUP.md](docs/BACKUP.md))
@@ -193,6 +193,11 @@ honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
   0.9902 on dbpedia-1536; ingest up to **5 324 vec/s** over the wire with
   sharded delta. After bulk loads the index consolidates back to peak shape
   automatically (`-idle-consolidate`).
+- **Search stays online during bulk loads:** per-shard delta freeze + batched
+  L0 merges hold a **750–800 QPS** search floor on dbpedia-1536 (100k, SQ8)
+  while 12 connections ingest concurrently at **673 vec/s**, converging to
+  **3 544 QPS** @ 0.9900 after the load — no brownout window (earlier builds
+  dipped to double-digit QPS in this state).
 - **High-dim (GIST-960, target path):** SQ8 beats hnswlib float32 **2.5–2.7×**
   in multithreaded QPS at equal recall, with 4× less vector memory.
 - **Real embeddings (dbpedia ada-002, 1536-dim):** recall@10 0.977 (SQ8) /
