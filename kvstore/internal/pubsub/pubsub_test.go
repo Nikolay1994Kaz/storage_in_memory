@@ -35,17 +35,23 @@ func TestHub_SubscribeAndPublish(t *testing.T) {
 		hub.Publish("news", "padding-to-trigger-bufio-flush")
 	}
 
-	// Теперь данные ушли в pipe — читаем с клиентской стороны
+	// Теперь данные ушли в pipe — читаем с клиентской стороны.
+	// Читаем в цикле: первый чанк может оказаться одним лишь ack'ом
+	// подписки (writePump иногда флашит его отдельно — 33 байта).
 	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 8192)
-	n, err := clientConn.Read(buf)
-	if err != nil {
-		t.Fatalf("client read: %v", err)
+	total := 0
+	for total < len(buf) && !strings.Contains(string(buf[:total]), "hello world") {
+		n, err := clientConn.Read(buf[total:])
+		total += n
+		if err != nil {
+			t.Fatalf("client read after %d bytes: %v", total, err)
+		}
 	}
 
-	resp := string(buf[:n])
+	resp := string(buf[:total])
 	if !strings.Contains(resp, "hello world") {
-		t.Fatalf("response should contain 'hello world', got %d bytes", n)
+		t.Fatalf("response should contain 'hello world', got %d bytes", total)
 	}
 	if !strings.Contains(resp, "news") {
 		t.Fatalf("response should contain channel name 'news'")
