@@ -283,11 +283,11 @@ func TestSecondaryLayout_Profit(t *testing.T) {
 		qps, rec float64
 	}
 	type storeRes struct {
-		build    time.Duration
-		segs     int
-		globQPS  float64
-		globRec  float64
-		filt     []mrow
+		build   time.Duration
+		segs    int
+		globQPS float64
+		globRec float64
+		filt    []mrow
 	}
 
 	runStore := func(name string, all []kv) storeRes {
