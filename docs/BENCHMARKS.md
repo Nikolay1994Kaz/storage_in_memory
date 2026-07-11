@@ -126,23 +126,42 @@ The classic ann-benchmarks dataset: 1M × 128-dim, M=16, efC=200, official
 ground truth, iso-recall comparison, both engines float32 (dim 128 is below the
 SQ8 payoff threshold).
 
+Segment count is the dominant variable on this dataset, so both operating
+points are shown honestly.
+
+**Fresh multi-segment LSM state** — right after a bulk load, before merges
+catch up (the validation harness deliberately measures this worst case):
+
 | recall@10 | ours QPS_12 | hnswlib QPS_12 | ratio |
 |---|---|---|---|
 | ≈0.955 | 5 734 | 18 833 | 0.30× |
 | ≈0.986 | 3 517 | 10 500 | 0.33× |
 | ≈0.997 | 2 066 | 5 833 | 0.35× |
 
-**Honest takeaway:** on low-dimensional float32 data hnswlib is ~3× faster.
-Recall per ef is equal or better on our side (the neighbor-selection heuristic
-builds a good graph); the throughput gap is architectural — this engine
-searches an LSM of segments (fan-out + merge per query) to support concurrent
-writes, deletes and crash recovery, while hnswlib searches one static monolith.
-The gap narrows as segments consolidate and reverses on high-dim data where
-SQ8 applies (see §2). If your workload is a static, low-dim, single-tenant
-index with no durability needs — use hnswlib/Faiss; that is not this engine's
-target.
+**Consolidated single segment** — the steady state the server converges to on
+its own (merge cascade + `-idle-consolidate`); in the harness: deltaMax=N:
 
-Test: `TestSIFT1M_Validation` (`kvstore/vector/step_profit_test.go`).
+| recall@10 | ours QPS_1 | hnswlib QPS_1 | ours QPS_12 | hnswlib QPS_12 |
+|---|---|---|---|---|
+| ≈0.96 | 5 115 (0.84×) | 6 082 | **25 697 (1.36×)** | 18 833 |
+| ≈0.99 | 2 840 (0.86×) | 3 300 | **14 464 (1.38×)** | 10 500 |
+
+**Honest takeaway:** single-threaded, hnswlib is ~15% faster (its hand-tuned
+SIMD vs our AVX2 assembly). Multithreaded on a consolidated index this engine
+is **1.36–1.38× faster** — throughput scales ~5.0× on 6 cores vs ~3.2× for
+hnswlib. On a fresh fragmented index hnswlib is ~3× faster: fan-out + merge
+across segments per query is the architectural price of supporting concurrent
+writes, deletes and crash recovery, while hnswlib searches one static
+monolith. Which state you live in depends on write pressure — idle
+consolidation restores the consolidated shape automatically after write lulls.
+If your workload is a static, low-dim, single-tenant index with no durability
+needs, hnswlib/Faiss serve that perfectly; the live-workload case is the
+target here.
+
+Tests: `TestSIFT1M_Validation` (multi-segment state) and
+`TestSIFT1M_SegmentEffect` (deltaMax=50k vs deltaMax=N A/B, QPS_1/QPS_12 per
+ef) — both in `kvstore/vector/step_profit_test.go`; hnswlib side: same M/efC/ef
+grid, same queries and ground truth.
 
 ## 4. Filtered / multi-tenant search
 

@@ -204,8 +204,12 @@ honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
   0.984 (fp32); SQ8 gives ~2.3× QPS and 3.7× less memory.
 - **Multi-tenant filtered search:** tenant-routed queries are **5.8×–28 620×**
   faster than post-filtering a full graph traversal, at recall 1.0.
-- **Low-dim float32 (SIFT-1M):** hnswlib is ~3× faster — the honest cost of an
-  LSM design that supports concurrent writes, deletes and crash recovery.
+- **Low-dim float32 (SIFT-1M):** on a consolidated index the engine beats
+  hnswlib **1.36–1.38×** multithreaded (25 697 vs 18 833 QPS @ recall 0.96;
+  scaling 5.0× vs 3.2× on 6 cores); on a freshly loaded fragmented index
+  hnswlib is ~3× faster — the honest cost of an LSM design that supports
+  concurrent writes, deletes and crash recovery. Idle consolidation converges
+  to the fast state automatically.
 
 ## Status & Scope
 
