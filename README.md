@@ -189,8 +189,8 @@ same-machine head-to-head runs against hnswlib — full tables, methodology and
 honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
 
 - **End-to-end through the server (RESP, real query vectors):**
-  **10 093 QPS** @ recall@10 0.9994 on MNIST-784 (SQ8) and **3 535 QPS** @
-  0.9902 on dbpedia-1536; ingest up to **5 324 vec/s** over the wire with
+  **12 985 QPS** @ recall@10 0.9996 on MNIST-784 (SQ8) and **3 928 QPS** @
+  0.9888 on dbpedia-1536; ingest up to **5 533 vec/s** over the wire with
   sharded delta. After bulk loads the index consolidates back to peak shape
   automatically (`-idle-consolidate`).
 - **Search stays online during bulk loads:** per-shard delta freeze + batched

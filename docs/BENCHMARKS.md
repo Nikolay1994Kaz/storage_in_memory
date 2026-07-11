@@ -32,21 +32,23 @@ Insert rate over RESP (12 connections):
 
 | Dataset | single delta graph | `-delta-shards 12` |
 |---|---|---|
-| MNIST-784 (fp32) | 976 vec/s | **5 324 vec/s** |
-| dbpedia 1536-dim (SQ8) | — | **2 725 vec/s** |
+| MNIST-784 (fp32) | 976 vec/s | **5 533 vec/s** |
+| dbpedia 1536-dim (SQ8) | — | **3 681 vec/s** |
 
-Search over RESP (12 connections, consolidated index):
+Search over RESP (12 connections, consolidated index; re-measured after the
+fused-ADC rerank landed — previous canon was 10 093 / 3 535):
 
 | Dataset | mode | QPS | recall@10 |
 |---|---|---|---|
-| MNIST-784, 60k | float32 | 5 743 | 0.9998 |
-| MNIST-784, 60k | **SQ8** | **10 093** | 0.9994 |
-| dbpedia-openai-100k, 1536-dim | **SQ8** | **3 535** | 0.9902 |
+| MNIST-784, 60k | float32 | 6 190 | 0.9992 |
+| MNIST-784, 60k | **SQ8** | **12 985** | 0.9996 |
+| dbpedia-openai-100k, 1536-dim | **SQ8** | **3 928** | 0.9888 |
 
 Mixed workload (12 insert + 12 search connections simultaneously,
 dbpedia-1536 100k, SQ8): **673 inserts/s** sustained while search holds a
 **750–800 QPS** floor for the whole load, then converges to **3 544 QPS @
-recall@10 0.9900** once ingest stops — matching the consolidated canon above.
+recall@10 0.9900** once ingest stops — matching the consolidated canon of the
+build it was measured on (3 535, pre-ADC-rerank).
 SIFT-60k smoke under the same protocol: search floor ~2 350 QPS during
 ingest, terminal 13.5–15.5k QPS, zero errors.
 
@@ -211,8 +213,8 @@ the ceiling when memory bandwidth is not the constraint:
 Test: `TestStep6_CurrentStateQPS` (`kvstore/vector/step_profit_test.go`).
 
 Note: this harness searches a multi-segment index. End-to-end through the
-server on a fully consolidated single segment measures *higher* — 10 093 QPS
-@ 0.9994 at the same ef=100 (see the end-to-end section above) — segment
+server on a fully consolidated single segment measures *higher* — 12 985 QPS
+@ 0.9996 at the same ef=100 (see the end-to-end section above) — segment
 count, not protocol, is the dominant QPS factor.
 
 ---
