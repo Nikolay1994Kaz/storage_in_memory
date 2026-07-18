@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -161,10 +162,30 @@ func assertBM25Ranking(t *testing.T, queryID string, want []bm25GoldenHit, got [
 	}
 }
 
-// TestBM25OracleParity — паритет Go-реализации с golden.
-// Включить после шагов 2–3 (токенайзер + segmentText/скоринг): токенизировать
-// corpus.docs, посчитать скоры по каждому запросу и прогнать через
-// assertBM25Ranking; токены доков/запросов сверить с golden побуквенно.
+// TestBM25TokenizerParity — токены Go-токенайзера бит-в-бит равны эталону
+// (шаг 2 плана): все доки и запросы корпуса, включая закреплённые кварки
+// snowball («Астана»→аста ≠ «Астане»→астан, «Дана»/«данных»→дан, ё→е).
+func TestBM25TokenizerParity(t *testing.T) {
+	corpus, golden := loadBM25Golden(t)
+	textByID := make(map[string]string, len(corpus.Docs)+len(corpus.Queries))
+	for _, d := range corpus.Docs {
+		textByID[d.ID] = d.Text
+	}
+	for _, d := range golden.Docs {
+		if got := bm25Tokenize(textByID[d.ID]); !slices.Equal(got, d.Tokens) {
+			t.Errorf("док %s: токены %v, ждём %v", d.ID, got, d.Tokens)
+		}
+	}
+	for _, q := range golden.Queries {
+		if got := bm25Tokenize(q.Text); !slices.Equal(got, q.Tokens) {
+			t.Errorf("запрос %s %q: токены %v, ждём %v", q.ID, q.Text, got, q.Tokens)
+		}
+	}
+}
+
+// TestBM25OracleParity — паритет скоринга с golden. Включить на шаге 3
+// (segmentText + глобальный IDF): посчитать скоры по каждому запросу и
+// прогнать через assertBM25Ranking.
 func TestBM25OracleParity(t *testing.T) {
-	t.Skip("BM25 ещё не реализован — оракул-харнесс готов, ждёт шагов 2–3 плана")
+	t.Skip("скоринг BM25 ещё не реализован — ждёт шага 3 плана (segmentText)")
 }
