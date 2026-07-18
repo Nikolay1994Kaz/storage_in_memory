@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"testing"
 )
 
@@ -183,9 +184,80 @@ func TestBM25TokenizerParity(t *testing.T) {
 	}
 }
 
-// TestBM25OracleParity — паритет скоринга с golden. Включить на шаге 3
-// (segmentText + глобальный IDF): посчитать скоры по каждому запросу и
-// прогнать через assertBM25Ranking.
+// TestBM25OracleParity — паритет скоринга с golden (шаг 3). Корпус нарочно
+// режется на ДВА сегмента: эталон считался на едином корпусе, поэтому паритет
+// возможен только если глобальная статистика (N/avgdl/df суммой по сегментам)
+// собирается правильно — локальный IDF сегмента дал бы другие скоры.
 func TestBM25OracleParity(t *testing.T) {
-	t.Skip("скоринг BM25 ещё не реализован — ждёт шага 3 плана (segmentText)")
+	corpus, golden := loadBM25Golden(t)
+
+	entries := make([]DeltaEntry, len(corpus.Docs))
+	for i, d := range corpus.Docs {
+		entries[i] = DeltaEntry{Key: d.ID, Terms: bm25CountTerms(bm25Tokenize(d.Text))}
+	}
+	split := len(entries) / 2
+	segs := []*segmentText{buildSegmentText(entries[:split]), buildSegmentText(entries[split:])}
+	bases := []uint32{0, uint32(split)}
+
+	for _, q := range golden.Queries {
+		terms := bm25Tokenize(q.Text)
+		n, avgdl, df := bm25GlobalStats(segs, terms)
+		idf := make([]float64, len(terms))
+		for i := range terms {
+			idf[i] = bm25IDF(n, df[i])
+		}
+		var got []bm25GoldenHit
+		for si, st := range segs {
+			for _, h := range st.search(terms, idf, avgdl, 0, uint32(len(st.docLen)), len(entries)) {
+				got = append(got, bm25GoldenHit{Doc: entries[bases[si]+h.doc].Key, Score: h.score})
+			}
+		}
+		sort.Slice(got, func(i, j int) bool {
+			if got[i].Score != got[j].Score {
+				return got[i].Score > got[j].Score
+			}
+			return got[i].Doc < got[j].Doc
+		})
+		assertBM25Ranking(t, q.ID, q.Ranking, got)
+	}
+}
+
+// TestBM25ScopedSearch — скоуп [lo,hi) эквивалентен фильтрации полной выдачи
+// (модель тенант-блока: после sortEntriesByTenant тенант = непрерывный
+// диапазон frozen-индексов).
+func TestBM25ScopedSearch(t *testing.T) {
+	corpus, golden := loadBM25Golden(t)
+	entries := make([]DeltaEntry, len(corpus.Docs))
+	for i, d := range corpus.Docs {
+		entries[i] = DeltaEntry{Key: d.ID, Terms: bm25CountTerms(bm25Tokenize(d.Text))}
+	}
+	st := buildSegmentText(entries)
+	full := uint32(len(entries))
+
+	for _, q := range golden.Queries {
+		terms := bm25Tokenize(q.Text)
+		n, avgdl, df := bm25GlobalStats([]*segmentText{st}, terms)
+		idf := make([]float64, len(terms))
+		for i := range terms {
+			idf[i] = bm25IDF(n, df[i])
+		}
+		all := st.search(terms, idf, avgdl, 0, full, len(entries))
+		for _, rng := range [][2]uint32{{0, 5}, {3, 9}, {9, full}, {5, 5}} {
+			want := make([]bm25Hit, 0, len(all))
+			for _, h := range all {
+				if h.doc >= rng[0] && h.doc < rng[1] {
+					want = append(want, h)
+				}
+			}
+			got := st.search(terms, idf, avgdl, rng[0], rng[1], len(entries))
+			if len(got) != len(want) {
+				t.Fatalf("%s [%d,%d): %d хитов, ждём %d", q.ID, rng[0], rng[1], len(got), len(want))
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Errorf("%s [%d,%d) поз.%d: %+v != %+v", q.ID, rng[0], rng[1], i, got[i], want[i])
+				}
+			}
+		}
+	}
 }

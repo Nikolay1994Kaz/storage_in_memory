@@ -44,6 +44,7 @@ type DeltaEntry struct {
 	Key   string
 	Vec   []float32  // ссылка в data-слайсе, не копия
 	Attrs Attributes // колоночный слой (uint/multi-attr); zero-value = без атрибутов
+	Terms []TermTF   // текстовый слой BM25 (термы+tf с ADDDOC); nil = без текста
 }
 
 // deltaResult — внутренний тип результата Search/BruteForce.
