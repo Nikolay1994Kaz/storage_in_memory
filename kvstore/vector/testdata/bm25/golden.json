@@ -1,0 +1,407 @@
+{
+ "params": {
+  "k1": 1.2,
+  "b": 0.75,
+  "idf": "ln(1 + (N - df + 0.5) / (df + 0.5))",
+  "tf_norm": "tf*(k1+1) / (tf + k1*(1 - b + b*dl/avgdl))"
+ },
+ "tokenizer": "lowercase; runs of unicode letters/digits; kazakh letters (әғқңөұүһі) => no stem; cyrillic => snowball-ru; latin => snowball-en",
+ "avgdl": 7.928571,
+ "docs": [
+  {
+   "id": "f1",
+   "tokens": [
+    "дан",
+    "пьет",
+    "ча",
+    "в",
+    "астан",
+    "утр"
+   ]
+  },
+  {
+   "id": "f2",
+   "tokens": [
+    "дан",
+    "живет",
+    "и",
+    "работа",
+    "в",
+    "астан"
+   ]
+  },
+  {
+   "id": "f3",
+   "tokens": [
+    "дан",
+    "люб",
+    "зелен",
+    "ча",
+    "и",
+    "коф",
+    "по",
+    "утр"
+   ]
+  },
+  {
+   "id": "r1",
+   "tokens": [
+    "векторн",
+    "баз",
+    "дан",
+    "хран",
+    "эмбеддинг"
+   ]
+  },
+  {
+   "id": "r2",
+   "tokens": [
+    "векторн",
+    "баз",
+    "дан",
+    "ищут",
+    "ближайш",
+    "сосед"
+   ]
+  },
+  {
+   "id": "k1",
+   "tokens": [
+    "аста",
+    "қазақстанның",
+    "астанас"
+   ]
+  },
+  {
+   "id": "k2",
+   "tokens": [
+    "қазақ",
+    "тілі",
+    "әдемі",
+    "тіл"
+   ]
+  },
+  {
+   "id": "e1",
+   "tokens": [
+    "the",
+    "quick",
+    "brown",
+    "fox",
+    "jump",
+    "over",
+    "the",
+    "lazi",
+    "dog"
+   ]
+  },
+  {
+   "id": "e2",
+   "tokens": [
+    "a",
+    "cat",
+    "stori",
+    "cat",
+    "cat",
+    "and",
+    "more",
+    "cat",
+    "about",
+    "a",
+    "cat"
+   ]
+  },
+  {
+   "id": "e3",
+   "tokens": [
+    "onc",
+    "upon",
+    "a",
+    "time",
+    "in",
+    "a",
+    "small",
+    "quiet",
+    "villag",
+    "there",
+    "live",
+    "an",
+    "old",
+    "cat",
+    "that",
+    "slept",
+    "all",
+    "day",
+    "near",
+    "the",
+    "warm",
+    "stone",
+    "fireplac"
+   ]
+  },
+  {
+   "id": "e4",
+   "tokens": [
+    "hnsw",
+    "graph",
+    "index",
+    "implement",
+    "in",
+    "go",
+    "with",
+    "simd",
+    "distanc",
+    "kernel"
+   ]
+  },
+  {
+   "id": "m1",
+   "tokens": [
+    "поиск",
+    "ближайш",
+    "сосед",
+    "через",
+    "граф",
+    "hnsw"
+   ]
+  },
+  {
+   "id": "e5",
+   "tokens": [
+    "server",
+    "return",
+    "error",
+    "404",
+    "not",
+    "found"
+   ]
+  },
+  {
+   "id": "e6",
+   "tokens": [
+    "reciproc",
+    "rank",
+    "fusion",
+    "combin",
+    "lexic",
+    "and",
+    "vector",
+    "rank"
+   ]
+  }
+ ],
+ "queries": [
+  {
+   "id": "q01",
+   "text": "чай в Астане",
+   "tokens": [
+    "ча",
+    "в",
+    "астан"
+   ],
+   "ranking": [
+    {
+     "doc": "f1",
+     "score": 5.969272
+    },
+    {
+     "doc": "f2",
+     "score": 3.979515
+    },
+    {
+     "doc": "f3",
+     "score": 1.78518
+    }
+   ]
+  },
+  {
+   "id": "q02",
+   "text": "Дана",
+   "tokens": [
+    "дан"
+   ],
+   "ranking": [
+    {
+     "doc": "r1",
+     "score": 1.181893
+    },
+    {
+     "doc": "f1",
+     "score": 1.114172
+    },
+    {
+     "doc": "f2",
+     "score": 1.114172
+    },
+    {
+     "doc": "r2",
+     "score": 1.114172
+    },
+    {
+     "doc": "f3",
+     "score": 0.999618
+    }
+   ]
+  },
+  {
+   "id": "q12",
+   "text": "Астана",
+   "tokens": [
+    "аста"
+   ],
+   "ranking": [
+    {
+     "doc": "k1",
+     "score": 3.087816
+    }
+   ]
+  },
+  {
+   "id": "q03",
+   "text": "cat",
+   "tokens": [
+    "cat"
+   ],
+   "ranking": [
+    {
+     "doc": "e2",
+     "score": 3.009683
+    },
+    {
+     "doc": "e3",
+     "score": 1.007942
+    }
+   ]
+  },
+  {
+   "id": "q04",
+   "text": "quick fox",
+   "tokens": [
+    "quick",
+    "fox"
+   ],
+   "ranking": [
+    {
+     "doc": "e1",
+     "score": 4.363921
+    }
+   ]
+  },
+  {
+   "id": "q05",
+   "text": "векторные базы данных",
+   "tokens": [
+    "векторн",
+    "баз",
+    "дан"
+   ],
+   "ranking": [
+    {
+     "doc": "r1",
+     "score": 5.403288
+    },
+    {
+     "doc": "r2",
+     "score": 5.093687
+    },
+    {
+     "doc": "f1",
+     "score": 1.114172
+    },
+    {
+     "doc": "f2",
+     "score": 1.114172
+    },
+    {
+     "doc": "f3",
+     "score": 0.999618
+    }
+   ]
+  },
+  {
+   "id": "q06",
+   "text": "астанасы",
+   "tokens": [
+    "астанас"
+   ],
+   "ranking": [
+    {
+     "doc": "k1",
+     "score": 3.087816
+    }
+   ]
+  },
+  {
+   "id": "q07",
+   "text": "404",
+   "tokens": [
+    "404"
+   ],
+   "ranking": [
+    {
+     "doc": "e5",
+     "score": 2.557032
+    }
+   ]
+  },
+  {
+   "id": "q08",
+   "text": "hnsw graph",
+   "tokens": [
+    "hnsw",
+    "graph"
+   ],
+   "ranking": [
+    {
+     "doc": "e4",
+     "score": 3.698997
+    },
+    {
+     "doc": "m1",
+     "score": 1.989757
+    }
+   ]
+  },
+  {
+   "id": "q09",
+   "text": "зелёный чай",
+   "tokens": [
+    "зелен",
+    "ча"
+   ],
+   "ranking": [
+    {
+     "doc": "f3",
+     "score": 4.07931
+    },
+    {
+     "doc": "f1",
+     "score": 1.989757
+    }
+   ]
+  },
+  {
+   "id": "q10",
+   "text": "vector rankings",
+   "tokens": [
+    "vector",
+    "rank"
+   ],
+   "ranking": [
+    {
+     "doc": "e6",
+     "score": 5.452183
+    }
+   ]
+  },
+  {
+   "id": "q11",
+   "text": "жоқ сөз",
+   "tokens": [
+    "жоқ",
+    "сөз"
+   ],
+   "ranking": []
+  }
+ ]
+}

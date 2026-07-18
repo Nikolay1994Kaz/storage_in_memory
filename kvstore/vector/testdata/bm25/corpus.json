@@ -1,0 +1,33 @@
+{
+  "comment": "Фиксированный корпус оракула BM25. Правится руками; golden.json генерируется scripts/bm25_oracle.py — после любой правки перегенерировать.",
+  "docs": [
+    {"id": "f1", "text": "Дана пьёт чай в Астане утром"},
+    {"id": "f2", "text": "Дана живёт и работает в Астане"},
+    {"id": "f3", "text": "Дана любит зелёный чай и кофе по утрам"},
+    {"id": "r1", "text": "Векторная база данных хранит эмбеддинги"},
+    {"id": "r2", "text": "Векторные базы данных ищут ближайших соседей"},
+    {"id": "k1", "text": "Астана — Қазақстанның астанасы"},
+    {"id": "k2", "text": "Қазақ тілі әдемі тіл"},
+    {"id": "e1", "text": "The quick brown fox jumps over the lazy dog"},
+    {"id": "e2", "text": "A cat story: cats, cats and more cats about a cat"},
+    {"id": "e3", "text": "Once upon a time in a small quiet village there lived an old cat that slept all day near the warm stone fireplace"},
+    {"id": "e4", "text": "HNSW graph index implementation in Go with SIMD distance kernels"},
+    {"id": "m1", "text": "Поиск ближайших соседей через граф HNSW"},
+    {"id": "e5", "text": "Server returned error 404 not found"},
+    {"id": "e6", "text": "Reciprocal rank fusion combines lexical and vector rankings"}
+  ],
+  "queries": [
+    {"id": "q01", "text": "чай в Астане", "why": "ru мульти-терм: редкость и штраф длины"},
+    {"id": "q02", "text": "Дана", "why": "частый терм + стем-коллизия: дана/данных -> дан, r1/r2 матчатся (реальное поведение snowball)"},
+    {"id": "q12", "text": "Астана", "why": "кварк snowball: Астана->аста != Астане->астан; именительный НЕ матчит локатив f1/f2, только k1"},
+    {"id": "q03", "text": "cat", "why": "насыщение tf (e2) против штрафа длины (e3)"},
+    {"id": "q04", "text": "quick fox", "why": "en мульти-терм"},
+    {"id": "q05", "text": "векторные базы данных", "why": "ru-стемминг склеивает словоформы r1/r2"},
+    {"id": "q06", "text": "астанасы", "why": "казахская форма без kk-букв идёт через ru-стеммер (астанасы->астанас); матчит только k1, с «Астана» не склеивается"},
+    {"id": "q07", "text": "404", "why": "числовой токен"},
+    {"id": "q08", "text": "hnsw graph", "why": "en против смешанного ru-en дока; граф≠graph"},
+    {"id": "q09", "text": "зелёный чай", "why": "ru: редкий+средний терм"},
+    {"id": "q10", "text": "vector rankings", "why": "en-стемминг; ru-доки не матчатся кросс-языково"},
+    {"id": "q11", "text": "жоқ сөз", "why": "термы отсутствуют в корпусе — пустая выдача"}
+  ]
+}
