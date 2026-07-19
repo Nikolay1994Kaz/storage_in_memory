@@ -264,8 +264,10 @@ func TestBM25DFShadowedInflation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// df терма по всем источникам — как его видит SearchText. Терм берём из
-	// токенайзера (в индексе лежит стем, не сырое слово).
+	// df терма по всем источникам — как его видит SearchText: сегменты +
+	// активная дельта + flushing-дельты (свежий upsert может уехать в flushing
+	// ре-триггером компакции после публикации сегмента — гонка теста, не кода).
+	// Терм берём из токенайзера (в индексе лежит стем, не сырое слово).
 	terms := bm25Tokenize("чай")
 	var df uint64
 	lvs.mu.RLock()
@@ -276,8 +278,13 @@ func TestBM25DFShadowedInflation(t *testing.T) {
 			}
 		}
 	}
+	mts := make([]*DeltaSegment, 0, 1+len(lvs.flushing))
 	if lvs.delta != nil {
-		_, _, mdf := lvs.delta.TextStats(terms)
+		mts = append(mts, lvs.delta)
+	}
+	mts = append(mts, lvs.flushing...)
+	for _, mt := range mts {
+		_, _, mdf := mt.TextStats(terms)
 		df += mdf[0]
 	}
 	lvs.mu.RUnlock()

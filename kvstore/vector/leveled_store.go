@@ -3503,18 +3503,33 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 	// который провенанс-дедуп поиска уже не различит — одинаковый ранг).
 	var entries []DeltaEntry
 	seen := make(map[string]int)
-	addEntry := func(key string, vec []float32, attrs Attributes) {
+	addEntry := func(key string, vec []float32, attrs Attributes, terms []TermTF) {
 		if pos, ok := seen[key]; ok {
-			entries[pos] = DeltaEntry{Key: key, Vec: vec, Attrs: attrs}
+			entries[pos] = DeltaEntry{Key: key, Vec: vec, Attrs: attrs, Terms: terms}
 			return
 		}
 		seen[key] = len(entries)
-		entries = append(entries, DeltaEntry{Key: key, Vec: vec, Attrs: attrs})
+		entries = append(entries, DeltaEntry{Key: key, Vec: vec, Attrs: attrs, Terms: terms})
+	}
+	// Текст (шаг 6): постинги сегмента декодируются в пер-доковые термы ОДИН раз
+	// на входной сегмент (decodeTerms — обратный проход buildSegmentText), едут в
+	// entries и пересобираются build'ом заново. Слияние листов напрямую невозможно:
+	// frozen id перенумеровываются, tombstoned/затенённые копии выпадают, тенант-
+	// сорт меняет порядок. Побочный эффект пересборки — нормализация статистики:
+	// df/N/avgdl завышенные затенёнными копиями возвращаются к правде (конец
+	// «принятой семантики» шага 4). Все входы без текста → termsAt даёт nil →
+	// buildSegmentText вернёт nil (zero overhead сохраняется).
+	termsAt := func(dec [][]TermTF, i int) []TermTF {
+		if i < len(dec) {
+			return dec[i]
+		}
+		return nil
 	}
 	for _, seg := range segs {
 		switch s := seg.(type) {
 		case *frozenSegment:
 			fg := s.fg
+			decTerms := s.text.decodeTerms()
 			for i := 0; i < fg.n; i++ {
 				if fg.keys.view(i) == "" {
 					continue
@@ -3528,7 +3543,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				vec := fg.data[i*fg.dim : (i+1)*fg.dim]
 				vecCopy := make([]float32, dim)
 				copy(vecCopy, vec)
-				addEntry(fg.keys.clone(i), vecCopy, s.attrs.decodeAt(i))
+				addEntry(fg.keys.clone(i), vecCopy, s.attrs.decodeAt(i), termsAt(decTerms, i))
 			}
 		case *frozenSQSegment:
 			// Деквантуем SQ8-векторы обратно в float32 для rebuild.
@@ -3536,6 +3551,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 			// ≈ исходный с точностью SQ8 (error ≤ scale/2 per dimension).
 			// При rebuild новый сегмент квантуется заново — накопления ошибки нет.
 			fg := s.fg
+			decTerms := s.text.decodeTerms()
 			for i := 0; i < fg.n; i++ {
 				if fg.keys.view(i) == "" {
 					continue
@@ -3551,11 +3567,14 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				for d := 0; d < dim; d++ {
 					vecCopy[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
 				}
-				addEntry(fg.keys.clone(i), vecCopy, s.attrs.decodeAt(i))
+				addEntry(fg.keys.clone(i), vecCopy, s.attrs.decodeAt(i), termsAt(decTerms, i))
 			}
 		case *hnswSegment:
 			s.mu.RLock()
 			g := s.g
+			// node id = frozen id текстового слоя (build без шафла) — тот же
+			// индекс, что у attrs.decodeAt.
+			decTerms := s.text.decodeTerms()
 			for i := range g.nodes {
 				if !g.nodes[i].Alive {
 					continue
@@ -3573,7 +3592,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 				raw := g.arena.Get(g.nodes[i].VectorOffset)
 				vecCopy := make([]float32, dim)
 				copy(vecCopy, raw)
-				addEntry(key, vecCopy, s.attrs.decodeAt(i))
+				addEntry(key, vecCopy, s.attrs.decodeAt(i), termsAt(decTerms, i))
 			}
 			s.mu.RUnlock()
 		}
@@ -3670,8 +3689,8 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 
 	// Текстовый BM25-слой — тем же правилом, что attrs: всегда, когда в entries
 	// есть термы (nil иначе — zero overhead). entries уже в финальном порядке →
-	// постинги лягут по frozen id. NB: на merge-пути entries пока приходят без
-	// Terms (декод постингов — шаг 6), там слой корректно получится nil.
+	// постинги лягут по frozen id. Merge-путь кладёт Terms декодом постингов
+	// входных сегментов (mergeSegmentsWithAllocator → decodeTerms).
 	text := buildSegmentText(entries)
 
 	// Строим HNSW из всех векторов.
