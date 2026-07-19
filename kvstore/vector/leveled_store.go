@@ -113,6 +113,12 @@ type segment interface {
 	// (если есть) задаёт блок тенанта через каталог; остальные Eq/Range — idx-предикат
 	// по uint-колонкам. filterFn — tombstone-фильтр, применяется наравне.
 	SearchFilter(query []float32, K, efSearch int, partitionAttr string, f Filter, dst []FrozenResult, filterFn func(string) bool) []FrozenResult
+	// Text возвращает текстовый BM25-слой сегмента (постинги по frozen id) или
+	// nil, если текстов в сегменте нет. Слой выровнен по frozen id (как Attrs).
+	Text() *segmentText
+	// TextKey маппит frozen id дока (bm25Hit.doc из Text().search) в
+	// пользовательский ключ. Валиден при Text() != nil.
+	TextKey(doc uint32) string
 }
 
 type leveledSearchState struct {
@@ -147,11 +153,14 @@ type frozenSegment struct {
 	fg    *FrozenGraph
 	cat   *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
 	attrs *segmentAttrs  // колоночный слой атрибутов; nil если атрибутов нет
+	text  *segmentText   // текстовый BM25-слой; nil если текстов нет
 }
 
-func (s *frozenSegment) Len() int                { return s.fg.Len() }
-func (s *frozenSegment) Catalog() *TenantCatalog { return s.cat }
-func (s *frozenSegment) Attrs() *segmentAttrs    { return s.attrs }
+func (s *frozenSegment) Len() int                  { return s.fg.Len() }
+func (s *frozenSegment) Catalog() *TenantCatalog   { return s.cat }
+func (s *frozenSegment) Attrs() *segmentAttrs      { return s.attrs }
+func (s *frozenSegment) Text() *segmentText        { return s.text }
+func (s *frozenSegment) TextKey(doc uint32) string { return s.fg.viewKey(int(doc)) }
 
 // HasKey — O(N) линейный поиск по keys. Дорогая операция!
 // Вызывается только из Delete для редких ручных DEL / TTL-eviction.
@@ -305,11 +314,14 @@ type frozenSQSegment struct {
 	fg    *FrozenGraphSQ
 	cat   *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
 	attrs *segmentAttrs  // колоночный слой атрибутов; nil если атрибутов нет
+	text  *segmentText   // текстовый BM25-слой; nil если текстов нет
 }
 
-func (s *frozenSQSegment) Len() int                { return s.fg.Len() }
-func (s *frozenSQSegment) Catalog() *TenantCatalog { return s.cat }
-func (s *frozenSQSegment) Attrs() *segmentAttrs    { return s.attrs }
+func (s *frozenSQSegment) Len() int                  { return s.fg.Len() }
+func (s *frozenSQSegment) Catalog() *TenantCatalog   { return s.cat }
+func (s *frozenSQSegment) Attrs() *segmentAttrs      { return s.attrs }
+func (s *frozenSQSegment) Text() *segmentText        { return s.text }
+func (s *frozenSQSegment) TextKey(doc uint32) string { return s.fg.viewKey(int(doc)) }
 
 // HasKey — O(N) линейный поиск по keys (аналог frozenSegment).
 func (s *frozenSQSegment) HasKey(key string) bool {
@@ -354,10 +366,16 @@ type hnswSegment struct {
 	mu    sync.RWMutex      // защита от чтения пока граф строится
 	cat   *TenantCatalog    // тенант-каталог (Вещь 1); nil если тенант-режим выключен
 	attrs *segmentAttrs     // колоночный слой атрибутов; nil если атрибутов нет
+	text  *segmentText      // текстовый BM25-слой; nil если текстов нет
 }
 
 func (s *hnswSegment) Catalog() *TenantCatalog { return s.cat }
 func (s *hnswSegment) Attrs() *segmentAttrs    { return s.attrs }
+func (s *hnswSegment) Text() *segmentText      { return s.text }
+
+// TextKey — для hnswSegment frozen id текстового слоя = graph id: build без
+// freeze вставляет entries по порядку (без шафла), id идут последовательно.
+func (s *hnswSegment) TextKey(doc uint32) string { return s.keys[uint64(doc)] }
 
 // SearchTenant — для hnswSegment brute по arena не реализован (редкий случай:
 // dim>csr И !UseSQ). Всегда фильтрованный обход графа с тенант-предикатом — корректно,
@@ -883,6 +901,12 @@ func (lvs *LeveledVectorStore) Add(key string, vec []float32) error {
 // Атрибуты едут с данными через дельту и переживают flush/merge. Партиционный
 // атрибут (cfg.PartitionAttr) задаёт тенант-раскладку. Add — обёртка без атрибутов.
 func (lvs *LeveledVectorStore) AddWithAttrs(key string, vec []float32, attrs Attributes) error {
+	return lvs.addEntry(key, vec, attrs, nil)
+}
+
+// addEntry — общий путь вставки для Add/AddWithAttrs/AddDoc: полная замена
+// состояния дока (вектор + attrs + термы текста; terms=nil ⇒ текста нет).
+func (lvs *LeveledVectorStore) addEntry(key string, vec []float32, attrs Attributes, terms []TermTF) error {
 	// Choke-point персистентности: и Add, и реплей WAL (OpVSimAdd/OpVSimAddAttrs)
 	// идут сюда. Санитизируем недоверенный вход до любых сайд-эффектов — ошибка
 	// вместо паники (deltaMax dim=0), тихой потери (пустой ключ = tombstone) или
@@ -910,7 +934,7 @@ func (lvs *LeveledVectorStore) AddWithAttrs(key string, vec []float32, attrs Att
 		return &dimMismatchError{expected: lvs.dim, got: len(vec)}
 	}
 
-	becameFull := lvs.delta.AppendWithAttrs(key, vec, attrs)
+	becameFull := lvs.delta.AppendDoc(key, vec, attrs, terms)
 	lvs.touchMutation()
 
 	// Если ключ ранее был удалён (есть в tombstones) — снимаем tombstone,
@@ -2683,8 +2707,11 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 		// Тенант-режим (TenantOf/PartitionAttr) и атрибуты требуют rebuild для
 		// сортировки/колонок → freeze (заморозка инкрементального графа как есть)
 		// несовместим: он сохранил бы временной порядок вставки, а не тенант-порядок.
+		// HasText — как HasAttrs: freeze заморозил бы граф БЕЗ segmentText, и
+		// SEARCHTEXT, работавший по дельте, молча слеп бы после flush.
 		canFreeze := lvs.cfg.TenantOf == nil && lvs.cfg.PartitionAttr == "" &&
-			!oldDelta.HasAttrs() && (lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold)
+			!oldDelta.HasAttrs() && !oldDelta.HasText() &&
+			(lvs.cfg.UseSQ || lvs.dim <= csrDimThreshold)
 		switch {
 		case canFreeze && !oldDelta.Sharded():
 			// Один шард → один граф → один сегмент. Close аллокатора — внутри
@@ -3600,6 +3627,12 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 	// frozen id = позиция, колонки выровнены.
 	attrs = buildSegmentAttrs(entries, presets)
 
+	// Текстовый BM25-слой — тем же правилом, что attrs: всегда, когда в entries
+	// есть термы (nil иначе — zero overhead). entries уже в финальном порядке →
+	// постинги лягут по frozen id. NB: на merge-пути entries пока приходят без
+	// Terms (декод постингов — шаг 6), там слой корректно получится nil.
+	text := buildSegmentText(entries)
+
 	// Строим HNSW из всех векторов.
 	g := NewGraph(lvs.cfg.Distance, allocator)
 	g.workerID = 0 // изолированный allocator: всегда shard 0
@@ -3664,17 +3697,17 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 		if fg == nil {
 			return nil
 		}
-		return &frozenSQSegment{fg: fg, cat: cat, attrs: attrs}
+		return &frozenSQSegment{fg: fg, cat: cat, attrs: attrs, text: text}
 	}
 	if dim <= csrDimThreshold {
 		fg := FreezeGraphOrdered(g, lvs.cfg.Distance, keys, pos)
 		if fg == nil {
 			return nil
 		}
-		return &frozenSegment{fg: fg, cat: cat, attrs: attrs}
+		return &frozenSegment{fg: fg, cat: cat, attrs: attrs, text: text}
 	}
 
-	return &hnswSegment{g: g, keys: keys, cat: cat, attrs: attrs}
+	return &hnswSegment{g: g, keys: keys, cat: cat, attrs: attrs, text: text}
 }
 
 // =============================================================================

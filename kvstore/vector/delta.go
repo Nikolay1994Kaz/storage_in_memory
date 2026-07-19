@@ -4,6 +4,7 @@ import (
 	"hash/maphash"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -55,10 +56,22 @@ type deltaResult struct {
 
 // deltaShard — независимый под-сегмент дельты со своим slab, HNSW-индексом и локом.
 type deltaShard struct {
-	mu      sync.RWMutex
-	data    []float32      // flat: data[i*dim : (i+1)*dim] = вектор i (источник истины для flush)
-	keys    []string       // keys[i] = ключ вектора i ("" = tombstone)
-	attrs   []Attributes   // attrs[i] = атрибуты вектора i (nil-поля = без атрибутов)
+	mu    sync.RWMutex
+	data  []float32    // flat: data[i*dim : (i+1)*dim] = вектор i (источник истины для flush)
+	keys  []string     // keys[i] = ключ вектора i ("" = tombstone)
+	attrs []Attributes // attrs[i] = атрибуты вектора i (nil-поля = без атрибутов)
+	// Текстовый слой BM25 (ленивый: всё nil/0, пока в шард не пришёл док с
+	// текстом — zero overhead для чистых векторов). terms/docLen параллельны
+	// keys (выравнивает ensureTextLocked), text — мутабельный инвертед-индекс:
+	// терм → постинги (doc = слот в keys, tf). Листы НЕ отсортированы по doc
+	// (upsert делает swap-delete) — скоуп-бинпоиск нужен только frozen-слою,
+	// дельта проходит лист целиком. nText/textLen — вклад шарда в глобальные
+	// N/avgdl (df терма = len его листа, как во frozen).
+	terms   [][]TermTF
+	docLen  []uint32
+	text    map[string][]bm25Posting
+	nText   int
+	textLen uint64
 	keyIdx  map[string]int // ключ → индекс в data (для быстрого upsert/delete)
 	idx     *Graph         // инкрементальный HNSW-индекс для поиска (Qdrant-style)
 	alloc   *tcmalloc.TCMallocStore
@@ -83,6 +96,11 @@ type DeltaSegment struct {
 	// строить колоночный слой: иначе freeze-fast-path заморозил бы граф БЕЗ attrs
 	// и SearchFilter молча выпал бы после flush (attrs были только в дельте).
 	attrsPresent atomic.Bool
+
+	// textPresent — хоть раз добавляли термы (ADDDOC). Роль та же, что у
+	// attrsPresent: freeze-fast-path не строит segmentText, поэтому дельта с
+	// текстом обязана флашиться через rebuild (buildSegmentWithAllocator).
+	textPresent atomic.Bool
 }
 
 // deltaInitSlots — стартовая ёмкость slab/keys шарда. НЕ преаллоцируем на весь
@@ -229,14 +247,87 @@ func (d *DeltaSegment) MaxSize() int { return d.maxSize }
 // если ЭТА вставка довела число занятых слотов ровно до maxSize — сигнал для
 // единственного триггера компакции (без busy-loop, как прежний `==maxSize`).
 func (d *DeltaSegment) Append(key string, vec []float32) (becameFull bool) {
-	return d.AppendWithAttrs(key, vec, Attributes{})
+	return d.AppendDoc(key, vec, Attributes{}, nil)
 }
 
 // AppendWithAttrs — вставка с атрибутами (колоночный слой). attrs хранятся параллельно
 // keys/data в шарде и переживают flush через ExtractAll → buildSegmentAttrs.
 func (d *DeltaSegment) AppendWithAttrs(key string, vec []float32, attrs Attributes) (becameFull bool) {
+	return d.AppendDoc(key, vec, attrs, nil)
+}
+
+// ensureTextLocked инициализирует текстовый слой шарда и выравнивает
+// параллельные массивы по len(keys). Под s.mu.Lock.
+func (s *deltaShard) ensureTextLocked() {
+	if s.text == nil {
+		s.text = make(map[string][]bm25Posting)
+	}
+	for len(s.terms) < len(s.keys) {
+		s.terms = append(s.terms, nil)
+	}
+	for len(s.docLen) < len(s.keys) {
+		s.docLen = append(s.docLen, 0)
+	}
+}
+
+// clearTextLocked снимает текст со слота: выкидывает его постинги из инвертед-
+// мапы (swap-delete; пустой лист удаляется, чтобы df=len(лист) не завышался
+// мусором) и откатывает вклад слота в nText/textLen. No-op для слота без
+// текста. Под s.mu.Lock.
+func (s *deltaShard) clearTextLocked(slot int) {
+	if slot >= len(s.terms) || len(s.terms[slot]) == 0 {
+		return
+	}
+	for _, tt := range s.terms[slot] {
+		pl := s.text[tt.Term]
+		for i := range pl {
+			if pl[i].doc == uint32(slot) {
+				pl[i] = pl[len(pl)-1]
+				pl = pl[:len(pl)-1]
+				break
+			}
+		}
+		if len(pl) == 0 {
+			delete(s.text, tt.Term)
+		} else {
+			s.text[tt.Term] = pl
+		}
+	}
+	s.nText--
+	s.textLen -= uint64(s.docLen[slot])
+	s.terms[slot] = nil
+	s.docLen[slot] = 0
+}
+
+// setTextLocked вешает термы на слот. Слот обязан быть чист (upsert сначала
+// clearTextLocked). Под s.mu.Lock.
+func (s *deltaShard) setTextLocked(slot int, terms []TermTF) {
+	if len(terms) == 0 {
+		return
+	}
+	s.ensureTextLocked()
+	var dl uint32
+	for _, tt := range terms {
+		s.text[tt.Term] = append(s.text[tt.Term], bm25Posting{doc: uint32(slot), tf: tt.TF})
+		dl += uint32(tt.TF)
+	}
+	s.terms[slot] = terms
+	s.docLen[slot] = dl
+	s.nText++
+	s.textLen += uint64(dl)
+}
+
+// AppendDoc — вставка полного дока: вектор + атрибуты + термы текста (BM25).
+// Семантика upsert — полная замена состояния дока: прежние attrs И прежний
+// текст перезаписываются переданными. Append/AppendWithAttrs идут сюда с
+// terms=nil ⇒ после них у дока текста НЕТ (как перезапись attrs пустым
+// значением) — иначе SEARCHTEXT матчил бы док по термам стёртой версии.
+func (d *DeltaSegment) AppendDoc(key string, vec []float32, attrs Attributes, terms []TermTF) (becameFull bool) {
 	if !attrs.empty() {
 		d.attrsPresent.Store(true)
+	}
+	if len(terms) > 0 {
+		d.textPresent.Store(true)
 	}
 	s := d.shardFor(key)
 	s.mu.Lock()
@@ -246,6 +337,8 @@ func (d *DeltaSegment) AppendWithAttrs(key string, vec []float32, attrs Attribut
 		if slot < len(s.attrs) {
 			s.attrs[slot] = attrs
 		}
+		s.clearTextLocked(slot)
+		s.setTextLocked(slot, terms)
 		if oldGid, ok := s.keyNode[key]; ok {
 			s.idx.Delete(uint64(oldGid))
 			delete(s.nodeKey, oldGid)
@@ -261,6 +354,7 @@ func (d *DeltaSegment) AppendWithAttrs(key string, vec []float32, attrs Attribut
 	s.keys = append(s.keys, key)
 	s.attrs = append(s.attrs, attrs)
 	s.keyIdx[key] = slot
+	s.setTextLocked(slot, terms)
 	gid := s.idx.Insert(vec)
 	s.keyNode[key] = gid
 	s.nodeKey[gid] = key
@@ -283,6 +377,7 @@ func (d *DeltaSegment) Delete(key string) bool {
 	}
 	delete(s.keyIdx, key)
 	s.keys[idx] = "" // tombstone
+	s.clearTextLocked(idx)
 	if gid, ok := s.keyNode[key]; ok {
 		s.idx.Delete(uint64(gid))
 		delete(s.nodeKey, gid)
@@ -296,6 +391,10 @@ func (d *DeltaSegment) Delete(key string) bool {
 // HasAttrs сообщает, добавлялись ли в дельту непустые атрибуты. Flush использует
 // это, чтобы НЕ уходить в freeze-fast-path (он роняет attrs) и построить колонки.
 func (d *DeltaSegment) HasAttrs() bool { return d.attrsPresent.Load() }
+
+// HasText сообщает, добавлялись ли в дельту термы (ADDDOC). Роль та же, что у
+// HasAttrs: дельта с текстом флашится через rebuild, freeze уронил бы слой.
+func (d *DeltaSegment) HasText() bool { return d.textPresent.Load() }
 
 // Contains сообщает, есть ли ЖИВОЙ вектор с этим ключом в дельте. O(1) по keyIdx
 // шарда под shard RLock (race-free с Append/Delete). Используется поиском:
@@ -521,6 +620,84 @@ func (d *DeltaSegment) AttrsSnapshot() map[string]Attributes {
 	return out
 }
 
+// deltaTextResult — результат текстового BM25-поиска по дельте.
+type deltaTextResult struct {
+	key   string
+	score float64
+}
+
+// TextStats — вклад дельты в глобальную BM25-статистику по термам запроса:
+// n (доки с текстом), totalLen (сумма их docLen), df[i] — по терму terms[i].
+// Дубли термов в запросе допустимы (выровнено с bm25GlobalStats). Каждый шард
+// под своим RLock: снимок консистентен пошардово — достаточно, статистика и
+// так «мягкая» (затенённые копии завышают df до компакции).
+func (d *DeltaSegment) TextStats(terms []string) (n, totalLen uint64, df []uint64) {
+	df = make([]uint64, len(terms))
+	if !d.textPresent.Load() {
+		return
+	}
+	for _, s := range d.shards {
+		s.mu.RLock()
+		n += uint64(s.nText)
+		totalLen += s.textLen
+		for i, t := range terms {
+			df[i] += uint64(len(s.text[t]))
+		}
+		s.mu.RUnlock()
+	}
+	return
+}
+
+// SearchText — BM25-скоринг дельты по термам запроса. idf выровнен с terms и
+// посчитан ГЛОБАЛЬНО (сегменты + все дельты) вызывающим — дельта, как и
+// segmentText.search, применяет чужую статистику, не свою. filterFn
+// (tombstone-фильтр) применяется к каждому доку ДО отбора top-K. Возвращает
+// top-K по убыванию скора; ничьи — по ключу (детерминизм выдачи).
+func (d *DeltaSegment) SearchText(terms []string, idf []float64, avgdl float64, K int, filterFn func(string) bool) []deltaTextResult {
+	if K <= 0 || avgdl == 0 || !d.textPresent.Load() {
+		return nil
+	}
+	var out []deltaTextResult
+	for _, s := range d.shards {
+		s.mu.RLock()
+		if len(s.text) == 0 {
+			s.mu.RUnlock()
+			continue
+		}
+		acc := make(map[uint32]float64)
+		for qi, t := range terms {
+			for _, p := range s.text[t] {
+				tf := float64(p.tf)
+				dl := float64(s.docLen[p.doc])
+				acc[p.doc] += idf[qi] * tf * (bm25K1 + 1) / (tf + bm25K1*(1-bm25B+bm25B*dl/avgdl))
+			}
+		}
+		for slot, score := range acc {
+			// Delete чистит постинги слота, так что "" здесь не ждём — guard
+			// на инвариант, не на семантику.
+			key := s.keys[slot]
+			if key == "" || (filterFn != nil && !filterFn(key)) {
+				continue
+			}
+			out = append(out, deltaTextResult{key: key, score: score})
+		}
+		s.mu.RUnlock()
+	}
+	slices.SortFunc(out, func(a, b deltaTextResult) int {
+		if a.score > b.score {
+			return -1
+		}
+		if a.score < b.score {
+			return 1
+		}
+		return strings.Compare(a.key, b.key)
+	})
+	if len(out) > K {
+		out = out[:K]
+	}
+	return out
+}
+
 // ExtractAll возвращает все живые записи (key, vec-slice) для compaction.
 // Возвращает срезы на внутренний data-буфер шардов — не копирует.
 // Вызывать только когда дельта больше не используется для записи (после swap).
@@ -536,10 +713,15 @@ func (d *DeltaSegment) ExtractAll() []DeltaEntry {
 			if i < len(s.attrs) {
 				attrs = s.attrs[i]
 			}
+			var terms []TermTF
+			if i < len(s.terms) {
+				terms = s.terms[i]
+			}
 			out = append(out, DeltaEntry{
 				Key:   key,
 				Vec:   s.data[i*d.dim : (i+1)*d.dim],
 				Attrs: attrs,
+				Terms: terms,
 			})
 		}
 		s.mu.RUnlock()

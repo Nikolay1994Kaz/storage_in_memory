@@ -19,6 +19,10 @@ func (d *dummySegment) Catalog() *TenantCatalog { return nil }
 
 func (d *dummySegment) Attrs() *segmentAttrs { return nil }
 
+func (d *dummySegment) Text() *segmentText { return nil }
+
+func (d *dummySegment) TextKey(doc uint32) string { return "" }
+
 func (d *dummySegment) SearchTenant(query []float32, K, efSearch int, tenant uint64, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
 	return d.Search(query, K, efSearch, dst, filterFn)
 }
