@@ -186,6 +186,18 @@ placeholder vector or a cheap server-side embedder.
    in absolute terms; posting pruning (WAND / max-score) is the known next
    lever if long queries ever matter. Full numbers: docs/BENCHMARKS.md §6.
 
+   **Resolved same day by query-side df pruning.** An A/B experiment
+   (`bm25_boost_experiment_test.go`) confirmed the scan cost was dominated
+   by high-df query terms: dropping them client-side gave 6.6× QPS with
+   bit-identical known-item quality. Productized in `SearchText`: terms with
+   df > N/2 are dropped at query time when N ≥ 1000 (df is already computed
+   there; no re-ingest, no tokenizer change, small corpora and the golden
+   oracle untouched; all-common queries fall back to unpruned). Canon after:
+   short query 7 958 QPS (3.2× *faster* than vector — expectation now
+   holds), full-doc 234, hybrid 218. The same experiment validated the
+   `TITLE` ingest boost (poor-man's BM25F, title terms ×3): known-item
+   hit@1 0.846 → 0.906, MRR 0.907 → 0.941, no full-text recall loss.
+
 ## Work plan (in order)
 
 1. Bench harness + correctness oracle (data prep for dbpedia texts included).

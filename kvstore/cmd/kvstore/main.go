@@ -1531,14 +1531,16 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		buf.WriteSimpleString("OK")
 
 	case "VSIM.ADDDOC":
-		// VSIM.ADDDOC <key> TEXT <text> [CAT <k> <v>]... [NUM <k> <v>]... VEC <f1> ... <fN>
+		// VSIM.ADDDOC <key> TEXT <text> [TITLE <title>] [CAT <k> <v>]... [NUM <k> <v>]... VEC <f1> ... <fN>
 		// Ингест дока: вектор + атрибуты + текст (BM25). Текст токенизируется
 		// ЗДЕСЬ, ровно один раз: одни и те же термы уходят в дельту (AddDocTerms)
 		// и в WAL (OpVSimAddDoc) — реплей НЕ перетокенизирует, журнал везёт
 		// результат токенизации (бит-в-бит независимо от версии стеммера).
+		// TITLE — опциональный буст заголовка («бедный BM25F», вес зашит в
+		// vector.TokenizeDocTitled); вес вшивается в термы на ингесте.
 		// Пустой TEXT "" снимает текст дока (семантика upsert, как у attrs).
 		if len(args) < 3 {
-			buf.WriteError("ERR usage: VSIM.ADDDOC <key> TEXT <text> [CAT k v]... [NUM k v]... VEC <v1> ... <vN>")
+			buf.WriteError("ERR usage: VSIM.ADDDOC <key> TEXT <text> [TITLE <title>] [CAT k v]... [NUM k v]... VEC <v1> ... <vN>")
 			return
 		}
 		lvs, ok := vecStore.(*vector.LeveledVectorStore)
@@ -1555,7 +1557,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		attrs := vector.Attributes{Cat: map[string]string{}, Num: map[string]float64{}}
 		var vec []float32
-		text := ""
+		text, title := "", ""
 		textSeen := false
 		parseErr := ""
 	addDocParse:
@@ -1568,6 +1570,13 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				}
 				text = string(args[i+1])
 				textSeen = true
+				i += 2
+			case "TITLE":
+				if i+1 >= len(args) {
+					parseErr = "TITLE requires <title>"
+					break addDocParse
+				}
+				title = string(args[i+1])
 				i += 2
 			case "CAT":
 				if i+2 >= len(args) {
@@ -1600,7 +1609,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				}
 				break addDocParse
 			default:
-				parseErr = fmt.Sprintf("unexpected token %q (want TEXT|CAT|NUM|VEC)", unsafeString(args[i]))
+				parseErr = fmt.Sprintf("unexpected token %q (want TEXT|TITLE|CAT|NUM|VEC)", unsafeString(args[i]))
 				break addDocParse
 			}
 		}
@@ -1620,7 +1629,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		monitoring.VectorAddTotal.Inc()
-		terms := vector.TokenizeDoc(text)
+		terms := vector.TokenizeDocTitled(title, text)
 		// Add ДО bw.Write (watermark-safety, как VSIM.ADD/ADDATTR): док в дельте
 		// раньше, чем LSN покрыт снапшот-watermark'ом → нет потери на рестарте.
 		if err := lvs.AddDocTerms(key, vec, attrs, terms); err != nil {

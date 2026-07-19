@@ -32,12 +32,40 @@ func TokenizeDoc(text string) []TermTF {
 	return bm25CountTerms(bm25Tokenize(text))
 }
 
+// bm25TitleWeight — вес заголовка в «бедном BM25F»: термы TITLE повторяются
+// W раз перед токенизацией, tf растёт в W раз — эффект пер-полевого веса без
+// поля в формате сегмента. Подобран экспериментом 19.07 (dbpedia100k,
+// bm25_boost_experiment_test.go): ×3 даёт known-item hit@1 0.846→0.906,
+// MRR 0.907→0.941 без просадки полнотекстового recall. Вес вшивается на
+// ингесте (термы в WAL уже взвешены) — смена веса = re-ingest, как у стеммера.
+const bm25TitleWeight = 3
+
+// bm25PruneMinN — минимальный размер корпуса (N доков с текстом), с которого
+// включается отсечение общеупотребимых термов запроса в SearchText. Ниже
+// порога выигрыша нет (постинги короткие), а сдвиг скоров ломал бы
+// golden-оракул на микрокорпусах.
+const bm25PruneMinN = 1000
+
+// TokenizeDocTitled — токенизация дока с бустом заголовка: title×W + text.
+// Пустой title вырождается в TokenizeDoc(text).
+func TokenizeDocTitled(title, text string) []TermTF {
+	if strings.TrimSpace(title) == "" {
+		return TokenizeDoc(text)
+	}
+	return TokenizeDoc(strings.Repeat(title+" ", bm25TitleWeight) + text)
+}
+
 // AddDoc вставляет док: вектор + атрибуты + текст. Текст токенизируется здесь
 // (единственное место, где он существует) и дальше живёт термами. Upsert —
 // полная замена состояния дока: прежний текст перезаписывается; пустой text
 // снимает текст (та же семантика, что у attrs).
 func (lvs *LeveledVectorStore) AddDoc(key string, vec []float32, attrs Attributes, text string) error {
 	return lvs.AddDocTerms(key, vec, attrs, TokenizeDoc(text))
+}
+
+// AddDocTitled — AddDoc с выделенным заголовком (буст bm25TitleWeight).
+func (lvs *LeveledVectorStore) AddDocTitled(key string, vec []float32, attrs Attributes, title, text string) error {
+	return lvs.AddDocTerms(key, vec, attrs, TokenizeDocTitled(title, text))
 }
 
 // AddDocTerms — вставка дока с УЖЕ готовыми термами: реплей WAL (OpVSimAddDoc)
@@ -114,6 +142,34 @@ func (lvs *LeveledVectorStore) SearchText(query string, K int) ([]VTextResult, e
 	if n == 0 {
 		lvs.mu.RUnlock()
 		return nil, nil // в корпусе нет ни одного дока с текстом
+	}
+
+	// Отсечение общеупотребимых термов запроса (эксперимент 19.07,
+	// bm25_boost_experiment_test.go: QPS коротких запросов 1192→7850 при
+	// нулевом изменении hit@1/hit@10/MRR). Скоринг сканирует постинг-лист
+	// каждого терма запроса ЦЕЛИКОМ; терм с df>N/2 стоит десятки тысяч доков
+	// скана, а несёт idf<ln2≈0.69 — почти шум. Порог N/2 консервативен
+	// сознательно: на dbpedia содержательное «county» имеет df=35% (idf≈1.0),
+	// резать 25–35%-ную полосу опасно. Гейты: маленькие корпуса не трогаем
+	// (golden-оракул), запрос целиком из общих термов ищется как есть.
+	if n >= bm25PruneMinN {
+		kept := 0
+		for i := range terms {
+			if df[i]*2 < n {
+				kept++
+			}
+		}
+		if kept > 0 && kept < len(terms) {
+			prunedTerms := make([]string, 0, kept)
+			prunedDF := make([]uint64, 0, kept)
+			for i := range terms {
+				if df[i]*2 < n {
+					prunedTerms = append(prunedTerms, terms[i])
+					prunedDF = append(prunedDF, df[i])
+				}
+			}
+			terms, df = prunedTerms, prunedDF
+		}
 	}
 	avgdl := float64(totalLen) / float64(n)
 	idf := make([]float64, len(terms))

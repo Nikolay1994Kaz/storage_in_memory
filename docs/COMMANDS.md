@@ -144,12 +144,12 @@ bad keys are rejected so poison never survives via replay), and all `Add`s happe
 | `VSIM.ADD` | `VSIM.ADD key v1 … vN` | `+OK` |
 | `VSIM.ADDBIN` | `VSIM.ADDBIN key <float32-LE bytes>` | `+OK` |
 | `VSIM.ADDATTR` | `VSIM.ADDATTR key [CAT k v]… [NUM k v]… VEC v1 … vN` | `+OK` — columnar attr/tenant ingest; WAL: `OpVSimAddAttrs` |
-| `VSIM.ADDDOC` | `VSIM.ADDDOC key TEXT text [CAT k v]… [NUM k v]… VEC v1 … vN` | `+OK` — doc ingest (vector + attrs + BM25 text). Tokenized once at ingest; the WAL entry (`OpVSimAddDoc`) carries the resulting terms, never raw text (replay never re-tokenizes → bit-exact across stemmer versions). Empty `TEXT ""` clears the doc's text (upsert semantics, same as attrs) |
+| `VSIM.ADDDOC` | `VSIM.ADDDOC key TEXT text [TITLE title] [CAT k v]… [NUM k v]… VEC v1 … vN` | `+OK` — doc ingest (vector + attrs + BM25 text). Tokenized once at ingest; the WAL entry (`OpVSimAddDoc`) carries the resulting terms, never raw text (replay never re-tokenizes → bit-exact across stemmer versions). Optional `TITLE` boosts title terms ×3 (field weighting baked into terms at ingest; changing the weight = re-ingest). Empty `TEXT ""` clears the doc's text (upsert semantics, same as attrs) |
 | `VSIM.DEL` | `VSIM.DEL key` | `:1` / `:0` |
 | `VSIM.EXISTS` | `VSIM.EXISTS key` | `:1` / `:0` — direct point lookup (delta/tombstones/segments), bypasses ANN; used by the soak durability oracle to separate real loss from recall miss |
 | `VSIM.SEARCH` | `VSIM.SEARCH K v1 … vN` | flat array `key, dist, …` |
 | `VSIM.SEARCHBIN` | `VSIM.SEARCHBIN K <float32-LE bytes>` | flat array |
-| `VSIM.SEARCHTEXT` | `VSIM.SEARCHTEXT K query` | flat array `key, score, …` — lexical BM25 top-K (embedder-free path); score is BM25, **higher = better** (not a distance) |
+| `VSIM.SEARCHTEXT` | `VSIM.SEARCHTEXT K query` | flat array `key, score, …` — lexical BM25 top-K (embedder-free path); score is BM25, **higher = better** (not a distance). Query terms with df > N/2 are pruned at search time on corpora ≥ 1000 docs (near-zero idf, dominates posting scan; all-common queries fall back to unpruned) |
 | `VSIM.HYBRID` | `VSIM.HYBRID K TEXT query VEC v1 … vN` | flat array `key, score, …` — top-100 lexical + top-100 vector fused by Reciprocal Rank Fusion (k=60, rank-based → no score calibration); score is the RRF sum, comparable to nothing but itself |
 | `VSIM.FILTER` | `VSIM.FILTER K [EQ attr val]… [RANGE attr lo hi]… VEC v1 … vN` | flat array — columnar filter (+tenant routing via `-partition-attr`) |
 | `VSIM.SEARCHFILTER` | `VSIM.SEARCHFILTER K field value v1 … vN` \| `… K PREFIX prefix v1 … vN` | flat array — KV-metadata filter (`GET field:key == value`) or key-prefix filter |

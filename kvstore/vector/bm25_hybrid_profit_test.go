@@ -99,9 +99,10 @@ func TestBM25HybridProfit(t *testing.T) {
 	lvs := NewLeveledVectorStore(cfg)
 	t0 := time.Now()
 	for i, v := range train {
-		// Индексируем title+text — тем же конкатом, что реальный ingest дока.
-		if err := lvs.AddDoc(strconv.Itoa(i), v, Attributes{}, docs[i].Title+" "+docs[i].Text); err != nil {
-			t.Fatalf("AddDoc %d: %v", i, err)
+		// Продовый путь ингеста: TITLE-буст (бедный BM25F, вес ×3) + текст —
+		// как VSIM.ADDDOC ... TITLE <t> TEXT <text>.
+		if err := lvs.AddDocTitled(strconv.Itoa(i), v, Attributes{}, docs[i].Title, docs[i].Text); err != nil {
+			t.Fatalf("AddDocTitled %d: %v", i, err)
 		}
 	}
 	settle(lvs)
@@ -232,19 +233,20 @@ func TestBM25HybridProfit(t *testing.T) {
 		W, qpsVec, qpsText, qpsTitle, qpsHyb)
 	fmt.Println("---------------------------------------------------------------------------------------")
 
-	// Планки зафиксированы по baseline 19.07 (первый прогон, канон машины):
-	// vector=0.9944; hybrid(full)=0.534 — внутри предсказанной RRF-полосы;
-	// known-item hit@1=0.846 hit@10=0.990 MRR=0.907. Стражи — с запасом от шума.
+	// Планки зафиксированы по прогонам 19.07: baseline без буста/отсечения —
+	// hit@1=0.846, QPS_title=934-1192; с TITLE×3 и df-отсечением (эксперимент
+	// bm25_boost_experiment_test.go) — hit@1=0.906, QPS_title=7850,
+	// vector=0.993-0.994, hybrid(full)=0.533-0.534. Стражи — с запасом от шума.
 	if recVec < 0.98 {
 		t.Errorf("vector recall=%.4f < 0.98 — деградировал векторный путь", recVec)
 	}
 	if recHybF < 0.45 || recHybF > 0.75 {
 		t.Errorf("hybrid(full) recall=%.4f вне RRF-полосы [0.45,0.75] — слияние ведёт себя не как задумано", recHybF)
 	}
-	if hit1 < 0.80 {
-		t.Errorf("known-item hit@1=%.3f < 0.80 (baseline 0.846)", hit1)
+	if hit1 < 0.87 {
+		t.Errorf("known-item hit@1=%.3f < 0.87 (baseline с TITLE-бустом 0.906)", hit1)
 	}
-	if hit10 < 0.95 {
-		t.Errorf("known-item hit@10=%.3f < 0.95 (baseline 0.990)", hit10)
+	if hit10 < 0.97 {
+		t.Errorf("known-item hit@10=%.3f < 0.97 (baseline с TITLE-бустом 0.994)", hit10)
 	}
 }

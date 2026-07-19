@@ -49,6 +49,18 @@ func TestExec_VsimAddDocAndSearchText(t *testing.T) {
 	}
 }
 
+// TITLE-буст через команду: терм в заголовке бьёт тот же терм в тексте,
+// даже когда в тексте он встречается чаще (tf×3 бедного BM25F).
+func TestExec_VsimAddDocTitleBoost(t *testing.T) {
+	e := newAttrEnv(t, "")
+	wantOK(t, e.do("VSIM.ADDDOC", "titled", "TEXT", "напиток из листьев", "TITLE", "чай", "VEC", "1", "0", "0"))
+	wantOK(t, e.do("VSIM.ADDDOC", "plain", "TEXT", "чай чай напиток из листьев", "VEC", "0", "1", "0"))
+	got := keysOf(e.do("VSIM.SEARCHTEXT", "10", "чай"))
+	if len(got) != 2 || got[0] != "titled" {
+		t.Fatalf("SEARCHTEXT: ждали titled первым, got %v", got)
+	}
+}
+
 // Гибрид через команду: сценарий консенсуса из bm25_hybrid_test.go —
 // векторный победитель без текстового матча (z) проигрывает докам,
 // найденным обоими путями.
@@ -141,6 +153,7 @@ func TestExec_VsimTextParseErrors(t *testing.T) {
 	wantErr(t, e.do("VSIM.ADDDOC", "k", "VEC", "1", "0", "0"))            // нет TEXT
 	wantErr(t, e.do("VSIM.ADDDOC", "k", "TEXT"))                          // TEXT без значения
 	wantErr(t, e.do("VSIM.ADDDOC", "k", "TEXT", "чай"))                   // нет VEC
+	wantErr(t, e.do("VSIM.ADDDOC", "k", "TEXT", "чай", "TITLE"))          // TITLE без значения
 	wantErr(t, e.do("VSIM.ADDDOC", "k", "BOGUS", "x", "VEC", "1"))        // чужой токен
 	wantErr(t, e.do("VSIM.ADDDOC", "k", "TEXT", "чай", "VEC", "хи"))      // не float
 	wantErr(t, e.do("VSIM.SEARCHTEXT", "0", "чай"))                       // K вне диапазона

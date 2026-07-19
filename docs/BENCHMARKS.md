@@ -224,7 +224,13 @@ Self-contained dataset from HF `dbpedia-entities-openai-1M` (the ann-benchmarks
 rows (title + text + ada-002 embedding), queries = next 1000 held-out rows,
 GT = exact brute-force cosine top-100 (`scripts/convert_dbpedia_hf.py`).
 One consolidated segment, float32, ef=128, K=10. Fusion: `VSIM.HYBRID` =
-top-100 lexical + top-100 vector → RRF (k=60).
+top-100 lexical + top-100 vector → RRF (k=60). Ingest uses the `TITLE` field
+boost (poor-man's BM25F: title terms weighted ×3); search applies query-side
+common-term pruning (terms with df > N/2 dropped when N ≥ 1000). Both were
+adopted only after an A/B experiment on this dataset
+(`bm25_boost_experiment_test.go`): the boost took hit@1 0.846 → 0.906 with no
+full-text recall loss, and pruning multiplied short-query QPS ~7× with zero
+change in hit@1/hit@10/MRR.
 
 **Known-item** (query = exact entity title; all 100k titles unique). This is
 the class of queries the embedder-free `VSIM.SEARCHTEXT` exists for — without
@@ -232,13 +238,13 @@ an embedder the vector path cannot serve them at all:
 
 | hit@1 | hit@10 | MRR@10 |
 |---|---|---|
-| 0.846 | 0.990 | 0.907 |
+| 0.906 | 0.994 | 0.941 |
 
 **Semantic** (1000 held-out queries, recall@10 vs cosine GT):
 
 | vector | text (title) | text (full doc) | hybrid (title) | hybrid (full doc) |
 |---|---|---|---|---|
-| 0.993 | 0.152 | 0.300 | 0.564 | 0.533 |
+| 0.994 | 0.158 | 0.306 | 0.570 | 0.539 |
 
 Read the hybrid column correctly: the only GT this dataset has is exact
 *cosine* — by construction the ideal output of the vector arm. Equal-weight
@@ -254,17 +260,22 @@ known-item table above is where the lexical arm's product value shows.
 
 | path | QPS_12 |
 |---|---|
-| `VSIM.SEARCH` (vector) | 2 453 |
-| `VSIM.SEARCHTEXT`, short query (~2–3 terms) | 934 |
-| `VSIM.SEARCHTEXT`, full-doc query (~52 terms) | 50 |
-| `VSIM.HYBRID`, full-doc text arm | 48 |
+| `VSIM.SEARCH` (vector) | 2 461 |
+| `VSIM.SEARCHTEXT`, short query (~2–3 terms) | **7 958** |
+| `VSIM.SEARCHTEXT`, full-doc query (~52 terms) | 234 |
+| `VSIM.HYBRID`, full-doc text arm | 218 |
 
-Honest miss vs the design expectation: `SEARCHTEXT` was expected to come in
-*under* vector cost, but postings currently have no WAND/top-k pruning — every
-query term scans its full posting list, and common English terms are long
-(there is no stopword removal). Short keyword queries (the product case) are
-fine; long full-text queries are a known stress case, and pruning is the
-obvious next lever if they ever matter.
+The first run of this bench measured short-query `SEARCHTEXT` at 934 QPS —
+*slower* than vector search, against the design expectation. Root cause:
+every query term scans its full posting list, and common English terms
+(df 60–95% of the corpus) dominated the scan while carrying idf ≤ 0.5 —
+near-noise. Query-side pruning of df > N/2 terms fixed it: 8.5× on short
+queries (now 3.2× *faster* than vector search, as designed), 4.7× on
+full-doc queries, with bit-identical known-item quality. The threshold is
+deliberately conservative — on this corpus the *content* word "county" sits
+at df=35% (idf≈1.0), so pruning the 25–50% band would eat real signal. Long
+full-text queries remain postings-bound; WAND/max-score is the next lever if
+they ever matter.
 
 Test: `TestBM25HybridProfit` (`kvstore/vector/bm25_hybrid_profit_test.go`).
 
