@@ -356,6 +356,43 @@ func SerializeVectorWithAttrs(vec []float32, attrs Attributes) []byte {
 	return buf.Bytes()
 }
 
+// SerializeVectorWithDoc кодирует вектор + атрибуты + термы текста в
+// self-contained блоб для WAL-операции OpVSimAddDoc. Формат = формат
+// OpVSimAddAttrs + секция terms (writeTerms) в хвосте: [uint32 nFloats]
+// [vec float32 LE...][attrs][terms]. Термы, не сырой текст — см. wal.go.
+func SerializeVectorWithDoc(vec []float32, attrs Attributes, terms []TermTF) []byte {
+	buf := bytes.NewBuffer(SerializeVectorWithAttrs(vec, attrs))
+	// writeTerms пишет в io.Writer; на bytes.Buffer ошибки не бывает.
+	_ = writeTerms(buf, terms)
+	return buf.Bytes()
+}
+
+// DeserializeVectorWithDoc — обратная операция для replay OpVSimAddDoc.
+func DeserializeVectorWithDoc(data []byte) ([]float32, Attributes, []TermTF, error) {
+	r := bytes.NewReader(data)
+	var u4 [4]byte
+	if _, err := io.ReadFull(r, u4[:]); err != nil {
+		return nil, Attributes{}, nil, fmt.Errorf("vec+doc: read nFloats: %w", err)
+	}
+	n := int(binary.LittleEndian.Uint32(u4[:]))
+	vec := make([]float32, n)
+	for i := 0; i < n; i++ {
+		if _, err := io.ReadFull(r, u4[:]); err != nil {
+			return nil, Attributes{}, nil, fmt.Errorf("vec+doc: read float[%d]: %w", i, err)
+		}
+		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(u4[:]))
+	}
+	attrs, err := readAttrs(r)
+	if err != nil {
+		return nil, Attributes{}, nil, fmt.Errorf("vec+doc: read attrs: %w", err)
+	}
+	terms, err := readTerms(r)
+	if err != nil {
+		return nil, Attributes{}, nil, fmt.Errorf("vec+doc: read terms: %w", err)
+	}
+	return vec, attrs, terms, nil
+}
+
 // DeserializeVectorWithAttrs — обратная операция для replay OpVSimAddAttrs.
 func DeserializeVectorWithAttrs(data []byte) ([]float32, Attributes, error) {
 	r := bytes.NewReader(data)

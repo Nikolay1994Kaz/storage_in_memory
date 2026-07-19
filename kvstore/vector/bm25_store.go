@@ -28,7 +28,16 @@ type VTextResult struct {
 // полная замена состояния дока: прежний текст перезаписывается; пустой text
 // снимает текст (та же семантика, что у attrs).
 func (lvs *LeveledVectorStore) AddDoc(key string, vec []float32, attrs Attributes, text string) error {
-	return lvs.addEntry(key, vec, attrs, bm25CountTerms(bm25Tokenize(text)))
+	return lvs.AddDocTerms(key, vec, attrs, bm25CountTerms(bm25Tokenize(text)))
+}
+
+// AddDocTerms — вставка дока с УЖЕ готовыми термами: реплей WAL (OpVSimAddDoc)
+// и будущий командный путь после токенизации. Реплей обязан идти сюда, а не
+// через AddDoc: журнал везёт результат токенизации, повторная токенизация
+// сломала бы бит-в-бит воспроизводимость (см. wal.go). Тот же choke-point
+// addEntry, что у Add/AddWithAttrs — вся upsert/затенение-семантика едина.
+func (lvs *LeveledVectorStore) AddDocTerms(key string, vec []float32, attrs Attributes, terms []TermTF) error {
+	return lvs.addEntry(key, vec, attrs, terms)
 }
 
 // SearchText — глобальный BM25 top-K: memtable-дельты (активная + flushing) +

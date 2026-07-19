@@ -27,8 +27,14 @@ const (
 	// vector.SerializeVectorWithAttrs. Replay восстанавливает attrs/tenant через
 	// AddWithAttrs (P0-4). Эмитится write-путём, когда AddWithAttrs выходит в RESP.
 	OpVSimAddAttrs byte = 7
-	OpZAdd         byte = 16 // sorted set: Key = setName, Value = [8B score LE float64][member string]
-	OpZRem         byte = 17 // sorted set: Key = setName, Value = [member string]
+	// OpVSimAddDoc: вектор + атрибуты + термы текста (BM25). Value кодируется
+	// vector.SerializeVectorWithDoc — в WAL едут ТЕРМЫ, не сырой текст (реплей
+	// не перетокенизирует: журнал самодостаточен, состояние воспроизводится
+	// бит-в-бит независимо от версии стеммера). Реплей через AddDocTerms.
+	// Эмитится write-путём, когда VSIM.ADDDOC выходит в RESP (шаг 7 спринта).
+	OpVSimAddDoc byte = 8
+	OpZAdd       byte = 16 // sorted set: Key = setName, Value = [8B score LE float64][member string]
+	OpZRem       byte = 17 // sorted set: Key = setName, Value = [member string]
 )
 
 // maxEntrySize — защита от мусорных данных при recovery.

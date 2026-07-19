@@ -24,12 +24,13 @@ func bm25TestConfig() LeveledConfig {
 }
 
 // bm25AddCorpus добавляет доки корпуса [from, to) через живой AddDoc.
-// Векторы — фиктивные (текстовый путь их не читает), но валидные для LSM.
-func bm25AddCorpus(t *testing.T, lvs *LeveledVectorStore, corpus bm25Corpus, from, to int) {
+// Векторы — фиктивные (текстовый путь их не читает), но валидные для LSM;
+// dim задаёт размерность (8 = frozen-CSR путь, >256 = hnswSegment).
+func bm25AddCorpus(t *testing.T, lvs *LeveledVectorStore, corpus bm25Corpus, from, to, dim int) {
 	t.Helper()
 	for i := from; i < to; i++ {
 		d := corpus.Docs[i]
-		if err := lvs.AddDoc(d.ID, mkVecN(8, float32(i)), Attributes{}, d.Text); err != nil {
+		if err := lvs.AddDoc(d.ID, mkVecN(dim, float32(i)), Attributes{}, d.Text); err != nil {
 			t.Fatalf("AddDoc %s: %v", d.ID, err)
 		}
 	}
@@ -62,14 +63,14 @@ func TestBM25LivePath(t *testing.T) {
 	t.Run("delta_only", func(t *testing.T) {
 		lvs := NewLeveledVectorStore(bm25TestConfig())
 		defer lvs.Clear()
-		bm25AddCorpus(t, lvs, corpus, 0, len(corpus.Docs))
+		bm25AddCorpus(t, lvs, corpus, 0, len(corpus.Docs), 8)
 		bm25AssertGolden(t, lvs, corpus, golden)
 	})
 
 	t.Run("after_flush", func(t *testing.T) {
 		lvs := NewLeveledVectorStore(bm25TestConfig())
 		defer lvs.Clear()
-		bm25AddCorpus(t, lvs, corpus, 0, len(corpus.Docs))
+		bm25AddCorpus(t, lvs, corpus, 0, len(corpus.Docs), 8)
 		lvs.FlushDeltaSync()
 		bm25AssertGolden(t, lvs, corpus, golden)
 	})
@@ -78,9 +79,9 @@ func TestBM25LivePath(t *testing.T) {
 		lvs := NewLeveledVectorStore(bm25TestConfig())
 		defer lvs.Clear()
 		split := len(corpus.Docs) / 2
-		bm25AddCorpus(t, lvs, corpus, 0, split)
+		bm25AddCorpus(t, lvs, corpus, 0, split, 8)
 		lvs.FlushDeltaSync()
-		bm25AddCorpus(t, lvs, corpus, split, len(corpus.Docs))
+		bm25AddCorpus(t, lvs, corpus, split, len(corpus.Docs), 8)
 		bm25AssertGolden(t, lvs, corpus, golden)
 	})
 }

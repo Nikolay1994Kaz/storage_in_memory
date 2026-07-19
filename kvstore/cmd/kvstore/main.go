@@ -65,7 +65,7 @@ func unsafeString(b []byte) string {
 // recovery как уже отражённый в снапшоте graph_leveled.bin. Из snapshot.wal —
 // пропускаем, если граф загружен из бинарного снапшота; из wal_*.log — если
 // LSN ≤ vecWatermark (запись уже в снапшоте). Применяется КО ВСЕМ записям,
-// меняющим вектор: OpVSimAdd/Attrs/Del И каскадным OpDel/OpExpire (KV-DEL, что
+// меняющим вектор: OpVSimAdd/Attrs/Doc/Del И каскадным OpDel/OpExpire (KV-DEL, что
 // также удаляет вектор) — иначе старый DEL с LSN ≤ watermark удалил бы вектор,
 // воскрешённый более поздним re-add, уже присутствующий в снапшоте.
 func shouldSkipVecReplay(entry wal.Entry, isFromSnapshot, graphLoaded bool, vecWatermark uint64) bool {
@@ -363,6 +363,28 @@ func main() {
 				}
 			} else if err := vecStore.Add(entry.Key, vec); err != nil {
 				// Индекс без attr-слоя — восстанавливаем хотя бы вектор.
+				slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
+			}
+			vecRestored++
+			restored++
+		case wal.OpVSimAddDoc:
+			// Вектор + атрибуты + термы текста (BM25, шаг 5). Реплей через
+			// AddDocTerms: в журнале УЖЕ готовые термы, перетокенизация запрещена
+			// (бит-в-бит воспроизводимость независимо от версии стеммера).
+			if skipVec(entry, isFromSnapshot) {
+				return
+			}
+			vec, attrs, terms, err := vector.DeserializeVectorWithDoc(entry.Value)
+			if err != nil {
+				slog.Warn("failed to decode vector+doc", "key", entry.Key, "err", err)
+				return
+			}
+			if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+				if err := lvs.AddDocTerms(entry.Key, vec, attrs, terms); err != nil {
+					slog.Warn("failed to restore vector+doc", "key", entry.Key, "err", err)
+				}
+			} else if err := vecStore.Add(entry.Key, vec); err != nil {
+				// Индекс без текстового слоя — восстанавливаем хотя бы вектор.
 				slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
 			}
 			vecRestored++
