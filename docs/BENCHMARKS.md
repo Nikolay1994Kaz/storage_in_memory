@@ -217,6 +217,57 @@ server on a fully consolidated single segment measures *higher* — 12 985 QPS
 @ 0.9996 at the same ef=100 (see the end-to-end section above) — segment
 count, not protocol, is the dominant QPS factor.
 
+## 6. Lexical BM25 + hybrid RRF — dbpedia-openai-100k with texts
+
+Self-contained dataset from HF `dbpedia-entities-openai-1M` (the ann-benchmarks
+100k sample carries no texts and does not match HF rows): corpus = first 100k
+rows (title + text + ada-002 embedding), queries = next 1000 held-out rows,
+GT = exact brute-force cosine top-100 (`scripts/convert_dbpedia_hf.py`).
+One consolidated segment, float32, ef=128, K=10. Fusion: `VSIM.HYBRID` =
+top-100 lexical + top-100 vector → RRF (k=60).
+
+**Known-item** (query = exact entity title; all 100k titles unique). This is
+the class of queries the embedder-free `VSIM.SEARCHTEXT` exists for — without
+an embedder the vector path cannot serve them at all:
+
+| hit@1 | hit@10 | MRR@10 |
+|---|---|---|
+| 0.846 | 0.990 | 0.907 |
+
+**Semantic** (1000 held-out queries, recall@10 vs cosine GT):
+
+| vector | text (title) | text (full doc) | hybrid (title) | hybrid (full doc) |
+|---|---|---|---|---|
+| 0.993 | 0.152 | 0.300 | 0.564 | 0.533 |
+
+Read the hybrid column correctly: the only GT this dataset has is exact
+*cosine* — by construction the ideal output of the vector arm. Equal-weight
+RRF interleaves two weakly-overlapping lists (v1,t1,v2,t2,…), so a fused
+top-10 keeps ~5–6 vector docs and recall vs cosine-GT has a ~0.5–0.65 ceiling
+*regardless of implementation quality*. The measured 0.53–0.56 sits inside
+that predicted band — fusion behaves exactly as RRF arithmetic dictates.
+Demonstrating a genuine hybrid *win* on semantic queries requires
+human-labeled relevance (BEIR-class), which this dataset lacks; the
+known-item table above is where the lexical arm's product value shows.
+
+**Throughput** (same harness, 12 workers):
+
+| path | QPS_12 |
+|---|---|
+| `VSIM.SEARCH` (vector) | 2 453 |
+| `VSIM.SEARCHTEXT`, short query (~2–3 terms) | 934 |
+| `VSIM.SEARCHTEXT`, full-doc query (~52 terms) | 50 |
+| `VSIM.HYBRID`, full-doc text arm | 48 |
+
+Honest miss vs the design expectation: `SEARCHTEXT` was expected to come in
+*under* vector cost, but postings currently have no WAND/top-k pruning — every
+query term scans its full posting list, and common English terms are long
+(there is no stopword removal). Short keyword queries (the product case) are
+fine; long full-text queries are a known stress case, and pruning is the
+obvious next lever if they ever matter.
+
+Test: `TestBM25HybridProfit` (`kvstore/vector/bm25_hybrid_profit_test.go`).
+
 ---
 
 ## Caveats, all in one place
@@ -254,11 +305,14 @@ wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
 # dbpedia (includes angular ground truth, separate format):
 # https://storage.googleapis.com/ann-datasets/ann-benchmarks/dbpedia-openai-100k-angular.hdf5
 ./convert_dbpedia.py dbpedia-openai-100k-angular.hdf5 /tmp/dbpedia100k.bin
+# dbpedia with texts for BM25/hybrid (downloads HF parquet shards on first run):
+python3 scripts/convert_dbpedia_hf.py   # → /tmp/dbpedia100k_text.* + queries jsonl
 
 # 2. Run (no -short → heavy tests enabled; -v prints the tables)
 go test -run 'TestSIFT1M_Validation|TestGIST1M_Validation' -v -timeout 60m ./kvstore/vector/
 go test -run 'TestDBpedia_RealEmbeddingValidation' -v -timeout 30m ./kvstore/vector/
 go test -run 'TestTenant_SearchTenantQPSGain|TestFilter_AttrScaleQPSGain' -v -timeout 60m ./kvstore/vector/
+go test -run 'TestBM25HybridProfit' -v -timeout 60m ./kvstore/vector/
 ```
 
 The hnswlib side of the head-to-heads: `pip install hnswlib`, same M/efC/ef

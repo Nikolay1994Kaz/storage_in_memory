@@ -156,9 +156,35 @@ placeholder vector or a cheap server-side embedder.
    ground truth). **Sprint success criterion: hybrid ≥ vector-only on semantic
    queries AND materially better on keyword queries.** Numeric bar set after
    the first baseline run, not invented up front.
+
+   **Criterion refined after the baseline run (2026-07-19).** The dataset's
+   only semantic ground truth is exact brute-force *cosine* — i.e. by
+   construction it equals the ideal output of the vector arm. Against such a
+   GT `hybrid ≥ vector-only` is mathematically unreachable: with weakly
+   overlapping arm lists, equal-weight RRF interleaves them (v1,t1,v2,t2,…),
+   so only ~5–6 vector docs survive in a fused top-10 → recall ceiling
+   ~0.5–0.65 regardless of implementation quality. Measured 0.534 — inside
+   the predicted band; the fusion behaves exactly as RRF arithmetic says.
+   Showing a genuine hybrid *win* on semantic queries requires
+   human-labeled relevance (BEIR-class), which this dataset does not have.
+   The criterion as validated therefore is: (a) known-item — text path
+   materially better than the (non-existent, embedder-free) vector baseline:
+   hit@1 0.846 / hit@10 0.990 / MRR 0.907; (b) semantic — hybrid degradation
+   vs cosine-GT stays inside the RRF-interleave band (pinned [0.45, 0.75]),
+   proving fusion adds the lexical signal without collapsing the vector one.
 3. **Performance** — `SEARCHTEXT` latency must come in well under vector
    search (postings are cheaper than HNSW); `HYBRID` ≈ vector + ~10–20%.
    Russian-language smoke test for tokenizer+stemmer correctness.
+
+   **Measured 2026-07-19 — the expectation did not hold as written.** QPS_12
+   on the consolidated 100k corpus: vector 2 453; `SEARCHTEXT` short query
+   (~2–3 terms) 934; full-doc query (~52 terms) 50; `HYBRID` 48. Postings
+   have no WAND/top-k pruning, every query term scans its full posting list,
+   and common English terms are long (no stopword removal) — so lexical
+   search is ~2.6× *slower* than HNSW on short queries and dominated by long
+   ones. Short keyword queries (the product case for `SEARCHTEXT`) are fine
+   in absolute terms; posting pruning (WAND / max-score) is the known next
+   lever if long queries ever matter. Full numbers: docs/BENCHMARKS.md §6.
 
 ## Work plan (in order)
 
