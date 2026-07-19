@@ -60,13 +60,14 @@ Every command is classified against two independent gates (single choke point in
 
 - **OOM gate** (`isMemoryGrowingCmd`): when used memory > `maxmemory`, memory-growing
   commands are rejected with `OOM command not allowed…`. Applies to: `SET`, `ZADD`,
-  `VSIM.ADD`, `VSIM.ADDBIN`, `VSIM.ADDATTR`, `WASM.LOAD`, `WASM.LOADFILE`, `AI.INGEST`.
+  `VSIM.ADD`, `VSIM.ADDBIN`, `VSIM.ADDATTR`, `VSIM.ADDDOC`, `WASM.LOAD`,
+  `WASM.LOADFILE`, `AI.INGEST`.
   Deleting/reading commands are always allowed (the only way out of OOM).
 - **Durability fail-stop** (`isWriteCmd`): when the WAL can no longer write durably
   (ENOSPC, I/O error), *all* mutating commands are rejected — including deletes
   (a delete must be logged too, or it resurrects on restart). Applies to: `SET`,
-  `DEL`, `EXPIRE`, `PERSIST`, `VSIM.ADD`, `VSIM.ADDBIN`, `VSIM.ADDATTR`, `VSIM.DEL`,
-  `ZADD`, `ZREM`, `AI.INGEST`. Reads stay available.
+  `DEL`, `EXPIRE`, `PERSIST`, `VSIM.ADD`, `VSIM.ADDBIN`, `VSIM.ADDATTR`,
+  `VSIM.ADDDOC`, `VSIM.DEL`, `ZADD`, `ZREM`, `AI.INGEST`. Reads stay available.
 
 A new mutating command (any tier) MUST be added to both classifiers explicitly.
 
@@ -143,10 +144,13 @@ bad keys are rejected so poison never survives via replay), and all `Add`s happe
 | `VSIM.ADD` | `VSIM.ADD key v1 … vN` | `+OK` |
 | `VSIM.ADDBIN` | `VSIM.ADDBIN key <float32-LE bytes>` | `+OK` |
 | `VSIM.ADDATTR` | `VSIM.ADDATTR key [CAT k v]… [NUM k v]… VEC v1 … vN` | `+OK` — columnar attr/tenant ingest; WAL: `OpVSimAddAttrs` |
+| `VSIM.ADDDOC` | `VSIM.ADDDOC key TEXT text [CAT k v]… [NUM k v]… VEC v1 … vN` | `+OK` — doc ingest (vector + attrs + BM25 text). Tokenized once at ingest; the WAL entry (`OpVSimAddDoc`) carries the resulting terms, never raw text (replay never re-tokenizes → bit-exact across stemmer versions). Empty `TEXT ""` clears the doc's text (upsert semantics, same as attrs) |
 | `VSIM.DEL` | `VSIM.DEL key` | `:1` / `:0` |
 | `VSIM.EXISTS` | `VSIM.EXISTS key` | `:1` / `:0` — direct point lookup (delta/tombstones/segments), bypasses ANN; used by the soak durability oracle to separate real loss from recall miss |
 | `VSIM.SEARCH` | `VSIM.SEARCH K v1 … vN` | flat array `key, dist, …` |
 | `VSIM.SEARCHBIN` | `VSIM.SEARCHBIN K <float32-LE bytes>` | flat array |
+| `VSIM.SEARCHTEXT` | `VSIM.SEARCHTEXT K query` | flat array `key, score, …` — lexical BM25 top-K (embedder-free path); score is BM25, **higher = better** (not a distance) |
+| `VSIM.HYBRID` | `VSIM.HYBRID K TEXT query VEC v1 … vN` | flat array `key, score, …` — top-100 lexical + top-100 vector fused by Reciprocal Rank Fusion (k=60, rank-based → no score calibration); score is the RRF sum, comparable to nothing but itself |
 | `VSIM.FILTER` | `VSIM.FILTER K [EQ attr val]… [RANGE attr lo hi]… VEC v1 … vN` | flat array — columnar filter (+tenant routing via `-partition-attr`) |
 | `VSIM.SEARCHFILTER` | `VSIM.SEARCHFILTER K field value v1 … vN` \| `… K PREFIX prefix v1 … vN` | flat array — KV-metadata filter (`GET field:key == value`) or key-prefix filter |
 | `VSIM.SEARCHRANGE` | `VSIM.SEARCHRANGE K zsetKey minScore maxScore v1 … vN` | flat array — B+Tree range ∩ HNSW |

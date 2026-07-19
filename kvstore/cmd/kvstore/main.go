@@ -970,7 +970,7 @@ func isLoopbackBind(bind string) bool {
 // освобождением памяти, а не заблокировать себе единственный путь наружу.
 func isMemoryGrowingCmd(cmd string) bool {
 	switch cmd {
-	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR",
+	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC",
 		"WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
 		return true
 	}
@@ -987,7 +987,7 @@ func isMemoryGrowingCmd(cmd string) bool {
 func isWriteCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "DEL", "EXPIRE", "PERSIST",
-		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.DEL",
+		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC", "VSIM.DEL",
 		"ZADD", "ZREM", "AI.INGEST":
 		return true
 	}
@@ -1530,6 +1530,107 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// attrs+legacy-replica-протокол не определён) — CheckKey-редирект работает.
 		buf.WriteSimpleString("OK")
 
+	case "VSIM.ADDDOC":
+		// VSIM.ADDDOC <key> TEXT <text> [CAT <k> <v>]... [NUM <k> <v>]... VEC <f1> ... <fN>
+		// Ингест дока: вектор + атрибуты + текст (BM25). Текст токенизируется
+		// ЗДЕСЬ, ровно один раз: одни и те же термы уходят в дельту (AddDocTerms)
+		// и в WAL (OpVSimAddDoc) — реплей НЕ перетокенизирует, журнал везёт
+		// результат токенизации (бит-в-бит независимо от версии стеммера).
+		// Пустой TEXT "" снимает текст дока (семантика upsert, как у attrs).
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: VSIM.ADDDOC <key> TEXT <text> [CAT k v]... [NUM k v]... VEC <v1> ... <vN>")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR text documents not supported by this vector store")
+			return
+		}
+		key := string(args[0])
+		if cl != nil {
+			if moved := cl.CheckKey(key); moved != nil {
+				writeValue(buf, *moved)
+				return
+			}
+		}
+		attrs := vector.Attributes{Cat: map[string]string{}, Num: map[string]float64{}}
+		var vec []float32
+		text := ""
+		textSeen := false
+		parseErr := ""
+	addDocParse:
+		for i := 1; i < len(args); {
+			switch strings.ToUpper(string(args[i])) {
+			case "TEXT":
+				if i+1 >= len(args) {
+					parseErr = "TEXT requires <text>"
+					break addDocParse
+				}
+				text = string(args[i+1])
+				textSeen = true
+				i += 2
+			case "CAT":
+				if i+2 >= len(args) {
+					parseErr = "CAT requires <attr> <value>"
+					break addDocParse
+				}
+				attrs.Cat[string(args[i+1])] = string(args[i+2])
+				i += 3
+			case "NUM":
+				if i+2 >= len(args) {
+					parseErr = "NUM requires <attr> <value>"
+					break addDocParse
+				}
+				f, err := strconv.ParseFloat(unsafeString(args[i+2]), 64)
+				if err != nil {
+					parseErr = "NUM value not a float"
+					break addDocParse
+				}
+				attrs.Num[string(args[i+1])] = f
+				i += 3
+			case "VEC":
+				vec = make([]float32, 0, len(args)-i-1)
+				for j := i + 1; j < len(args); j++ {
+					f, err := strconv.ParseFloat(unsafeString(args[j]), 32)
+					if err != nil {
+						parseErr = fmt.Sprintf("invalid float %q", unsafeString(args[j]))
+						break addDocParse
+					}
+					vec = append(vec, float32(f))
+				}
+				break addDocParse
+			default:
+				parseErr = fmt.Sprintf("unexpected token %q (want TEXT|CAT|NUM|VEC)", unsafeString(args[i]))
+				break addDocParse
+			}
+		}
+		if parseErr == "" && !textSeen {
+			parseErr = "TEXT is required (use VSIM.ADDATTR for text-less vectors)"
+		}
+		if parseErr != "" {
+			buf.WriteError("ERR " + parseErr)
+			return
+		}
+		if err := vector.ValidateKey(key); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if err := vector.ValidateVector(vec); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		monitoring.VectorAddTotal.Inc()
+		terms := vector.TokenizeDoc(text)
+		// Add ДО bw.Write (watermark-safety, как VSIM.ADD/ADDATTR): док в дельте
+		// раньше, чем LSN покрыт снапшот-watermark'ом → нет потери на рестарте.
+		if err := lvs.AddDocTerms(key, vec, attrs, terms); err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		bw.Write(wal.Entry{Op: wal.OpVSimAddDoc, Key: key, Value: vector.SerializeVectorWithDoc(vec, attrs, terms)})
+		// Репликация в кластере не проброшена — как у ADDATTR (CheckKey-редирект есть).
+		buf.WriteSimpleString("OK")
+
 	case "VSIM.DEL":
 		if len(args) < 1 {
 			buf.WriteError("ERR usage: VSIM.DEL <key>")
@@ -1662,6 +1763,81 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		for _, r := range results {
 			buf.WriteBulkString(r.Key)
 			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
+		}
+
+	case "VSIM.SEARCHTEXT":
+		// VSIM.SEARCHTEXT <K> <query> — лексический BM25 top-K, embedder-free
+		// путь («шаг 0» без эмбеддера). Ответ зеркалит VSIM.SEARCH: пары
+		// [key, score, ...], но score — BM25 (БОЛЬШЕ = лучше, не дистанция).
+		if len(args) != 2 {
+			buf.WriteError("ERR usage: VSIM.SEARCHTEXT <K> <query>")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR text search not supported by this vector store")
+			return
+		}
+		K, err := strconv.Atoi(unsafeString(args[0]))
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
+			return
+		}
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
+		results, err := lvs.SearchText(unsafeString(args[1]), K)
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(results) * 2)
+		for _, r := range results {
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Score))
+		}
+
+	case "VSIM.HYBRID":
+		// VSIM.HYBRID <K> TEXT <query> VEC <v1> ... <vN> — гибрид: top-100
+		// лексический + top-100 векторный → Reciprocal Rank Fusion (k=60,
+		// docs/BM25_HYBRID_DESIGN.md). Ответ [key, rrf_score, ...]; RRF-скор
+		// НЕ сравним ни с BM25, ни с дистанцией — полезен только порядок.
+		if len(args) < 5 || strings.ToUpper(string(args[1])) != "TEXT" ||
+			strings.ToUpper(string(args[3])) != "VEC" {
+			buf.WriteError("ERR usage: VSIM.HYBRID <K> TEXT <query> VEC <v1> ... <vN>")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR hybrid search not supported by this vector store")
+			return
+		}
+		K, err := strconv.Atoi(unsafeString(args[0]))
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
+			return
+		}
+		query := make([]float32, len(args)-4)
+		for i := 4; i < len(args); i++ {
+			f, err := strconv.ParseFloat(unsafeString(args[i]), 32)
+			if err != nil {
+				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, unsafeString(args[i])))
+				return
+			}
+			query[i-4] = float32(f)
+		}
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
+		results, err := lvs.SearchHybrid(unsafeString(args[2]), query, K)
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(results) * 2)
+		for _, r := range results {
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Score))
 		}
 
 	case "VSIM.SEARCHBIN":

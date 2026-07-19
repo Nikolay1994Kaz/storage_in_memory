@@ -23,12 +23,21 @@ type VTextResult struct {
 	Score float64
 }
 
+// TokenizeDoc — единственный публичный вход токенизации: текст → (терм, tf).
+// Нужен write-site'у VSIM.ADDDOC: одни и те же термы обязаны уйти и в дельту
+// (AddDocTerms), и в WAL (SerializeVectorWithDoc) — журнал везёт РЕЗУЛЬТАТ
+// токенизации, реплей не перетокенизирует (бит-в-бит воспроизводимость
+// независимо от версии стеммера, см. wal.go про OpVSimAddDoc).
+func TokenizeDoc(text string) []TermTF {
+	return bm25CountTerms(bm25Tokenize(text))
+}
+
 // AddDoc вставляет док: вектор + атрибуты + текст. Текст токенизируется здесь
 // (единственное место, где он существует) и дальше живёт термами. Upsert —
 // полная замена состояния дока: прежний текст перезаписывается; пустой text
 // снимает текст (та же семантика, что у attrs).
 func (lvs *LeveledVectorStore) AddDoc(key string, vec []float32, attrs Attributes, text string) error {
-	return lvs.AddDocTerms(key, vec, attrs, bm25CountTerms(bm25Tokenize(text)))
+	return lvs.AddDocTerms(key, vec, attrs, TokenizeDoc(text))
 }
 
 // AddDocTerms — вставка дока с УЖЕ готовыми термами: реплей WAL (OpVSimAddDoc)
