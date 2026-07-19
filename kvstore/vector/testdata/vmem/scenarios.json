@@ -1,0 +1,218 @@
+{
+  "comment": "Оракул корректности VMEM (шаг 1 спринта, docs/VMEM_DESIGN.md). Golden-сценарии написаны руками; TestVMEMGoldenIntegrity пересчитывает ожидания исполняемой моделью (интервалы валидности + лексический матч bm25Tokenize) — расхождение с expect = баг сценария. Все факты без векторов (ступень 0): семантика памяти пинится независимо от эмбеддера. Времена — абстрактные unix-секунды; запросы исполняются ПОСЛЕ всей ленты операций (now >= последнего at), историю дают as_of. Валидность: valid_from <= t < valid_to (полуинтервал); открытый interval = сентинел 2^53. TTL = erasure: истёкший факт невидим во ВСЕХ режимах, включая all и as_of.",
+  "scenarios": [
+    {
+      "name": "basic_recall",
+      "comment": "запись и выборка по ключевым словам в одном scope; нерелевантный запрос пуст",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Дана предпочитает отчёты таблицей", "type": "preference", "at": 100},
+        {"op": "remember", "id": "f2", "scope": "user:dana", "text": "Дедлайн проекта Восток в марте", "type": "fact", "at": 200}
+      ],
+      "queries": [
+        {"id": "q1", "scope": "user:dana", "query": "отчёты", "now": 1000, "expect": ["f1"]},
+        {"id": "q2", "scope": "user:dana", "query": "дедлайн", "now": 1000, "expect": ["f2"]},
+        {"id": "q3", "comment": "ни один факт не матчится лексически", "scope": "user:dana", "query": "бюджет", "now": 1000, "expect": []}
+      ]
+    },
+    {
+      "name": "scope_isolation",
+      "comment": "память Даны не утекает Борису; неизвестный scope пуст",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Дедлайн проекта март", "at": 100},
+        {"op": "remember", "id": "f2", "scope": "user:boris", "text": "Дедлайн проекта июнь", "at": 200}
+      ],
+      "queries": [
+        {"id": "q1", "scope": "user:dana", "query": "дедлайн", "now": 1000, "expect": ["f1"]},
+        {"id": "q2", "scope": "user:boris", "query": "дедлайн", "now": 1000, "expect": ["f2"]},
+        {"id": "q3", "scope": "user:eve", "query": "дедлайн", "now": 1000, "expect": []}
+      ]
+    },
+    {
+      "name": "supersedes_pair",
+      "comment": "ядро темпоральности: новый факт закрывает интервал старого, история доступна as_of/all",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Дедлайн проекта Восток в марте", "at": 100},
+        {"op": "remember", "id": "f2", "scope": "user:dana", "text": "Дедлайн проекта Восток перенесли на май", "at": 200, "supersedes": "f1"}
+      ],
+      "queries": [
+        {"id": "q_now", "comment": "валидное-сейчас: только май", "scope": "user:dana", "query": "дедлайн Восток", "now": 1000, "expect": ["f2"]},
+        {"id": "q_asof", "comment": "что считали дедлайном в t=150", "scope": "user:dana", "query": "дедлайн Восток", "as_of": 150, "now": 1000, "expect": ["f1"]},
+        {"id": "q_all", "scope": "user:dana", "query": "дедлайн Восток", "all": true, "now": 1000, "expect": ["f1", "f2"]}
+      ]
+    },
+    {
+      "name": "supersedes_chain3",
+      "comment": "цепочка из трёх: валидное-сейчас = хвост; as_of до первого факта пуст",
+      "ops": [
+        {"op": "remember", "id": "fa", "scope": "user:dana", "text": "Дедлайн в марте", "at": 100},
+        {"op": "remember", "id": "fb", "scope": "user:dana", "text": "Дедлайн в мае", "at": 200, "supersedes": "fa"},
+        {"op": "remember", "id": "fc", "scope": "user:dana", "text": "Дедлайн в сентябре", "at": 300, "supersedes": "fb"}
+      ],
+      "queries": [
+        {"id": "q_now", "scope": "user:dana", "query": "дедлайн", "now": 1000, "expect": ["fc"]},
+        {"id": "q_asof_mid", "scope": "user:dana", "query": "дедлайн", "as_of": 250, "now": 1000, "expect": ["fb"]},
+        {"id": "q_asof_before", "comment": "до первого знания ответа не было", "scope": "user:dana", "query": "дедлайн", "as_of": 50, "now": 1000, "expect": []},
+        {"id": "q_all", "scope": "user:dana", "query": "дедлайн", "all": true, "now": 1000, "expect": ["fa", "fb", "fc"]}
+      ]
+    },
+    {
+      "name": "superseded_only_lexical_match",
+      "comment": "фильтр валидности сильнее лексики: единственный матчащийся факт устарел -> пусто, а не мусорный ответ",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Пароль от стенда лежит в сейфе", "at": 100},
+        {"op": "remember", "id": "f2", "scope": "user:dana", "text": "Доступ к стенду теперь через SSO", "at": 200, "supersedes": "f1"}
+      ],
+      "queries": [
+        {"id": "q_now", "comment": "матчится только устаревший f1", "scope": "user:dana", "query": "пароль сейфе", "now": 1000, "expect": []},
+        {"id": "q_asof", "scope": "user:dana", "query": "пароль", "as_of": 150, "now": 1000, "expect": ["f1"]}
+      ]
+    },
+    {
+      "name": "ttl_expiry",
+      "comment": "TTL = erasure, не supersession: после истечения факт невидим во всех режимах, включая all и as_of",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "agent:7", "text": "Временный токен деплоя ABC123", "at": 100, "ttl": 400}
+      ],
+      "queries": [
+        {"id": "q_before", "comment": "expires_at=500, ещё жив", "scope": "agent:7", "query": "токен", "now": 450, "expect": ["f1"]},
+        {"id": "q_after", "scope": "agent:7", "query": "токен", "now": 600, "expect": []},
+        {"id": "q_all_after", "comment": "erasure не история", "scope": "agent:7", "query": "токен", "all": true, "now": 600, "expect": []},
+        {"id": "q_asof_after", "comment": "as_of не воскрешает стёртое", "scope": "agent:7", "query": "токен", "as_of": 200, "now": 600, "expect": []}
+      ]
+    },
+    {
+      "name": "forget_erases",
+      "comment": "FORGET = физическое стирание, GDPR: недоступен даже через all",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Диагноз пользователя мигрень", "at": 100},
+        {"op": "remember", "id": "f2", "scope": "user:dana", "text": "Пользователь любит кофе", "at": 200},
+        {"op": "forget", "id": "f1", "at": 300}
+      ],
+      "queries": [
+        {"id": "q_now", "scope": "user:dana", "query": "диагноз мигрень", "now": 1000, "expect": []},
+        {"id": "q_all", "scope": "user:dana", "query": "диагноз мигрень", "all": true, "now": 1000, "expect": []},
+        {"id": "q_other", "comment": "сосед не задет", "scope": "user:dana", "query": "кофе", "now": 1000, "expect": ["f2"]}
+      ]
+    },
+    {
+      "name": "forget_middle_of_chain",
+      "comment": "FORGET не обходит цепочку supersedes; стирание среднего звена не воскрешает закрытый интервал предка",
+      "ops": [
+        {"op": "remember", "id": "fa", "scope": "user:dana", "text": "Зарплата обсуждалась в январе", "at": 100},
+        {"op": "remember", "id": "fb", "scope": "user:dana", "text": "Зарплата пересмотрена в апреле", "at": 200, "supersedes": "fa"},
+        {"op": "remember", "id": "fc", "scope": "user:dana", "text": "Зарплата утверждена в июле", "at": 300, "supersedes": "fb"},
+        {"op": "forget", "id": "fb", "at": 400}
+      ],
+      "queries": [
+        {"id": "q_now", "scope": "user:dana", "query": "зарплата", "now": 1000, "expect": ["fc"]},
+        {"id": "q_asof_b", "comment": "интервал fb стёрт вместе с фактом", "scope": "user:dana", "query": "зарплата", "as_of": 250, "now": 1000, "expect": []},
+        {"id": "q_asof_a", "comment": "интервал fa остался закрыт, хотя закрывший его fb стёрт", "scope": "user:dana", "query": "зарплата", "as_of": 150, "now": 1000, "expect": ["fa"]},
+        {"id": "q_all", "scope": "user:dana", "query": "зарплата", "all": true, "now": 1000, "expect": ["fa", "fc"]}
+      ]
+    },
+    {
+      "name": "upsert_same_id",
+      "comment": "клиентский ID: повторный REMEMBER того же id = полная замена состояния (идемпотентность ретраев), не дубль",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Офис в Алматы", "at": 100},
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Офис переехал в Астану", "at": 200}
+      ],
+      "queries": [
+        {"id": "q_old", "comment": "старый текст умер при замене", "scope": "user:dana", "query": "Алматы", "now": 1000, "expect": []},
+        {"id": "q_new", "scope": "user:dana", "query": "Астану", "now": 1000, "expect": ["f1"]},
+        {"id": "q_all", "comment": "ровно один факт, не два", "scope": "user:dana", "query": "офис", "all": true, "now": 1000, "expect": ["f1"]}
+      ]
+    },
+    {
+      "name": "duplicate_without_client_id",
+      "comment": "без клиентского ID ретрай = дубль (записанное поведение, remedy = ID=)",
+      "ops": [
+        {"op": "remember", "id": "f1a", "scope": "user:dana", "text": "Любит зелёный чай", "at": 100},
+        {"op": "remember", "id": "f1b", "scope": "user:dana", "text": "Любит зелёный чай", "at": 200}
+      ],
+      "queries": [
+        {"id": "q1", "scope": "user:dana", "query": "чай", "now": 1000, "expect": ["f1a", "f1b"]}
+      ]
+    },
+    {
+      "name": "type_filter",
+      "comment": "EQ-фильтр по type сужает выдачу",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Предпочитает Python", "type": "preference", "at": 100},
+        {"op": "remember", "id": "f2", "scope": "user:dana", "text": "Выучить Python до осени", "type": "task", "at": 200}
+      ],
+      "queries": [
+        {"id": "q_pref", "scope": "user:dana", "query": "Python", "type_eq": "preference", "now": 1000, "expect": ["f1"]},
+        {"id": "q_nofilter", "scope": "user:dana", "query": "Python", "now": 1000, "expect": ["f1", "f2"]}
+      ]
+    },
+    {
+      "name": "as_of_boundary",
+      "comment": "пин границы полуинтервала: в момент t замены валиден НОВЫЙ факт (valid_from <= t < valid_to)",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Статус задачи открыта", "at": 100},
+        {"op": "remember", "id": "f2", "scope": "user:dana", "text": "Статус задачи закрыта", "at": 200, "supersedes": "f1"}
+      ],
+      "queries": [
+        {"id": "q_at_boundary", "scope": "user:dana", "query": "статус задачи", "as_of": 200, "now": 1000, "expect": ["f2"]},
+        {"id": "q_just_before", "scope": "user:dana", "query": "статус задачи", "as_of": 199, "now": 1000, "expect": ["f1"]}
+      ]
+    },
+    {
+      "name": "open_interval_far_future",
+      "comment": "открытый valid_to = сентинел 2^53: факт валиден в далёком будущем без спецслучаев",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Родной язык русский", "at": 100}
+      ],
+      "queries": [
+        {"id": "q_year_2100", "scope": "user:dana", "query": "родной язык", "now": 4102444800, "expect": ["f1"]}
+      ]
+    },
+    {
+      "name": "known_item_ticket",
+      "comment": "ступень 0, known-item: точный идентификатор находится лексически там, где вектор слеп (главный выигрыш BM25-плеча)",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "agent:7", "text": "Инцидент PX-1042 закрыт после ретроспективы", "at": 100},
+        {"op": "remember", "id": "f2", "scope": "agent:7", "text": "Инцидент SRV-2077 ещё расследуется", "at": 200}
+      ],
+      "queries": [
+        {"id": "q_exact", "comment": "токенайзер режет PX-1042 на px+1042; ни один токен не пересекается с SRV-2077", "scope": "agent:7", "query": "PX-1042", "now": 1000, "expect": ["f1"]}
+      ]
+    },
+    {
+      "name": "ttl_plus_supersedes",
+      "comment": "комбинация фильтров: supersession действует до истечения, erasure добивает историю после",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Купон SPRING действует", "at": 100, "ttl": 300},
+        {"op": "remember", "id": "f2", "scope": "user:dana", "text": "Купон SPRING отменён", "at": 200, "supersedes": "f1"}
+      ],
+      "queries": [
+        {"id": "q_now_alive", "comment": "f1 ещё не истёк (expires 400), но уже устарел", "scope": "user:dana", "query": "купон", "now": 250, "expect": ["f2"]},
+        {"id": "q_asof_alive", "comment": "история доступна, пока факт не стёрт", "scope": "user:dana", "query": "купон", "as_of": 150, "now": 250, "expect": ["f1"]},
+        {"id": "q_asof_expired", "comment": "после expires_at история f1 стёрта; f2 в t=150 ещё не существовал", "scope": "user:dana", "query": "купон", "as_of": 150, "now": 500, "expect": []}
+      ]
+    },
+    {
+      "name": "scoring_importance",
+      "comment": "шаг 5 (порядок, не множество): важное сопротивляется затуханию — аллергия важнее упоминания в статье",
+      "ops": [
+        {"op": "remember", "id": "f1", "scope": "user:dana", "text": "Аллергия на пенициллин", "type": "fact", "importance": 0.9, "at": 100},
+        {"op": "remember", "id": "f2", "scope": "user:dana", "text": "Упоминал пенициллин в статье", "type": "event", "importance": 0.1, "at": 100}
+      ],
+      "queries": [
+        {"id": "q1", "scoring": true, "expect_first": "f1", "scope": "user:dana", "query": "пенициллин", "now": 1000, "expect": ["f1", "f2"]}
+      ]
+    },
+    {
+      "name": "scoring_freshness",
+      "comment": "шаг 5 (порядок, не множество): при равной релевантности и важности свежий факт выше старого",
+      "ops": [
+        {"op": "remember", "id": "f_old", "scope": "user:dana", "text": "Проект использует Postgres", "at": 100},
+        {"op": "remember", "id": "f_new", "scope": "user:dana", "text": "Проект использует Postgres", "at": 5000}
+      ],
+      "queries": [
+        {"id": "q1", "scoring": true, "expect_first": "f_new", "scope": "user:dana", "query": "Postgres", "now": 6000, "expect": ["f_old", "f_new"]}
+      ]
+    }
+  ]
+}
