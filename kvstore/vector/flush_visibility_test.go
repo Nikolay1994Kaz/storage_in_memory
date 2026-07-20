@@ -146,6 +146,60 @@ func TestFlushVisibility_ConcurrentAddSearch(t *testing.T) {
 	}
 }
 
+// TestFlushVisibility_FilterAttrsInWindow — страж атрибут-фильтра в окне
+// flush-visibility. Дефект (pre-existing, вскрыт VMEM-оракулом шага 2,
+// mixed-состояние): SearchFilter снимал атрибуты ТОЛЬКО активной дельты, а
+// pass-through «не delta-ключ → пусть судят колонки сегмента» пропускал доки
+// из flushing-дельт (swap сделан, сегмент не опубликован) мимо фильтра —
+// любой Eq/Range для них молча игнорировался (утечка между тенантами).
+// Окно пришпиливается тем же buildSem-приёмом, что и NoGapDuringBuild.
+func TestFlushVisibility_FilterAttrsInWindow(t *testing.T) {
+	const dim = 8
+	cfg := leveledConfigForVisibility()
+	lvs := NewLeveledVectorStore(cfg)
+	defer lvs.Clear()
+
+	lvs.buildSem <- struct{}{}
+
+	query := mkVecN(dim, 0)
+	if err := lvs.AddWithAttrs("k", query, Attributes{Cat: map[string]string{"scope": "user:dana"}}); err != nil {
+		t.Fatalf("AddWithAttrs: %v", err)
+	}
+	lvs.triggerCompact()
+
+	// Ждём окна: дельта свапнута (пуста), сегмент не опубликован, build пришпилен.
+	waitUntil(t, func() bool {
+		lvs.mu.RLock()
+		defer lvs.mu.RUnlock()
+		deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
+		nSegs := 0
+		for i := range lvs.levels {
+			nSegs += len(lvs.levels[i])
+		}
+		return deltaEmpty && nSegs == 0 && lvs.inFlightBuilds.Load() > 0
+	})
+
+	// «k» живёт только во flushing-дельте. Фильтр по чужому значению обязан его скрыть.
+	neg, negErr := lvs.SearchFilter(query, 1, Filter{Eq: map[string]string{"scope": "no-such-scope"}})
+	// А по своему — найти (flushing-дельта searchable, атрибуты судятся снимком).
+	pos, posErr := lvs.SearchFilter(query, 1, Filter{Eq: map[string]string{"scope": "user:dana"}})
+
+	// Освобождаем build-слот до проверок, чтобы горутина не висела на shutdown.
+	<-lvs.buildSem
+
+	if negErr != nil || posErr != nil {
+		t.Fatalf("SearchFilter: neg=%v pos=%v", negErr, posErr)
+	}
+	for _, r := range neg {
+		if r.Key == "k" {
+			t.Fatal("фильтр по несуществующему значению вернул док из flushing-дельты (атрибуты не судились)")
+		}
+	}
+	if len(pos) != 1 || pos[0].Key != "k" {
+		t.Fatalf("позитивный фильтр в окне flush-visibility: %+v", pos)
+	}
+}
+
 func leveledConfigForVisibility() LeveledConfig {
 	return LeveledConfig{
 		Distance:       EuclideanDistance,

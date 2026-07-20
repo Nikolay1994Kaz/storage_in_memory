@@ -102,6 +102,35 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
    mixed), mirroring the BM25 golden harness.
 2. **REMEMBER** — thin wrapper over the ADDDOC path: server fields (ULID,
    `valid_from`), TTL→`expires_at` conversion, optional client `ID=`/`VEC`.
+   **Status: done (2026-07-20).** Internal `store.Remember` (`vmem.go`):
+   a pure "field kitchen" (`rememberDoc`) resolves every server decision —
+   ULID (own 30-line encoder, no dependency), defaults, TTL→absolute
+   `expires_at` — and returns the materialized doc; the command layer
+   (step 7) must serialize *that* doc into the WAL, never re-derive fields
+   (door 1). Decisions pinned during implementation:
+   - **No-VEC facts get a deterministic placeholder unit vector derived
+     from the fact id** (the "trivial placeholder" recipe of the reserved
+     has-vector door in `BM25_HYBRID_DESIGN.md`, moved server-side into the
+     kitchen). Determinism keeps client-`ID=` retries bit-identical in the
+     WAL. On an empty store this fixes `dim=32`; recorded trap: switching
+     a step-0 store to BYO embeddings of another dimension requires
+     re-ingest into a fresh store.
+   - **TTL counts from ingest (`now`)**, not from a client-overridden
+     `valid_from`: the override speaks about truth, not retention.
+   - `supersedes` is recorded as provenance only; target existence is NOT
+     validated at ingest (needs a per-key attr read — step 4 decides).
+   - Oracle partially enabled (`TestVMEMOracleIngestParity`): scenario op
+     tapes replayed through live `Remember`/`Delete` across 3 LSM states,
+     consequences checked through real read paths (`Get` / `SearchText`
+     set-parity vs the model / point Eq+Range `SearchFilter` on every
+     contract attribute). RECALL queries stay for step 3.
+   - **Bonus: pre-existing core bug found by the parity harness and
+     fixed** — `SearchFilter` snapshotted attributes of the *active* delta
+     only, so docs sitting in *flushing* deltas (flush-visibility window)
+     passed through every Eq/Range filter unjudged (cross-tenant leak).
+     Fix: snapshot all memtable deltas (active + flushing, freshest wins);
+     deterministic regression `TestFlushVisibility_FilterAttrsInWindow`
+     (buildSem-pinned window, fails on pre-fix code).
 3. **RECALL v1 (correct set, dumb order)** — scoped hybrid + validity filter
    (Range attrs). Correctness first, ranking later — separate layers, debugged
    one at a time.

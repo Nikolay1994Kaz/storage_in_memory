@@ -1274,12 +1274,33 @@ func (lvs *LeveledVectorStore) SearchTenant(query []float32, K int, tenant uint6
 func (lvs *LeveledVectorStore) SearchFilter(query []float32, K int, f Filter) ([]VSearchResult, error) {
 	partitionAttr := lvs.cfg.PartitionAttr
 
-	// Снимок атрибутов дельты (bounded): замыкание-«pass-through» для не-дельта-ключей,
-	// чтобы тот же composedFilter не отсёк frozen-результаты (их судят колонки сегмента).
+	// Снимок атрибутов ВСЕХ memtable-дельт (bounded): замыкание-«pass-through» для
+	// не-memtable-ключей, чтобы тот же composedFilter не отсёк frozen-результаты
+	// (их судят колонки сегмента). Flushing-дельты обязаны войти в снимок: в окне
+	// flush-visibility (swap сделан, сегмент не опубликован) их доки ищутся как
+	// memtable, и pass-through пропускал бы их МИМО фильтра — любой Eq/Range
+	// молча игнорировался для свежесфлашиваемых доков (вскрыто VMEM-оракулом,
+	// mixed-состояние). Порядок старые→свежие: при коллизии ключа (upsert)
+	// выигрывают свежие атрибуты — семантика полной замены.
 	var deltaAttrs map[string]Attributes
 	lvs.mu.RLock()
-	if lvs.delta != nil && lvs.delta.Len() > 0 {
-		deltaAttrs = lvs.delta.AttrsSnapshot()
+	memDeltas := make([]*DeltaSegment, 0, 1+len(lvs.flushing))
+	memDeltas = append(memDeltas, lvs.flushing...)
+	if lvs.delta != nil {
+		memDeltas = append(memDeltas, lvs.delta)
+	}
+	for _, d := range memDeltas {
+		if d.Len() == 0 {
+			continue
+		}
+		snap := d.AttrsSnapshot()
+		if deltaAttrs == nil {
+			deltaAttrs = snap
+			continue
+		}
+		for k, v := range snap {
+			deltaAttrs[k] = v
+		}
 	}
 	lvs.mu.RUnlock()
 

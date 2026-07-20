@@ -31,7 +31,7 @@ import (
 	"testing"
 )
 
-const vmemOpenValidTo = int64(1) << 53 // сентинел открытого интервала (дверь контракта)
+// Сентинел открытого интервала vmemOpenValidTo живёт в vmem.go (шаг 2).
 
 type vmemOp struct {
 	Op         string   `json:"op"` // remember | forget
