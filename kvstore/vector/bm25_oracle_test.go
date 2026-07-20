@@ -208,7 +208,7 @@ func TestBM25OracleParity(t *testing.T) {
 		}
 		var got []bm25GoldenHit
 		for si, st := range segs {
-			for _, h := range st.search(terms, idf, avgdl, 0, uint32(len(st.docLen)), len(entries)) {
+			for _, h := range st.search(terms, idf, avgdl, 0, uint32(len(st.docLen)), len(entries), nil) {
 				got = append(got, bm25GoldenHit{Doc: entries[bases[si]+h.doc].Key, Score: h.score})
 			}
 		}
@@ -241,7 +241,7 @@ func TestBM25ScopedSearch(t *testing.T) {
 		for i := range terms {
 			idf[i] = bm25IDF(n, df[i])
 		}
-		all := st.search(terms, idf, avgdl, 0, full, len(entries))
+		all := st.search(terms, idf, avgdl, 0, full, len(entries), nil)
 		for _, rng := range [][2]uint32{{0, 5}, {3, 9}, {9, full}, {5, 5}} {
 			want := make([]bm25Hit, 0, len(all))
 			for _, h := range all {
@@ -249,7 +249,7 @@ func TestBM25ScopedSearch(t *testing.T) {
 					want = append(want, h)
 				}
 			}
-			got := st.search(terms, idf, avgdl, rng[0], rng[1], len(entries))
+			got := st.search(terms, idf, avgdl, rng[0], rng[1], len(entries), nil)
 			if len(got) != len(want) {
 				t.Fatalf("%s [%d,%d): %d хитов, ждём %d", q.ID, rng[0], rng[1], len(got), len(want))
 			}

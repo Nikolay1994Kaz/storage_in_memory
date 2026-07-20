@@ -98,7 +98,13 @@ type vmemFact struct {
 // vmemReplay проигрывает ленту операций сценария и возвращает финальное
 // состояние фактов. Валидирует структурные инварианты (существование целей
 // supersedes/forget, одинаковый scope, монотонность времени) через t.Fatalf.
-func vmemReplay(t *testing.T, name string, ops []vmemOp) map[string]*vmemFact {
+//
+// closeSupersedes — закрывать ли valid_to цели supersedes (полная модель
+// контракта). false = модель шага 3: механизм закрытия интервала — шаг 4,
+// до него живой путь держит valid_to открытым, и паритет обязан сверяться
+// с этой семантикой (golden-expect'ы supersedes-сценариев разойдутся с
+// живым путём ровно до шага 4 — задокументированный зазор).
+func vmemReplay(t *testing.T, name string, ops []vmemOp, closeSupersedes bool) map[string]*vmemFact {
 	t.Helper()
 	facts := make(map[string]*vmemFact)
 	prevAt := int64(0)
@@ -137,7 +143,9 @@ func vmemReplay(t *testing.T, name string, ops []vmemOp) map[string]*vmemFact {
 				if target.scope != op.Scope {
 					t.Fatalf("%s: op[%d] supersedes через границу scope (%s vs %s) — запрещено контрактом", name, i, target.scope, op.Scope)
 				}
-				target.validTo = op.At
+				if closeSupersedes {
+					target.validTo = op.At
+				}
 			}
 			facts[op.ID] = f
 		case "forget":
@@ -200,7 +208,7 @@ func TestVMEMGoldenIntegrity(t *testing.T) {
 			t.Fatalf("дубль имени сценария %q", sc.Name)
 		}
 		seenNames[sc.Name] = true
-		facts := vmemReplay(t, sc.Name, sc.Ops)
+		facts := vmemReplay(t, sc.Name, sc.Ops, true)
 
 		lastAt := sc.Ops[len(sc.Ops)-1].At
 		seenQ := make(map[string]bool)
@@ -232,9 +240,43 @@ func TestVMEMGoldenIntegrity(t *testing.T) {
 	}
 }
 
-// TestVMEMOracleParity — те же сценарии через живой путь REMEMBER/RECALL
-// (по образцу BM25: x3 состояния LSM — дельта / после flush / смешанное).
-// Включается в шагах 2–3, когда появится реализация.
+// TestVMEMOracleParity — сценарии через живой путь Remember/Recall x3
+// состояния LSM (по образцу BM25). ВКЛЮЧЁН в шаге 3 с моделью шага 3
+// (closeSupersedes=false): живой Recall обязан бит-в-бит совпадать с
+// пересчётом модели по множеству (порядок/expect_first — шаг 5). После
+// шага 4 (механизм закрытия valid_to) флаг переключается на true, и живой
+// путь сойдётся уже с полными golden-expect'ами.
 func TestVMEMOracleParity(t *testing.T) {
-	t.Skip("шаги 2–3 VMEM-спринта: путь REMEMBER/RECALL ещё не реализован")
+	all := loadVMEMScenarios(t)
+	for _, sc := range all.Scenarios {
+		for _, st := range vmemLSMStates {
+			t.Run(sc.Name+"/"+st.name, func(t *testing.T) {
+				lvs := NewLeveledVectorStore(bm25TestConfig())
+				defer lvs.Close()
+				vmemLiveReplay(t, lvs, sc.Ops, st.flushAt(len(sc.Ops)))
+
+				facts := vmemReplay(t, sc.Name, sc.Ops, false)
+				K := len(facts) + 8
+				for _, q := range sc.Queries {
+					req := RecallRequest{
+						Scope: q.Scope, Query: q.Query, K: K,
+						AsOf: q.AsOf, All: q.All, TypeEq: q.TypeEq,
+					}
+					res, err := lvs.Recall(req, q.Now)
+					if err != nil {
+						t.Fatalf("%s: Recall: %v", q.ID, err)
+					}
+					got := make([]string, 0, len(res))
+					for _, r := range res {
+						got = append(got, r.Key)
+					}
+					slices.Sort(got)
+					want := vmemModelRecall(facts, q)
+					if !slices.Equal(got, want) {
+						t.Errorf("%s: живой Recall даёт %v, модель шага 3 — %v", q.ID, got, want)
+					}
+				}
+			})
+		}
+	}
 }

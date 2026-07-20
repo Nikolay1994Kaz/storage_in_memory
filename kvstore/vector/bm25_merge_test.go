@@ -103,7 +103,7 @@ func TestBM25MergeNormalizesDF(t *testing.T) {
 
 	// Скор doc по «чай» на чистой статистике = IDF = ln2 (TF-часть ровно 1).
 	idf := []float64{bm25IDF(uint64(st.nText), st.df(tea))}
-	hits := st.search([]string{tea}, idf, 1.0, 0, uint32(len(st.docLen)), 10)
+	hits := st.search([]string{tea}, idf, 1.0, 0, uint32(len(st.docLen)), 10, nil)
 	if len(hits) != 1 {
 		t.Fatalf("ждём 1 хит по «чай», получили %d", len(hits))
 	}

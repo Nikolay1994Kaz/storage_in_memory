@@ -200,6 +200,50 @@ func TestFlushVisibility_FilterAttrsInWindow(t *testing.T) {
 	}
 }
 
+// TestFlushVisibility_TextFilterAttrsInWindow — текстовый близнец
+// FilterAttrsInWindow: SearchTextFilter обязан судить атрибутами и доки из
+// flushing-дельт (снимок ВСЕХ memtable-дельт строится в SearchTextFilter с
+// рождения — тест пришпиливает окно и охраняет это от регрессии).
+func TestFlushVisibility_TextFilterAttrsInWindow(t *testing.T) {
+	const dim = 8
+	cfg := leveledConfigForVisibility()
+	lvs := NewLeveledVectorStore(cfg)
+	defer lvs.Clear()
+
+	lvs.buildSem <- struct{}{}
+
+	if err := lvs.AddDoc("k", mkVecN(dim, 0), Attributes{Cat: map[string]string{"scope": "user:dana"}}, "переезд в алматы"); err != nil {
+		t.Fatalf("AddDoc: %v", err)
+	}
+	lvs.triggerCompact()
+
+	waitUntil(t, func() bool {
+		lvs.mu.RLock()
+		defer lvs.mu.RUnlock()
+		deltaEmpty := lvs.delta == nil || lvs.delta.Len() == 0
+		nSegs := 0
+		for i := range lvs.levels {
+			nSegs += len(lvs.levels[i])
+		}
+		return deltaEmpty && nSegs == 0 && lvs.inFlightBuilds.Load() > 0
+	})
+
+	neg, negErr := lvs.SearchTextFilter("алматы", 10, Filter{Eq: map[string]string{"scope": "no-such-scope"}})
+	pos, posErr := lvs.SearchTextFilter("алматы", 10, Filter{Eq: map[string]string{"scope": "user:dana"}})
+
+	<-lvs.buildSem
+
+	if negErr != nil || posErr != nil {
+		t.Fatalf("SearchTextFilter: neg=%v pos=%v", negErr, posErr)
+	}
+	if len(neg) != 0 {
+		t.Fatalf("фильтр по несуществующему значению вернул текстовый хит из flushing-дельты: %+v", neg)
+	}
+	if len(pos) != 1 || pos[0].Key != "k" {
+		t.Fatalf("позитивный текстовый фильтр в окне flush-visibility: %+v", pos)
+	}
+}
+
 func leveledConfigForVisibility() LeveledConfig {
 	return LeveledConfig{
 		Distance:       EuclideanDistance,

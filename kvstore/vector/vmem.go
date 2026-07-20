@@ -67,6 +67,12 @@ var (
 	ErrVMEMValidFrom = errors.New("vmem: valid_from must be positive unix seconds below the sentinel")
 	// ErrVMEMSelfSupersedes — факт не может заменять сам себя.
 	ErrVMEMSelfSupersedes = errors.New("vmem: fact cannot supersede itself")
+	// ErrVMEMQuery — запрос RECALL обязателен: recall — это поиск, не скан scope.
+	ErrVMEMQuery = errors.New("vmem: query is required")
+	// ErrVMEMK — top-K RECALL должен быть положительным.
+	ErrVMEMK = errors.New("vmem: k must be positive")
+	// ErrVMEMAsOf — as_of вне (0, сентинел) либо задан вместе с all.
+	ErrVMEMAsOf = errors.New("vmem: as_of must be positive unix seconds below the sentinel and is mutually exclusive with all")
 )
 
 // RememberRequest — вход VMEM.REMEMBER до кухни полей (см. таблицу контракта).
@@ -204,6 +210,82 @@ func vmemPlaceholderVector(id string, dim int) []float32 {
 		vec[i] = float32(float64(vec[i]) * inv)
 	}
 	return vec
+}
+
+// RecallRequest — вход VMEM.RECALL до кухни фильтра (шаг 3: правильное
+// множество, глупый порядок — скоринг свежесть×важность придёт в шаге 5).
+type RecallRequest struct {
+	Scope  string    // чья память; обязателен
+	Query  string    // текстовый запрос (лексическое плечо); обязателен
+	Vector []float32 // эмбеддинг запроса; nil → BM25-only (ступень 0: placeholder-запрос был бы шумовым плечом в RRF)
+	K      int       // top-K
+	AsOf   *int64    // история: валидность на момент ts вместо now (application time, не transaction time)
+	All    bool      // отключить фильтр валидности; erasure (TTL/FORGET) скрыт ВСЕГДА
+	TypeEq string    // опциональный фильтр вида факта
+}
+
+// recallFilter — чистая кухня фильтра RECALL: три режима валидности = один
+// Filter с разными границами Range (контракт VMEM_DESIGN).
+//   - дефолт: валидное-сейчас  ≡ AS_OF now;
+//   - AS_OF ts: valid_from <= ts < valid_to — «что было истинно в ts»;
+//   - ALL: интервал не судится вовсе.
+//
+// Erasure — отдельная ось и фильтруется во ВСЕХ режимах против now (не ts):
+// «право быть забытым побеждает машину времени», а до TTL-жнеца (шаг 6)
+// истёкший факт ещё физически жив — Range по expires_at скрывает его уже
+// на чтении. Все времена — целые unix-секунды < 2^53, поэтому строгие
+// неравенства модели (t < valid_to, expires_at > now) выражаются
+// инклюзивным Range сдвигом границы на +1.
+func recallFilter(req RecallRequest, now int64) (Filter, error) {
+	if now <= 0 || now >= vmemOpenValidTo {
+		return Filter{}, ErrVMEMNow
+	}
+	if req.Scope == "" {
+		return Filter{}, ErrVMEMScope
+	}
+	if req.Query == "" {
+		return Filter{}, ErrVMEMQuery
+	}
+	if req.K <= 0 {
+		return Filter{}, ErrVMEMK
+	}
+	if req.AsOf != nil && (*req.AsOf <= 0 || *req.AsOf >= vmemOpenValidTo || req.All) {
+		return Filter{}, ErrVMEMAsOf
+	}
+	f := Filter{
+		Eq: map[string]string{vmemAttrScope: req.Scope},
+		Range: map[string][2]float64{
+			vmemAttrExpiresAt: {float64(now + 1), float64(vmemOpenValidTo)},
+		},
+	}
+	if req.TypeEq != "" {
+		f.Eq[vmemAttrType] = req.TypeEq
+	}
+	if !req.All {
+		tEff := now
+		if req.AsOf != nil {
+			tEff = *req.AsOf
+		}
+		f.Range[vmemAttrValidFrom] = [2]float64{0, float64(tEff)}
+		f.Range[vmemAttrValidTo] = [2]float64{float64(tEff + 1), float64(vmemOpenValidTo)}
+	}
+	return f, nil
+}
+
+// Recall — внутренний путь VMEM.RECALL (RESP-команда — шаг 7): кухня фильтра
+// + filter-then-fuse поверх готовых плеч. Без вектора запроса гибрид осознанно
+// вырождается в BM25-only (SearchTextFilter): RRF слеп к скорам, и шумовое
+// плечо из placeholder-векторов голосовало бы наравне с осмысленным.
+// Порядок выдачи на шаге 3 «глупый» (BM25/RRF); decay×importance — шаг 5.
+func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResult, error) {
+	f, err := recallFilter(req, now)
+	if err != nil {
+		return nil, err
+	}
+	if req.Vector == nil {
+		return lvs.SearchTextFilter(req.Query, req.K, f)
+	}
+	return lvs.SearchHybridFilter(req.Query, req.Vector, req.K, f)
 }
 
 // Remember — внутренний путь VMEM.REMEMBER (RESP-команда — шаг 7): кухня

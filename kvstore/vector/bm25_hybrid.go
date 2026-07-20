@@ -38,15 +38,32 @@ const (
 // Пустой текстовый запрос (нет термов после токенизации) деградирует до
 // векторного ранжирования в RRF-шкале; вектор обязателен всегда.
 func (lvs *LeveledVectorStore) SearchHybrid(query string, vec []float32, K int) ([]VTextResult, error) {
+	return lvs.SearchHybridFilter(query, vec, K, Filter{})
+}
+
+// SearchHybridFilter — гибрид с мульти-атрибутным фильтром, применённым к
+// ОБОИМ плечам ДО RRF (filter-then-fuse, правило шага 3а VMEM_DESIGN):
+// каждое плечо формирует свой top-depth уже из прошедших фильтр доков.
+// Пост-фьюжн отсев недопустим: top-depth плеча был бы занят чужими доками,
+// и после отсева маленькому scope доставался бы огрызок или пусто
+// (голодание; та же грабля, что post-hoc фильтр дельты).
+func (lvs *LeveledVectorStore) SearchHybridFilter(query string, vec []float32, K int, f Filter) ([]VTextResult, error) {
 	if K <= 0 {
 		return nil, nil
 	}
 	depth := max(rrfFusionDepth, K)
-	textHits, err := lvs.SearchText(query, depth)
+	textHits, err := lvs.SearchTextFilter(query, depth, f)
 	if err != nil {
 		return nil, err
 	}
-	vecHits, err := lvs.Search(vec, depth, nil)
+	// Пустой фильтр — прежний глобальный путь Search (без обвязки SearchFilter):
+	// SearchHybrid остаётся бит-в-бит прежним.
+	var vecHits []VSearchResult
+	if f.empty() {
+		vecHits, err = lvs.Search(vec, depth, nil)
+	} else {
+		vecHits, err = lvs.SearchFilter(vec, depth, f)
+	}
 	if err != nil {
 		return nil, err
 	}

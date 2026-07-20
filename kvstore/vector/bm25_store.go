@@ -88,6 +88,22 @@ func (lvs *LeveledVectorStore) AddDocTerms(key string, vec []float32, attrs Attr
 //  2. memtables (mutable) скорим под RLock, сегменты (immutable) — после;
 //  3. merge: затенение + провенанс-дедуп + tombstones (см. ниже).
 func (lvs *LeveledVectorStore) SearchText(query string, K int) ([]VTextResult, error) {
+	return lvs.SearchTextFilter(query, K, Filter{})
+}
+
+// SearchTextFilter — SearchText с мульти-атрибутным фильтром (Eq/Range,
+// зеркало SearchFilter). Фильтр судится ДО формирования top-K каждого
+// источника: memtables — по снимку атрибутов (свежие выигрывают при коллизии
+// ключа — семантика полной замены upsert), сегменты — idx-предикатом по
+// uint-колонкам (sa.compile) внутри скоринга постингов. Пре-фильтр
+// обязателен: пост-отсев готового топа морил бы маленький scope голодом.
+//
+// Статистика BM25 (N/df/avgdl) остаётся ГЛОБАЛЬНОЙ, не пер-scope — решение
+// 20.07: дёшево (статистика уже собрана), стабильно на крошечных scope
+// (N=5 даёт вырожденный IDF), консистентно с SearchText/golden-оракулом.
+// Цена: локально-частое слово тенанта скорится как глобально-редкое.
+// Пересмотр — по измеренному профиту (бенч шага 8 VMEM), не по «честнее».
+func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) ([]VTextResult, error) {
 	terms := bm25Tokenize(query)
 	if len(terms) == 0 || K <= 0 {
 		return nil, nil
@@ -177,8 +193,8 @@ func (lvs *LeveledVectorStore) SearchText(query string, K int) ([]VTextResult, e
 		idf[i] = bm25IDF(n, df[i])
 	}
 
-	// tombstone-фильтр (аналог composedFilter; пользовательских фильтров у
-	// SEARCHTEXT v1 нет). Snapshot снят под RLock — консистентен с источниками.
+	// tombstone-фильтр (аналог composedFilter). Snapshot снят под RLock —
+	// консистентен с источниками.
 	var tombFilter func(string) bool
 	if tombSnap != nil {
 		ts := *tombSnap
@@ -188,12 +204,36 @@ func (lvs *LeveledVectorStore) SearchText(query string, K int) ([]VTextResult, e
 		}
 	}
 
+	// Атрибут-суд memtable-ключей: снимок ВСЕХ memtable-дельт (активная +
+	// flushing — та же грабля окна flush-visibility, что чинилась в
+	// SearchFilter), свежая копия ключа выигрывает (memtables уже
+	// freshest-first). Ключ судится ТЕКУЩИМИ атрибутами дока: старая копия
+	// с другими атрибутами либо затенится Contains-правилом merge, либо
+	// правомерно отсечётся — полная замена upsert.
+	memFilter := tombFilter
+	if !f.empty() {
+		memAttrs := make(map[string]Attributes)
+		for _, mt := range memtables {
+			for k, a := range mt.AttrsSnapshot() {
+				if _, seen := memAttrs[k]; !seen {
+					memAttrs[k] = a
+				}
+			}
+		}
+		memFilter = func(key string) bool {
+			if tombFilter != nil && !tombFilter(key) {
+				return false
+			}
+			return matchAttrs(memAttrs[key], f, "")
+		}
+	}
+
 	// Memtables — MUTABLE, скорим под lvs.mu.RLock (та же дисциплина, что у
 	// векторного пути: активная — конкурентный Add, flushing — Close в
 	// applyResult). Сегменты immutable — обойдём после RUnlock.
 	memHits := make([][]deltaTextResult, nMem)
 	for i, mt := range memtables {
-		memHits[i] = mt.SearchText(terms, idf, avgdl, K, tombFilter)
+		memHits[i] = mt.SearchText(terms, idf, avgdl, K, memFilter)
 	}
 	lvs.mu.RUnlock()
 
@@ -238,7 +278,19 @@ func (lvs *LeveledVectorStore) SearchText(query string, K int) ([]VTextResult, e
 		if st == nil {
 			continue
 		}
-		for _, h := range st.search(terms, idf, avgdl, 0, uint32(len(st.docLen)), K) {
+		// Компиляция фильтра в idx-предикат по колонкам сегмента (то же
+		// пространство индексов, что у text-слоя). matchable=false — фильтр
+		// в этом сегменте заведомо никого не пропустит (значения нет в dict /
+		// атрибута нет) → сегмент пропускается целиком.
+		var pred func(int) bool
+		if !f.empty() {
+			var matchable bool
+			pred, matchable = seg.Attrs().compile(f, "")
+			if !matchable {
+				continue
+			}
+		}
+		for _, h := range st.search(terms, idf, avgdl, 0, uint32(len(st.docLen)), K, pred) {
 			key := seg.TextKey(h.doc)
 			// "" — док удалён in-place внутри сегмента (graph-delete), маскируем
 			// как векторный путь; затем tombstone-маска на живые ключи.

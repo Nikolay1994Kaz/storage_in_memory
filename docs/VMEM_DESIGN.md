@@ -140,6 +140,38 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
      layer lags. Standalone value: multi-tenant RAG over SEARCHTEXT. Pinned
      rule: in HYBRID the filter applies to **both arms before RRF** (filter
      then fuse) — post-fusion filtering starves the fused list; test first.
+
+   **Status: done, incl. 3a (2026-07-20).**
+   - `SearchTextFilter` — pre-filter inside each source: memtables judged by
+     an attrs snapshot of ALL memtable deltas (active + flushing — the same
+     flush-visibility trap fixed in `SearchFilter` at step 2; freshest copy
+     wins on key collision), segments by the compiled column predicate
+     *inside* posting scoring, before the arm's top-K forms.
+     **BM25 statistics stay global** (whole-corpus N/df/avgdl), not
+     per-scope — decided 2026-07-20: cheap, stable on tiny scopes (N=5
+     gives degenerate IDF), consistent with SearchText and the golden
+     oracle. Cost accepted: a tenant-locally-common word scores as
+     globally-rare. Revisit only on measured profit (step-8 bench), not on
+     "fairer".
+   - `SearchHybridFilter` — filter-then-fuse; empty filter degrades to the
+     bit-exact old SearchHybrid path. Starvation regression: 300-doc
+     foreign tenant vs 2-fact target scope, both arms dominated — target
+     facts must all surface (`TestRecallSmallScopeNoStarvation`).
+   - `store.Recall` — pure filter kitchen (`recallFilter`): three validity
+     modes = one Filter (default ≡ AS_OF now; ALL drops the interval axis);
+     erasure (`expires_at`) filtered in **every** mode against `now`, which
+     also hides TTL-expired facts before the step-6 reaper exists. Integer
+     seconds < 2^53 turn the model's strict inequalities into inclusive
+     Ranges via +1 shifts. No query vector → deliberate BM25-only
+     degradation (RRF is rank-blind, a placeholder-vector arm would vote
+     noise with full weight).
+   - `TestVMEMOracleParity` enabled: all scenarios through live
+     Remember/Recall ×3 LSM states, set-parity against the executable model
+     run in **step-3 semantics** (supersedes does not close `valid_to`
+     yet — flag in `vmemReplay`); flips to the full model at step 4.
+     Order/`expect_first` remain step 5.
+   - RESP: `[EQ…][RANGE…]` in both commands (shared `parseAttrFilter`,
+     backward-compatible), `docs/COMMANDS.md` updated.
 4. **Supersession mechanism** — the one genuinely hard step. Closing the old
    fact's `valid_to` is a mutation of an already-ingested doc, but upsert =
    full replacement and raw text is not stored. Three candidates, chosen by

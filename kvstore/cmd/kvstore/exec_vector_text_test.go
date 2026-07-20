@@ -147,6 +147,33 @@ func TestExec_VsimAddDocWALCarriesTerms(t *testing.T) {
 	}
 }
 
+// Шаг 3а VMEM-спринта: паритет фильтров — EQ/RANGE в SEARCHTEXT/HYBRID
+// (синтаксис VSIM.FILTER). В гибриде фильтр применяется к ОБОИМ плечам ДО
+// RRF (filter-then-fuse); без фильтра поведение команд прежнее.
+func TestExec_VsimTextFilterParity(t *testing.T) {
+	e := newAttrEnv(t, "")
+	wantOK(t, e.do("VSIM.ADDDOC", "d1", "TEXT", "чай зелёный", "CAT", "scope", "dana", "NUM", "imp", "0.9", "VEC", "1", "0", "0"))
+	wantOK(t, e.do("VSIM.ADDDOC", "d2", "TEXT", "чай чёрный", "CAT", "scope", "erlan", "NUM", "imp", "0.2", "VEC", "0", "1", "0"))
+
+	if got := keysOf(e.do("VSIM.SEARCHTEXT", "10", "чай", "EQ", "scope", "dana")); !reflect.DeepEqual(got, []string{"d1"}) {
+		t.Fatalf("SEARCHTEXT EQ: ждали [d1], got %v", got)
+	}
+	if got := keysOf(e.do("VSIM.SEARCHTEXT", "10", "чай", "RANGE", "imp", "0.5", "1")); !reflect.DeepEqual(got, []string{"d1"}) {
+		t.Fatalf("SEARCHTEXT RANGE: ждали [d1], got %v", got)
+	}
+	if got := keysOf(e.do("VSIM.SEARCHTEXT", "10", "чай")); len(got) != 2 {
+		t.Fatalf("SEARCHTEXT без фильтра: ждали оба дока, got %v", got)
+	}
+	if got := keysOf(e.do("VSIM.HYBRID", "10", "TEXT", "чай", "EQ", "scope", "erlan", "VEC", "0", "0", "0")); !reflect.DeepEqual(got, []string{"d2"}) {
+		t.Fatalf("HYBRID EQ: ждали [d2], got %v", got)
+	}
+
+	wantErr(t, e.do("VSIM.SEARCHTEXT", "10", "чай", "EQ", "scope"))             // EQ без значения
+	wantErr(t, e.do("VSIM.SEARCHTEXT", "10", "чай", "BOGUS"))                   // чужой хвост
+	wantErr(t, e.do("VSIM.SEARCHTEXT", "10", "чай", "RANGE", "imp", "x", "1"))  // lo не float
+	wantErr(t, e.do("VSIM.HYBRID", "10", "TEXT", "чай", "EQ", "scope", "dana")) // нет VEC после фильтра
+}
+
 // Ошибки парсинга поверхности: команда обязана падать ДО каких-либо мутаций.
 func TestExec_VsimTextParseErrors(t *testing.T) {
 	e := newAttrEnv(t, "")

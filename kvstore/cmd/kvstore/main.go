@@ -1024,6 +1024,47 @@ func (a leveledStatsAdapter) Stats() monitoring.VectorStats {
 	}
 }
 
+// parseAttrFilter парсит хвост [EQ <attr> <val>]... [RANGE <attr> <lo> <hi>]...
+// начиная с args[start] (синтаксис VSIM.FILTER, шаг 3а VMEM_DESIGN: паритет
+// фильтров в SEARCHTEXT/HYBRID). Останавливается на первом токене, не
+// являющемся EQ/RANGE (например VEC), и возвращает фильтр, индекс этого
+// токена и текст ошибки (""=ок). Без токенов возвращает нулевой Filter
+// (f.empty()=true — команды сохраняют старое поведение бит-в-бит).
+func parseAttrFilter(args [][]byte, start int) (vector.Filter, int, string) {
+	var f vector.Filter
+	i := start
+	for i < len(args) {
+		switch strings.ToUpper(string(args[i])) {
+		case "EQ":
+			if i+2 >= len(args) {
+				return f, i, "EQ requires <attr> <value>"
+			}
+			if f.Eq == nil {
+				f.Eq = map[string]string{}
+			}
+			f.Eq[string(args[i+1])] = string(args[i+2])
+			i += 3
+		case "RANGE":
+			if i+3 >= len(args) {
+				return f, i, "RANGE requires <attr> <lo> <hi>"
+			}
+			lo, e1 := strconv.ParseFloat(unsafeString(args[i+2]), 64)
+			hi, e2 := strconv.ParseFloat(unsafeString(args[i+3]), 64)
+			if e1 != nil || e2 != nil {
+				return f, i, "RANGE lo/hi not floats"
+			}
+			if f.Range == nil {
+				f.Range = map[string][2]float64{}
+			}
+			f.Range[string(args[i+1])] = [2]float64{lo, hi}
+			i += 4
+		default:
+			return f, i, ""
+		}
+	}
+	return f, i, ""
+}
+
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
 	hub *pubsub.Hub, cl clusterNode, wasm computeRuntime,
 	vecStore vector.VectorIndex,
@@ -1775,11 +1816,14 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 
 	case "VSIM.SEARCHTEXT":
-		// VSIM.SEARCHTEXT <K> <query> — лексический BM25 top-K, embedder-free
-		// путь («шаг 0» без эмбеддера). Ответ зеркалит VSIM.SEARCH: пары
-		// [key, score, ...], но score — BM25 (БОЛЬШЕ = лучше, не дистанция).
-		if len(args) != 2 {
-			buf.WriteError("ERR usage: VSIM.SEARCHTEXT <K> <query>")
+		// VSIM.SEARCHTEXT <K> <query> [EQ <attr> <val>]... [RANGE <attr> <lo> <hi>]...
+		// Лексический BM25 top-K, embedder-free путь («шаг 0» без эмбеддера).
+		// EQ/RANGE (синтаксис VSIM.FILTER, шаг 3а VMEM_DESIGN) судятся ДО
+		// формирования top-K (пре-фильтр); статистика BM25 глобальная.
+		// Ответ зеркалит VSIM.SEARCH: пары [key, score, ...], но score — BM25
+		// (БОЛЬШЕ = лучше, не дистанция).
+		if len(args) < 2 {
+			buf.WriteError("ERR usage: VSIM.SEARCHTEXT <K> <query> [EQ attr val]... [RANGE attr lo hi]...")
 			return
 		}
 		lvs, ok := vecStore.(*vector.LeveledVectorStore)
@@ -1792,9 +1836,17 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
+		f, next, perr := parseAttrFilter(args, 2)
+		if perr == "" && next != len(args) {
+			perr = fmt.Sprintf("unexpected token %q (want EQ|RANGE)", unsafeString(args[next]))
+		}
+		if perr != "" {
+			buf.WriteError("ERR " + perr)
+			return
+		}
 		monitoring.VectorSearchTotal.Inc()
 		searchStart := time.Now()
-		results, err := lvs.SearchText(unsafeString(args[1]), K)
+		results, err := lvs.SearchTextFilter(unsafeString(args[1]), K, f)
 		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
@@ -1807,13 +1859,15 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 
 	case "VSIM.HYBRID":
-		// VSIM.HYBRID <K> TEXT <query> VEC <v1> ... <vN> — гибрид: top-100
-		// лексический + top-100 векторный → Reciprocal Rank Fusion (k=60,
-		// docs/BM25_HYBRID_DESIGN.md). Ответ [key, rrf_score, ...]; RRF-скор
-		// НЕ сравним ни с BM25, ни с дистанцией — полезен только порядок.
-		if len(args) < 5 || strings.ToUpper(string(args[1])) != "TEXT" ||
-			strings.ToUpper(string(args[3])) != "VEC" {
-			buf.WriteError("ERR usage: VSIM.HYBRID <K> TEXT <query> VEC <v1> ... <vN>")
+		// VSIM.HYBRID <K> TEXT <query> [EQ <attr> <val>]... [RANGE <attr> <lo> <hi>]... VEC <v1> ... <vN>
+		// Гибрид: top-100 лексический + top-100 векторный → Reciprocal Rank
+		// Fusion (k=60, docs/BM25_HYBRID_DESIGN.md). EQ/RANGE применяются к
+		// ОБОИМ плечам ДО RRF (filter-then-fuse, шаг 3а VMEM_DESIGN) — пост-
+		// фьюжн отсев морил бы маленький scope голодом. Ответ
+		// [key, rrf_score, ...]; RRF-скор НЕ сравним ни с BM25, ни с
+		// дистанцией — полезен только порядок.
+		if len(args) < 5 || strings.ToUpper(string(args[1])) != "TEXT" {
+			buf.WriteError("ERR usage: VSIM.HYBRID <K> TEXT <query> [EQ attr val]... [RANGE attr lo hi]... VEC <v1> ... <vN>")
 			return
 		}
 		lvs, ok := vecStore.(*vector.LeveledVectorStore)
@@ -1826,18 +1880,26 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError("ERR invalid K (must be 1..100000)")
 			return
 		}
-		query := make([]float32, len(args)-4)
-		for i := 4; i < len(args); i++ {
-			f, err := strconv.ParseFloat(unsafeString(args[i]), 32)
+		f, next, perr := parseAttrFilter(args, 3)
+		if perr == "" && (next >= len(args) || strings.ToUpper(string(args[next])) != "VEC") {
+			perr = "missing VEC section"
+		}
+		if perr != "" {
+			buf.WriteError("ERR " + perr)
+			return
+		}
+		query := make([]float32, 0, len(args)-next-1)
+		for i := next + 1; i < len(args); i++ {
+			fv, err := strconv.ParseFloat(unsafeString(args[i]), 32)
 			if err != nil {
 				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, unsafeString(args[i])))
 				return
 			}
-			query[i-4] = float32(f)
+			query = append(query, float32(fv))
 		}
 		monitoring.VectorSearchTotal.Inc()
 		searchStart := time.Now()
-		results, err := lvs.SearchHybrid(unsafeString(args[2]), query, K)
+		results, err := lvs.SearchHybridFilter(unsafeString(args[2]), query, K, f)
 		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
 		if err != nil {
 			buf.WriteError(fmt.Sprintf("ERR %v", err))

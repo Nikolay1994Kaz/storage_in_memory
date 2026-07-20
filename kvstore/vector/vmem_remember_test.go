@@ -349,6 +349,50 @@ func vmemIngestReplay(ops []vmemOp) map[string]*vmemIngestTruth {
 	return truth
 }
 
+// vmemLSMStates — три состояния LSM для паритет-прогонов (образец BM25):
+// всё в дельте; всё во frozen-сегменте; смешанное (flush в середине ленты).
+// flushAt — после какой операции (1-based) звать FlushDeltaSync; 0 = никогда.
+var vmemLSMStates = []struct {
+	name    string
+	flushAt func(nOps int) int
+}{
+	{"delta", func(int) int { return 0 }},
+	{"flushed", func(n int) int { return n }},
+	{"mixed", func(n int) int { return n / 2 }},
+}
+
+// vmemLiveReplay проигрывает ленту операций сценария через живой путь
+// (Remember/Delete) с flush после flushAfter-й операции. Возвращает
+// материализованные доки последнего upsert'а каждого id.
+func vmemLiveReplay(t *testing.T, lvs *LeveledVectorStore, ops []vmemOp, flushAfter int) map[string]RememberedDoc {
+	t.Helper()
+	docs := make(map[string]RememberedDoc)
+	for i, op := range ops {
+		switch op.Op {
+		case "remember":
+			doc, err := lvs.Remember(RememberRequest{
+				ID: op.ID, Scope: op.Scope, Text: op.Text, Type: op.Type,
+				Importance: op.Importance, TTL: op.TTL, Supersedes: op.Supersedes,
+			}, op.At)
+			if err != nil {
+				t.Fatalf("op[%d] Remember %s: %v", i, op.ID, err)
+			}
+			if doc.ID != op.ID {
+				t.Fatalf("op[%d]: клиентский id %q подменён на %q", i, op.ID, doc.ID)
+			}
+			docs[op.ID] = doc
+		case "forget":
+			if !lvs.Delete(op.ID) {
+				t.Fatalf("op[%d] forget %s: Delete=false", i, op.ID)
+			}
+		}
+		if i+1 == flushAfter {
+			lvs.FlushDeltaSync()
+		}
+	}
+	return docs
+}
+
 // TestVMEMOracleIngestParity — частичное включение оракула (шаг 2): лента
 // операций каждого сценария через живой путь Remember/Delete в трёх
 // состояниях LSM; следствия проверяются реальными путями чтения:
@@ -364,44 +408,12 @@ func vmemIngestReplay(ops []vmemOp) map[string]*vmemIngestTruth {
 // истёкший TTL физически жив (жнец — шаг 6), RECALL-запросы — шаг 3.
 func TestVMEMOracleIngestParity(t *testing.T) {
 	all := loadVMEMScenarios(t)
-	states := []struct {
-		name    string
-		flushAt func(nOps int) int // после какой операции (1-based) звать FlushDeltaSync; 0 = никогда
-	}{
-		{"delta", func(int) int { return 0 }},
-		{"flushed", func(n int) int { return n }},
-		{"mixed", func(n int) int { return n / 2 }},
-	}
 	for _, sc := range all.Scenarios {
-		for _, st := range states {
+		for _, st := range vmemLSMStates {
 			t.Run(sc.Name+"/"+st.name, func(t *testing.T) {
 				lvs := NewLeveledVectorStore(bm25TestConfig())
 				defer lvs.Close()
-				docs := make(map[string]RememberedDoc)
-				flushAfter := st.flushAt(len(sc.Ops))
-				for i, op := range sc.Ops {
-					switch op.Op {
-					case "remember":
-						doc, err := lvs.Remember(RememberRequest{
-							ID: op.ID, Scope: op.Scope, Text: op.Text, Type: op.Type,
-							Importance: op.Importance, TTL: op.TTL, Supersedes: op.Supersedes,
-						}, op.At)
-						if err != nil {
-							t.Fatalf("op[%d] Remember %s: %v", i, op.ID, err)
-						}
-						if doc.ID != op.ID {
-							t.Fatalf("op[%d]: клиентский id %q подменён на %q", i, op.ID, doc.ID)
-						}
-						docs[op.ID] = doc
-					case "forget":
-						if !lvs.Delete(op.ID) {
-							t.Fatalf("op[%d] forget %s: Delete=false", i, op.ID)
-						}
-					}
-					if i+1 == flushAfter {
-						lvs.FlushDeltaSync()
-					}
-				}
+				docs := vmemLiveReplay(t, lvs, sc.Ops, st.flushAt(len(sc.Ops)))
 
 				truth := vmemIngestReplay(sc.Ops)
 				K := len(truth) + 8

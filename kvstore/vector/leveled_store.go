@@ -1283,26 +1283,28 @@ func (lvs *LeveledVectorStore) SearchFilter(query []float32, K int, f Filter) ([
 	// mixed-состояние). Порядок старые→свежие: при коллизии ключа (upsert)
 	// выигрывают свежие атрибуты — семантика полной замены.
 	var deltaAttrs map[string]Attributes
-	lvs.mu.RLock()
-	memDeltas := make([]*DeltaSegment, 0, 1+len(lvs.flushing))
-	memDeltas = append(memDeltas, lvs.flushing...)
-	if lvs.delta != nil {
-		memDeltas = append(memDeltas, lvs.delta)
+	if !f.empty() {
+		lvs.mu.RLock()
+		memDeltas := make([]*DeltaSegment, 0, 1+len(lvs.flushing))
+		memDeltas = append(memDeltas, lvs.flushing...)
+		if lvs.delta != nil {
+			memDeltas = append(memDeltas, lvs.delta)
+		}
+		for _, d := range memDeltas {
+			if d.Len() == 0 {
+				continue
+			}
+			snap := d.AttrsSnapshot()
+			if deltaAttrs == nil {
+				deltaAttrs = snap
+				continue
+			}
+			for k, v := range snap {
+				deltaAttrs[k] = v
+			}
+		}
+		lvs.mu.RUnlock()
 	}
-	for _, d := range memDeltas {
-		if d.Len() == 0 {
-			continue
-		}
-		snap := d.AttrsSnapshot()
-		if deltaAttrs == nil {
-			deltaAttrs = snap
-			continue
-		}
-		for k, v := range snap {
-			deltaAttrs[k] = v
-		}
-	}
-	lvs.mu.RUnlock()
 
 	var deltaFilter func(string) bool
 	if !f.empty() {

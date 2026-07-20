@@ -163,7 +163,13 @@ type bm25Hit struct {
 // idf выровнен с terms и посчитан глобально (bm25GlobalStats) — сегмент
 // применяет чужую статистику, не свою. Возвращает top-k по убыванию скора,
 // при равенстве — по doc.
-func (st *segmentText) search(terms []string, idf []float64, avgdl float64, lo, hi uint32, k int) []bm25Hit {
+//
+// pred (nil = без фильтра) — idx-предикат атрибут-фильтра (sa.compile),
+// судится ДО скоринга и top-K: пре-фильтр, а не отсев готового топа —
+// иначе топ, занятый чужими доками, морил бы маленький scope голодом
+// (грабля дельта-пост-фильтра). Индексы text-слоя и attr-колонок — одно
+// пространство (buildSegment* строят по одному порядку entries).
+func (st *segmentText) search(terms []string, idf []float64, avgdl float64, lo, hi uint32, k int, pred func(int) bool) []bm25Hit {
 	if st == nil || k <= 0 || avgdl == 0 {
 		return nil
 	}
@@ -180,6 +186,9 @@ func (st *segmentText) search(terms []string, idf []float64, avgdl float64, lo, 
 		for _, p := range pl[start:] {
 			if p.doc >= hi {
 				break
+			}
+			if pred != nil && !pred(int(p.doc)) {
+				continue
 			}
 			tf := float64(p.tf)
 			dl := float64(st.docLen[p.doc])
