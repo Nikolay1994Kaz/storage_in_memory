@@ -800,7 +800,7 @@ func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 		}
 		offs[i+1] = uint32(len(blob))
 	}
-	fg.keys = internedKeys{blob: blob, offs: offs}
+	fg.keys = newInternedKeys(blob, offs)
 
 	return fg, nil
 }

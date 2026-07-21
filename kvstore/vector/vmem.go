@@ -6,6 +6,8 @@ import (
 	"hash/fnv"
 	"maps"
 	"math"
+	"slices"
+	"strings"
 )
 
 // =============================================================================
@@ -87,6 +89,9 @@ var (
 	ErrVMEMK = errors.New("vmem: k must be positive")
 	// ErrVMEMAsOf — as_of вне (0, сентинел) либо задан вместе с all.
 	ErrVMEMAsOf = errors.New("vmem: as_of must be positive unix seconds below the sentinel and is mutually exclusive with all")
+	// ErrVMEMHalfLife — период полураспада должен быть неотрицательным
+	// (0 = дефолт движка).
+	ErrVMEMHalfLife = errors.New("vmem: half_life must be >= 0 seconds")
 )
 
 // RememberRequest — вход VMEM.REMEMBER до кухни полей (см. таблицу контракта).
@@ -226,8 +231,18 @@ func vmemPlaceholderVector(id string, dim int) []float32 {
 	return vec
 }
 
-// RecallRequest — вход VMEM.RECALL до кухни фильтра (шаг 3: правильное
-// множество, глупый порядок — скоринг свежесть×важность придёт в шаге 5).
+// vmemDefaultHalfLifeSec — дефолтный период полураспада свежести (30 дней).
+// Механизм наш, политика клиента: переопределяется per-request (HalfLifeSec).
+// Per-type полураспады — открытая дверь (нужен проброс type кандидатам),
+// добавляются спрос-driven, формат не трогают.
+const vmemDefaultHalfLifeSec = int64(30 * 24 * 3600)
+
+// vmemRecallOverfetch — глубина кандидатов до скоринга (шаг 5): свежий важный
+// факт с рангом похожести > K обязан уметь всплыть в top-K; скоринг только
+// top-K мог бы лишь переставлять внутри него. Совпадает с rrfFusionDepth.
+const vmemRecallOverfetch = 100
+
+// RecallRequest — вход VMEM.RECALL до кухни фильтра.
 type RecallRequest struct {
 	Scope  string    // чья память; обязателен
 	Query  string    // текстовый запрос (лексическое плечо); обязателен
@@ -236,6 +251,9 @@ type RecallRequest struct {
 	AsOf   *int64    // история: валидность на момент ts вместо now (application time, не transaction time)
 	All    bool      // отключить фильтр валидности; erasure (TTL/FORGET) скрыт ВСЕГДА
 	TypeEq string    // опциональный фильтр вида факта
+	// HalfLifeSec — период полураспада свежести в секундах (шаг 5);
+	// 0 → vmemDefaultHalfLifeSec. Политика затухания принадлежит клиенту.
+	HalfLifeSec int64
 }
 
 // recallFilter — чистая кухня фильтра RECALL: три режима валидности = один
@@ -266,6 +284,9 @@ func recallFilter(req RecallRequest, now int64) (Filter, error) {
 	if req.AsOf != nil && (*req.AsOf <= 0 || *req.AsOf >= vmemOpenValidTo || req.All) {
 		return Filter{}, ErrVMEMAsOf
 	}
+	if req.HalfLifeSec < 0 {
+		return Filter{}, ErrVMEMHalfLife
+	}
 	f := Filter{
 		Eq: map[string]string{vmemAttrScope: req.Scope},
 		Range: map[string][2]float64{
@@ -287,19 +308,193 @@ func recallFilter(req RecallRequest, now int64) (Filter, error) {
 }
 
 // Recall — внутренний путь VMEM.RECALL (RESP-команда — шаг 7): кухня фильтра
-// + filter-then-fuse поверх готовых плеч. Без вектора запроса гибрид осознанно
-// вырождается в BM25-only (SearchTextFilter): RRF слеп к скорам, и шумовое
-// плечо из placeholder-векторов голосовало бы наравне с осмысленным.
-// Порядок выдачи на шаге 3 «глупый» (BM25/RRF); decay×importance — шаг 5.
+// + filter-then-fuse поверх готовых плеч + скоринг памяти (шаг 5). Без вектора
+// запроса гибрид осознанно вырождается в BM25-only (SearchTextFilter): RRF
+// слеп к скорам, и шумовое плечо из placeholder-векторов голосовало бы наравне
+// с осмысленным.
+//
+// Скоринг (шаг 5) — чистая арифметика ранг-слоя поверх top-overfetch
+// кандидатов, ядро не тронуто:
+//
+//	final = score × 2^(−age/halfLife) × (0.5 + importance)
+//
+// где age = tEff − valid_from, tEff = as_of|now: свежесть меряется на момент,
+// О КОТОРОМ спрашивают, не на момент запроса («что было важно тогда»).
+// Нейтральная importance 0.5 даёт множитель ровно 1; importance не обнуляет
+// факт (пол 0.5×) — затухание двигает порядок, но не прячет (прятать умеет
+// только erasure). Умножение на RRF-скор — решение дизайна (score×decay×imp
+// дословно); риск «ранговая шкала RRF слишком плоская против decay» запинен,
+// пересмотр — по бенчу шага 8, не по «звучит правильно».
 func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResult, error) {
 	f, err := recallFilter(req, now)
 	if err != nil {
 		return nil, err
 	}
+	depth := max(vmemRecallOverfetch, req.K)
+	var cands []VTextResult
 	if req.Vector == nil {
-		return lvs.SearchTextFilter(req.Query, req.K, f)
+		cands, err = lvs.SearchTextFilter(req.Query, depth, f)
+	} else {
+		cands, err = lvs.SearchHybridFilter(req.Query, req.Vector, depth, f)
 	}
-	return lvs.SearchHybridFilter(req.Query, req.Vector, req.K, f)
+	if err != nil || len(cands) == 0 {
+		return cands, err
+	}
+
+	tEff := now
+	if req.AsOf != nil {
+		tEff = *req.AsOf
+	}
+	halfLife := req.HalfLifeSec
+	if halfLife == 0 {
+		halfLife = vmemDefaultHalfLifeSec
+	}
+	keys := make([]string, len(cands))
+	for i := range cands {
+		keys[i] = cands[i].Key
+	}
+	nums := lvs.numsForKeys(keys, vmemAttrValidFrom, vmemAttrImp)
+	for i := range cands {
+		cands[i].Score *= vmemDecayImp(nums[i][0], nums[i][1], tEff, halfLife)
+	}
+	slices.SortFunc(cands, func(a, b VTextResult) int {
+		if a.Score > b.Score {
+			return -1
+		}
+		if a.Score < b.Score {
+			return 1
+		}
+		return strings.Compare(a.Key, b.Key)
+	})
+	if len(cands) > req.K {
+		cands = cands[:req.K]
+	}
+	return cands, nil
+}
+
+// vmemDecayImp — множитель памяти поверх скора похожести. NaN (атрибута нет —
+// не-VMEM док, попавший в scope) → соответствующий фактор нейтрален.
+func vmemDecayImp(validFrom, imp float64, tEff, halfLife int64) float64 {
+	m := 1.0
+	if !math.IsNaN(validFrom) {
+		if age := float64(tEff) - validFrom; age > 0 {
+			m = math.Exp2(-age / float64(halfLife))
+		}
+	}
+	if !math.IsNaN(imp) {
+		m *= 0.5 + imp
+	}
+	return m
+}
+
+// numsForKeys — батч-проекция NUM-атрибутов по ключам кандидатов: значения
+// СВЕЖАЙШЕЙ версии дока (провенанс Get: активная дельта → flushing
+// новее-первым → сегменты свежее-первым), NaN = атрибута нет. Цена на ключ:
+// O(1) в memtable (keyIdx), O(log n) во frozen/SQ (sorted-пермутация
+// internedKeys), O(n карты) в hnswSegment — линейный обход id→key принят для
+// v1 (высокоразмерный BYO-путь; обратная мапа под s.mu — открытая дверь,
+// добавить по QPS-бенчу, не заранее).
+func (lvs *LeveledVectorStore) numsForKeys(keys []string, names ...string) [][]float64 {
+	out := make([][]float64, len(keys))
+	todo := len(keys)
+	for i := range out {
+		row := make([]float64, len(names))
+		for j := range row {
+			row[j] = math.NaN()
+		}
+		out[i] = row
+	}
+	fillFromAttrs := func(i int, a Attributes) {
+		for j, name := range names {
+			if v, ok := a.Num[name]; ok {
+				out[i][j] = v
+			}
+		}
+	}
+
+	lvs.mu.RLock()
+	defer lvs.mu.RUnlock()
+	memtables := make([]*DeltaSegment, 0, 1+len(lvs.flushing))
+	if lvs.delta != nil {
+		memtables = append(memtables, lvs.delta)
+	}
+	for i := len(lvs.flushing) - 1; i >= 0; i-- {
+		memtables = append(memtables, lvs.flushing[i])
+	}
+	done := make([]bool, len(keys))
+	for _, mt := range memtables {
+		if todo == 0 {
+			return out
+		}
+		for i, key := range keys {
+			if done[i] {
+				continue
+			}
+			if a, ok := mt.GetAttrs(key); ok {
+				fillFromAttrs(i, a)
+				done[i] = true
+				todo--
+			}
+		}
+	}
+	fillFromCols := func(sa *segmentAttrs, i, idx int) {
+		if sa == nil {
+			return
+		}
+		for j, name := range names {
+			if col, ok := sa.num[name]; ok {
+				out[i][j] = col.vals[idx] // NaN, если атрибута нет у дока
+			}
+		}
+	}
+	for _, level := range lvs.levels {
+		for pos := len(level) - 1; pos >= 0; pos-- {
+			if todo == 0 {
+				return out
+			}
+			switch s := level[pos].(type) {
+			case *frozenSegment:
+				for i, key := range keys {
+					if done[i] {
+						continue
+					}
+					if idx, ok := s.fg.keys.find(key); ok {
+						fillFromCols(s.attrs, i, idx)
+						done[i] = true
+						todo--
+					}
+				}
+			case *frozenSQSegment:
+				for i, key := range keys {
+					if done[i] {
+						continue
+					}
+					if idx, ok := s.fg.keys.find(key); ok {
+						fillFromCols(s.attrs, i, idx)
+						done[i] = true
+						todo--
+					}
+				}
+			case *hnswSegment:
+				s.mu.RLock()
+				for id, k := range s.keys {
+					if !s.g.nodes[id].Alive {
+						continue
+					}
+					for i, key := range keys {
+						if !done[i] && k == key {
+							fillFromCols(s.attrs, i, int(id))
+							done[i] = true
+							todo--
+							break
+						}
+					}
+				}
+				s.mu.RUnlock()
+			}
+		}
+	}
+	return out
 }
 
 // RememberResult — материализованный результат REMEMBER: командный слой
@@ -428,24 +623,20 @@ func (lvs *LeveledVectorStore) getFactDocLocked(key string) (DeltaEntry, bool) {
 			switch s := level[pos].(type) {
 			case *frozenSegment:
 				fg := s.fg
-				for i := 0; i < fg.n; i++ {
-					if fg.keys.view(i) == key {
-						vec := make([]float32, fg.dim)
-						copy(vec, fg.data[i*fg.dim:(i+1)*fg.dim])
-						return DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs.decodeAt(i), Terms: s.text.termsForDoc(uint32(i))}, true
-					}
+				if i, ok := fg.keys.find(key); ok {
+					vec := make([]float32, fg.dim)
+					copy(vec, fg.data[i*fg.dim:(i+1)*fg.dim])
+					return DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs.decodeAt(i), Terms: s.text.termsForDoc(uint32(i))}, true
 				}
 			case *frozenSQSegment:
 				fg := s.fg
-				for i := 0; i < fg.n; i++ {
-					if fg.keys.view(i) == key {
-						vec := make([]float32, fg.dim)
-						base := i * fg.dim
-						for d := 0; d < fg.dim; d++ {
-							vec[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
-						}
-						return DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs.decodeAt(i), Terms: s.text.termsForDoc(uint32(i))}, true
+				if i, ok := fg.keys.find(key); ok {
+					vec := make([]float32, fg.dim)
+					base := i * fg.dim
+					for d := 0; d < fg.dim; d++ {
+						vec[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
 					}
+					return DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs.decodeAt(i), Terms: s.text.termsForDoc(uint32(i))}, true
 				}
 			case *hnswSegment:
 				s.mu.RLock()

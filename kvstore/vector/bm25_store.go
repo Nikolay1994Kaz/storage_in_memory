@@ -249,8 +249,13 @@ func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) (
 	//     свой top-K, может всплыть до merge — принятая семантика, компакция
 	//     нормализует (шаг 6).
 	dedup := make(map[string]int)
-	combined := make([]VTextResult, 0, K)
-	ranks := make([]int64, 0, K)
+	// Ёмкость по факту, не по K: RECALL шага 5 оверфетчит K=100 при типичных
+	// единицах хитов на scope-запрос — преаллокация полного K дала бы ~4КБ
+	// мусора на каждый запрос (GC-просадка QPS, замер шага 5); рост append
+	// амортизирован для редких больших выдач.
+	capHint := min(K, 16)
+	combined := make([]VTextResult, 0, capHint)
+	ranks := make([]int64, 0, capHint)
 	addHit := func(key string, score float64, rank int64, shadowLimit int) {
 		for j := 0; j < shadowLimit; j++ {
 			if memtables[j].Contains(key) {

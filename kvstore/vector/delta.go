@@ -454,6 +454,20 @@ func (d *DeltaSegment) GetDoc(key string) (DeltaEntry, bool) {
 	return e, true
 }
 
+// GetAttrs возвращает атрибуты живого дока по ключу — O(1) по keyIdx шарда
+// (шаг 5 VMEM: проекция NUM-значений кандидатам RECALL без цены GetDoc —
+// вектор и термы не копируются). Мапы Attributes читать как иммутабельные.
+func (d *DeltaSegment) GetAttrs(key string) (Attributes, bool) {
+	s := d.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	idx, ok := s.keyIdx[key]
+	if !ok || s.keys[idx] == "" {
+		return Attributes{}, false
+	}
+	return s.attrs[idx], true
+}
+
 // ForEachLive вызывает fn(key, vec) для каждого живого вектора во всех шардах.
 // vec — ссылка во внутренний slab (не копия): не сохранять между вызовами.
 // Под shard RLock каждого шарда поочерёдно.

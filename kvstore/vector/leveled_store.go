@@ -1881,25 +1881,21 @@ func (lvs *LeveledVectorStore) Get(key string) ([]float32, bool) {
 			switch s := seg.(type) {
 			case *frozenSegment:
 				fg := s.fg
-				for i := 0; i < fg.n; i++ {
-					if fg.keys.view(i) == key {
-						out := make([]float32, fg.dim)
-						copy(out, fg.data[i*fg.dim:(i+1)*fg.dim])
-						return out, true
-					}
+				if i, ok := fg.keys.find(key); ok {
+					out := make([]float32, fg.dim)
+					copy(out, fg.data[i*fg.dim:(i+1)*fg.dim])
+					return out, true
 				}
 			case *frozenSQSegment:
 				fg := s.fg
 				dim := fg.dim
-				for i := 0; i < fg.n; i++ {
-					if fg.keys.view(i) == key {
-						out := make([]float32, dim)
-						base := i * dim
-						for d := 0; d < dim; d++ {
-							out[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
-						}
-						return out, true
+				if i, ok := fg.keys.find(key); ok {
+					out := make([]float32, dim)
+					base := i * dim
+					for d := 0; d < dim; d++ {
+						out[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
 					}
+					return out, true
 				}
 			case *hnswSegment:
 				s.mu.RLock()

@@ -265,6 +265,13 @@ func TestVMEMOracleParity(t *testing.T) {
 					if err != nil {
 						t.Fatalf("%s: Recall: %v", q.ID, err)
 					}
+					// Порядок (шаг 5): авторский expect_first сценария — первый
+					// в живой выдаче. Проверяется ДО сортировки got.
+					if q.ExpectFirst != "" {
+						if len(res) == 0 || res[0].Key != q.ExpectFirst {
+							t.Errorf("%s: первый в выдаче %v, golden ожидает %q", q.ID, res, q.ExpectFirst)
+						}
+					}
 					got := make([]string, 0, len(res))
 					for _, r := range res {
 						got = append(got, r.Key)
@@ -272,7 +279,7 @@ func TestVMEMOracleParity(t *testing.T) {
 					slices.Sort(got)
 					want := vmemModelRecall(facts, q)
 					if !slices.Equal(got, want) {
-						t.Errorf("%s: живой Recall даёт %v, модель шага 3 — %v", q.ID, got, want)
+						t.Errorf("%s: живой Recall даёт %v, модель — %v", q.ID, got, want)
 					}
 				}
 			})

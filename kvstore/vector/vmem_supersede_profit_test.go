@@ -123,7 +123,7 @@ func TestVMEMRecallQPSProbe(t *testing.T) {
 		corpusN = 20000
 		vocab   = 20000
 		nTok    = 30
-		nQ      = 4000
+		nQ      = 40000 // фаза запросов ≫ шума планировщика: ~0.5–0.8с
 	)
 	cfg := bm25TestConfig()
 	cfg.DeltaMax = corpusN

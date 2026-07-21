@@ -1,6 +1,9 @@
 package vector
 
-import "unsafe"
+import (
+	"sort"
+	"unsafe"
+)
 
 // =============================================================================
 // internedKeys — N пользовательских ключей в ОДНОМ байтовом блобе + оффсетах.
@@ -21,6 +24,14 @@ import "unsafe"
 type internedKeys struct {
 	blob []byte
 	offs []uint32 // len = n+1; offs[0]=0; offs[i+1] >= offs[i]
+
+	// sorted — пермутация индексов, отсортированная по значению ключа: обратный
+	// лукап key→idx бинпоиском за O(log n) строковых сравнений (шаг 5 VMEM).
+	// До него точечные чтения сегмента (Get, supersedes-цель, проекция NUM для
+	// скоринга RECALL) сканировали все ключи линейно. 4 байта на ключ, ни одной
+	// новой строки (сравнения через view), формат снапшота не меняется —
+	// пермутация строится при freeze и на load (newInternedKeys).
+	sorted []uint32
 }
 
 // count возвращает число ключей.
@@ -55,6 +66,48 @@ func (k internedKeys) clone(i int) string {
 	return string(k.blob[s:e])
 }
 
+// find возвращает индекс ключа за O(log n) по sorted-пермутации.
+// Пустой ключ (tombstone-слот) не ищется. Дубли ключа внутри сегмента
+// невозможны (freeze — из дельты с уникальными слотами, merge дедуплицирует).
+func (k internedKeys) find(key string) (int, bool) {
+	if key == "" || len(k.sorted) == 0 {
+		return 0, false
+	}
+	lo, hi := 0, len(k.sorted)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if k.view(int(k.sorted[mid])) < key {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < len(k.sorted) {
+		if i := int(k.sorted[lo]); k.view(i) == key {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// newInternedKeys достраивает sorted-пермутацию над готовыми blob+offs —
+// общий конструктор freeze- и load-путей.
+func newInternedKeys(blob []byte, offs []uint32) internedKeys {
+	k := internedKeys{blob: blob, offs: offs}
+	n := k.count()
+	if n == 0 {
+		return k
+	}
+	k.sorted = make([]uint32, n)
+	for i := range k.sorted {
+		k.sorted[i] = uint32(i)
+	}
+	sort.Slice(k.sorted, func(a, b int) bool {
+		return k.view(int(k.sorted[a])) < k.view(int(k.sorted[b]))
+	})
+	return k
+}
+
 // buildInternedKeys упаковывает []string → blob+offs (используется при freeze).
 func buildInternedKeys(keys []string) internedKeys {
 	total := 0
@@ -67,5 +120,5 @@ func buildInternedKeys(keys []string) internedKeys {
 		blob = append(blob, s...)
 		offs[i+1] = uint32(len(blob))
 	}
-	return internedKeys{blob: blob, offs: offs}
+	return newInternedKeys(blob, offs)
 }

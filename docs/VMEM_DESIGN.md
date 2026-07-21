@@ -207,6 +207,27 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
    `score × decay(now − valid_from) × importance`, return top-K. Pure
    rank-layer arithmetic (like RRF), core untouched. Decay shape and per-type
    half-lives chosen by experiment on the golden scenarios.
+
+   **DONE.** `final = fused × 2^(−age/halfLife) × (0.5 + importance)`; age is
+   measured against `as_of` when given ("what mattered *then*"), neutral
+   importance 0.5 yields exactly 1, and importance never zeroes a fact (floor
+   0.5×) — decay moves rank, only erasure hides. Half-life is per-request
+   (`half_life`, default 30 days): the mechanism is ours, the policy is the
+   client's; per-type half-lives remain an open door (needs type projection).
+   Candidate attributes (`valid_from`, `imp`) are batch-projected by key:
+   O(1) from memtables, O(log n) from frozen segments via a sorted key
+   permutation added to the interned-key table (4 bytes/key, no format
+   change, built at freeze/load — it also turned point `Get` and the step-4
+   supersedes read from linear scans into binary searches). The golden
+   scoring scenarios' `expect_first` is now asserted in the live parity test
+   across all three LSM states. Pre-registered threshold: scored RECALL QPS
+   ≥ 0.8× of the unscored step-4 path — measured 0.85× (median 52.5k vs
+   61.5k on the same probe) after fixing an overfetch-sized allocation
+   (result buffers were pre-sized to the fetch depth of 100 while typical
+   scope queries return units of hits; ~4 KB of garbage per query gated QPS
+   through GC — buffers now grow amortized from a small hint). The known
+   risk "flat RRF rank scale vs multiplicative decay" is accepted and
+   deferred to the step-8 corpus bench.
 6. **FORGET + TTL reaper** — delete-in-place (churn already solved) + idle-task
    sweep of `expires_at <= now`.
 7. **RESP surface + durability** — `VMEM.REMEMBER / RECALL / FORGET`; both
