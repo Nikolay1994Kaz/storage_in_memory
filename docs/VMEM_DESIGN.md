@@ -182,6 +182,27 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
    (cheap writes, new durability surface);
    (c) re-ingest the old fact with a closed interval (simple, needs its text
    from the KV tier).
+
+   **DONE — (c) chosen by experiment.** (a) was eliminated by analysis before
+   any benchmark (correctness, not perf: the successor is not guaranteed to be
+   lexically reachable by the query, so validity computed at recall would need
+   a reverse index plus a per-candidate lookup, and a virtual `valid_to`
+   breaks pre-filter Range). (c) needs no KV tier after all: the target's
+   terms are re-read from the engine itself — O(1) from delta slots, and from
+   frozen segments via a compact forward layer `doc → (termID, tf)` built
+   alongside the postings (memory ≈ postings size; snapshot format unchanged,
+   the layer is rebuilt once on load by inverting postings). The whole
+   read-modify-write (read target → re-ingest with closed `valid_to` → insert
+   successor) runs under the store's exclusive lock, so a concurrent upsert of
+   the target either lands entirely before (its content gets closed) or
+   entirely after (it reopens the fact — last writer wins); the torn
+   interleaving is impossible. Target is validated (exists, same scope) before
+   any insert — an error leaves no half-written pair. Both docs must go to the
+   WAL as one atomic batch (step 7). Pre-registered thresholds, both met:
+   p99 REMEMBER-with-supersedes = 2.33× plain REMEMBER (threshold ≤5×, target
+   in a 20k-doc frozen segment, 20k vocabulary); RECALL QPS A/B vs pre-step-4
+   master: no regression (74–84k QPS both sides, same probe). Without the
+   forward layer the postings scan cost 7.5× — that variant is rejected.
 5. **Recall scoring** — re-rank the hybrid top-100 by
    `score × decay(now − valid_from) × importance`, return top-K. Pure
    rank-layer arithmetic (like RRF), core untouched. Decay shape and per-type

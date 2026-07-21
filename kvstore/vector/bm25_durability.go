@@ -194,6 +194,7 @@ func readSegText(r io.Reader) (*segmentText, error) {
 		}
 		st.postings = append(st.postings, pl)
 	}
+	st.rebuildFwd(int(nDocs))
 	return st, nil
 }
 
@@ -218,6 +219,27 @@ func (st *segmentText) decodeTerms() [][]TermTF {
 			sortTermTF(out[doc])
 		}
 	}
+	return out
+}
+
+// termsForDoc — термы ОДНОГО дока за O(его термов) по форвард-слою: точечный
+// родственник decodeTerms для supersedes-re-ingest (шаг 4 VMEM). Скан
+// инвертированных постингов здесь был бы патологией (профиль спайка: ~510µs
+// кэш-промахов по заголовкам 20k листов на каждый REMEMBER supersedes=) —
+// потому build/load всегда держат форвард-слой (см. segmentText).
+func (st *segmentText) termsForDoc(doc uint32) []TermTF {
+	if st == nil || int(doc) >= len(st.docLen) || st.docLen[doc] == 0 {
+		return nil
+	}
+	lo, hi := st.fwdOff[doc], st.fwdOff[doc+1]
+	out := make([]TermTF, 0, hi-lo)
+	for k := lo; k < hi; k++ {
+		out = append(out, TermTF{Term: st.dict.vals[st.fwdTerm[k]], TF: st.fwdTF[k]})
+	}
+	// Порядок по строке терма (инвариант bm25CountTerms): build-путь пишет fwd
+	// уже отсортированным (термы дока сортированы), load-путь (инверсия
+	// постингов) — по termID; вставки на почти-сортированном дёшевы.
+	sortTermTF(out)
 	return out
 }
 

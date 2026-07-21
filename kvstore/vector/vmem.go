@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"maps"
 	"math"
 )
 
@@ -18,9 +19,15 @@ import (
 // Кухня возвращает материализованный док, и командный слой (шаг 7) обязан
 // сериализовать в WAL именно его: журнал везёт следствия, не причины.
 //
-// Шаг 2 сознательно НЕ делает: закрытие valid_to цели supersedes (шаг 4 —
-// пока только CAT-провенанс, существование цели не проверяется), RECALL
-// (шаг 3), FORGET/TTL-жнец (шаг 6), RESP-команду (шаг 7).
+// Шаг 4 (supersession): REMEMBER f2 supersedes=f1 закрывает valid_to(f1) =
+// valid_from(f2) re-ingest'ом цели («c» из VMEM_DESIGN: платим на редкой
+// записи, ноль новых путей чтения). Гонка «прочитал цель → параллельный upsert
+// цели → re-ingest затёр» исключена примитивом: весь read-modify-write идёт
+// под эксклюзивным lvs.mu.Lock (обычные писатели держат RLock, swap дельты и
+// публикация merge — Lock, поэтому под замком LSM-состояние неподвижно), и
+// операции над одним ключом сериализуются целиком — побеждает поздний.
+//
+// Ещё НЕ сделано: FORGET/TTL-жнец (шаг 6), RESP-команда VMEM.* (шаг 7).
 // =============================================================================
 
 // vmemOpenValidTo — сентинел «интервал открыт» для valid_to/expires_at: 2^53,
@@ -67,6 +74,13 @@ var (
 	ErrVMEMValidFrom = errors.New("vmem: valid_from must be positive unix seconds below the sentinel")
 	// ErrVMEMSelfSupersedes — факт не может заменять сам себя.
 	ErrVMEMSelfSupersedes = errors.New("vmem: fact cannot supersede itself")
+	// ErrVMEMSupersedesTarget — цель supersedes не существует (или стёрта):
+	// закрывать нечего, и молча превращать замену в обычный remember нельзя —
+	// клиент явно утверждает связь, которой стор не может придать смысл.
+	ErrVMEMSupersedesTarget = errors.New("vmem: supersedes target does not exist")
+	// ErrVMEMSupersedesScope — цель supersedes живёт в другом scope (или не
+	// является VMEM-фактом): замена через границу памяти запрещена контрактом.
+	ErrVMEMSupersedesScope = errors.New("vmem: supersedes target belongs to a different scope")
 	// ErrVMEMQuery — запрос RECALL обязателен: recall — это поиск, не скан scope.
 	ErrVMEMQuery = errors.New("vmem: query is required")
 	// ErrVMEMK — top-K RECALL должен быть положительным.
@@ -288,25 +302,166 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	return lvs.SearchHybridFilter(req.Query, req.Vector, req.K, f)
 }
 
+// RememberResult — материализованный результат REMEMBER: командный слой
+// (шаг 7) пишет в WAL именно эти доки (Key=ID, Value=SerializeVectorWithDoc)
+// без пересборки полей (дверь 1). При supersedes в WAL обязана уехать ВСЯ
+// пара одним атомарным батчем: полузаписанная пара после краша — это либо два
+// «истинных сейчас» факта, либо факт, закрытый без наследника, и реплей
+// честно воспроизведёт любую из этих лжей.
+type RememberResult struct {
+	Doc    RememberedDoc  // новый факт
+	Closed *RememberedDoc // re-ingest цели supersedes с закрытым valid_to; nil без supersedes
+}
+
 // Remember — внутренний путь VMEM.REMEMBER (RESP-команда — шаг 7): кухня
 // полей + вставка через тот же choke-point AddDocTerms, что ADDDOC и реплей
 // WAL. now — unix-секунды серверных часов; часы существуют только у
-// вызывающего, кухня и реплей их не читают.
-//
-// Возвращает материализованный док: командный слой пишет в WAL именно его
-// (Key=ID, Value=SerializeVectorWithDoc) — пересборка полей после вставки
-// запрещена (дверь 1). Порядок «вставка до записи WAL» сохраняет
-// watermark-safety, как у VSIM.ADD/ADDDOC.
-func (lvs *LeveledVectorStore) Remember(req RememberRequest, now int64) (RememberedDoc, error) {
+// вызывающего, кухня и реплей их не читают. Порядок «вставка до записи WAL»
+// сохраняет watermark-safety, как у VSIM.ADD/ADDDOC.
+func (lvs *LeveledVectorStore) Remember(req RememberRequest, now int64) (RememberResult, error) {
+	if req.Supersedes != "" {
+		return lvs.rememberSupersede(req, now)
+	}
 	lvs.mu.RLock()
 	dim := lvs.dim
 	lvs.mu.RUnlock()
 	doc, err := rememberDoc(req, now, dim)
 	if err != nil {
-		return RememberedDoc{}, err
+		return RememberResult{}, err
 	}
 	if err := lvs.AddDocTerms(doc.ID, doc.Vec, doc.Attrs, doc.Terms); err != nil {
-		return RememberedDoc{}, err
+		return RememberResult{}, err
 	}
-	return doc, nil
+	return RememberResult{Doc: doc}, nil
+}
+
+// rememberSupersede — REMEMBER с закрытием интервала цели (шаг 4, вариант «c»
+// VMEM_DESIGN): цель перечитывается из стора и re-ingest'ится тем же
+// содержимым с valid_to = valid_from наследника. Весь read-modify-write — под
+// эксклюзивным lvs.mu.Lock: параллельный upsert цели либо целиком до (закроем
+// уже его содержимое), либо целиком после (перезапишет закрытие заново
+// открытым фактом — поздний прав); интерливинг «прочитал старое → затёр
+// новое» исключён. Валидация цели — до любых вставок: ошибка не оставляет
+// полузаписанной пары.
+func (lvs *LeveledVectorStore) rememberSupersede(req RememberRequest, now int64) (RememberResult, error) {
+	lvs.mu.Lock()
+	doc, err := rememberDoc(req, now, lvs.dim)
+	if err != nil {
+		lvs.mu.Unlock()
+		return RememberResult{}, err
+	}
+	if err := ValidateVector(doc.Vec); err != nil {
+		lvs.mu.Unlock()
+		return RememberResult{}, err
+	}
+	target, ok := lvs.getFactDocLocked(req.Supersedes)
+	if !ok {
+		lvs.mu.Unlock()
+		return RememberResult{}, ErrVMEMSupersedesTarget
+	}
+	if target.Attrs.Cat[vmemAttrScope] != req.Scope {
+		lvs.mu.Unlock()
+		return RememberResult{}, ErrVMEMSupersedesScope
+	}
+	closed := closeFactDoc(target, doc.Attrs.Num[vmemAttrValidFrom])
+
+	if lvs.delta == nil {
+		if err := lvs.initDeltaLocked(len(doc.Vec)); err != nil {
+			lvs.mu.Unlock()
+			return RememberResult{}, err
+		}
+	}
+	if len(doc.Vec) != lvs.dim {
+		lvs.mu.Unlock()
+		return RememberResult{}, &dimMismatchError{expected: lvs.dim, got: len(doc.Vec)}
+	}
+	fullA := lvs.delta.AppendDoc(closed.ID, closed.Vec, closed.Attrs, closed.Terms)
+	fullB := lvs.delta.AppendDoc(doc.ID, doc.Vec, doc.Attrs, doc.Terms)
+	lvs.touchMutation()
+	lvs.removeTombstone(closed.ID)
+	lvs.removeTombstone(doc.ID)
+	lvs.mu.Unlock()
+	if fullA || fullB {
+		lvs.triggerCompact()
+	}
+	return RememberResult{Doc: doc, Closed: &closed}, nil
+}
+
+// closeFactDoc — док закрытия интервала: содержимое цели бит-в-бит (вектор,
+// термы, остальные атрибуты), valid_to = valid_from наследника. Attrs —
+// глубокая копия: мапы из дельты делятся с исходной вставкой, а из flushing-
+// дельты их параллельно читает build-горутина — мутация на месте отравила бы
+// строящийся сегмент.
+func closeFactDoc(target DeltaEntry, validTo float64) RememberedDoc {
+	attrs := Attributes{Num: make(map[string]float64, len(target.Attrs.Num)+1)}
+	if target.Attrs.Cat != nil {
+		attrs.Cat = maps.Clone(target.Attrs.Cat)
+	}
+	maps.Copy(attrs.Num, target.Attrs.Num)
+	attrs.Num[vmemAttrValidTo] = validTo
+	return RememberedDoc{ID: target.Key, Vec: target.Vec, Attrs: attrs, Terms: target.Terms}
+}
+
+// getFactDocLocked — материализованный док по ключу через все LSM-состояния:
+// активная дельта → tombstone-маска → flushing-дельты новее-первым → сегменты
+// свежее-первым (зеркало провенанса Get, см. комментарии там). Вызывать под
+// lvs.mu (supersedes-путь держит Lock — состояние неподвижно на весь RMW).
+// Термы из frozen-слоёв восстанавливаются точечно (termsForDoc).
+func (lvs *LeveledVectorStore) getFactDocLocked(key string) (DeltaEntry, bool) {
+	if lvs.delta != nil {
+		if e, ok := lvs.delta.GetDoc(key); ok {
+			return e, true
+		}
+	}
+	if t := lvs.tombstones.Load(); t != nil {
+		if _, deleted := (*t)[key]; deleted {
+			return DeltaEntry{}, false
+		}
+	}
+	for i := len(lvs.flushing) - 1; i >= 0; i-- {
+		if e, ok := lvs.flushing[i].GetDoc(key); ok {
+			return e, true
+		}
+	}
+	for _, level := range lvs.levels {
+		for pos := len(level) - 1; pos >= 0; pos-- {
+			switch s := level[pos].(type) {
+			case *frozenSegment:
+				fg := s.fg
+				for i := 0; i < fg.n; i++ {
+					if fg.keys.view(i) == key {
+						vec := make([]float32, fg.dim)
+						copy(vec, fg.data[i*fg.dim:(i+1)*fg.dim])
+						return DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs.decodeAt(i), Terms: s.text.termsForDoc(uint32(i))}, true
+					}
+				}
+			case *frozenSQSegment:
+				fg := s.fg
+				for i := 0; i < fg.n; i++ {
+					if fg.keys.view(i) == key {
+						vec := make([]float32, fg.dim)
+						base := i * fg.dim
+						for d := 0; d < fg.dim; d++ {
+							vec[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
+						}
+						return DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs.decodeAt(i), Terms: s.text.termsForDoc(uint32(i))}, true
+					}
+				}
+			case *hnswSegment:
+				s.mu.RLock()
+				for id, k := range s.keys {
+					if k == key && s.g.nodes[id].Alive {
+						raw := s.g.arena.Get(s.g.nodes[id].VectorOffset)
+						vec := make([]float32, len(raw))
+						copy(vec, raw)
+						e := DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs.decodeAt(int(id)), Terms: s.text.termsForDoc(uint32(id))}
+						s.mu.RUnlock()
+						return e, true
+					}
+				}
+				s.mu.RUnlock()
+			}
+		}
+	}
+	return DeltaEntry{}, false
 }

@@ -241,11 +241,10 @@ func TestVMEMGoldenIntegrity(t *testing.T) {
 }
 
 // TestVMEMOracleParity — сценарии через живой путь Remember/Recall x3
-// состояния LSM (по образцу BM25). ВКЛЮЧЁН в шаге 3 с моделью шага 3
-// (closeSupersedes=false): живой Recall обязан бит-в-бит совпадать с
-// пересчётом модели по множеству (порядок/expect_first — шаг 5). После
-// шага 4 (механизм закрытия valid_to) флаг переключается на true, и живой
-// путь сойдётся уже с полными golden-expect'ами.
+// состояния LSM (по образцу BM25). С шага 4 (механизм закрытия valid_to)
+// closeSupersedes=true: живой Recall сходится с ПОЛНОЙ моделью контракта —
+// а через TestVMEMGoldenIntegrity и с golden-expect'ами сценариев
+// (порядок/expect_first — шаг 5).
 func TestVMEMOracleParity(t *testing.T) {
 	all := loadVMEMScenarios(t)
 	for _, sc := range all.Scenarios {
@@ -255,7 +254,7 @@ func TestVMEMOracleParity(t *testing.T) {
 				defer lvs.Close()
 				vmemLiveReplay(t, lvs, sc.Ops, st.flushAt(len(sc.Ops)))
 
-				facts := vmemReplay(t, sc.Name, sc.Ops, false)
+				facts := vmemReplay(t, sc.Name, sc.Ops, true)
 				K := len(facts) + 8
 				for _, q := range sc.Queries {
 					req := RecallRequest{

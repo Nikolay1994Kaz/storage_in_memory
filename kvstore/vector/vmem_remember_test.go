@@ -205,6 +205,10 @@ func TestRememberWALRoundTrip(t *testing.T) {
 	lvs := NewLeveledVectorStore(bm25TestConfig())
 	defer lvs.Close()
 
+	// Цель supersedes обязана существовать (валидация шага 4).
+	if _, err := lvs.Remember(RememberRequest{ID: "fact:old", Scope: "user:dana", Text: "Дана живёт в Караганде"}, now-100); err != nil {
+		t.Fatalf("Remember цели: %v", err)
+	}
 	imp := 0.9
 	req := RememberRequest{
 		ID:         "fact:wal",
@@ -215,10 +219,11 @@ func TestRememberWALRoundTrip(t *testing.T) {
 		TTL:        600,
 		Supersedes: "fact:old",
 	}
-	doc, err := lvs.Remember(req, now)
+	rr, err := lvs.Remember(req, now)
 	if err != nil {
 		t.Fatalf("Remember: %v", err)
 	}
+	doc := rr.Doc
 
 	blob := SerializeVectorWithDoc(doc.Vec, doc.Attrs, doc.Terms)
 	vec2, attrs2, terms2, err := DeserializeVectorWithDoc(blob)
@@ -265,11 +270,13 @@ func TestRememberWALRoundTrip(t *testing.T) {
 		t.Fatalf("SearchText в реплей-сторе: %v, %v", res, err)
 	}
 
-	// Ретрай того же REMEMBER: тот же док и тот же блоб бит-в-бит.
-	doc2, err := lvs.Remember(req, now)
+	// Ретрай того же REMEMBER: тот же док и тот же блоб бит-в-бит (закрытие
+	// цели тоже идемпотентно: тот же valid_to из того же valid_from наследника).
+	rr2, err := lvs.Remember(req, now)
 	if err != nil {
 		t.Fatalf("повторный Remember: %v", err)
 	}
+	doc2 := rr2.Doc
 	if doc2.ID != doc.ID {
 		t.Fatalf("ретрай сменил id: %q -> %q", doc.ID, doc2.ID)
 	}
@@ -307,7 +314,7 @@ func TestRememberUpsertSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Remember: %v", err)
 	}
-	if d1.ID == d2.ID {
+	if d1.Doc.ID == d2.Doc.ID {
 		t.Fatal("два REMEMBER без клиентского ID слились в один факт")
 	}
 	if res, _ := lvs.SearchText("абракадабра", 10); len(res) != 2 {
@@ -320,12 +327,14 @@ func TestRememberUpsertSemantics(t *testing.T) {
 type vmemIngestTruth struct {
 	text, scope, typ, supersedes string
 	imp                          float64
-	validFrom, expiresAt         int64
+	validFrom, validTo, expiresAt int64
 	forgotten                    bool
 }
 
-// vmemIngestReplay — модель ингеста шага 2 (без семантики RECALL): дефолты и
-// конвертации кухни в терминах ленты операций сценария.
+// vmemIngestReplay — модель ингеста (без семантики RECALL): дефолты и
+// конвертации кухни в терминах ленты операций сценария. С шага 4 supersedes
+// закрывает valid_to цели (упсерт цели ПОСЛЕ закрытия открывает её заново —
+// «поздний прав», см. rememberSupersede).
 func vmemIngestReplay(ops []vmemOp) map[string]*vmemIngestTruth {
 	truth := make(map[string]*vmemIngestTruth)
 	for _, op := range ops {
@@ -333,13 +342,16 @@ func vmemIngestReplay(ops []vmemOp) map[string]*vmemIngestTruth {
 		case "remember":
 			f := &vmemIngestTruth{
 				text: op.Text, scope: op.Scope, typ: op.Type, supersedes: op.Supersedes,
-				imp: 0.5, validFrom: op.At, expiresAt: vmemOpenValidTo,
+				imp: 0.5, validFrom: op.At, validTo: vmemOpenValidTo, expiresAt: vmemOpenValidTo,
 			}
 			if op.Importance != nil {
 				f.imp = *op.Importance
 			}
 			if op.TTL > 0 {
 				f.expiresAt = op.At + op.TTL
+			}
+			if op.Supersedes != "" {
+				truth[op.Supersedes].validTo = op.At
 			}
 			truth[op.ID] = f
 		case "forget":
@@ -370,17 +382,20 @@ func vmemLiveReplay(t *testing.T, lvs *LeveledVectorStore, ops []vmemOp, flushAf
 	for i, op := range ops {
 		switch op.Op {
 		case "remember":
-			doc, err := lvs.Remember(RememberRequest{
+			rr, err := lvs.Remember(RememberRequest{
 				ID: op.ID, Scope: op.Scope, Text: op.Text, Type: op.Type,
 				Importance: op.Importance, TTL: op.TTL, Supersedes: op.Supersedes,
 			}, op.At)
 			if err != nil {
 				t.Fatalf("op[%d] Remember %s: %v", i, op.ID, err)
 			}
-			if doc.ID != op.ID {
-				t.Fatalf("op[%d]: клиентский id %q подменён на %q", i, op.ID, doc.ID)
+			if rr.Doc.ID != op.ID {
+				t.Fatalf("op[%d]: клиентский id %q подменён на %q", i, op.ID, rr.Doc.ID)
 			}
-			docs[op.ID] = doc
+			if (op.Supersedes != "") != (rr.Closed != nil) {
+				t.Fatalf("op[%d]: supersedes=%q, а Closed=%v", i, op.Supersedes, rr.Closed)
+			}
+			docs[op.ID] = rr.Doc
 		case "forget":
 			if !lvs.Delete(op.ID) {
 				t.Fatalf("op[%d] forget %s: Delete=false", i, op.ID)
@@ -403,9 +418,9 @@ func vmemLiveReplay(t *testing.T, lvs *LeveledVectorStore, ops []vmemOp, flushAf
 //     supersedes, imp, valid_from, valid_to, expires_at) лежат в колоночном
 //     слое в точности как выдала кухня.
 //
-// Намеренные расхождения с полной моделью оракула (закрываются позже):
-// valid_to у superseded-фактов здесь ещё сентинел (механизм закрытия — шаг 4),
-// истёкший TTL физически жив (жнец — шаг 6), RECALL-запросы — шаг 3.
+// С шага 4 valid_to superseded-фактов закрыт и проверяется точечным Range.
+// Намеренное расхождение с полной моделью: истёкший TTL физически жив
+// (жнец — шаг 6; на чтении его скрывает фильтр RECALL).
 func TestVMEMOracleIngestParity(t *testing.T) {
 	all := loadVMEMScenarios(t)
 	for _, sc := range all.Scenarios {
@@ -456,7 +471,7 @@ func TestVMEMOracleIngestParity(t *testing.T) {
 						Eq: map[string]string{vmemAttrScope: f.scope},
 						Range: map[string][2]float64{
 							vmemAttrValidFrom: {float64(f.validFrom), float64(f.validFrom)},
-							vmemAttrValidTo:   {float64(vmemOpenValidTo), float64(vmemOpenValidTo)},
+							vmemAttrValidTo:   {float64(f.validTo), float64(f.validTo)},
 							vmemAttrExpiresAt: {float64(f.expiresAt), float64(f.expiresAt)},
 							vmemAttrImp:       {f.imp, f.imp},
 						},

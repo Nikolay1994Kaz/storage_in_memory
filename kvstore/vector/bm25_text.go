@@ -71,6 +71,16 @@ type segmentText struct {
 	docLen   []uint32        // docLen[i] = токенов в доке i; 0 = док без текста
 	nText    int             // доков с текстом — вклад сегмента в глобальный N
 	totalLen uint64          // сумма docLen — вклад в глобальный avgdl
+
+	// Форвард-слой doc → термы (шаг 4 VMEM): supersedes-re-ingest достаёт
+	// термы ОДНОГО дока за O(его термов) вместо скана всех постинг-листов
+	// (профиль спайка: 20k заголовков листов = ~510µs кэш-промахов на каждый
+	// REMEMBER supersedes=). Память ≈ размер постингов (те же вхождения,
+	// 6 байт каждое). Снапшот-формат НЕ меняется: на load слой один раз
+	// восстанавливается инверсией постингов (rebuildFwd).
+	fwdOff  []uint32 // fwdOff[i]..fwdOff[i+1] — окно дока i в fwdTerm/fwdTF; len = n+1
+	fwdTerm []uint32 // termID вхождения
+	fwdTF   []uint16 // tf вхождения
 }
 
 // buildSegmentText строит слой по entries в ИХ ПОРЯДКЕ (frozen-индекс =
@@ -90,6 +100,7 @@ func buildSegmentText(entries []DeltaEntry) *segmentText {
 	st := &segmentText{
 		dict:   newAttrDict(),
 		docLen: make([]uint32, len(entries)),
+		fwdOff: make([]uint32, len(entries)+1),
 	}
 	for i := range entries {
 		var dl uint32
@@ -100,8 +111,11 @@ func buildSegmentText(entries []DeltaEntry) *segmentText {
 			}
 			// доки идут по возрастанию i → каждый лист отсортирован по doc
 			st.postings[id] = append(st.postings[id], bm25Posting{doc: uint32(i), tf: tt.TF})
+			st.fwdTerm = append(st.fwdTerm, id)
+			st.fwdTF = append(st.fwdTF, tt.TF)
 			dl += uint32(tt.TF)
 		}
+		st.fwdOff[i+1] = uint32(len(st.fwdTerm))
 		st.docLen[i] = dl
 		if dl > 0 {
 			st.nText++
@@ -109,6 +123,32 @@ func buildSegmentText(entries []DeltaEntry) *segmentText {
 		}
 	}
 	return st
+}
+
+// rebuildFwd восстанавливает форвард-слой инверсией постингов — один раз на
+// load снапшота (формат на диске не меняется, там только постинги).
+func (st *segmentText) rebuildFwd(nDocs int) {
+	st.fwdOff = make([]uint32, nDocs+1)
+	total := 0
+	for _, pl := range st.postings {
+		total += len(pl)
+		for _, p := range pl {
+			st.fwdOff[p.doc+1]++
+		}
+	}
+	for i := 1; i <= nDocs; i++ {
+		st.fwdOff[i] += st.fwdOff[i-1]
+	}
+	st.fwdTerm = make([]uint32, total)
+	st.fwdTF = make([]uint16, total)
+	next := append([]uint32(nil), st.fwdOff[:nDocs]...)
+	for id, pl := range st.postings {
+		for _, p := range pl {
+			st.fwdTerm[next[p.doc]] = uint32(id)
+			st.fwdTF[next[p.doc]] = p.tf
+			next[p.doc]++
+		}
+	}
 }
 
 // df — документная частота терма в сегменте. Это ДЛИНА постинг-листа:

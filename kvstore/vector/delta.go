@@ -431,6 +431,29 @@ func (d *DeltaSegment) Get(key string) ([]float32, bool) {
 	return out, true
 }
 
+// GetDoc возвращает материализованный док по ключу (шаг 4 VMEM: чтение цели
+// supersedes перед re-ingest). Vec и Terms — копии (слэб шарда растёт append'ом,
+// термы живут до clearTextLocked при upsert — ссылки наружу пережили бы RLock);
+// Attrs — struct по значению, его мапы делятся с исходной вставкой и ЧИТАЮТСЯ
+// как иммутабельные (мутация valid_to при закрытии интервала обязана идти через
+// глубокую копию — см. closeFactDoc).
+func (d *DeltaSegment) GetDoc(key string) (DeltaEntry, bool) {
+	s := d.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	idx, ok := s.keyIdx[key]
+	if !ok || s.keys[idx] == "" {
+		return DeltaEntry{}, false
+	}
+	vec := make([]float32, d.dim)
+	copy(vec, s.data[idx*d.dim:(idx+1)*d.dim])
+	e := DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs[idx]}
+	if idx < len(s.terms) && len(s.terms[idx]) > 0 {
+		e.Terms = append([]TermTF(nil), s.terms[idx]...)
+	}
+	return e, true
+}
+
 // ForEachLive вызывает fn(key, vec) для каждого живого вектора во всех шардах.
 // vec — ссылка во внутренний slab (не копия): не сохранять между вызовами.
 // Под shard RLock каждого шарда поочерёдно.

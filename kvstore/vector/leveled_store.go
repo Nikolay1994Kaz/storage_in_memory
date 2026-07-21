@@ -961,6 +961,12 @@ func (lvs *LeveledVectorStore) addEntry(key string, vec []float32, attrs Attribu
 func (lvs *LeveledVectorStore) initDelta(dim int) error {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
+	return lvs.initDeltaLocked(dim)
+}
+
+// initDeltaLocked — тело initDelta для вызова под уже удерживаемым lvs.mu.Lock
+// (supersedes-путь VMEM держит замок на весь read-modify-write).
+func (lvs *LeveledVectorStore) initDeltaLocked(dim int) error {
 	if lvs.delta != nil {
 		if dim != lvs.dim {
 			return &dimMismatchError{expected: lvs.dim, got: dim}
