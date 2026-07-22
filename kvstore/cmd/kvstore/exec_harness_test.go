@@ -31,6 +31,7 @@ import (
 // один переиспользуемый ConnState. Всё чистится через t.Cleanup.
 type execEnv struct {
 	t    *testing.T
+	dir  string // t.TempDir окружения; WAL живёт в dir/t.wal (рестарт-тесты VMEM)
 	s    *tcmalloc.TCMallocStore
 	bw   *wal.BatchWAL
 	ttl  *store.TTLManager
@@ -66,6 +67,7 @@ func newExecEnv(t *testing.T) *execEnv {
 
 	e := &execEnv{
 		t:           t,
+		dir:         dir,
 		s:           s,
 		bw:          bw,
 		ttl:         ttl,

@@ -33,8 +33,16 @@ const (
 	// бит-в-бит независимо от версии стеммера). Реплей через AddDocTerms.
 	// Эмитится write-путём, когда VSIM.ADDDOC выходит в RESP (шаг 7 спринта).
 	OpVSimAddDoc byte = 8
-	OpZAdd       byte = 16 // sorted set: Key = setName, Value = [8B score LE float64][member string]
-	OpZRem       byte = 17 // sorted set: Key = setName, Value = [member string]
+	// OpVSimAddDocBatch: НЕСКОЛЬКО доков одной атомарной записью (один CRC на
+	// всю запись → торн-хвост после краша отбрасывает батч целиком, частичное
+	// применение невоспроизводимо реплеем ПО ПОСТРОЕНИЮ). Появился для пары
+	// supersedes VMEM.REMEMBER (шаг 7 VMEM_DESIGN): закрытая цель + наследник
+	// порознь дали бы после краша либо «два истинных сейчас», либо «закрыт без
+	// наследника». Value кодируется vector.SerializeDocBatch (Key записи =
+	// ключ первого дока, информативно). Реплей: AddDocTerms по порядку.
+	OpVSimAddDocBatch byte = 9
+	OpZAdd            byte = 16 // sorted set: Key = setName, Value = [8B score LE float64][member string]
+	OpZRem            byte = 17 // sorted set: Key = setName, Value = [member string]
 )
 
 // maxEntrySize — защита от мусорных данных при recovery.

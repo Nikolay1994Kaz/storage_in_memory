@@ -84,6 +84,9 @@ var (
 	// ErrVMEMSupersedesScope — цель supersedes живёт в другом scope (или не
 	// является VMEM-фактом): замена через границу памяти запрещена контрактом.
 	ErrVMEMSupersedesScope = errors.New("vmem: supersedes target belongs to a different scope")
+	// ErrVMEMForgetScope — цель FORGET живёт в другом scope (или не является
+	// VMEM-фактом с данным scope): стирание через границу памяти запрещено.
+	ErrVMEMForgetScope = errors.New("vmem: forget target belongs to a different scope")
 	// ErrVMEMQuery — запрос RECALL обязателен: recall — это поиск, не скан scope.
 	ErrVMEMQuery = errors.New("vmem: query is required")
 	// ErrVMEMK — top-K RECALL должен быть положительным.

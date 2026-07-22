@@ -389,6 +389,27 @@ func main() {
 			}
 			vecRestored++
 			restored++
+		case wal.OpVSimAddDocBatch:
+			// Атомарная пара supersedes VMEM.REMEMBER (шаг 7): один CRC на всю
+			// запись — DeserializeDocBatch либо отдаёт все доки, либо ошибку;
+			// частичное применение невозможно по построению.
+			if skipVec(entry, isFromSnapshot) {
+				return
+			}
+			docs, err := vector.DeserializeDocBatch(entry.Value)
+			if err != nil {
+				slog.Warn("failed to decode doc batch", "key", entry.Key, "err", err)
+				return
+			}
+			if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+				for _, d := range docs {
+					if err := lvs.AddDocTerms(d.Key, d.Vec, d.Attrs, d.Terms); err != nil {
+						slog.Warn("failed to restore doc from batch", "key", d.Key, "err", err)
+					}
+				}
+				vecRestored += len(docs)
+			}
+			restored++
 		case wal.OpVSimDel:
 			if skipVec(entry, isFromSnapshot) {
 				return
@@ -971,7 +992,7 @@ func isLoopbackBind(bind string) bool {
 func isMemoryGrowingCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC",
-		"WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
+		"VMEM.REMEMBER", "WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
 		return true
 	}
 	return false
@@ -988,6 +1009,7 @@ func isWriteCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "DEL", "EXPIRE", "PERSIST",
 		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC", "VSIM.DEL",
+		"VMEM.REMEMBER", "VMEM.FORGET",
 		"ZADD", "ZREM", "AI.INGEST":
 		return true
 	}
@@ -1680,6 +1702,290 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		bw.Write(wal.Entry{Op: wal.OpVSimAddDoc, Key: key, Value: vector.SerializeVectorWithDoc(vec, attrs, terms)})
 		// Репликация в кластере не проброшена — как у ADDATTR (CheckKey-редирект есть).
 		buf.WriteSimpleString("OK")
+
+	// === VMEM — слой памяти агентов (шаг 7, docs/VMEM_DESIGN.md) ===
+	case "VMEM.REMEMBER":
+		// VMEM.REMEMBER <scope> TEXT <text> [ID <id>] [TYPE <t>] [IMPORTANCE <0..1>]
+		//   [VALIDFROM <unix>] [TTL <sec>] [SUPERSEDES <id>] [VEC <f1> ... <fN>]
+		// Ответ: id факта (серверный ULID, если ID не задан). Вся
+		// недетерминированность (часы, ULID, placeholder-вектор) умирает в
+		// store.Remember ДО WAL (дверь 1) — журнал везёт материализованный
+		// результат. Пара supersedes (закрытая цель + наследник) едет ОДНОЙ
+		// записью OpVSimAddDocBatch: один CRC — краш не воспроизводит
+		// полуправду. Дословный текст факта — «якорь» контракта — кладётся в
+		// KV (vmem:<id>, OpSet; TTL зеркалится OpExpire; FORGET удаляет):
+		// термы индекса lossy, RECALL обязан вернуть сам факт. Кластерная
+		// маршрутизация не проброшена (single-node продукт, id генерится
+		// сервером). Порядок в WAL: доки → текст (факт без текста деградирует
+		// мягче, чем сирота-текст копился бы без TTL).
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: VMEM.REMEMBER <scope> TEXT <text> [ID id] [TYPE t] [IMPORTANCE 0..1] [VALIDFROM unix] [TTL sec] [SUPERSEDES id] [VEC v1 ... vN]")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR vmem not supported by this vector store")
+			return
+		}
+		req := vector.RememberRequest{Scope: string(args[0])}
+		textSeen := false
+		parseErr := ""
+	rememberParse:
+		for i := 1; i < len(args); {
+			switch strings.ToUpper(string(args[i])) {
+			case "TEXT":
+				if i+1 >= len(args) {
+					parseErr = "TEXT requires <text>"
+					break rememberParse
+				}
+				req.Text = string(args[i+1])
+				textSeen = true
+				i += 2
+			case "ID":
+				if i+1 >= len(args) {
+					parseErr = "ID requires <id>"
+					break rememberParse
+				}
+				req.ID = string(args[i+1])
+				i += 2
+			case "TYPE":
+				if i+1 >= len(args) {
+					parseErr = "TYPE requires <type>"
+					break rememberParse
+				}
+				req.Type = string(args[i+1])
+				i += 2
+			case "IMPORTANCE":
+				if i+1 >= len(args) {
+					parseErr = "IMPORTANCE requires <0..1>"
+					break rememberParse
+				}
+				f, err := strconv.ParseFloat(unsafeString(args[i+1]), 64)
+				if err != nil {
+					parseErr = "IMPORTANCE not a float"
+					break rememberParse
+				}
+				req.Importance = &f
+				i += 2
+			case "VALIDFROM":
+				if i+1 >= len(args) {
+					parseErr = "VALIDFROM requires <unix seconds>"
+					break rememberParse
+				}
+				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
+				if err != nil {
+					parseErr = "VALIDFROM not an integer"
+					break rememberParse
+				}
+				req.ValidFrom = v
+				i += 2
+			case "TTL":
+				if i+1 >= len(args) {
+					parseErr = "TTL requires <seconds>"
+					break rememberParse
+				}
+				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
+				if err != nil {
+					parseErr = "TTL not an integer"
+					break rememberParse
+				}
+				req.TTL = v
+				i += 2
+			case "SUPERSEDES":
+				if i+1 >= len(args) {
+					parseErr = "SUPERSEDES requires <id>"
+					break rememberParse
+				}
+				req.Supersedes = string(args[i+1])
+				i += 2
+			case "VEC":
+				req.Vector = make([]float32, 0, len(args)-i-1)
+				for j := i + 1; j < len(args); j++ {
+					f, err := strconv.ParseFloat(unsafeString(args[j]), 32)
+					if err != nil {
+						parseErr = fmt.Sprintf("invalid float %q", unsafeString(args[j]))
+						break rememberParse
+					}
+					req.Vector = append(req.Vector, float32(f))
+				}
+				break rememberParse
+			default:
+				parseErr = fmt.Sprintf("unexpected token %q (want TEXT|ID|TYPE|IMPORTANCE|VALIDFROM|TTL|SUPERSEDES|VEC)", unsafeString(args[i]))
+				break rememberParse
+			}
+		}
+		if parseErr == "" && !textSeen {
+			parseErr = "TEXT is required"
+		}
+		if parseErr != "" {
+			buf.WriteError("ERR " + parseErr)
+			return
+		}
+		monitoring.VectorAddTotal.Inc()
+		// Remember ДО bw.Write (watermark-safety, как VSIM.ADDDOC).
+		res, err := lvs.Remember(req, time.Now().Unix())
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if res.Closed != nil {
+			pair := vector.SerializeDocBatch([]vector.BatchDoc{
+				{Key: res.Closed.ID, Vec: res.Closed.Vec, Attrs: res.Closed.Attrs, Terms: res.Closed.Terms},
+				{Key: res.Doc.ID, Vec: res.Doc.Vec, Attrs: res.Doc.Attrs, Terms: res.Doc.Terms},
+			})
+			bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Doc.ID, Value: pair})
+		} else {
+			bw.Write(wal.Entry{Op: wal.OpVSimAddDoc, Key: res.Doc.ID, Value: vector.SerializeVectorWithDoc(res.Doc.Vec, res.Doc.Attrs, res.Doc.Terms)})
+		}
+		textKey := "vmem:" + res.Doc.ID
+		textVal := []byte(req.Text)
+		bw.Write(wal.Entry{Op: wal.OpSet, Key: textKey, Value: textVal})
+		s.Set(workerID, textKey, textVal)
+		if req.TTL > 0 {
+			// Абсолютное время смерти якоря = expires_at факта (дверь 1: OpExpire
+			// и так везёт абсолютный nano). Расхождение таймеров некритично:
+			// авторитет видимости — Range-фильтр RECALL, якорь лишь догоняет.
+			dur := time.Duration(req.TTL) * time.Second
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], uint64(time.Now().Add(dur).UnixNano()))
+			bw.Write(wal.Entry{Op: wal.OpExpire, Key: textKey, Value: b[:]})
+			ttl.Set(textKey, dur)
+		} else {
+			ttl.Remove(textKey) // upsert без TTL снимает прежний таймер якоря
+		}
+		buf.WriteBulkString(res.Doc.ID)
+
+	case "VMEM.RECALL":
+		// VMEM.RECALL <scope> <K> <query> [ASOF <unix> | ALL] [TYPE <t>] [HALFLIFE <sec>] [VEC <f1> ... <fN>]
+		// Ответ: тройки [id, score, text]. Скор = fused × 2^(−age/halfLife) ×
+		// (0.5+imp) — сравним только внутри выдачи. text — дословный якорь из
+		// KV (пустая строка, если якоря нет: не-VMEM док, попавший в scope).
+		// Без VEC — осознанная деградация в BM25-only (ступень 0). Дефолт =
+		// валидное-сейчас; ASOF ts — машина времени (сквозь supersession, но
+		// НЕ сквозь erasure); ALL — без суда интервалов.
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: VMEM.RECALL <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [HALFLIFE sec] [VEC v1 ... vN]")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR vmem not supported by this vector store")
+			return
+		}
+		K, err := strconv.Atoi(unsafeString(args[1]))
+		if err != nil || K <= 0 || K > vector.MaxSearchK {
+			buf.WriteError("ERR invalid K (must be 1..100000)")
+			return
+		}
+		rreq := vector.RecallRequest{Scope: string(args[0]), K: K, Query: string(args[2])}
+		parseErr := ""
+	recallParse:
+		for i := 3; i < len(args); {
+			switch strings.ToUpper(string(args[i])) {
+			case "ASOF":
+				if i+1 >= len(args) {
+					parseErr = "ASOF requires <unix seconds>"
+					break recallParse
+				}
+				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
+				if err != nil {
+					parseErr = "ASOF not an integer"
+					break recallParse
+				}
+				rreq.AsOf = &v
+				i += 2
+			case "ALL":
+				rreq.All = true
+				i++
+			case "TYPE":
+				if i+1 >= len(args) {
+					parseErr = "TYPE requires <type>"
+					break recallParse
+				}
+				rreq.TypeEq = string(args[i+1])
+				i += 2
+			case "HALFLIFE":
+				if i+1 >= len(args) {
+					parseErr = "HALFLIFE requires <seconds>"
+					break recallParse
+				}
+				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
+				if err != nil {
+					parseErr = "HALFLIFE not an integer"
+					break recallParse
+				}
+				rreq.HalfLifeSec = v
+				i += 2
+			case "VEC":
+				rreq.Vector = make([]float32, 0, len(args)-i-1)
+				for j := i + 1; j < len(args); j++ {
+					f, err := strconv.ParseFloat(unsafeString(args[j]), 32)
+					if err != nil {
+						parseErr = fmt.Sprintf("invalid float %q", unsafeString(args[j]))
+						break recallParse
+					}
+					rreq.Vector = append(rreq.Vector, float32(f))
+				}
+				break recallParse
+			default:
+				parseErr = fmt.Sprintf("unexpected token %q (want ASOF|ALL|TYPE|HALFLIFE|VEC)", unsafeString(args[i]))
+				break recallParse
+			}
+		}
+		if parseErr != "" {
+			buf.WriteError("ERR " + parseErr)
+			return
+		}
+		monitoring.VectorSearchTotal.Inc()
+		searchStart := time.Now()
+		results, err := lvs.Recall(rreq, time.Now().Unix())
+		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		buf.WriteArrayHeader(len(results) * 3)
+		for _, r := range results {
+			buf.WriteBulkString(r.Key)
+			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Score))
+			if text, ok := s.Get("vmem:" + r.Key); ok {
+				buf.WriteBulkString(string(text))
+			} else {
+				buf.WriteBulkString("")
+			}
+		}
+
+	case "VMEM.FORGET":
+		// VMEM.FORGET <scope> <id> — erasure: физически, из истории тоже
+		// (AS_OF не видит), без обхода цепочек supersedes. Чужой scope —
+		// ошибка (стирание через границу памяти запрещено); повторный FORGET
+		// того же id → :0 (идемпотентность). Стирает и якорь-текст из KV.
+		if len(args) != 2 {
+			buf.WriteError("ERR usage: VMEM.FORGET <scope> <id>")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR vmem not supported by this vector store")
+			return
+		}
+		scope, id := string(args[0]), string(args[1])
+		monitoring.VectorDeleteTotal.Inc()
+		deleted, err := lvs.ForgetInScope(id, scope)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if !deleted {
+			buf.WriteInt(0)
+			return
+		}
+		bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: id})
+		textKey := "vmem:" + id
+		bw.Write(wal.Entry{Op: wal.OpDel, Key: textKey})
+		s.Del(workerID, textKey)
+		ttl.OnDelete(textKey)
+		buf.WriteInt(1)
 
 	case "VSIM.DEL":
 		if len(args) < 1 {

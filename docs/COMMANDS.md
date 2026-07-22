@@ -162,8 +162,32 @@ bad keys are rejected so poison never survives via replay), and all `Add`s happe
 **Cross-engine joins** (why KV/zset live in the same process as the index):
 `VSIM.SEARCHFILTER` reads KV metadata per candidate; `VSIM.SEARCHRANGE` joins the
 zset B+Tree with HNSW; `DEL`/TTL expiry atomically covers both stores; `AI.ASK`
-joins vector search with KV documents. These joins are only cheap and consistent
-because there is one process, one WAL, one memory space.
+joins vector search with KV documents; `VMEM.RECALL` joins the index with the
+verbatim KV anchors. These joins are only cheap and consistent because there is
+one process, one WAL, one memory space.
+
+## VMEM commands (agent memory)
+
+Thin memory layer over the same store (`docs/VMEM_DESIGN.md`, sprint 2). A fact
+is an ordinary doc: key + CAT/NUM attributes + BM25 text — **zero new fields in
+the engine format**. Times are absolute unix seconds; everything time-dependent
+is stamped **before** the WAL write (replay never looks at the clock).
+
+| Command | Syntax | Reply |
+|---|---|---|
+| `VMEM.REMEMBER` | `VMEM.REMEMBER scope TEXT text [ID id] [TYPE t] [IMPORTANCE 0..1] [VALIDFROM unix] [TTL sec] [SUPERSEDES id] [VEC v1 … vN]` | bulk `id` (server ULID unless `ID` given; retry with client `ID` = idempotent upsert). No `VEC` = embedding-ladder step 0: the fact lives BM25-only (deterministic placeholder vector). `SUPERSEDES` closes the target's `valid_to` and ingests the pair as **one atomic WAL record** (`OpVSimAddDocBatch`, single CRC — a crash cannot replay a half-pair); superseding a TTL-expired target is rejected regardless of reaper timing. The verbatim text (the anchor) is also stored in KV under `vmem:<id>` (`OpSet`; `TTL` mirrored via `OpExpire`) |
+| `VMEM.RECALL` | `VMEM.RECALL scope K query [ASOF unix \| ALL] [TYPE t] [HALFLIFE sec] [VEC v1 … vN]` | flat triples `id, score, text, …` — hybrid (or BM25-only without `VEC`) over the valid slice, rescored by `fused × 2^(−age/halfLife) × (0.5 + importance)` on a top-100 overfetch; score comparable to nothing but itself. Default = valid-now; `ASOF ts` answers "what was true at ts" (sees through supersession, **never** through erasure); `ALL` disables interval judgement. `HALFLIFE` defaults to 30 days (decay policy belongs to the client). `text` is the verbatim anchor from KV (empty if none) |
+| `VMEM.FORGET` | `VMEM.FORGET scope id` | `:1` erased / `:0` no such fact (idempotent). Physical erasure: gone from history too (`ASOF` included), does **not** walk supersedes chains; deletes the KV anchor. Cross-scope forget is an error and leaves the fact intact |
+
+Notes per the unfreeze checklist: gates — `VMEM.REMEMBER` is memory-growing +
+write, `VMEM.FORGET` is write-only (erasure must stay available under OOM),
+`VMEM.RECALL` is read-only. Allowed in `MULTI`/`EXEC`; ordinary-command
+behavior in subscriber mode (no special casing). TTL erasure is enforced at
+read time (`expires_at` range filter) and physically reclaimed by the idle-tick
+reaper; the KV anchor carries its own mirrored TTL. Cluster: not routed or
+replicated in v1 (single-node product; ids may be server-generated); a future
+replication alphabet must carry `OpVSimAddDocBatch` as one atomic unit.
+Soak-oracle modelling of `VMEM.*` is deferred to the step-8 corpus bench.
 
 ## Demand-driven tier — `AI.*` (optional, requires a reachable Ollama)
 

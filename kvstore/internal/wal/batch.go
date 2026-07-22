@@ -83,6 +83,9 @@ type BatchWAL struct {
 	// Переиспользуется между flush'ами (zero-alloc на горячем пути).
 	// Размер: 256 entries × ~128B = ~32KB.
 	encodeBuf []byte
+
+	// closeOnce делает Close идемпотентным (shutdown + t.Cleanup).
+	closeOnce sync.Once
 }
 
 // NewBatchWAL создаёт BatchWAL поверх существующего WAL.
@@ -119,16 +122,21 @@ func (bw *BatchWAL) Write(entry Entry) {
 	bw.ch <- entry
 }
 
-// Close останавливает flusher и закрывает WAL.
+// Close останавливает flusher и закрывает WAL. Идемпотентен: повторный Close
+// (shutdown-путь + t.Cleanup в тестах) — no-op, а не паника на закрытом канале.
 //
 // Порядок:
 //  1. Закрываем канал → flusher видит close и дочитывает остатки
 //  2. wg.Wait() → ждём пока flusher допишет последний batch
 //  3. WAL.Close() → flush bufio + close file
 func (bw *BatchWAL) Close() error {
-	close(bw.ch)
-	bw.wg.Wait()
-	return bw.wal.Close()
+	var err error
+	bw.closeOnce.Do(func() {
+		close(bw.ch)
+		bw.wg.Wait()
+		err = bw.wal.Close()
+	})
+	return err
 }
 
 // Failed возвращает залатченную фатальную ошибку персистентности нижележащего

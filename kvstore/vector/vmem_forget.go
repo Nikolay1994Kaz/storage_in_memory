@@ -41,6 +41,24 @@ func (lvs *LeveledVectorStore) Forget(id string) bool {
 	return lvs.Delete(id)
 }
 
+// ForgetInScope — FORGET с проверкой принадлежности (RESP-слой, шаг 7):
+// стирание разрешено только внутри собственного scope. Чтение scope цели и
+// убийство — атомарно под одним замком (иначе окно с параллельным Remember).
+// Несуществующая (или уже стёртая) цель → (false, nil): повторный FORGET
+// идемпотентен; чужой scope → ошибка, факт жив.
+func (lvs *LeveledVectorStore) ForgetInScope(id, scope string) (bool, error) {
+	lvs.mu.Lock()
+	defer lvs.mu.Unlock()
+	sc, ok := lvs.factCatAttrLocked(id, vmemAttrScope)
+	if !ok {
+		return false, nil
+	}
+	if sc != scope {
+		return false, ErrVMEMForgetScope
+	}
+	return lvs.deleteLocked(id), nil
+}
+
 // ReapExpired — TTL-жнец: стереть до limit фактов с expires_at <= now.
 // Возвращает число пожатых. Вызывается idle-механикой (handleIdleTick) и
 // напрямую тестами/оператором; безопасен конкурентно с писателями и чтением.
@@ -180,6 +198,69 @@ func (lvs *LeveledVectorStore) reapKeys(keys []string, now int64) int {
 	addTombstones(&lvs.tombstones, tombs)
 	lvs.mu.Unlock()
 	return n
+}
+
+// factCatAttrLocked — CAT-атрибут СВЕЖАЙШЕЙ версии ключа: категориальное
+// зеркало factNumAttrLocked (тот же провенанс), для проверки scope у FORGET.
+func (lvs *LeveledVectorStore) factCatAttrLocked(key, name string) (string, bool) {
+	catOf := func(a Attributes) (string, bool) {
+		v, ok := a.Cat[name]
+		return v, ok
+	}
+	if lvs.delta != nil {
+		if a, ok := lvs.delta.GetAttrs(key); ok {
+			return catOf(a)
+		}
+	}
+	if t := lvs.tombstones.Load(); t != nil {
+		if _, deleted := (*t)[key]; deleted {
+			return "", false
+		}
+	}
+	for i := len(lvs.flushing) - 1; i >= 0; i-- {
+		if a, ok := lvs.flushing[i].GetAttrs(key); ok {
+			return catOf(a)
+		}
+	}
+	segCat := func(sa *segmentAttrs, idx int) (string, bool) {
+		if sa == nil {
+			return "", false
+		}
+		col, ok := sa.cat[name]
+		if !ok {
+			return "", false
+		}
+		c := col.codes[idx]
+		if c == attrMissing {
+			return "", false
+		}
+		return sa.dict[name].vals[c], true
+	}
+	for _, level := range lvs.levels {
+		for pos := len(level) - 1; pos >= 0; pos-- {
+			switch s := level[pos].(type) {
+			case *frozenSegment:
+				if i, ok := s.fg.keys.find(key); ok {
+					return segCat(s.attrs, i)
+				}
+			case *frozenSQSegment:
+				if i, ok := s.fg.keys.find(key); ok {
+					return segCat(s.attrs, i)
+				}
+			case *hnswSegment:
+				s.mu.RLock()
+				for id, k := range s.keys {
+					if k == key && s.g.nodes[id].Alive {
+						v, ok := segCat(s.attrs, int(id))
+						s.mu.RUnlock()
+						return v, ok
+					}
+				}
+				s.mu.RUnlock()
+			}
+		}
+	}
+	return "", false
 }
 
 // factNumAttrLocked — NUM-атрибут СВЕЖАЙШЕЙ версии ключа (провенанс Get:
