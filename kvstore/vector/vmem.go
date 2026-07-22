@@ -357,10 +357,39 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	for i := range cands {
 		keys[i] = cands[i].Key
 	}
-	nums := lvs.numsForKeys(keys, vmemAttrValidFrom, vmemAttrImp)
-	for i := range cands {
-		cands[i].Score *= vmemDecayImp(nums[i][0], nums[i][1], tEff, halfLife)
+	// Пере-суд кандидатов по СВЕЖАЙШЕЙ версии ключа (найдено корпус-бенчем
+	// шага 8, репро TestVMEMSupersedeTwoSegmentLeak): пре-фильтр судит каждую
+	// копию дока внутри её источника, а затенение сегмент-vs-сегмент решается
+	// только среди хитов (bm25_store.go, merge). Закрытая supersession-копия в
+	// новом сегменте отсекается фильтром валидности ДО хитов — она и должна
+	// быть невалидной, — и глушить старую ОТКРЫТУЮ копию в старом сегменте
+	// некому: закрытая версия воскресала бы как «истинная сейчас» на любом
+	// переходном мульти-сегментном состоянии LSM. Пере-суд тем же предикатом
+	// по свежайшим атрибутам (провенанс numsForKeys ≡ Get) восстанавливает
+	// контракт; цена — те же O(log n)-лукапы, что уже платит скоринг, +2
+	// колонки в общей проекции. NaN expires_at → свежайшая версия не
+	// VMEM-факт (upsert заменил факт не-фактом) → кандидат стейл, вон.
+	nums := lvs.numsForKeys(keys, vmemAttrValidFrom, vmemAttrImp, vmemAttrValidTo, vmemAttrExpiresAt)
+	var typeOK []bool
+	if req.TypeEq != "" {
+		typeOK = lvs.catEqForKeys(keys, vmemAttrType, req.TypeEq)
 	}
+	kept := cands[:0]
+	for i := range cands {
+		vf, imp, vt, exp := nums[i][0], nums[i][1], nums[i][2], nums[i][3]
+		if !(exp > float64(now)) { // erasure против now во ВСЕХ режимах; NaN → false
+			continue
+		}
+		if !req.All && !(vf <= float64(tEff) && float64(tEff) < vt) {
+			continue
+		}
+		if typeOK != nil && !typeOK[i] {
+			continue
+		}
+		cands[i].Score *= vmemDecayImp(vf, imp, tEff, halfLife)
+		kept = append(kept, cands[i])
+	}
+	cands = kept
 	slices.SortFunc(cands, func(a, b VTextResult) int {
 		if a.Score > b.Score {
 			return -1
@@ -389,6 +418,21 @@ func vmemDecayImp(validFrom, imp float64, tEff, halfLife int64) float64 {
 		m *= 0.5 + imp
 	}
 	return m
+}
+
+// catEqForKeys — батч-проверка «CAT-атрибут СВЕЖАЙШЕЙ версии == want» по
+// ключам кандидатов: пере-суд TypeEq в Recall (см. комментарий там) — стейл
+// копия из старого сегмента могла пройти Eq по типу, который свежайший upsert
+// уже сменил. Провенанс — factCatAttrLocked (≡ Get).
+func (lvs *LeveledVectorStore) catEqForKeys(keys []string, name, want string) []bool {
+	out := make([]bool, len(keys))
+	lvs.mu.RLock()
+	defer lvs.mu.RUnlock()
+	for i, key := range keys {
+		v, ok := lvs.factCatAttrLocked(key, name)
+		out[i] = ok && v == want
+	}
+	return out
 }
 
 // numsForKeys — батч-проекция NUM-атрибутов по ключам кандидатов: значения
