@@ -166,17 +166,12 @@ func (s *frozenSegment) Attrs() *segmentAttrs      { return s.attrs }
 func (s *frozenSegment) Text() *segmentText        { return s.text }
 func (s *frozenSegment) TextKey(doc uint32) string { return s.fg.viewKey(int(doc)) }
 
-// HasKey — O(N) линейный поиск по keys. Дорогая операция!
-// Вызывается только из Delete для редких ручных DEL / TTL-eviction.
-// Не на горячем пути Search (там обход графа, не lookup по ключу).
+// HasKey — O(log n) бинпоиском по sorted-пермутации internedKeys. Исторически
+// был линейным («редкие ручные DEL»), но TTL-жнец (шаг 6 VMEM) зовёт его
+// батчами под write-замком — линейность голодила читателей (порог 3: 55µs/вызов).
 func (s *frozenSegment) HasKey(key string) bool {
-	fg := s.fg
-	for i := 0; i < fg.n; i++ {
-		if fg.keys.view(i) == key {
-			return true
-		}
-	}
-	return false
+	_, ok := s.fg.keys.find(key)
+	return ok
 }
 
 func (s *frozenSegment) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
@@ -327,15 +322,10 @@ func (s *frozenSQSegment) Attrs() *segmentAttrs      { return s.attrs }
 func (s *frozenSQSegment) Text() *segmentText        { return s.text }
 func (s *frozenSQSegment) TextKey(doc uint32) string { return s.fg.viewKey(int(doc)) }
 
-// HasKey — O(N) линейный поиск по keys (аналог frozenSegment).
+// HasKey — O(log n) по sorted-пермутации (аналог frozenSegment).
 func (s *frozenSQSegment) HasKey(key string) bool {
-	fg := s.fg
-	for i := 0; i < fg.n; i++ {
-		if fg.keys.view(i) == key {
-			return true
-		}
-	}
-	return false
+	_, ok := s.fg.keys.find(key)
+	return ok
 }
 
 func (s *frozenSQSegment) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
@@ -1003,6 +993,26 @@ func (lvs *LeveledVectorStore) removeTombstone(key string) {
 func (lvs *LeveledVectorStore) Delete(key string) bool {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
+	return lvs.deleteLocked(key)
+}
+
+// deleteLocked — тело Delete под уже взятым lvs.mu.Lock: жнец TTL (шаг 6 VMEM)
+// обязан перепроверить приговор и удалить атомарно под одним замком, иначе
+// между перепроверкой и Delete вклинился бы параллельный Remember.
+func (lvs *LeveledVectorStore) deleteLocked(key string) bool {
+	deleted, needTomb := lvs.deleteClassifyLocked(key)
+	if needTomb {
+		addTombstone(&lvs.tombstones, key)
+	}
+	return deleted
+}
+
+// deleteClassifyLocked — логика Delete БЕЗ вставки в tombstone-карту: решает
+// судьбу ключа, а нужный tombstone отдаёт флагом. Единственная причина
+// расщепления — COW карты: одиночный Delete платит копию за ключ (редкая
+// операция), а массовая жатва (reapKeys) обязана батчировать — одна копия на
+// батч, иначе O(n²) под write-замком (порог 3 шага 6 ловил именно это).
+func (lvs *LeveledVectorStore) deleteClassifyLocked(key string) (deleted, needTomb bool) {
 	lvs.touchMutation()
 
 	// Если в дельте — hard delete (вектор физически исчезает из дельты).
@@ -1012,28 +1022,26 @@ func (lvs *LeveledVectorStore) Delete(key string) bool {
 		// Тогда ставим tombstone на неё, иначе она воскреснет при чтении/merge.
 		// Иначе — снимаем возможный прежний tombstone.
 		if lvs.keyInFlushingLocked(key) || lvs.keyPhysicallyInSegmentsLocked(key) {
-			addTombstone(&lvs.tombstones, key)
-		} else {
-			deleteTombstone(&lvs.tombstones, key)
+			return true, true
 		}
-		return true
+		deleteTombstone(&lvs.tombstones, key)
+		return true, false
 	}
 
 	// Не в активной дельте. Уже tombstoned → уже удалён.
 	if t := lvs.tombstones.Load(); t != nil {
 		if _, ok := (*t)[key]; ok {
-			return false
+			return false, false
 		}
 	}
 	// Ключ мог быть в сфлашиваемой дельте (flush-окно) ИЛИ в сегменте. В обоих
 	// случаях ставим tombstone: сфлашиваемую дельту мутировать НЕЛЬЗЯ (её читает
 	// build-горутина), а tombstone замаскирует ключ и в получившемся сегменте.
 	if !lvs.keyInFlushingLocked(key) && !lvs.keyPhysicallyInSegmentsLocked(key) {
-		return false
+		return false, false
 	}
-	addTombstone(&lvs.tombstones, key)
 	monitoring.VectorTombstoneTotal.Inc()
-	return true
+	return true, true
 }
 
 // keyInFlushingLocked — есть ли живой ключ в какой-либо сфлашиваемой дельте
@@ -1123,6 +1131,30 @@ func addTombstone(p *atomic.Pointer[map[string]struct{}], key string) {
 		return
 	}
 	nw := map[string]struct{}{key: {}}
+	p.Store(&nw)
+}
+
+// addTombstones: батчевое COW-добавление — ОДНА копия карты на весь батч.
+// Вызывать под lvs.mu (write). Массовое удаление (TTL-жнец) с per-key COW
+// стоило бы O(n²) переносов записей под write-замком.
+func addTombstones(p *atomic.Pointer[map[string]struct{}], keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	old := p.Load()
+	nOld := 0
+	if old != nil {
+		nOld = len(*old)
+	}
+	nw := make(map[string]struct{}, nOld+len(keys))
+	if old != nil {
+		for k, v := range *old {
+			nw[k] = v
+		}
+	}
+	for _, k := range keys {
+		nw[k] = struct{}{}
+	}
 	p.Store(&nw)
 }
 
@@ -2633,6 +2665,15 @@ func (lvs *LeveledVectorStore) handleIdleTick() {
 	if time.Now().UnixNano()-lvs.lastMutation.Load() < int64(lvs.cfg.IdleConsolidateAfter) {
 		return
 	}
+
+	// Жатва TTL (шаг 6 VMEM) — ДО консолидации: Delete истёкших ставит
+	// tombstones, и консолидация ниже выметает их физически тем же циклом
+	// простоя (стор становится и чистым, и плотным). Пожатые удаления трогают
+	// lastMutation → следующий тик отсчитает окно затишья заново; это принято.
+	// Часы легальны (дверь 1): решение жнеца локально, в WAL не едет — после
+	// реплея истёкшие воскресают физически, невидимы фильтром чтения и будут
+	// пожаты заново.
+	lvs.ReapExpired(time.Now().Unix(), vmemReapTickLimit)
 
 	lvs.mu.Lock()
 	epoch := lvs.compactionEpoch.Load()

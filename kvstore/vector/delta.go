@@ -657,6 +657,30 @@ func (d *DeltaSegment) AttrsSnapshot() map[string]Attributes {
 	return out
 }
 
+// KeysNumLE — ключи живых записей с NUM-атрибутом name <= hi. Скан-фаза
+// TTL-жнеца (шаг 6 VMEM) по memtable: без полного снимка атрибутов, только
+// попавшие под порог. Отсутствующий атрибут не проходит сравнение — не-VMEM
+// доки и сентинел «без TTL» (2^53 > любого now) отсеиваются без веток.
+func (d *DeltaSegment) KeysNumLE(name string, hi float64) []string {
+	if !d.HasAttrs() {
+		return nil
+	}
+	var out []string
+	for _, s := range d.shards {
+		s.mu.RLock()
+		for i, key := range s.keys {
+			if key == "" || i >= len(s.attrs) {
+				continue
+			}
+			if v, ok := s.attrs[i].Num[name]; ok && v <= hi {
+				out = append(out, key)
+			}
+		}
+		s.mu.RUnlock()
+	}
+	return out
+}
+
 // deltaTextResult — результат текстового BM25-поиска по дельте.
 type deltaTextResult struct {
 	key   string

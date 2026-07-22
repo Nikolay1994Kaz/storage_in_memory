@@ -29,7 +29,8 @@ import (
 // публикация merge — Lock, поэтому под замком LSM-состояние неподвижно), и
 // операции над одним ключом сериализуются целиком — побеждает поздний.
 //
-// Ещё НЕ сделано: FORGET/TTL-жнец (шаг 6), RESP-команда VMEM.* (шаг 7).
+// Erasure (шаг 6) — vmem_forget.go: Forget по id + TTL-жнец на idle-механике.
+// Ещё НЕ сделано: RESP-команда VMEM.* (шаг 7).
 // =============================================================================
 
 // vmemOpenValidTo — сентинел «интервал открыт» для valid_to/expires_at: 2^53,
@@ -557,6 +558,13 @@ func (lvs *LeveledVectorStore) rememberSupersede(req RememberRequest, now int64)
 	if target.Attrs.Cat[vmemAttrScope] != req.Scope {
 		lvs.mu.Unlock()
 		return RememberResult{}, ErrVMEMSupersedesScope
+	}
+	// Цель, истёкшая по TTL, — уже не цель, даже если жнец (шаг 6) её ещё не
+	// пожал физически: иначе успех supersedes зависел бы от расписания жнеца.
+	// Erasure судится тем же правилом, что фильтр чтения: expires_at <= now.
+	if exp, ok := target.Attrs.Num[vmemAttrExpiresAt]; ok && exp <= float64(now) {
+		lvs.mu.Unlock()
+		return RememberResult{}, ErrVMEMSupersedesTarget
 	}
 	closed := closeFactDoc(target, doc.Attrs.Num[vmemAttrValidFrom])
 

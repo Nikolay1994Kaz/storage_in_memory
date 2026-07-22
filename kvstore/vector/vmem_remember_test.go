@@ -325,10 +325,10 @@ func TestRememberUpsertSemantics(t *testing.T) {
 // vmemIngestTruth — ожидаемое состояние ингеста одного факта: что обязано
 // лежать в сторе после ленты операций (последний remember выигрывает).
 type vmemIngestTruth struct {
-	text, scope, typ, supersedes string
-	imp                          float64
+	text, scope, typ, supersedes  string
+	imp                           float64
 	validFrom, validTo, expiresAt int64
-	forgotten                    bool
+	forgotten                     bool
 }
 
 // vmemIngestReplay — модель ингеста (без семантики RECALL): дефолты и
@@ -397,8 +397,8 @@ func vmemLiveReplay(t *testing.T, lvs *LeveledVectorStore, ops []vmemOp, flushAf
 			}
 			docs[op.ID] = rr.Doc
 		case "forget":
-			if !lvs.Delete(op.ID) {
-				t.Fatalf("op[%d] forget %s: Delete=false", i, op.ID)
+			if !lvs.Forget(op.ID) {
+				t.Fatalf("op[%d] forget %s: Forget=false", i, op.ID)
 			}
 		}
 		if i+1 == flushAfter {
