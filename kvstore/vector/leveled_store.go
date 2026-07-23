@@ -158,6 +158,13 @@ type frozenSegment struct {
 	cat   *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
 	attrs *segmentAttrs  // колоночный слой атрибутов; nil если атрибутов нет
 	text  *segmentText   // текстовый BM25-слой; nil если текстов нет
+	// keySet — ленивый индекс ключей для HasKey (строится первым вызовом,
+	// string-ключи — views в blob сегмента, живут не дольше него). Мотив:
+	// строгое затенение (StrictSegShadow) зовёт HasKey на каждый кандидат
+	// top-K × каждый более свежий сегмент — бинпоиск find стал заметен в
+	// профиле (замер №2 П3: 0.865×). Цена: +~(30-50Б)/ключ, платится лениво.
+	keySetOnce sync.Once
+	keySet     map[string]struct{}
 }
 
 func (s *frozenSegment) Len() int                  { return s.fg.Len() }
@@ -166,11 +173,21 @@ func (s *frozenSegment) Attrs() *segmentAttrs      { return s.attrs }
 func (s *frozenSegment) Text() *segmentText        { return s.text }
 func (s *frozenSegment) TextKey(doc uint32) string { return s.fg.viewKey(int(doc)) }
 
-// HasKey — O(log n) бинпоиском по sorted-пермутации internedKeys. Исторически
-// был линейным («редкие ручные DEL»), но TTL-жнец (шаг 6 VMEM) зовёт его
-// батчами под write-замком — линейность голодила читателей (порог 3: 55µs/вызов).
+// HasKey — O(1) по ленивому keySet. Исторически был линейным («редкие ручные
+// DEL»), затем бинпоиском по sorted-пермутации (TTL-жнец, порог 3 шага 6),
+// теперь map: строгое затенение П3 сделало HasKey горячим путём чтения.
 func (s *frozenSegment) HasKey(key string) bool {
-	_, ok := s.fg.keys.find(key)
+	s.keySetOnce.Do(func() {
+		n := s.fg.keys.count()
+		ks := make(map[string]struct{}, n)
+		for i := 0; i < n; i++ {
+			if k := s.fg.keys.view(i); k != "" {
+				ks[k] = struct{}{}
+			}
+		}
+		s.keySet = ks
+	})
+	_, ok := s.keySet[key]
 	return ok
 }
 
@@ -314,6 +331,9 @@ type frozenSQSegment struct {
 	cat   *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
 	attrs *segmentAttrs  // колоночный слой атрибутов; nil если атрибутов нет
 	text  *segmentText   // текстовый BM25-слой; nil если текстов нет
+	// keySet — ленивый индекс ключей для HasKey (см. frozenSegment.keySet).
+	keySetOnce sync.Once
+	keySet     map[string]struct{}
 }
 
 func (s *frozenSQSegment) Len() int                  { return s.fg.Len() }
@@ -322,9 +342,19 @@ func (s *frozenSQSegment) Attrs() *segmentAttrs      { return s.attrs }
 func (s *frozenSQSegment) Text() *segmentText        { return s.text }
 func (s *frozenSQSegment) TextKey(doc uint32) string { return s.fg.viewKey(int(doc)) }
 
-// HasKey — O(log n) по sorted-пермутации (аналог frozenSegment).
+// HasKey — O(1) по ленивому keySet (аналог frozenSegment).
 func (s *frozenSQSegment) HasKey(key string) bool {
-	_, ok := s.fg.keys.find(key)
+	s.keySetOnce.Do(func() {
+		n := s.fg.keys.count()
+		ks := make(map[string]struct{}, n)
+		for i := 0; i < n; i++ {
+			if k := s.fg.keys.view(i); k != "" {
+				ks[k] = struct{}{}
+			}
+		}
+		s.keySet = ks
+	})
+	_, ok := s.keySet[key]
 	return ok
 }
 
@@ -355,12 +385,18 @@ func (s *frozenSQSegment) SearchFilter(query []float32, K, efSearch int, partiti
 // -----------------------------------------------------------------------------
 
 type hnswSegment struct {
-	g     *Graph
-	keys  map[uint64]string // internal_id → user_key
-	mu    sync.RWMutex      // защита от чтения пока граф строится
-	cat   *TenantCatalog    // тенант-каталог (Вещь 1); nil если тенант-режим выключен
-	attrs *segmentAttrs     // колоночный слой атрибутов; nil если атрибутов нет
-	text  *segmentText      // текстовый BM25-слой; nil если текстов нет
+	g    *Graph
+	keys map[uint64]string // internal_id → user_key
+	// keySet — ленивый обратный индекс user_key → ∃ для HasKey: keys иммутабелен
+	// после build (мутаций по месту нет, удаления идут tombstone'ами store-уровня),
+	// строится один раз при первом HasKey под mu.Lock. Цена: +~(16-48Б)/ключ
+	// памяти, платится только если сегмент вообще спрашивают (жнец, строгое
+	// затенение П3). До индекса HasKey был O(N)-сканом на каждый вызов.
+	keySet map[string]struct{}
+	mu     sync.RWMutex   // защита от чтения пока граф строится
+	cat    *TenantCatalog // тенант-каталог (Вещь 1); nil если тенант-режим выключен
+	attrs  *segmentAttrs  // колоночный слой атрибутов; nil если атрибутов нет
+	text   *segmentText   // текстовый BM25-слой; nil если текстов нет
 }
 
 func (s *hnswSegment) Catalog() *TenantCatalog { return s.cat }
@@ -451,16 +487,28 @@ func (s *hnswSegment) Len() int {
 	return s.g.nodeCount
 }
 
-// HasKey — O(N) итерация по keys map. Редкий путь (Delete/TTL-eviction).
+// HasKey — O(1) по ленивому keySet (первый вызов строит индекс за O(N)).
 func (s *hnswSegment) HasKey(key string) bool {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, k := range s.keys {
-		if k == key {
-			return true
-		}
+	if s.keySet != nil {
+		_, ok := s.keySet[key]
+		s.mu.RUnlock()
+		return ok
 	}
-	return false
+	s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.keySet == nil {
+		ks := make(map[string]struct{}, len(s.keys))
+		for _, k := range s.keys {
+			if k != "" {
+				ks[k] = struct{}{}
+			}
+		}
+		s.keySet = ks
+	}
+	_, ok := s.keySet[key]
+	return ok
 }
 
 func (s *hnswSegment) Search(query []float32, K, efSearch int, dst []FrozenResult, filterFn func(string) bool) []FrozenResult {
@@ -597,6 +645,18 @@ type LeveledConfig struct {
 	// крупнейший сегмент уже держит ≥90% векторов, полный rebuild ради хвоста не
 	// запускается (мелочь дочистит fanout-каскад). 0 = выключено.
 	IdleConsolidateAfter time.Duration
+
+	// StrictSegShadow — строгое затенение сегмент-vs-сегмент в публичных путях
+	// поиска (Search*/SearchTextFilter): хит сегмента гасится, если БОЛЕЕ СВЕЖИЙ
+	// сегмент содержит этот ключ, даже когда свежая копия не попала в свои хиты
+	// (отфильтрована атрибутами или не матчится запросом). Закрывает стейл-
+	// семантику переходных мульти-сегментных состояний (та же дыра, что чинил
+	// пере-суд VMEM.Recall, репро TestVMEMSupersedeTwoSegmentLeak) ценой
+	// HasKey-лукапов по более свежим сегментам на каждый хит: O(log n) во
+	// frozen/SQ, O(N) в hnsw. false = прежняя семантика («затенение живёт
+	// только среди хитов», компакция нормализует). Экспериментальный флаг
+	// П3-прототипа: судьба решается A/B-замером цены (порог ≥0.9× QPS).
+	StrictSegShadow bool
 }
 
 // compactionResult — результат build/merge goroutine, передаётся через resultChan.
@@ -1620,13 +1680,17 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 	}
 	clear(st.dedupPos)
 
+	strictShadow := lvs.cfg.StrictSegShadow
 	for i := range st.workerBufs {
 		r := rankFor(i)
 		// Затенение: более свежий источник гасит stale-копию того же ключа, даже когда
 		// свежая копия далеко от запроса и не попала в top-K (провенанс-дедуп тогда
 		// бессилен — stale заняла бы слот и вытеснила легитимного соседа).
 		//   - сегмент (i>=nMem) затеняется ЛЮБОЙ memtable-дельтой;
-		//   - memtable[i] затеняется лишь БОЛЕЕ СВЕЖЕЙ memtable (индекс < i).
+		//   - memtable[i] затеняется лишь БОЛЕЕ СВЕЖЕЙ memtable (индекс < i);
+		//   - при StrictSegShadow сегмент затеняется и БОЛЕЕ СВЕЖИМ сегментом
+		//     (segRank меньше): инвариант LSM — копия в более свежем сегменте
+		//     всегда новее (merge дедупит, сохраняя свежайшую).
 		// Contains race-free и O(1), безопасен и на сфлашенной (закрытой) дельте.
 		shadowLimit := i
 		if i >= nMem {
@@ -1654,6 +1718,51 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 			st.combined = append(st.combined, VSearchResult{Key: res.Key, Distance: res.Dist})
 			st.rank = append(st.rank, r)
 		}
+	}
+
+	if strictShadow {
+		// Ленивый пере-суд топа (StrictSegShadow): хиты сортируются вместе с
+		// рангом (плоская структура — без двойной индирекции пермутации),
+		// спуск по дистанции гасит сегментные хиты, чей ключ живёт в более
+		// свежем сегменте. Судятся только кандидаты до наполнения top-K.
+		type rankedRes struct {
+			res  VSearchResult
+			rank int64
+		}
+		hits := make([]rankedRes, len(st.combined))
+		for i := range st.combined {
+			hits[i] = rankedRes{st.combined[i], st.rank[i]}
+		}
+		slices.SortFunc(hits, func(a, b rankedRes) int {
+			if a.res.Distance < b.res.Distance {
+				return -1
+			}
+			if a.res.Distance > b.res.Distance {
+				return 1
+			}
+			return 0
+		})
+		memBound := int64(math.MinInt64) + int64(nMem)
+		result := make([]VSearchResult, 0, min(K, len(hits)))
+		for i := range hits {
+			if len(result) == K {
+				break
+			}
+			if r := hits[i].rank; r >= memBound { // хит сегмента
+				stale := false
+				for j := range segs {
+					if segRank[j] < r && segs[j].HasKey(hits[i].res.Key) {
+						stale = true
+						break
+					}
+				}
+				if stale {
+					continue
+				}
+			}
+			result = append(result, VSearchResult{Key: strings.Clone(hits[i].res.Key), Distance: hits[i].res.Distance})
+		}
+		return result, nil
 	}
 
 	slices.SortFunc(st.combined, func(a, b VSearchResult) int {

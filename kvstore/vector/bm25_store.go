@@ -247,7 +247,10 @@ func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) (
 	//   - сегмент-vs-сегмент затеняется только дедупом среди хитов (как у
 	//     векторов): stale-копия старого сегмента, чья свежая копия не попала в
 	//     свой top-K, может всплыть до merge — принятая семантика, компакция
-	//     нормализует (шаг 6).
+	//     нормализует (шаг 6). При StrictSegShadow (П3-прототип) сегментный хит
+	//     дополнительно гасится HasKey более свежего сегмента — стейл не
+	//     всплывает и в переходных состояниях.
+	strictShadow := lvs.cfg.StrictSegShadow
 	dedup := make(map[string]int)
 	// Ёмкость по факту, не по K: RECALL шага 5 оверфетчит K=100 при типичных
 	// единицах хитов на scope-запрос — преаллокация полного K дала бы ~4КБ
@@ -306,7 +309,7 @@ func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) (
 		}
 	}
 
-	slices.SortFunc(combined, func(a, b VTextResult) int {
+	cmpHits := func(a, b VTextResult) int {
 		if a.Score > b.Score {
 			return -1
 		}
@@ -314,7 +317,46 @@ func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) (
 			return 1
 		}
 		return strings.Compare(a.Key, b.Key)
-	})
+	}
+	if strictShadow {
+		// Ленивый пере-суд топа (StrictSegShadow): хиты сортируются ВМЕСТЕ с
+		// рангом-провенансом (плоская структура, не пермутация — сортировка с
+		// двойной индирекцией по combined[idxs[i]] стоила ~13% QPS в замере №2/3
+		// П3), затем спуск по убыванию скора гасит сегментные хиты, чей ключ
+		// живёт в более свежем сегменте. Судятся только кандидаты до наполнения
+		// top-K (обычно ровно K) — та же экономия, что пере-суд VMEM.Recall.
+		type rankedHit struct {
+			hit  VTextResult
+			rank int64
+		}
+		hits := make([]rankedHit, len(combined))
+		for i := range combined {
+			hits[i] = rankedHit{combined[i], ranks[i]}
+		}
+		slices.SortFunc(hits, func(a, b rankedHit) int { return cmpHits(a.hit, b.hit) })
+		memBound := int64(math.MinInt64) + int64(nMem)
+		out := make([]VTextResult, 0, min(K, len(hits)))
+		for i := range hits {
+			if len(out) == K {
+				break
+			}
+			if r := hits[i].rank; r >= memBound { // хит сегмента (memtable-ранги ниже)
+				stale := false
+				for j := range segs {
+					if segRank[j] < r && segs[j].HasKey(hits[i].hit.Key) {
+						stale = true
+						break
+					}
+				}
+				if stale {
+					continue
+				}
+			}
+			out = append(out, VTextResult{Key: strings.Clone(hits[i].hit.Key), Score: hits[i].hit.Score})
+		}
+		return out, nil
+	}
+	slices.SortFunc(combined, cmpHits)
 	if len(combined) > K {
 		combined = combined[:K]
 	}
