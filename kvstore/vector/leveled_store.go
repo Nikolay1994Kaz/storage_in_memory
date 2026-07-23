@@ -1329,12 +1329,12 @@ func defaultSegSearch(seg segment, query []float32, K, efSearch int, dst []Froze
 
 // Search выполняет поиск K ближайших. dst — неиспользуется (для совместимости с VectorIndex).
 func (lvs *LeveledVectorStore) Search(query []float32, K int, dst []VSearchResult) ([]VSearchResult, error) {
-	return lvs.search(query, K, nil, defaultSegSearch)
+	return lvs.search(query, K, nil, nil, defaultSegSearch)
 }
 
 // SearchFiltered выполняет поиск K ближайших с фильтром по ключу. dst — неиспользуется.
 func (lvs *LeveledVectorStore) SearchFiltered(query []float32, K int, filterFn func(string) bool, dst []VSearchResult) ([]VSearchResult, error) {
-	return lvs.search(query, K, filterFn, defaultSegSearch)
+	return lvs.search(query, K, filterFn, nil, defaultSegSearch)
 }
 
 // SearchTenant — tenant-aware поиск (Вещь 1): результаты только из блока тенанта.
@@ -1361,7 +1361,7 @@ func (lvs *LeveledVectorStore) SearchTenant(query []float32, K int, tenant uint6
 	segSearch := func(seg segment, q []float32, k, efS int, d []FrozenResult, f func(string) bool) []FrozenResult {
 		return seg.SearchTenant(q, k, efS, tenant, d, f)
 	}
-	return lvs.search(query, K, tenantPred, segSearch)
+	return lvs.search(query, K, tenantPred, nil, segSearch)
 }
 
 // SearchFilter — мульти-атрибутный фильтр (колоночный слой uint/multi-attr).
@@ -1372,53 +1372,25 @@ func (lvs *LeveledVectorStore) SearchTenant(query []float32, K int, tenant uint6
 func (lvs *LeveledVectorStore) SearchFilter(query []float32, K int, f Filter) ([]VSearchResult, error) {
 	partitionAttr := lvs.cfg.PartitionAttr
 
-	// Снимок атрибутов ВСЕХ memtable-дельт (bounded): замыкание-«pass-through» для
-	// не-memtable-ключей, чтобы тот же composedFilter не отсёк frozen-результаты
-	// (их судят колонки сегмента). Flushing-дельты обязаны войти в снимок: в окне
-	// flush-visibility (swap сделан, сегмент не опубликован) их доки ищутся как
-	// memtable, и pass-through пропускал бы их МИМО фильтра — любой Eq/Range
-	// молча игнорировался для свежесфлашиваемых доков (вскрыто VMEM-оракулом,
-	// mixed-состояние). Порядок старые→свежие: при коллизии ключа (upsert)
-	// выигрывают свежие атрибуты — семантика полной замены.
-	var deltaAttrs map[string]Attributes
+	// Атрибут-суд memtable-кандидатов — инлайн по СОБСТВЕННЫМ атрибутам копии,
+	// которые подаёт шард из-под своего RLock (см. deltaFilterFn): ни снапшота,
+	// ни лукапов, ни замков. Flushing-дельты покрыты устройством search()
+	// (memtable-набор = активная + flushing, грабля окна flush-visibility,
+	// вскрытая VMEM-оракулом). История: здесь был ПОЛНЫЙ снимок AttrsSnapshot
+	// всех дельт на КАЖДЫЙ запрос — O(|delta|) map-аллокация и конвой на
+	// runtime-локах аллокатора под конкуренцией (E2E vmemload 23.07,
+	// mutex-профиль: 88% в maps.newTable); затем freshest-лукап GetAttrs —
+	// дедлок рекурсивного RLock из-под шардового замка. Стейл-копию, прошедшую
+	// суд по своим атрибутам, гасит Contains/дедуп-затенение merge.
+	var memAttrFilter deltaFilterFn
 	if !f.empty() {
-		lvs.mu.RLock()
-		memDeltas := make([]*DeltaSegment, 0, 1+len(lvs.flushing))
-		memDeltas = append(memDeltas, lvs.flushing...)
-		if lvs.delta != nil {
-			memDeltas = append(memDeltas, lvs.delta)
-		}
-		for _, d := range memDeltas {
-			if d.Len() == 0 {
-				continue
-			}
-			snap := d.AttrsSnapshot()
-			if deltaAttrs == nil {
-				deltaAttrs = snap
-				continue
-			}
-			for k, v := range snap {
-				deltaAttrs[k] = v
-			}
-		}
-		lvs.mu.RUnlock()
-	}
-
-	var deltaFilter func(string) bool
-	if !f.empty() {
-		deltaFilter = func(key string) bool {
-			a, ok := deltaAttrs[key]
-			if !ok {
-				return true // не delta-ключ → не судим здесь (сегменты судят колонками)
-			}
-			return matchAttrs(a, f, "")
-		}
+		memAttrFilter = func(_ string, a Attributes) bool { return matchAttrs(a, f, "") }
 	}
 
 	segSearch := func(seg segment, q []float32, k, efS int, d []FrozenResult, filterFn func(string) bool) []FrozenResult {
 		return seg.SearchFilter(q, k, efS, partitionAttr, f, d, filterFn)
 	}
-	return lvs.search(query, K, deltaFilter, segSearch)
+	return lvs.search(query, K, nil, memAttrFilter, segSearch)
 }
 
 var errTenantModeOff = errorString("SearchTenant требует cfg.TenantOf != nil (тенант-режим выключен)")
@@ -1439,7 +1411,7 @@ func (e errorString) Error() string { return string(e) }
 // Tombstones: snapshot захватывается ПОД lock вместе с указателями сегментов
 // и компонуется с filterFn в composedFilter. Если tombstones==nil (нет удалений)
 // — ни одной аллокации, overhead нулевой.
-func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(string) bool, segSearch segSearchFn) ([]VSearchResult, error) {
+func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(string) bool, memAttrFilter deltaFilterFn, segSearch segSearchFn) ([]VSearchResult, error) {
 	if segSearch == nil {
 		segSearch = defaultSegSearch
 	}
@@ -1459,7 +1431,7 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		efSearch = K
 	}
 	// При фильтрации расширяем окно поиска ×4 для компенсации recall-потерь.
-	if filterFn != nil {
+	if filterFn != nil || memAttrFilter != nil {
 		if efSearch*4 <= 2000 {
 			efSearch *= 4
 		} else {
@@ -1511,6 +1483,21 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 		composedFilter = filterFn // nil или caller-provided, без обёртки
 	}
 
+	// deltaFn — фильтр memtable-путей: key-only composedFilter, поднятый в
+	// attrs-aware сигнатуру, + опциональный атрибутный суд memAttrFilter
+	// (SearchFilter). Атрибуты кандидата подаёт сам шард из-под своего RLock
+	// (см. deltaFilterFn) — внешних лукапов/замков в фильтре нет.
+	var deltaFn deltaFilterFn
+	if composedFilter != nil || memAttrFilter != nil {
+		cf, af := composedFilter, memAttrFilter
+		deltaFn = func(key string, attrs Attributes) bool {
+			if cf != nil && !cf(key) {
+				return false
+			}
+			return af == nil || af(key, attrs)
+		}
+	}
+
 	// Активная delta — MUTABLE (Add делает append/copy в неё). Все обращения
 	// к delta ниже идут ПОД lvs.mu.RLock(), иначе data race с параллельным Add.
 	// BruteForce по ~10k векторов ~200μs — RLock на это время блокирует Add,
@@ -1521,7 +1508,7 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 	// под RLock. 1 alloc/op (выходной heap). BruteForce по ~10k векторов ~200μs —
 	// RLock на это время блокирует Add, что приемлемо (delta bounded).
 	if nSegs == 0 && hasDelta && !hasFlushing {
-		raw := delta.Search(query, K, efSearch, composedFilter)
+		raw := delta.Search(query, K, efSearch, deltaFn)
 		lvs.mu.RUnlock()
 		if len(raw) == 0 {
 			return nil, nil
@@ -1584,7 +1571,7 @@ func (lvs *LeveledVectorStore) search(query []float32, K int, filterFn func(stri
 	// 1 alloc/op на memtable (выходной heap), сегменты — через sync.Pool.
 	memRes := make([][]deltaResult, nMem)
 	for i, mt := range memtables {
-		memRes[i] = mt.Search(query, K, efSearch, composedFilter)
+		memRes[i] = mt.Search(query, K, efSearch, deltaFn)
 	}
 
 	// Копируем указатели сегментов (дешёво: ~8 байт на сегмент) вместе с

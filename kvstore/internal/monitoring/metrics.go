@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -232,6 +233,11 @@ func httpHandler(enablePprof bool) http.Handler {
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		// Контеншн ловится ТОЛЬКО mutex/block-профилями (CPU-профиль слеп к
+		// блокировкам — ожидание = сон; урок драмы №3 шага 6). Стоимость
+		// сэмплирования мала и режим и так «не для прода».
+		runtime.SetMutexProfileFraction(20)
+		runtime.SetBlockProfileRate(100_000) // 100µs
 		slog.Warn("pprof включён — эндпоинты /debug/pprof/* открыты; не для прод-окружения")
 	}
 	return mux

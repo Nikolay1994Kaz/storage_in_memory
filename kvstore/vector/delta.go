@@ -487,7 +487,16 @@ func (d *DeltaSegment) ForEachLive(fn func(key string, vec []float32)) {
 // Search ищет K ближайших через инкрементальные HNSW-индексы шардов (за log(n)).
 // Фан-аут по всем шардам (каждый под RLock), затем merge top-K — контракт ≤K
 // результатов сохранён (как у одного графа). filterFn применяется к РЕЗУЛЬТАТАМ.
-func (d *DeltaSegment) Search(query []float32, K, efSearch int, filterFn func(string) bool) []deltaResult {
+// deltaFilterFn — фильтр кандидата дельты. attrs — атрибуты ЭТОЙ копии дока,
+// поданные шардом из-под его же RLock (слот лежит рядом с ключом): суд Eq/Range
+// не делает ни лукапов, ни аллокаций и, главное, не берёт замков — вызов
+// внешнего GetAttrs из-под шардового RLock был бы рекурсивным RLock и дедлочил
+// при ждущем писателе (вскрыто vmemload 23.07, mix-фаза). Стейл-копию,
+// прошедшую суд по СВОИМ атрибутам, гасит Contains-затенение merge — семантика
+// «свежайшая копия решает» сохраняется без freshest-лукапа здесь.
+type deltaFilterFn func(key string, attrs Attributes) bool
+
+func (d *DeltaSegment) Search(query []float32, K, efSearch int, filterFn deltaFilterFn) []deltaResult {
 	if d.live.Load() == 0 {
 		return nil
 	}
@@ -508,7 +517,7 @@ func (d *DeltaSegment) Search(query []float32, K, efSearch int, filterFn func(st
 }
 
 // search — поиск в одном шарде под RLock.
-func (s *deltaShard) search(query []float32, K, efSearch int, filterFn func(string) bool, dim int, distFn DistanceFunc) []deltaResult {
+func (s *deltaShard) search(query []float32, K, efSearch int, filterFn deltaFilterFn, dim int, distFn DistanceFunc) []deltaResult {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -542,14 +551,14 @@ func (s *deltaShard) search(query []float32, K, efSearch int, filterFn func(stri
 // берётся уже после фильтра (в отличие от post-filter в индексном пути). Стоимость
 // O(matched) дистанций — приемлемо, дельта ограничена. Семантика совпадает с
 // DeltaSegment.BruteForce (эталон тестов), но по одному шарду.
-func (s *deltaShard) bruteFiltered(query []float32, K, dim int, distFn DistanceFunc, filterFn func(string) bool) []deltaResult {
+func (s *deltaShard) bruteFiltered(query []float32, K, dim int, distFn DistanceFunc, filterFn deltaFilterFn) []deltaResult {
 	if K <= 0 || len(s.keys) == 0 {
 		return nil
 	}
 	var matched []deltaResult
 	for i := 0; i < len(s.keys); i++ {
 		key := s.keys[i]
-		if key == "" || !filterFn(key) { // "" = tombstone
+		if key == "" || !filterFn(key, s.attrAt(i)) { // "" = tombstone
 			continue
 		}
 		matched = append(matched, deltaResult{key: key, dist: distFn(query, s.data[i*dim:(i+1)*dim])})
@@ -714,7 +723,16 @@ func (d *DeltaSegment) TextStats(terms []string) (n, totalLen uint64, df []uint6
 // segmentText.search, применяет чужую статистику, не свою. filterFn
 // (tombstone-фильтр) применяется к каждому доку ДО отбора top-K. Возвращает
 // top-K по убыванию скора; ничьи — по ключу (детерминизм выдачи).
-func (d *DeltaSegment) SearchText(terms []string, idf []float64, avgdl float64, K int, filterFn func(string) bool) []deltaTextResult {
+// attrAt — атрибуты слота i (пустые, если слой атрибутов короче/отсутствует).
+// Вызывать под shard RLock.
+func (s *deltaShard) attrAt(i int) Attributes {
+	if i < len(s.attrs) {
+		return s.attrs[i]
+	}
+	return Attributes{}
+}
+
+func (d *DeltaSegment) SearchText(terms []string, idf []float64, avgdl float64, K int, filterFn deltaFilterFn) []deltaTextResult {
 	if K <= 0 || avgdl == 0 || !d.textPresent.Load() {
 		return nil
 	}
@@ -737,7 +755,7 @@ func (d *DeltaSegment) SearchText(terms []string, idf []float64, avgdl float64, 
 			// Delete чистит постинги слота, так что "" здесь не ждём — guard
 			// на инвариант, не на семантику.
 			key := s.keys[slot]
-			if key == "" || (filterFn != nil && !filterFn(key)) {
+			if key == "" || (filterFn != nil && !filterFn(key, s.attrAt(int(slot)))) {
 				continue
 			}
 			out = append(out, deltaTextResult{key: key, score: score})

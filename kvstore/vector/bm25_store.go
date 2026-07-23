@@ -204,27 +204,25 @@ func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) (
 		}
 	}
 
-	// Атрибут-суд memtable-ключей: снимок ВСЕХ memtable-дельт (активная +
-	// flushing — та же грабля окна flush-visibility, что чинилась в
-	// SearchFilter), свежая копия ключа выигрывает (memtables уже
-	// freshest-first). Ключ судится ТЕКУЩИМИ атрибутами дока: старая копия
-	// с другими атрибутами либо затенится Contains-правилом merge, либо
-	// правомерно отсечётся — полная замена upsert.
-	memFilter := tombFilter
-	if !f.empty() {
-		memAttrs := make(map[string]Attributes)
-		for _, mt := range memtables {
-			for k, a := range mt.AttrsSnapshot() {
-				if _, seen := memAttrs[k]; !seen {
-					memAttrs[k] = a
-				}
-			}
-		}
-		memFilter = func(key string) bool {
+	// Атрибут-суд memtable-кандидатов — инлайн по СОБСТВЕННЫМ атрибутам копии,
+	// которые подаёт шард из-под своего RLock (см. deltaFilterFn в delta.go):
+	// ни снапшота, ни лукапов, ни замков. Стейл-копия, прошедшая суд по своим
+	// атрибутам, гасится Contains-правилом merge (свежая memtable глушит) —
+	// семантика полной замены upsert сохранена. История (E2E vmemload 23.07):
+	// (1) полный снимок AttrsSnapshot всех дельт на КАЖДЫЙ запрос — O(|delta|)
+	// map-аллокация: 80µs/запрос на непустой дельте (~5.5k фактов) и конвой на
+	// runtime-локах аллокатора под конкуренцией (8 воркеров → p50 11ms, QPS
+	// 6469→620; mutex-профиль: 88% в maps.newTable); (2) freshest-лукап
+	// GetAttrs из фильтра — дедлок: рекурсивный RLock шарда при ждущем
+	// писателе (mix-фаза). Инлайн-атрибуты закрывают обе ямы разом.
+	fEmpty := f.empty()
+	var memFilter deltaFilterFn
+	if tombFilter != nil || !fEmpty {
+		memFilter = func(key string, a Attributes) bool {
 			if tombFilter != nil && !tombFilter(key) {
 				return false
 			}
-			return matchAttrs(memAttrs[key], f, "")
+			return fEmpty || matchAttrs(a, f, "")
 		}
 	}
 
