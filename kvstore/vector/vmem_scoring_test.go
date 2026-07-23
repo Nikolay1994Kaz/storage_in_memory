@@ -89,7 +89,9 @@ func TestRecallScoringRescue(t *testing.T) {
 				}
 			}
 
-			res, err := lvs.Recall(RecallRequest{Scope: "s", Query: "кофе", K: 2}, 16_100_000)
+			// Большой полураспад (~174д): возраст old ≈ 175д = ~1 полураспад →
+			// decay ≈ 0.5, ВЫШЕ пола 0.25 — политика клиента видна в скоре.
+			res, err := lvs.Recall(RecallRequest{Scope: "s", Query: "кофе", K: 2, HalfLifeSec: 15_000_000}, 16_100_000)
 			if err != nil {
 				t.Fatalf("Recall: %v", err)
 			}
@@ -97,10 +99,10 @@ func TestRecallScoringRescue(t *testing.T) {
 				t.Fatalf("скоринг не поднял свежий важный факт: %+v", res)
 			}
 
-			// Тот же запрос с гигантским полураспадом: decay≈1 у обоих, порядок
-			// решает похожесть+importance… но importance тоже за "new" — поэтому
-			// сверяем политику клиента иначе: полураспад крошечный → старый факт
-			// давится ещё сильнее, порядок тот же, а вот его скор должен упасть.
+			// Крошечный полураспад: старый факт давится до пола vmemDecayFloor
+			// (0.25 < ~0.5 выше) — порядок тот же, скор old обязан упасть.
+			// Сильнее пола не давит НИКАКОЙ полураспад — это контракт пола
+			// (суд 23.07: затухание двигает порядок, но не квантует в ноль).
 			res2, err := lvs.Recall(RecallRequest{Scope: "s", Query: "кофе", K: 2, HalfLifeSec: 3600}, 16_100_000)
 			if err != nil {
 				t.Fatalf("Recall hl=1h: %v", err)

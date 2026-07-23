@@ -101,6 +101,7 @@ func main() {
 	hnswUseSQ := flag.Bool("hnsw-use-sq", false, "Enable Scalar Quantization (int8) for frozen segments (any dim; рекомендуется для dim>256). 4x memory compression, recall ~0.97+ на реальных эмбеддингах, higher QPS via memory bandwidth")
 	compactionWorkers := flag.Int("compaction-workers", 0, "Number of parallel segment build workers (0 = auto NumCPU/2 clamped 2-8). Build Pool: insert does not block during heavy L2 compaction")
 	deltaShards := flag.Int("delta-shards", 1, "число шардов дельты для конкурентных вставок (1 = один граф, freeze-on-flush; >1 = ~2.4× insert @4 / ~4.25× @12 ценой search-штрафа ∝ доле дельты). См. step_profit_test.go:TestStep5_ShardedAddScaling")
+	strictSegShadow := flag.Bool("strict-seg-shadow", true, "строгое затенение сегмент-vs-сегмент в поиске: после upsert стейл-копия из старого сегмента не всплывает в фильтрованных запросах даже до компакции. Цена ≤10% QPS только в мульти-сегментных переходных состояниях, 0 на консолидированном индексе (замер 23.07, TestStrictShadowQPSProbe)")
 	partitionAttr := flag.String("partition-attr", "", "Categorical attribute name for tenant-contiguous layout (enables VSIM.FILTER tenant routing via columnar SearchFilter). Empty = no partition; attrs still filterable, just no tenant block-routing")
 	idleConsolidate := flag.Duration("idle-consolidate", 60*time.Second, "затишье записей, после которого индекс консолидируется в один сегмент (флаш остатка дельты + merge всех уровней). Закрывает bulk-load→read: суб-fanout сегменты иначе не мержатся, search в разы медленнее. Guard: пропуск, если крупнейший сегмент уже ≥90% данных. 0 = выключено")
 	shipURL := flag.String("ship-url", "", "continuous WAL-shipping на удалённое хранилище: file:///abs/path или s3://bucket/prefix?endpoint=...&region=... (S3-креды из env KVSTORE_S3_ACCESS_KEY/SECRET_KEY или AWS_*). Пусто = выключено")
@@ -216,6 +217,7 @@ func main() {
 		PartitionAttr:  *partitionAttr,
 		DeltaShards:    *deltaShards,
 
+		StrictSegShadow:      *strictSegShadow,
 		IdleConsolidateAfter: *idleConsolidate,
 	})
 	// LSH не применяется в LeveledVectorStore, вызов no-op через type assertion:

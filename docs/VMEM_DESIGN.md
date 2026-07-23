@@ -208,12 +208,37 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
    rank-layer arithmetic (like RRF), core untouched. Decay shape and per-type
    half-lives chosen by experiment on the golden scenarios.
 
-   **DONE.** `final = fused × 2^(−age/halfLife) × (0.5 + importance)`; age is
-   measured against `as_of` when given ("what mattered *then*"), neutral
-   importance 0.5 yields exactly 1, and importance never zeroes a fact (floor
-   0.5×) — decay moves rank, only erasure hides. Half-life is per-request
-   (`half_life`, default 30 days): the mechanism is ours, the policy is the
-   client's; per-type half-lives remain an open door (needs type projection).
+   **DONE; formulas revised 2026-07-23** after the real-embedding trial
+   (`TestVMEMDecayCandidatesJudge`, 20k dbpedia facts with real ada-002
+   1536d vectors): the original post-fusion multiplier
+   `fused × 2^(−age/halfLife)` mathematically zeroes old facts on the flat
+   RRF scale — the best possible fused score (2/61, top-1 in both arms)
+   times 2^−4 is smaller than a single-arm rank-100 tail (1/160), so
+   hit@10 for facts older than 90 days measured 0.003 *with a perfect
+   vector arm*. Age must pay in the same scale the score lives in, and the
+   two paths live in different scales:
+
+   - **BM25-only** (wide score scale): `final = score ×
+     max(2^(−age/halfLife), 0.25) × (0.5 + importance)` — the 0.25 floor
+     keeps decay reordering without quantizing the tail to zero
+     (para/>90d hit@10 0.762 → 0.985);
+   - **hybrid** (rank scale): fusion itself carries the age penalty,
+     `fused = Σ over arms 1/(rrfK + rank + 5·age/halfLife)` (one half-life
+     = +5 ranks), then `final = fused × (0.5 + importance)` — known/>90d
+     hit@10 0.003 → 1.000, fresh bucket hit@1 improved 0.917 → 0.995.
+     Fusion moved from `SearchHybridFilter` into `Recall` (it needs
+     `valid_from` before fusing; arms, depth and filter-then-fuse are
+     bit-for-bit the same contract).
+
+   Rejected by measurement: one floor for both paths (hybrid stays broken:
+   0.938/0.013), one rank penalty for both paths (BM25 para drops to
+   0.690 — rank discards BM25's score magnitudes), decay-before-fusion
+   (never fixes the BM25 tail). Age is measured against `as_of` when given
+   ("what mattered *then*"), neutral importance 0.5 yields exactly 1, and
+   neither age nor importance ever zeroes a fact — decay moves rank, only
+   erasure hides. Half-life is per-request (`half_life`, default 30 days):
+   the mechanism is ours, the policy is the client's; per-type half-lives
+   remain an open door (needs type projection).
    Candidate attributes (`valid_from`, `imp`) are batch-projected by key:
    O(1) from memtables, O(log n) from frozen segments via a sorted key
    permutation added to the interned-key table (4 bytes/key, no format

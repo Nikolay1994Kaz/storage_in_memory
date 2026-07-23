@@ -246,6 +246,23 @@ const vmemDefaultHalfLifeSec = int64(30 * 24 * 3600)
 // top-K мог бы лишь переставлять внутри него. Совпадает с rrfFusionDepth.
 const vmemRecallOverfetch = 100
 
+// vmemDecayFloor / vmemRankLambda — фикс «decay против плоской шкалы» (суд
+// 23.07, TestVMEMDecayCandidatesJudge на реальных ada-002 1536d): пост-фьюжн
+// множитель 2^(−age/HL) математически занулял старые факты в ранговой шкале
+// RRF (потолок 2/61 × 2^-4 < хвостовой 1/160 → hit@10 >90d = 0.003 при
+// ИДЕАЛЬНОМ векторном плече). Композитный победитель по трём критериям:
+//   - BM25-only (широкая шкала скоров): множитель с полом —
+//     max(2^(−age/HL), 0.25) × (0.5+imp); para/>90d 0.762→0.985;
+//   - hybrid (ранговая шкала): возраст платит рангом там же, где живёт скор —
+//     Σ 1/(rrfK + rank + λ·age/HL), λ=5 (одна полураспад-жизнь = +5 рангов);
+//     known/>90d 0.003→1.000, свежая корзина hit@1 0.917→0.995.
+//
+// Отвергнутые кандидаты (по метрике): один floor на оба пути (гибрид 0.938,
+// hit@1 0.013 — квантование хвоста), один rank на оба пути (BM25 para 0.690 —
+// ранговый штраф выбрасывает шкалу скоров), prefusion (BM25-хвост не лечит).
+const vmemDecayFloor = 0.25
+const vmemRankLambda = 5.0
+
 // RecallRequest — вход VMEM.RECALL до кухни фильтра.
 type RecallRequest struct {
 	Scope  string    // чья память; обязателен
@@ -317,34 +334,27 @@ func recallFilter(req RecallRequest, now int64) (Filter, error) {
 // слеп к скорам, и шумовое плечо из placeholder-векторов голосовало бы наравне
 // с осмысленным.
 //
-// Скоринг (шаг 5) — чистая арифметика ранг-слоя поверх top-overfetch
-// кандидатов, ядро не тронуто:
+// Скоринг (шаг 5, формулы пересмотрены судом 23.07 — см. vmemDecayFloor /
+// vmemRankLambda) — чистая арифметика ранг-слоя поверх top-overfetch
+// кандидатов, ядро не тронуто. Пути скорятся ПО-РАЗНОМУ, потому что живут в
+// разных шкалах:
 //
-//	final = score × 2^(−age/halfLife) × (0.5 + importance)
+//	BM25-only: final = score × max(2^(−age/halfLife), 0.25) × (0.5 + importance)
+//	hybrid:    fused = Σ по плечам 1/(rrfK + rank + 5·age/halfLife);
+//	           final = fused × (0.5 + importance)
 //
 // где age = tEff − valid_from, tEff = as_of|now: свежесть меряется на момент,
 // О КОТОРОМ спрашивают, не на момент запроса («что было важно тогда»).
-// Нейтральная importance 0.5 даёт множитель ровно 1; importance не обнуляет
-// факт (пол 0.5×) — затухание двигает порядок, но не прячет (прятать умеет
-// только erasure). Умножение на RRF-скор — решение дизайна (score×decay×imp
-// дословно); риск «ранговая шкала RRF слишком плоская против decay» запинен,
-// пересмотр — по бенчу шага 8, не по «звучит правильно».
+// Нейтральная importance 0.5 даёт множитель ровно 1; ни возраст, ни importance
+// не обнуляют факт (пол/ранговый штраф) — затухание двигает порядок, но не
+// прячет (прятать умеет только erasure). Риск «ранговая шкала RRF слишком
+// плоская против decay» из шага 5 ПОДТВЕРДИЛСЯ бенчем (hit@10 >90d = 0.003)
+// и закрыт ранговым штрафом: возраст платит там же, где живёт скор.
 func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResult, error) {
 	f, err := recallFilter(req, now)
 	if err != nil {
 		return nil, err
 	}
-	depth := max(vmemRecallOverfetch, req.K)
-	var cands []VTextResult
-	if req.Vector == nil {
-		cands, err = lvs.SearchTextFilter(req.Query, depth, f)
-	} else {
-		cands, err = lvs.SearchHybridFilter(req.Query, req.Vector, depth, f)
-	}
-	if err != nil || len(cands) == 0 {
-		return cands, err
-	}
-
 	tEff := now
 	if req.AsOf != nil {
 		tEff = *req.AsOf
@@ -353,9 +363,50 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	if halfLife == 0 {
 		halfLife = vmemDefaultHalfLifeSec
 	}
-	keys := make([]string, len(cands))
-	for i := range cands {
-		keys[i] = cands[i].Key
+
+	depth := max(vmemRecallOverfetch, req.K)
+	hybrid := req.Vector != nil
+	var cands []VTextResult // BM25-only: скоры плеча; hybrid: собирается ПОСЛЕ проекции
+	var keys []string
+	var textArm []VTextResult
+	var vecArm []VSearchResult
+	var pos map[string]int
+	if !hybrid {
+		cands, err = lvs.SearchTextFilter(req.Query, depth, f)
+		if err != nil || len(cands) == 0 {
+			return cands, err
+		}
+		keys = make([]string, len(cands))
+		for i := range cands {
+			keys[i] = cands[i].Key
+		}
+	} else {
+		// Гибрид сливается ЗДЕСЬ, не в SearchHybridFilter: возрастной штраф
+		// живёт в ранговой шкале (см. vmemRankLambda), а для него нужны
+		// valid_from кандидатов ДО фьюжна. Плечи, глубина и filter-then-fuse —
+		// бит-в-бит контракт SearchHybridFilter.
+		if textArm, err = lvs.SearchTextFilter(req.Query, depth, f); err != nil {
+			return nil, err
+		}
+		if vecArm, err = lvs.SearchFilter(req.Vector, depth, f); err != nil {
+			return nil, err
+		}
+		if len(textArm)+len(vecArm) == 0 {
+			return nil, nil
+		}
+		pos = make(map[string]int, len(textArm)+len(vecArm))
+		add := func(k string) {
+			if _, ok := pos[k]; !ok {
+				pos[k] = len(keys)
+				keys = append(keys, k)
+			}
+		}
+		for i := range textArm {
+			add(textArm[i].Key)
+		}
+		for i := range vecArm {
+			add(vecArm[i].Key)
+		}
 	}
 	// Пере-суд кандидатов по СВЕЖАЙШЕЙ версии ключа (найдено корпус-бенчем
 	// шага 8, репро TestVMEMSupersedeTwoSegmentLeak): пре-фильтр судит каждую
@@ -370,6 +421,35 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	// колонки в общей проекции. NaN expires_at → свежайшая версия не
 	// VMEM-факт (upsert заменил факт не-фактом) → кандидат стейл, вон.
 	nums := lvs.numsForKeys(keys, vmemAttrValidFrom, vmemAttrImp, vmemAttrValidTo, vmemAttrExpiresAt)
+
+	if hybrid {
+		// Слияние в ранговой шкале с возрастным штрафом: 1/(rrfK + rank + λ·hl),
+		// hl = возраст в полураспадах на момент tEff. NaN valid_from (не-VMEM
+		// док в scope) и будущие факты — штраф нейтрален (0), как в vmemDecayImp.
+		agePen := func(key string) float64 {
+			vf := nums[pos[key]][0]
+			if math.IsNaN(vf) {
+				return 0
+			}
+			age := float64(tEff) - vf
+			if age <= 0 {
+				return 0
+			}
+			return vmemRankLambda * age / float64(halfLife)
+		}
+		fused := make([]float64, len(keys))
+		for r := range textArm {
+			fused[pos[textArm[r].Key]] += 1.0 / (float64(rrfK+r+1) + agePen(textArm[r].Key))
+		}
+		for r := range vecArm {
+			fused[pos[vecArm[r].Key]] += 1.0 / (float64(rrfK+r+1) + agePen(vecArm[r].Key))
+		}
+		cands = make([]VTextResult, len(keys))
+		for i, k := range keys {
+			cands[i] = VTextResult{Key: k, Score: fused[i]}
+		}
+	}
+
 	var typeOK []bool
 	if req.TypeEq != "" {
 		typeOK = lvs.catEqForKeys(keys, vmemAttrType, req.TypeEq)
@@ -386,7 +466,11 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 		if typeOK != nil && !typeOK[i] {
 			continue
 		}
-		cands[i].Score *= vmemDecayImp(vf, imp, tEff, halfLife)
+		if hybrid {
+			cands[i].Score *= vmemImpFactor(imp) // возраст уже уплачен рангом
+		} else {
+			cands[i].Score *= vmemDecayImp(vf, imp, tEff, halfLife)
+		}
 		kept = append(kept, cands[i])
 	}
 	cands = kept
@@ -405,19 +489,29 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	return cands, nil
 }
 
-// vmemDecayImp — множитель памяти поверх скора похожести. NaN (атрибута нет —
-// не-VMEM док, попавший в scope) → соответствующий фактор нейтрален.
+// vmemDecayImp — множитель памяти поверх скора похожести (BM25-only путь).
+// NaN (атрибута нет — не-VMEM док, попавший в scope) → фактор нейтрален.
+// Пол vmemDecayFloor: затухание двигает порядок, но не квантует в ноль —
+// широкой BM25-шкале хватает, чтобы старая точная находка пережила деление
+// на 4, но не пережила бы 2^-6 (суд 23.07: para/>90d 0.762→0.985).
 func vmemDecayImp(validFrom, imp float64, tEff, halfLife int64) float64 {
 	m := 1.0
 	if !math.IsNaN(validFrom) {
 		if age := float64(tEff) - validFrom; age > 0 {
-			m = math.Exp2(-age / float64(halfLife))
+			m = math.Max(math.Exp2(-age/float64(halfLife)), vmemDecayFloor)
 		}
 	}
-	if !math.IsNaN(imp) {
-		m *= 0.5 + imp
+	return m * vmemImpFactor(imp)
+}
+
+// vmemImpFactor — множитель importance (0.5+imp); NaN → нейтрален. В гибриде
+// применяется ОДИН (возраст уже уплачен ранговым штрафом): диапазон 0.5×–1.5×
+// двигает порядок в ранговой шкале, не квантуя её (в отличие от 2^(−age/HL)).
+func vmemImpFactor(imp float64) float64 {
+	if math.IsNaN(imp) {
+		return 1
 	}
-	return m
+	return 0.5 + imp
 }
 
 // catEqForKeys — батч-проверка «CAT-атрибут СВЕЖАЙШЕЙ версии == want» по

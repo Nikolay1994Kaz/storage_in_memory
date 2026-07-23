@@ -287,8 +287,10 @@ func Generate(p Params) *Corpus {
 			if imp < 0 {
 				imp = 0.5
 			}
-			// ожидаемый множитель шага 5: 2^(−age/halfLife) × (0.5+imp)
-			m := math.Exp2(-float64(ages[j]*day)/float64(30*day)) * (0.5 + imp)
+			// ожидаемый множитель BM25-пути (шаг 5 + пол, суд 23.07):
+			// max(2^(−age/halfLife), 0.25) × (0.5+imp). Пробные возрасты
+			// {5,45,120}д дают {0.891, 0.354, 0.25} — порядок различим и с полом.
+			m := math.Max(math.Exp2(-float64(ages[j]*day)/float64(30*day)), 0.25) * (0.5 + imp)
 			members[j] = member{id: f.ID, m: m}
 			probes[pi].ids = append(probes[pi].ids, f.ID)
 		}

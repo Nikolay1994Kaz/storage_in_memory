@@ -83,42 +83,65 @@ func loadVMEMLife(t *testing.T) ([]vmemLifeDoc, [][]float32) {
 	return docs, vecs
 }
 
-// TestVMEMDBpediaLifeDecay — четыре режима на ОДНОМ корпусе:
-// {BM25-only, hybrid} × {decay 30д, decay off}, метрики по возрастным корзинам.
-func TestVMEMDBpediaLifeDecay(t *testing.T) {
-	if testing.Short() {
-		t.Skip("эксперимент: только полный прогон")
+const (
+	vmemLifeDay     = int64(86400)
+	vmemLifeHorizon = 180
+	vmemLifeT0      = int64(1_760_000_000)
+	vmemLifeNow     = vmemLifeT0 + int64(vmemLifeHorizon)*vmemLifeDay
+	vmemLifeHL      = 30 * vmemLifeDay // дефолтный half-life Recall
+)
+
+var vmemLifeBuckets = []string{"<30d", "30-90d", ">90d"}
+
+type vmemLifeQuery struct {
+	Sort   string // known | para
+	Bucket int
+	Fact   int
+	Text   string
+}
+
+func vmemLifeBucketOf(at int64) int {
+	age := vmemLifeNow - at
+	switch {
+	case age < 30*vmemLifeDay:
+		return 0
+	case age <= 90*vmemLifeDay:
+		return 1
+	default:
+		return 2
 	}
-	docs, vecs := loadVMEMLife(t)
+}
+
+// vmemLifeSetup — общий стенд П2-линейки: корпус реальных dbpedia-фактов в
+// store (детерминированная раздача scope/возраста, seed 42) + стратифицированные
+// запросы. Один код на все суды: бенч 4 режимов и суд decay-кандидатов обязаны
+// есть ОДНО состояние LSM и ОДНИ запросы.
+func vmemLifeSetup(t *testing.T) (lvs *LeveledVectorStore, docs []vmemLifeDoc, vecs [][]float32, scopeOf []string, atOf []int64, queries []vmemLifeQuery) {
+	t.Helper()
+	docs, vecs = loadVMEMLife(t)
 	const (
-		day      = int64(86400)
-		horizon  = 180
 		nScopes  = 200
 		perCell  = 400 // запросов на (сорт × корзина), максимум
-		hugeHL   = int64(1) << 40
 		flushEvr = 5000
 	)
-	t0 := int64(1_760_000_000)
-	nowV := t0 + int64(horizon)*day
 
 	cfg := bm25TestConfig()
 	cfg.Distance = CosineDistance
 	cfg.Metric = MetricCosine
 	cfg.DeltaMax = flushEvr + 1
-	lvs := NewLeveledVectorStore(cfg)
-	defer lvs.Close()
+	lvs = NewLeveledVectorStore(cfg)
 
 	// Раздача scope/возраста — детерминированная (seed 42), zipf-скосы как в
 	// vmemcorpus: квадрат равномерной → частые маленькие индексы.
 	rng := rand.New(rand.NewSource(42))
-	scopeOf := make([]string, len(docs))
-	atOf := make([]int64, len(docs))
+	scopeOf = make([]string, len(docs))
+	atOf = make([]int64, len(docs))
 	order := rng.Perm(len(docs))
 	events := make([]int, 0, len(docs))
 	for _, i := range order {
 		u := rng.Float64()
 		scopeOf[i] = fmt.Sprintf("user:%03d", int(float64(nScopes)*u*u)%nScopes)
-		atOf[i] = t0 + int64(rng.Float64()*float64(horizon))*day + int64(rng.Intn(int(day)))
+		atOf[i] = vmemLifeT0 + int64(rng.Float64()*float64(vmemLifeHorizon))*vmemLifeDay + int64(rng.Intn(int(vmemLifeDay)))
 		events = append(events, i)
 	}
 	sort.Slice(events, func(a, b int) bool { return atOf[events[a]] < atOf[events[b]] })
@@ -142,38 +165,33 @@ func TestVMEMDBpediaLifeDecay(t *testing.T) {
 	t.Logf("корпус: %d фактов, %d сегментов, dim=%d", len(docs), len(lvs.collectSegments()), len(vecs[0]))
 
 	// Запросы: стратификация по корзинам возраста, сорта known/para.
-	bucketOf := func(at int64) int {
-		age := nowV - at
-		switch {
-		case age < 30*day:
-			return 0
-		case age <= 90*day:
-			return 1
-		default:
-			return 2
-		}
-	}
-	bucketName := []string{"<30d", "30-90d", ">90d"}
-	type query struct {
-		sort   string
-		bucket int
-		fact   int
-		text   string
-	}
-	var queries []query
 	cnt := map[[2]int]int{}
 	for _, i := range rng.Perm(len(docs)) {
-		b := bucketOf(atOf[i])
+		b := vmemLifeBucketOf(atOf[i])
 		if cnt[[2]int{0, b}] < perCell {
-			queries = append(queries, query{"known", b, i, docs[i].Title})
+			queries = append(queries, vmemLifeQuery{"known", b, i, docs[i].Title})
 			cnt[[2]int{0, b}]++
 		}
 		words := strings.Fields(docs[i].Text)
 		if len(words) >= 16 && cnt[[2]int{1, b}] < perCell {
-			queries = append(queries, query{"para", b, i, strings.Join(words[6:14], " ")})
+			queries = append(queries, vmemLifeQuery{"para", b, i, strings.Join(words[6:14], " ")})
 			cnt[[2]int{1, b}]++
 		}
 	}
+	return lvs, docs, vecs, scopeOf, atOf, queries
+}
+
+// TestVMEMDBpediaLifeDecay — четыре режима на ОДНОМ корпусе:
+// {BM25-only, hybrid} × {decay 30д, decay off}, метрики по возрастным корзинам.
+func TestVMEMDBpediaLifeDecay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("эксперимент: только полный прогон")
+	}
+	const hugeHL = int64(1) << 40
+	lvs, _, vecs, scopeOf, _, queries := vmemLifeSetup(t)
+	defer lvs.Close()
+	nowV := vmemLifeNow
+	bucketName := vmemLifeBuckets
 
 	type cell struct {
 		n           int
@@ -184,26 +202,26 @@ func TestVMEMDBpediaLifeDecay(t *testing.T) {
 		res := map[string]*cell{}
 		for _, q := range queries {
 			req := RecallRequest{
-				Scope:       scopeOf[q.fact],
-				Query:       q.text,
+				Scope:       scopeOf[q.Fact],
+				Query:       q.Text,
 				K:           10,
 				HalfLifeSec: halfLife,
 			}
 			if hybrid {
-				req.Vector = vecs[q.fact]
+				req.Vector = vecs[q.Fact]
 			}
 			out, err := lvs.Recall(req, nowV)
 			if err != nil {
 				t.Fatalf("%s Recall: %v", name, err)
 			}
-			key := q.sort + "/" + bucketName[q.bucket]
+			key := q.Sort + "/" + bucketName[q.Bucket]
 			c := res[key]
 			if c == nil {
 				c = &cell{}
 				res[key] = c
 			}
 			c.n++
-			want := fmt.Sprintf("fact:%05d", q.fact)
+			want := fmt.Sprintf("fact:%05d", q.Fact)
 			for r, h := range out {
 				if h.Key == want {
 					if r == 0 {
@@ -242,9 +260,12 @@ func TestVMEMDBpediaLifeDecay(t *testing.T) {
 		t.Fatalf("пустая корзина known/>90d — корпус сгенерирован неверно")
 	}
 	drop := float64(a.hit10)/float64(a.n) - float64(b.hit10)/float64(b.n)
-	verdict := "в пределах порога (≤0.10) — «артефакт BoW» подтверждён данными"
+	// История порога: до фикса 23.07 (пол + ранговый штраф) дельта была 0.958 —
+	// «дефект подтверждён»; после фикса тест работает регрессом: гибрид не
+	// имеет права отставать от BM25-пути на старых фактах больше чем на 0.10.
+	verdict := "в пределах порога (≤0.10)"
 	if drop > 0.10 {
-		verdict = "ДЕФЕКТ ПОДТВЕРЖДЁН на реальных эмбеддингах (>0.10)"
+		verdict = "РЕГРЕСС: гибрид отстаёт от BM25 на старых фактах (>0.10)"
 	}
 	t.Logf("СУД: hit@10 known/>90d bm25+decay=%.3f vs hybrid+decay=%.3f, дельта=%.3f — %s",
 		float64(a.hit10)/float64(a.n), float64(b.hit10)/float64(b.n), drop, verdict)
