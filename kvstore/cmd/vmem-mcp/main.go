@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 
 	"kvstore/kvstore/internal/vmemmcp"
@@ -33,11 +34,15 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 
+	hintPort := "6380"
+	if _, p, err := net.SplitHostPort(*addr); err == nil {
+		hintPort = p
+	}
 	cfg := vmemmcp.Config{
 		DefaultScope: *scope,
 		StartHint: fmt.Sprintf(
-			"kvstore-server is unreachable at %s — start it (./kvstore-server --port 6380, or: docker compose up -d) and retry",
-			*addr),
+			"kvstore-server is unreachable at %s — start it (./kvstore-server --port %s, or: docker compose up -d) and retry",
+			*addr, hintPort),
 	}
 	be := vmemmcp.NewRESPClient(*addr, *auth)
 
