@@ -1,6 +1,8 @@
 # Релизная сборка: goreleaser собирает бинарники на тег v* (см.
-# .github/workflows/release.yml). Только Linux — сетевой слой сидит на epoll
-# (internal/server/epoll.go), darwin/windows не собираются принципиально.
+# .github/workflows/release.yml). Сервер — только Linux (сетевой слой сидит на
+# epoll, internal/server/epoll.go, darwin/windows не собираются принципиально);
+# MCP-адаптер vmem-mcp — чистый Go без epoll, собирается под все три ОС
+# (сценарий: Claude Desktop на маке/винде + сервер в Docker).
 # Локальная проверка без публикации: goreleaser release --snapshot --clean
 version: 2
 
@@ -22,15 +24,41 @@ builds:
     ldflags:
       # Тот же контракт версии, что в Makefile: -X main.version.
       - -s -w -X main.version={{.Version}}
+  - id: vmem-mcp
+    binary: vmem-mcp
+    main: ./kvstore/cmd/vmem-mcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
 
 archives:
-  - formats: [tar.gz]
+  - id: server
+    ids: [kvstore-server]
+    formats: [tar.gz]
     name_template: "{{ .ProjectName }}-server_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - LICENSE
       - README.md
       - docs/COMMANDS.md
       - docs/BACKUP.md
+  - id: vmem-mcp
+    ids: [vmem-mcp]
+    formats: [tar.gz]
+    name_template: "vmem-mcp_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - docs/QUICKSTART_MCP.md
+    format_overrides:
+      - goos: windows
+        formats: [zip]
 
 checksum:
   name_template: "checksums.txt"
@@ -48,5 +76,8 @@ release:
   # footer дописывается к автоген-ченджлогу релиза.
   footer: |
     ---
-    Binaries are static (CGO_ENABLED=0), Linux only — the server is built on epoll.
-    Quick start: `./kvstore-server --port 6380`, then `redis-cli -p 6380`.
+    The server binary is static (CGO_ENABLED=0), Linux only — it is built on
+    epoll. The `vmem-mcp` MCP adapter ships for Linux/macOS/Windows and
+    connects to the server over RESP (run the server in Docker on non-Linux).
+    Quick start: `./kvstore-server --port 6380`, then `redis-cli -p 6380`;
+    agent memory setup: docs/QUICKSTART_MCP.md.

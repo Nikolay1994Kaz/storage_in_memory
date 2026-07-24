@@ -3,15 +3,62 @@
 [![CI](https://github.com/Nikolay1994Kaz/storage_in_memory/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Nikolay1994Kaz/storage_in_memory/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Nikolay1994Kaz/storage_in_memory)](https://github.com/Nikolay1994Kaz/storage_in_memory/releases)
 
-Single-node in-memory **vector search engine** (HNSW) speaking the RESP protocol,
-with a small frozen KV/TTL/Pub-Sub payload layer around it and WAL-based durability
-with continuous shipping to S3. Bring your own embeddings — vectors go in via
-`VSIM.ADD` from any provider; an optional RAG demo layer (`AI.*` via Ollama) is
-available behind a Docker profile. Not a Redis replacement — the KV surface
-exists to serve the vector core.
+**Self-hosted memory engine for AI agents.** One process gives your agents
+durable, queryable memory: facts with validity intervals and supersession
+history ("what was true in March?"), hard erasure (right to be forgotten), and
+recency×importance-ranked recall — BM25 out of the box, hybrid BM25+vector
+when you bring embeddings. Agents plug in over **MCP** in two minutes
+([docs/QUICKSTART_MCP.md](docs/QUICKSTART_MCP.md)); everything is also
+scriptable over **RESP** from any Redis client library.
+
+Under the memory surface sits a single-node in-memory engine built for the
+job: HNSW vector search with SQ8 quantization, BM25 full-text with RRF hybrid
+fusion, tenant/attribute filtering, a small frozen KV/TTL/Pub-Sub layer, and
+WAL-based durability with continuous shipping to S3. One static ~13MB binary —
+no Postgres+Qdrant+Neo4j zoo — and self-hosted by design: your agents' memory
+runs where your data must live (laptop, VPC, air-gapped on-prem). Not a Redis
+replacement — the KV surface exists to serve the memory core.
+
+## Agent memory in two minutes
+
+```bash
+# 1. the server — one static binary; the working dir keeps WAL + snapshots
+./kvstore-server --port 6380
+
+# 2. the MCP adapter — plug into Claude Code (or any MCP host)
+claude mcp add memory -- vmem-mcp -addr 127.0.0.1:6380 -default-scope myproject
+```
+
+The agent now has three tools — `memory_remember`, `memory_recall`,
+`memory_forget` — and its facts survive restarts, sessions and model
+switches. Full setup incl. Claude Desktop and Docker:
+[docs/QUICKSTART_MCP.md](docs/QUICKSTART_MCP.md); agent-driven install:
+[INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md).
+
+What makes it a memory engine rather than a search index (`VMEM.*` —
+semantics in [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md)):
+
+- **Validity time.** A fact that replaces another (`supersedes`) closes the
+  old one's interval instead of deleting it; `RECALL … ASOF <ts>` answers
+  "what was true then".
+- **Erasure beats time travel.** `FORGET` and TTL expiry remove a fact from
+  history and `ASOF` too — the right to be forgotten wins over the time
+  machine.
+- **Ranking is not truth.** Recency decay and importance reorder results but
+  are mathematically floored so old facts stay reachable — judged on real
+  embeddings, not vibes ([docs/BENCHMARKS.md §7](docs/BENCHMARKS.md)).
+- **Verbatim anchor.** Recall returns the original stored text, never a lossy
+  rewrite; every derived structure is recomputable from the anchors.
+
+Measured (reproducible canon, §7): known-item hit@1 **0.982** / MRR **0.991**;
+temporal accuracy (`ASOF`, supersession chains) **1.000**; scope isolation
+**0 violations**; end-to-end `RECALL` p99 **0.29 ms** at **64 426 QPS** over
+RESP on a 2019 laptop.
 
 ## Features
 
+- **VMEM agent memory** — `VMEM.REMEMBER` / `VMEM.RECALL` / `VMEM.FORGET`: validity intervals + supersession history (`ASOF` time travel), TTL + hard erasure, recency×importance recall over BM25 or hybrid; verbatim KV anchors; MCP adapter `vmem-mcp` (Linux/macOS/Windows) for Claude Code/Desktop and any MCP host
+- **BM25 full-text + hybrid** — `VSIM.SEARCHTEXT` / `VSIM.HYBRID` (RRF fusion), embedder-free known-item search, query-side common-term pruning, attribute filters on both
 - **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization; non-blocking bulk ingest (per-shard delta freeze + batched LSM merges)
 - **AI / RAG** *(optional, off by default)* — Ollama embeddings, async ingestion, semantic queries (`AI.INGEST` / `AI.ASK`); the engine itself is BYO-embeddings
 - **WAL + Snapshots** — CRC32-protected, batch writes, crash recovery
@@ -144,8 +191,9 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 
 The full command manifest (syntax, replies, gate semantics, WAL ops) lives in
 [docs/COMMANDS.md](docs/COMMANDS.md) — the surface is deliberately small and frozen.
-Families: KV/TTL (`SET`/`GET`/`DEL`/`EXPIRE`/…), transactions (`MULTI`/`EXEC`/`DISCARD`),
-Pub/Sub, sorted sets (`ZADD`/…), vector search (`VSIM.*`), AI/RAG (`AI.*`,
+Families: agent memory (`VMEM.*`), vector + full-text search (`VSIM.*`, incl.
+`SEARCHTEXT`/`HYBRID`), KV/TTL (`SET`/`GET`/`DEL`/`EXPIRE`/…), transactions
+(`MULTI`/`EXEC`/`DISCARD`), Pub/Sub, sorted sets (`ZADD`/…), AI/RAG (`AI.*`,
 optional — requires a reachable Ollama).
 
 > **Isolation contract (read this).** `MULTI`/`EXEC` provides command **grouping and
@@ -173,12 +221,15 @@ optional — requires a reachable Ollama).
 │     ConnBuf (ring buffer, zero-alloc)        │
 ├──────────────────────────────────────────────┤
 │              AUTH Guard                      │
+├──────────────────────────────────────────────┤
+│   VMEM memory layer (validity / erasure /    │
+│   recency-ranked recall; MCP via vmem-mcp)   │
 ├──────────────┬───────────────────────────────┤
 │   TCMalloc   │  TTL    │ WAL    │ Pub/Sub   │
 │   Store      │  Heap   │ Batch  │ Hub       │
 ├──────────────┼─────────┼────────┼───────────┤
-│  HNSW Vector │  WASM   │   AI   │  Cluster  │
-│  Search      │  Engine │ Worker │  (gossip) │
+│ HNSW + BM25  │  WASM   │   AI   │  Cluster  │
+│ Search       │  Engine │ Worker │  (gossip) │
 └──────────────┴─────────┴────────┴───────────┘
 ```
 
@@ -188,6 +239,13 @@ Measured on standard ANN datasets and real OpenAI embeddings, including
 same-machine head-to-head runs against hnswlib — full tables, methodology and
 honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
 
+- **Agent memory (VMEM):** on a 27.5k-event synthetic "agent life" —
+  known-item hit@1 **0.982** / MRR **0.991**, paraphrase hit@10 1.000,
+  temporal accuracy (`ASOF` + supersession chains) **1.000**, scope isolation
+  **0 violations**; decay formula judged on 20k real ada-002 embeddings
+  (hit@10 = 1.000 in every age bucket). End-to-end over RESP: `RECALL` p50
+  110 µs / p99 **0.29 ms** at **64 426 QPS**, p99 13.3 ms under a mixed
+  read/write soak — zero errors.
 - **End-to-end through the server (RESP, real query vectors):**
   **12 985 QPS** @ recall@10 0.9996 on MNIST-784 (SQ8) and **3 928 QPS** @
   0.9888 on dbpedia-1536; ingest up to **5 533 vec/s** over the wire with
@@ -257,7 +315,8 @@ make vet               # Static analysis
 
 ```
 kvstore/
-├── cmd/kvstore/          # Entry point (main.go)
+├── cmd/kvstore/          # Server entry point (main.go)
+├── cmd/vmem-mcp/         # MCP stdio adapter (agent memory tools)
 ├── internal/
 │   ├── server/           # Epoll server, ConnBuf, Handler
 │   ├── store/            # KV store, TTL manager
@@ -271,8 +330,10 @@ kvstore/
 │   ├── cluster/          # Hash slots, gossip, replication (experimental)
 │   ├── logging/          # slog setup (levels, text/JSON)
 │   ├── monitoring/       # Prometheus-style metrics
-│   └── protocol/         # RESP parser and writer
-├── vector/               # HNSW graph, SQ8, tenant/attr filtering, arena allocator
+│   ├── protocol/         # RESP parser and writer
+│   ├── vmemcorpus/       # Deterministic "agent life" corpus generator (benches)
+│   └── vmemmcp/          # MCP adapter logic (JSON-RPC loop, tool mapping)
+├── vector/               # HNSW graph, SQ8, BM25 text index, VMEM layer, tenant/attr filtering
 └── examples/             # WASM module examples
 docs/                     # Command manifest, backup guide, benchmarks
 monitoring/               # Grafana/VictoriaMetrics provisioning for the local stack
