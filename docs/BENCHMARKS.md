@@ -279,6 +279,68 @@ they ever matter.
 
 Test: `TestBM25HybridProfit` (`kvstore/vector/bm25_hybrid_profit_test.go`).
 
+## 7. VMEM agent-memory layer — temporal quality and end-to-end latency
+
+`VMEM.*` (REMEMBER / RECALL / FORGET — scoped facts with validity intervals,
+supersession, TTL erasure and recency×importance scoring) is judged by two
+benches fed by the **same deterministic generator** (`internal/vmemcorpus`,
+seed=42), so the quality and latency numbers describe one world: a store-level
+quality bench on compressed virtual time, and an end-to-end latency bench over
+RESP on real clocks. The corpus is an "agent life": 200 scopes (Zipf sizes),
+27 561 events over 180 virtual days — 800 supersession chains of 2–5 versions,
+3k TTL facts (the reaper harvests 1 470 of them mid-run), 600 FORGETs — and
+5 760 queries of six sorts with ground truth built into the tape.
+
+**Quality** (`TestVMEMCorpusBench`, stage0 = BM25-only — the embedder-free v1
+default). Right column = the accepted floors; temporal correctness and
+isolation are invariants, not percentages:
+
+| query sort | n | measured | floor |
+|---|---|---|---|
+| known-item | 2 000 | hit@1 0.982 · hit@10 1.000 · MRR 0.991 | hit@1 ≥0.85, MRR ≥0.90 |
+| paraphrase | 2 000 | hit@1 0.974 · hit@10 1.000 · MRR 0.987 | — |
+| AS_OF (point-in-time) | 1 000 | accuracy 1.000 | =1.000 |
+| now-over-chain (supersession) | 300 | accuracy 1.000 | =1.000 |
+| importance ordering | 60 | pairwise 1.000, full order 60/60 | — |
+| erasure + scope isolation | 400+ | 0 violations | =0 |
+
+Recency decay reorders but does not evict old truth: known-item hit@1 by fact
+age is 1.000 (<30 d) / 0.984 (30–90 d) / 0.974 (>90 d).
+
+**Decay formula, judged on real embeddings** (`TestVMEMDBpediaLifeDecay`: 20k
+dbpedia facts, real ada-002 1536-dim vectors, ages spread over 180 d, 5 LSM
+segments). The naive `RRF × 2^(−age/HL)` multiplier mathematically zeroes old
+facts on the hybrid path — known-item hit@10 for >90 d facts measured **0.003**
+(max fused RRF score × 2⁻⁵ sinks below any single-arm rank-100 candidate); no
+embedder quality can fix a scale mismatch. Shipped scoring was picked by
+judging 7 candidate formulas on this dataset: the BM25 path multiplies by
+`max(2^(−age/HL), 0.25)` (floored decay), the hybrid path applies age as a
+rank penalty `Σ 1/(k + rank + 5·age/HL)`. After the fix, hybrid+decay
+known-item **hit@10 = 1.000 in every age bucket** (hit@1 0.995 / 0.840 /
+0.618 — freshness still reorders, no longer erases); BM25 paraphrase >90 d
+holds hit@10 0.985.
+
+**End-to-end latency over RESP** (`cmd/vmemload` replays the same seed=42 tape
+against a real server process, 8 connections; this laptop on the *powersave*
+governor — conservative):
+
+| phase | p50 | p99 | throughput |
+|---|---|---|---|
+| RECALL, settled store (5 760 queries) | 110 µs | **0.29 ms** | 64 426 QPS |
+| RECALL under mixed load (8 readers + 2 writers, 30 s) | 2.9 ms | **13.3 ms** | 2 084 QPS |
+| writes under mixed load | 3.8 ms | 10.4 ms | 509 op/s |
+| REMEMBER, bulk replay concurrent with merge cascade | 16.5 ms | 49 ms | 339 op/s |
+
+Accepted latency floors, all met: clean RECALL p99 ≤ 1 ms (measured 0.29 ms);
+RECALL p99 under mix ≤ 25 ms (13.3 ms); scope-isolation violations = 0
+(checked E2E on every returned id, 0 of 9 219); errors = 0 (across 77 777 mix
+operations and all recalls). REMEMBER latency is fsync-bound (durable WAL per
+batch), not CPU-bound.
+
+Tests: `TestVMEMCorpusBench` (`kvstore/vector/vmem_corpus_bench_test.go`),
+`TestVMEMDBpediaLifeDecay` (`kvstore/vector/vmem_dbpedia_life_test.go`),
+`cmd/vmemload`. Design: `docs/VMEM_DESIGN.md`.
+
 ---
 
 ## Caveats, all in one place
@@ -324,6 +386,19 @@ go test -run 'TestSIFT1M_Validation|TestGIST1M_Validation' -v -timeout 60m ./kvs
 go test -run 'TestDBpedia_RealEmbeddingValidation' -v -timeout 30m ./kvstore/vector/
 go test -run 'TestTenant_SearchTenantQPSGain|TestFilter_AttrScaleQPSGain' -v -timeout 60m ./kvstore/vector/
 go test -run 'TestBM25HybridProfit' -v -timeout 60m ./kvstore/vector/
+
+# 3. VMEM (section 7)
+# quality — self-contained synthetic corpus, no external data needed:
+go test -run 'TestVMEMCorpusBench' -v -timeout 30m ./kvstore/vector/
+# decay on real embeddings (builds /tmp/vmemlife.* from the HF dbpedia shards;
+# needs pyarrow):
+python3 scripts/prep_vmemlife.py
+go test -run 'TestVMEMDBpediaLifeDecay' -v -timeout 60m ./kvstore/vector/
+# end-to-end latency over RESP (fresh server in an empty dir, then the bench):
+go build -o /tmp/kv ./kvstore/cmd/kvstore
+(cd "$(mktemp -d)" && /tmp/kv -port 6390 -metrics-port 0 &)
+go run ./kvstore/cmd/vmemload -addr 127.0.0.1:6390 -mix 30s
+# stop the server with `kill $(pidof kv)` (an exact-name kill, not a substring pkill)
 ```
 
 The hnswlib side of the head-to-heads: `pip install hnswlib`, same M/efC/ef
