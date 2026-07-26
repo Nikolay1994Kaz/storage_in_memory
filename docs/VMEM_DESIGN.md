@@ -54,6 +54,23 @@ BM25 text layer, all of which already flow through WAL / snapshot / merge.
 - **RECALL default = valid-now**: facts with `valid_to <= now` or
   `expires_at <= now` are excluded. History is explicit: `AS_OF ts` evaluates
   validity at `ts`; `ALL` disables the validity filter.
+- **Revocation is a third axis, not a third meaning of `valid_to`.**
+  `VMEM.QUARANTINE` stamps `quarantined_at` and touches nothing else. The two
+  tempting alternatives are both wrong, and naming what each axis *means* shows
+  why: `valid_from`/`valid_to` are **application time** ("true from … to …"),
+  so `valid_to = <revocation moment>` would assert the poisoned fact *was* true
+  until then — a lie in the axis's own terms; while `valid_to = valid_from`
+  ("never true") is terminologically honest but erases the trace that the agent
+  **believed** it, which is exactly the evidence this layer exists to keep.
+  With its own axis, application time stays untouched and `ASOF` before the
+  revocation still answers "yes, at 14:32 it believed this". This is the first
+  concrete step toward the bitemporality already recorded as an open door — not
+  a workaround across it.
+  - Unlike `valid_to`, `quarantined_at` is **not** stamped on every fact: its
+    absence means "never revoked", it is judged in the ranking layer (where a
+    missing value is explicit `NaN`) rather than by a pre-filter `RANGE`, and
+    leaving it absent means facts written before the feature existed keep
+    reading normally — an upgrade must not hide data the user already stored.
 - **Two kinds of forgetting, never conflated**:
   - *supersession* (step 4): the fact is no longer true **now**, but history
     stays queryable — this is what buys temporality;

@@ -485,3 +485,57 @@ func TestExecVMEM_Provenance(t *testing.T) {
 		}
 	}
 }
+
+// TestExecVMEM_Quarantine — карантин через RESP: выборочный отзыв по
+// происхождению, законные факты целы, история веры доступна через ASOF, и всё
+// это переживает рестарт-реплей (батч едет одной записью — краш не может
+// оставить половину лжи отозванной).
+func TestExecVMEM_Quarantine(t *testing.T) {
+	e1 := newExecEnv(t)
+	e1.wantBulk(e1.do("VMEM.REMEMBER", "s", "TEXT", "дедлайн проекта март", "ID", "bad1", "SOURCE", "web-scraper", "VALIDFROM", "1000"), "bad1")
+	e1.wantBulk(e1.do("VMEM.REMEMBER", "s", "TEXT", "дедлайн проекта апрель", "ID", "bad2", "SOURCE", "web-scraper", "VALIDFROM", "1000"), "bad2")
+	e1.wantBulk(e1.do("VMEM.REMEMBER", "s", "TEXT", "дедлайн проекта май", "ID", "ok1", "SOURCE", "email-agent", "VALIDFROM", "1000"), "ok1")
+
+	recallIDs := func(e *execEnv, args ...string) []string {
+		v := e.do("VMEM.RECALL", args...)
+		if v.Typ != '*' {
+			t.Fatalf("RECALL не массив: %+v", v)
+		}
+		var ids []string
+		for i := 0; i < len(v.Array); i += 3 {
+			ids = append(ids, v.Array[i].Str)
+		}
+		slices.Sort(ids)
+		return ids
+	}
+	// «Отозвать всё» не должно быть выразимо ни одной формой команды:
+	// слишком мало аргументов, висящий SOURCE и полностью отсутствующий
+	// источник — три разных пути, все обязаны отказать.
+	e1.wantErrPrefix(e1.do("VMEM.QUARANTINE", "s", "SOURCE"), "ERR usage: VMEM.QUARANTINE")
+	e1.wantErrPrefix(e1.do("VMEM.QUARANTINE", "s", "SINCE", "1000", "SOURCE"), "ERR SOURCE requires")
+	e1.wantErrPrefix(e1.do("VMEM.QUARANTINE", "s", "SINCE", "1000", "LIMIT", "5"), "ERR vmem: quarantine requires a source")
+	e1.wantInt(e1.do("VMEM.QUARANTINE", "s", "SOURCE", "web-scraper"), 2)
+	e1.wantInt(e1.do("VMEM.QUARANTINE", "s", "SOURCE", "web-scraper"), 0) // идемпотентно
+
+	if got := recallIDs(e1, "s", "10", "дедлайн"); !slices.Equal(got, []string{"ok1"}) {
+		t.Fatalf("после карантина: %v, ожидался [ok1]", got)
+	}
+	if got := recallIDs(e1, "s", "10", "дедлайн", "ALL"); len(got) != 3 {
+		t.Fatalf("ALL: %v, ожидались все три (форензический режим)", got)
+	}
+	if got := recallIDs(e1, "s", "10", "дедлайн", "ASOF", "1500"); len(got) != 3 {
+		t.Fatalf("ASOF до отзыва: %v, ожидались все три — история веры стёрта", got)
+	}
+
+	if err := e1.bw.Close(); err != nil {
+		t.Fatalf("bw.Close: %v", err)
+	}
+	e2 := newExecEnv(t)
+	replayVMEMWAL(t, filepath.Join(e1.dir, "t.wal"), e2)
+	if got := recallIDs(e2, "s", "10", "дедлайн"); !slices.Equal(got, []string{"ok1"}) {
+		t.Fatalf("после реплея: %v, ожидался [ok1] — карантин не пережил рестарт", got)
+	}
+	if got := recallIDs(e2, "s", "10", "дедлайн", "ASOF", "1500"); len(got) != 3 {
+		t.Fatalf("после реплея ASOF: %v, ожидались все три — улика потеряна при рестарте", got)
+	}
+}

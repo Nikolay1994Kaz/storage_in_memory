@@ -453,7 +453,7 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	// контракт; цена — те же O(log n)-лукапы, что уже платит скоринг, +2
 	// колонки в общей проекции. NaN expires_at → свежайшая версия не
 	// VMEM-факт (upsert заменил факт не-фактом) → кандидат стейл, вон.
-	nums := lvs.numsForKeys(keys, vmemAttrValidFrom, vmemAttrImp, vmemAttrValidTo, vmemAttrExpiresAt)
+	nums := lvs.numsForKeys(keys, vmemAttrValidFrom, vmemAttrImp, vmemAttrValidTo, vmemAttrExpiresAt, vmemAttrQuarantinedAt)
 
 	if hybrid {
 		// Слияние в ранговой шкале с возрастным штрафом: 1/(rrfK + rank + λ·hl),
@@ -496,11 +496,23 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	}
 	kept := cands[:0]
 	for i := range cands {
-		vf, imp, vt, exp := nums[i][0], nums[i][1], nums[i][2], nums[i][3]
+		vf, imp, vt, exp, quar := nums[i][0], nums[i][1], nums[i][2], nums[i][3], nums[i][4]
 		if !(exp > float64(now)) { // erasure против now во ВСЕХ режимах; NaN → false
 			continue
 		}
 		if !req.All && !(vf <= float64(tEff) && float64(tEff) < vt) {
+			continue
+		}
+		// Карантин — ТРЕТЬЯ ось, отдельная и от валидности, и от erasure:
+		// «убеждение отозвано в момент q». Судится против tEff, а не now
+		// (в отличие от erasure): отзыв произошёл в конкретный момент истории,
+		// и вопрос «во что агент верил в 14:32» обязан получить честный ответ
+		// «верил вот в это» — даже если в 16:10 мы это отозвали. Стирать эту
+		// запись значило бы уничтожать ровно ту улику, ради которой слой и
+		// существует. NaN (атрибута нет) = никогда не карантинился — обычный
+		// случай, и он не требует ни штампа, ни миграции старых данных.
+		// ALL показывает всё: это форензический режим.
+		if !req.All && !math.IsNaN(quar) && float64(tEff) >= quar {
 			continue
 		}
 		if typeOK != nil && !typeOK[i] {

@@ -690,6 +690,29 @@ func (d *DeltaSegment) KeysNumLE(name string, hi float64) []string {
 	return out
 }
 
+// KeysCatEq — ключи живых записей с CAT-атрибутом name == want. Категориальное
+// зеркало KeysNumLE для скан-фазы карантина (отзыв по источнику): отсутствующий
+// атрибут не проходит сравнение, поэтому не-VMEM доки отсеиваются без веток.
+func (d *DeltaSegment) KeysCatEq(name, want string) []string {
+	if !d.HasAttrs() {
+		return nil
+	}
+	var out []string
+	for _, s := range d.shards {
+		s.mu.RLock()
+		for i, key := range s.keys {
+			if key == "" || i >= len(s.attrs) {
+				continue
+			}
+			if v, ok := s.attrs[i].Cat[name]; ok && v == want {
+				out = append(out, key)
+			}
+		}
+		s.mu.RUnlock()
+	}
+	return out
+}
+
 // deltaTextResult — результат текстового BM25-поиска по дельте.
 type deltaTextResult struct {
 	key   string

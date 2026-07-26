@@ -994,7 +994,7 @@ func isLoopbackBind(bind string) bool {
 func isMemoryGrowingCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC",
-		"VMEM.REMEMBER", "WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
+		"VMEM.REMEMBER", "VMEM.QUARANTINE", "WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
 		return true
 	}
 	return false
@@ -1011,7 +1011,7 @@ func isWriteCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "DEL", "EXPIRE", "PERSIST",
 		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC", "VSIM.DEL",
-		"VMEM.REMEMBER", "VMEM.FORGET",
+		"VMEM.REMEMBER", "VMEM.FORGET", "VMEM.QUARANTINE",
 		"ZADD", "ZREM", "AI.INGEST":
 		return true
 	}
@@ -1973,6 +1973,88 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				buf.WriteBulkString("")
 			}
 		}
+
+	case "VMEM.QUARANTINE":
+		// VMEM.QUARANTINE <scope> SOURCE <s> [SINCE <unix>] [LIMIT <n>]
+		// Массовый отзыв убеждений по происхождению: факты остаются в сторе
+		// целиком (текст, вектор, прикладное время), но получают ось
+		// quarantined_at — RECALL их больше не выдаёт, AS_OF до момента
+		// отзыва выдаёт по-прежнему (история веры не переписывается), ALL
+		// показывает всегда. Ответ: число отозванных.
+		//
+		// Весь батч едет ОДНОЙ записью OpVSimAddDocBatch — один CRC: краш не
+		// может оставить «часть лжи отозвана, часть жива». Отсюда потолок
+		// батча; хвост берётся повторным вызовом (операция идемпотентна —
+		// уже отозванные кандидаты отсеиваются приговором).
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: VMEM.QUARANTINE <scope> SOURCE <s> [SINCE unix] [LIMIT n]")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR vmem not supported by this vector store")
+			return
+		}
+		qreq := vector.QuarantineRequest{Scope: string(args[0])}
+		parseErr := ""
+	quarantineParse:
+		for i := 1; i < len(args); {
+			switch strings.ToUpper(string(args[i])) {
+			case "SOURCE":
+				if i+1 >= len(args) {
+					parseErr = "SOURCE requires <source>"
+					break quarantineParse
+				}
+				qreq.Source = string(args[i+1])
+				i += 2
+			case "SINCE":
+				if i+1 >= len(args) {
+					parseErr = "SINCE requires <unix seconds>"
+					break quarantineParse
+				}
+				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
+				if err != nil {
+					parseErr = "SINCE not an integer"
+					break quarantineParse
+				}
+				qreq.Since = v
+				i += 2
+			case "LIMIT":
+				if i+1 >= len(args) {
+					parseErr = "LIMIT requires <n>"
+					break quarantineParse
+				}
+				v, err := strconv.Atoi(unsafeString(args[i+1]))
+				if err != nil {
+					parseErr = "LIMIT not an integer"
+					break quarantineParse
+				}
+				qreq.Limit = v
+				i += 2
+			default:
+				parseErr = fmt.Sprintf("unexpected token %q (want SOURCE|SINCE|LIMIT)", unsafeString(args[i]))
+				break quarantineParse
+			}
+		}
+		if parseErr != "" {
+			buf.WriteError("ERR " + parseErr)
+			return
+		}
+		res, err := lvs.Quarantine(qreq, time.Now().Unix())
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if len(res.Docs) == 0 {
+			buf.WriteInt(0)
+			return
+		}
+		batch := make([]vector.BatchDoc, len(res.Docs))
+		for i, d := range res.Docs {
+			batch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
+		}
+		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Docs[0].ID, Value: vector.SerializeDocBatch(batch)})
+		buf.WriteInt(len(res.Docs))
 
 	case "VMEM.FORGET":
 		// VMEM.FORGET <scope> <id> — erasure: физически, из истории тоже
