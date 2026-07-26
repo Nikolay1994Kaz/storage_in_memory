@@ -73,9 +73,12 @@ func TestRememberKitchenDefaults(t *testing.T) {
 	if ms := ulidTimeMs(t, doc.ID); ms != now*1000 {
 		t.Errorf("время ULID = %d, ожидалось %d", ms, now*1000)
 	}
-	wantCat := map[string]string{vmemAttrScope: "user:dana"}
+	// source штампуется ВСЕГДА (явное "unknown"), в отличие от type/supersedes,
+	// которых при незаданности просто нет: отзыв по источнику обязан видеть
+	// факты, за которые никто не расписался.
+	wantCat := map[string]string{vmemAttrScope: "user:dana", vmemAttrSource: vmemSourceUnknown}
 	if !reflect.DeepEqual(doc.Attrs.Cat, wantCat) {
-		t.Errorf("Cat = %v, ожидалось %v (type/supersedes не заданы — ключей нет)", doc.Attrs.Cat, wantCat)
+		t.Errorf("Cat = %v, ожидалось %v (type/supersedes не заданы — ключей нет; source задан всегда)", doc.Attrs.Cat, wantCat)
 	}
 	wantNum := map[string]float64{
 		vmemAttrImp:       0.5,

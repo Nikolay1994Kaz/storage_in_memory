@@ -113,7 +113,10 @@ func TestSupersedeClosesInterval(t *testing.T) {
 			if !reflect.DeepEqual(cl.Terms, orig.Terms) {
 				t.Errorf("Closed.Terms=%v != термы цели %v (выемка из %s)", cl.Terms, orig.Terms, st.name)
 			}
-			wantAttrs := Attributes{Cat: map[string]string{vmemAttrScope: "user:a", vmemAttrType: "profile"}, Num: map[string]float64{}}
+			// source закрытой версии = source цели: провенанс обязан пережить
+			// закрытие интервала, иначе форензика теряет происхождение ровно
+			// у тех версий, ради которых её и открывают (что было до подмены).
+			wantAttrs := Attributes{Cat: map[string]string{vmemAttrScope: "user:a", vmemAttrType: "profile", vmemAttrSource: vmemSourceUnknown}, Num: map[string]float64{}}
 			for k, v := range orig.Attrs.Num {
 				wantAttrs.Num[k] = v
 			}

@@ -430,3 +430,58 @@ func TestExecVMEM_ServerTTLAndAnchor(t *testing.T) {
 		t.Fatalf("upsert без TTL обязан снять таймер якоря: %+v", v)
 	}
 }
+
+// TestExecVMEM_Provenance — провенанс через RESP: SOURCE едет в контракт,
+// фильтр RECALL отбирает по нему выборочно, необъявленный источник
+// первоклассно ищется как "unknown", и всё это переживает рестарт-реплей
+// (провенанс, не доживающий до перезапуска, форензике бесполезен).
+func TestExecVMEM_Provenance(t *testing.T) {
+	e1 := newExecEnv(t)
+	e1.wantBulk(e1.do("VMEM.REMEMBER", "s", "TEXT", "дедлайн проекта март", "ID", "f1", "SOURCE", "web-scraper"), "f1")
+	e1.wantBulk(e1.do("VMEM.REMEMBER", "s", "TEXT", "дедлайн проекта апрель", "ID", "f2", "SOURCE", "email-agent"), "f2")
+	e1.wantBulk(e1.do("VMEM.REMEMBER", "s", "TEXT", "дедлайн проекта май", "ID", "f3"), "f3")
+
+	recallIDs := func(e *execEnv, args ...string) []string {
+		v := e.do("VMEM.RECALL", args...)
+		if v.Typ != '*' {
+			t.Fatalf("RECALL не массив: %+v", v)
+		}
+		var ids []string
+		for i := 0; i < len(v.Array); i += 3 {
+			ids = append(ids, v.Array[i].Str)
+		}
+		slices.Sort(ids)
+		return ids
+	}
+	cases := []struct {
+		source string
+		want   []string
+	}{
+		{"web-scraper", []string{"f1"}},
+		{"email-agent", []string{"f2"}},
+		{"unknown", []string{"f3"}},
+	}
+	for _, tc := range cases {
+		if got := recallIDs(e1, "s", "10", "дедлайн", "SOURCE", tc.source); !slices.Equal(got, tc.want) {
+			t.Errorf("SOURCE=%s: %v, ожидалось %v", tc.source, got, tc.want)
+		}
+	}
+	// Без фильтра видны все три — фильтр отбирает, а не прячет.
+	if got := recallIDs(e1, "s", "10", "дедлайн"); len(got) != 3 {
+		t.Errorf("без SOURCE: %v, ожидались все три факта", got)
+	}
+	// SOURCE без значения — ошибка разбора, а не молчаливый пропуск фильтра.
+	e1.wantErrPrefix(e1.do("VMEM.RECALL", "s", "10", "дедлайн", "SOURCE"), "ERR SOURCE requires")
+	e1.wantErrPrefix(e1.do("VMEM.REMEMBER", "s", "TEXT", "факт", "SOURCE"), "ERR SOURCE requires")
+
+	if err := e1.bw.Close(); err != nil {
+		t.Fatalf("bw.Close: %v", err)
+	}
+	e2 := newExecEnv(t)
+	replayVMEMWAL(t, filepath.Join(e1.dir, "t.wal"), e2)
+	for _, tc := range cases {
+		if got := recallIDs(e2, "s", "10", "дедлайн", "SOURCE", tc.source); !slices.Equal(got, tc.want) {
+			t.Errorf("после реплея SOURCE=%s: %v, ожидалось %v — провенанс не пережил рестарт", tc.source, got, tc.want)
+		}
+	}
+}

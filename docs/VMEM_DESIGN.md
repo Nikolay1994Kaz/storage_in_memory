@@ -44,6 +44,7 @@ BM25 text layer, all of which already flow through WAL / snapshot / merge.
 | `valid_to` | true until | NUM attr | open interval = sentinel `2^53` (not "attr absent"), so `RANGE valid_to now +inf` needs no special case |
 | `expires_at` | TTL erasure deadline | NUM attr | **absolute** timestamp; client-relative `TTL=` is converted at ingest (see door 1) |
 | `supersedes` | provenance pointer to the replaced fact | CAT attr `supersedes` = old id | always recorded at contract level; the *mechanism* that closes the old fact's `valid_to` is step 4 and independent of this field |
+| `source` | where the fact came from (channel/tool/document) | CAT attr `source` | **always stamped**; omitted `SOURCE=` writes the literal `unknown` rather than leaving the attribute absent (see below). Filterable via `RECALL … SOURCE s` |
 | `vector` | semantic retrieval arm | `VEC`, optional | absent = step 0 of the embedding ladder: the fact lives BM25-only until (if ever) vectorized |
 
 ### Semantics pinned by the contract
@@ -62,6 +63,22 @@ BM25 text layer, all of which already flow through WAL / snapshot / merge.
 - Graceful degradation by construction: an unvectorized fact is invisible to
   the vector arm but found by the BM25 arm — hybrid gives step-0 tolerance for
   free.
+- **Undeclared provenance is a value, not a hole.** `source` is stamped on every
+  fact; when the client declares none, the literal `unknown` is written. The
+  reason is the operation provenance exists for — revoking by origin. An absent
+  attribute matches neither `Eq` nor `Range`, so a fact written without a
+  declared source would be invisible to a source-scoped revocation and would
+  silently survive it — precisely the failure this layer is meant to prevent.
+  Making it explicit turns "nobody vouched for this" into a first-class,
+  filterable class: `RECALL … SOURCE unknown` finds all of them.
+  - *Honesty boundary:* the stamp happens at ingest, so it describes facts
+    written **once provenance existed**. Facts written before this attribute was
+    introduced have no `source` column at all (physically absent), which is not
+    the same as `unknown` and must not be presented as it — the store observed
+    nothing about them. Distinguishing legacy from undeclared is itself
+    provenance. There is currently no predicate for "attribute absent"; if
+    mass-revoking legacy facts ever matters, that predicate is the missing
+    piece, not a relabelling of them into `unknown`.
 
 ## Doors (decisions that are expensive to reverse)
 

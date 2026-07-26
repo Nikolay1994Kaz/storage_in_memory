@@ -24,6 +24,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:6380", "адрес kvstore-server (RESP)")
 	auth := flag.String("auth", "", "пароль AUTH (если сервер поднят с -requirepass)")
 	scope := flag.String("default-scope", "default", "scope по умолчанию — идентичность агента; tool-аргумент scope переопределяет")
+	source := flag.String("source", "mcp", "провенанс фактов этого адаптера; задаётся при установке и НЕ переопределяется вызовом агента")
 	logLevel := flag.String("log-level", "info", "debug|info|warn|error (в stderr; stdout занят протоколом)")
 	flag.Parse()
 
@@ -40,13 +41,14 @@ func main() {
 	}
 	cfg := vmemmcp.Config{
 		DefaultScope: *scope,
+		Source:       *source,
 		StartHint: fmt.Sprintf(
 			"kvstore-server is unreachable at %s — start it (./kvstore-server --port %s, or: docker compose up -d) and retry",
 			*addr, hintPort),
 	}
 	be := vmemmcp.NewRESPClient(*addr, *auth)
 
-	log.Info("vmem-mcp up", "addr", *addr, "scope", *scope, "version", vmemmcp.Version)
+	log.Info("vmem-mcp up", "addr", *addr, "scope", *scope, "source", *source, "version", vmemmcp.Version)
 	if err := vmemmcp.Run(os.Stdin, os.Stdout, be, cfg, log); err != nil {
 		log.Error("session ended with error", "err", err)
 		os.Exit(1)

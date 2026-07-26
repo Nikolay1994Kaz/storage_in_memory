@@ -52,11 +52,28 @@ const (
 	vmemAttrScope      = "scope"
 	vmemAttrType       = "type"
 	vmemAttrSupersedes = "supersedes"
+	vmemAttrSource     = "source"
 	vmemAttrImp        = "imp"
 	vmemAttrValidFrom  = "valid_from"
 	vmemAttrValidTo    = "valid_to"
 	vmemAttrExpiresAt  = "expires_at"
 )
+
+// vmemSourceUnknown — источник факта, который клиент не объявил. Решение
+// (26.07): «неизвестно» пишется ЯВНЫМ значением, а не отсутствием атрибута.
+// Причина в том, ради чего провенанс вообще существует: отзыв по источнику.
+// Отсутствующий атрибут не выбирается ни Eq, ни Range — факт без объявленного
+// источника оказался бы невидим для массового отзыва и молча пережил бы
+// карантин, то есть ровно тот сценарий, от которого мы защищаем. Явное
+// значение делает «источник не объявлен» первоклассным, фильтруемым классом:
+// `SOURCE unknown` находит их все.
+//
+// ⚠Граница честности: значение штампуется на ингесте, поэтому оно относится к
+// фактам, записанным УЖЕ с провенансом. У фактов, записанных до появления
+// этого атрибута, колонка отсутствует физически (attrMissing) — это НЕ то же
+// самое, что unknown, и выдавать одно за другое нельзя: про них стор ничего не
+// наблюдал. Отличать легаси от необъявленного — само по себе провенанс.
+const vmemSourceUnknown = "unknown"
 
 var (
 	// ErrVMEMScope — scope обязателен: факт без владельца не имеет смысла
@@ -108,6 +125,7 @@ type RememberRequest struct {
 	ValidFrom  int64     // unix сек «истинно с»; 0 → серверный now (override — импорт старых логов)
 	TTL        int64     // секунд до erasure, относительный; 0 → без TTL
 	Supersedes string    // id заменяемого факта (провенанс; закрытие его интервала — шаг 4)
+	Source     string    // откуда факт (канал/инструмент/документ); "" → vmemSourceUnknown
 	Vector     []float32 // BYO-эмбеддинг; nil → ступень 0 (placeholder из id)
 }
 
@@ -172,8 +190,15 @@ func rememberDoc(req RememberRequest, now int64, dim int) (RememberedDoc, error)
 		return RememberedDoc{}, ErrVMEMSelfSupersedes
 	}
 
+	// Источник штампуется ВСЕГДА (см. vmemSourceUnknown): «не объявлен» — это
+	// значение, а не дырка. Иначе массовый отзыв по источнику пропускал бы
+	// ровно те факты, происхождение которых никто не подтверждал.
+	source := req.Source
+	if source == "" {
+		source = vmemSourceUnknown
+	}
 	attrs := Attributes{
-		Cat: map[string]string{vmemAttrScope: req.Scope},
+		Cat: map[string]string{vmemAttrScope: req.Scope, vmemAttrSource: source},
 		Num: map[string]float64{
 			vmemAttrImp:       imp,
 			vmemAttrValidFrom: float64(validFrom),
@@ -272,6 +297,11 @@ type RecallRequest struct {
 	AsOf   *int64    // история: валидность на момент ts вместо now (application time, не transaction time)
 	All    bool      // отключить фильтр валидности; erasure (TTL/FORGET) скрыт ВСЕГДА
 	TypeEq string    // опциональный фильтр вида факта
+	// SourceEq — опциональный фильтр по происхождению («что пришло из этого
+	// канала»). Идёт по той же полосе, что TypeEq: точный CAT-Eq, который
+	// колоночный слой судит батчем. Форензический вход: сначала посмотреть
+	// глазами на всё от подозрительного источника, потом отзывать.
+	SourceEq string
 	// HalfLifeSec — период полураспада свежести в секундах (шаг 5);
 	// 0 → vmemDefaultHalfLifeSec. Политика затухания принадлежит клиенту.
 	HalfLifeSec int64
@@ -316,6 +346,9 @@ func recallFilter(req RecallRequest, now int64) (Filter, error) {
 	}
 	if req.TypeEq != "" {
 		f.Eq[vmemAttrType] = req.TypeEq
+	}
+	if req.SourceEq != "" {
+		f.Eq[vmemAttrSource] = req.SourceEq
 	}
 	if !req.All {
 		tEff := now
@@ -454,6 +487,13 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	if req.TypeEq != "" {
 		typeOK = lvs.catEqForKeys(keys, vmemAttrType, req.TypeEq)
 	}
+	// SourceEq пере-судится по той же причине, что TypeEq: стейл-копия из
+	// старого сегмента могла пройти пре-фильтр по источнику, который свежайший
+	// upsert уже сменил.
+	var sourceOK []bool
+	if req.SourceEq != "" {
+		sourceOK = lvs.catEqForKeys(keys, vmemAttrSource, req.SourceEq)
+	}
 	kept := cands[:0]
 	for i := range cands {
 		vf, imp, vt, exp := nums[i][0], nums[i][1], nums[i][2], nums[i][3]
@@ -464,6 +504,9 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 			continue
 		}
 		if typeOK != nil && !typeOK[i] {
+			continue
+		}
+		if sourceOK != nil && !sourceOK[i] {
 			continue
 		}
 		if hybrid {

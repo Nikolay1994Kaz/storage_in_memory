@@ -44,6 +44,16 @@ Decisions:
   configured once at install time); a tool argument overrides per call. This
   keeps the common case zero-thought for the agent while allowing
   multi-profile setups.
+- **`source` is adapter-configured (`-source`) and deliberately absent from the
+  tool schema.** Provenance declared by the writing agent is worth exactly as
+  much as trust in that agent, and the whole point of this layer is to remain
+  useful in the case where the agent is already acting on injected
+  instructions — an attacker who can steer the agent must not be able to sign
+  their fact with someone else's origin. Left empty, the adapter sends no
+  `SOURCE` and the server stamps `unknown`; the adapter never invents an origin
+  it does not know. Agent-claimed sub-provenance ("this came from an email") is
+  genuinely useful information, but it belongs *beside* the trusted channel as
+  its own field, never instead of it.
 - **No vector argument in v1.** MCP hosts have no embeddings to pass; the
   product default is the embedding ladder's stage 0 (BM25-only). Adding an
   optional `vector` param later is additive — the door stays open at the RESP
@@ -70,7 +80,7 @@ dependency is not justified for four methods:
 - Unknown method with an id → `-32601`; malformed JSON → `-32700`.
 
 Flags: `-addr` (default `127.0.0.1:6380`), `-auth`, `-default-scope`
-(default `default`), `-log-level`. TLS: demand-driven door, same flags as
+(default `default`), `-source` (default `mcp`), `-log-level`. TLS: demand-driven door, same flags as
 other clients when it comes.
 
 ## Non-goals (v1)

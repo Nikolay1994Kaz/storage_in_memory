@@ -1708,7 +1708,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	// === VMEM — слой памяти агентов (шаг 7, docs/VMEM_DESIGN.md) ===
 	case "VMEM.REMEMBER":
 		// VMEM.REMEMBER <scope> TEXT <text> [ID <id>] [TYPE <t>] [IMPORTANCE <0..1>]
-		//   [VALIDFROM <unix>] [TTL <sec>] [SUPERSEDES <id>] [VEC <f1> ... <fN>]
+		//   [VALIDFROM <unix>] [TTL <sec>] [SUPERSEDES <id>] [SOURCE <s>] [VEC <f1> ... <fN>]
+		// SOURCE — происхождение факта; не задан → пишется явное "unknown"
+		// (см. vmemSourceUnknown): отзыв по источнику обязан видеть и те
+		// факты, за которые никто не расписался.
 		// Ответ: id факта (серверный ULID, если ID не задан). Вся
 		// недетерминированность (часы, ULID, placeholder-вектор) умирает в
 		// store.Remember ДО WAL (дверь 1) — журнал везёт материализованный
@@ -1721,7 +1724,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// сервером). Порядок в WAL: доки → текст (факт без текста деградирует
 		// мягче, чем сирота-текст копился бы без TTL).
 		if len(args) < 3 {
-			buf.WriteError("ERR usage: VMEM.REMEMBER <scope> TEXT <text> [ID id] [TYPE t] [IMPORTANCE 0..1] [VALIDFROM unix] [TTL sec] [SUPERSEDES id] [VEC v1 ... vN]")
+			buf.WriteError("ERR usage: VMEM.REMEMBER <scope> TEXT <text> [ID id] [TYPE t] [IMPORTANCE 0..1] [VALIDFROM unix] [TTL sec] [SUPERSEDES id] [SOURCE s] [VEC v1 ... vN]")
 			return
 		}
 		lvs, ok := vecStore.(*vector.LeveledVectorStore)
@@ -1800,6 +1803,13 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				}
 				req.Supersedes = string(args[i+1])
 				i += 2
+			case "SOURCE":
+				if i+1 >= len(args) {
+					parseErr = "SOURCE requires <source>"
+					break rememberParse
+				}
+				req.Source = string(args[i+1])
+				i += 2
 			case "VEC":
 				req.Vector = make([]float32, 0, len(args)-i-1)
 				for j := i + 1; j < len(args); j++ {
@@ -1812,7 +1822,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				}
 				break rememberParse
 			default:
-				parseErr = fmt.Sprintf("unexpected token %q (want TEXT|ID|TYPE|IMPORTANCE|VALIDFROM|TTL|SUPERSEDES|VEC)", unsafeString(args[i]))
+				parseErr = fmt.Sprintf("unexpected token %q (want TEXT|ID|TYPE|IMPORTANCE|VALIDFROM|TTL|SUPERSEDES|SOURCE|VEC)", unsafeString(args[i]))
 				break rememberParse
 			}
 		}
@@ -1858,7 +1868,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		buf.WriteBulkString(res.Doc.ID)
 
 	case "VMEM.RECALL":
-		// VMEM.RECALL <scope> <K> <query> [ASOF <unix> | ALL] [TYPE <t>] [HALFLIFE <sec>] [VEC <f1> ... <fN>]
+		// VMEM.RECALL <scope> <K> <query> [ASOF <unix> | ALL] [TYPE <t>] [SOURCE <s>] [HALFLIFE <sec>] [VEC <f1> ... <fN>]
 		// Ответ: тройки [id, score, text]. Скор = fused × 2^(−age/halfLife) ×
 		// (0.5+imp) — сравним только внутри выдачи. text — дословный якорь из
 		// KV (пустая строка, если якоря нет: не-VMEM док, попавший в scope).
@@ -1866,7 +1876,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// валидное-сейчас; ASOF ts — машина времени (сквозь supersession, но
 		// НЕ сквозь erasure); ALL — без суда интервалов.
 		if len(args) < 3 {
-			buf.WriteError("ERR usage: VMEM.RECALL <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [HALFLIFE sec] [VEC v1 ... vN]")
+			buf.WriteError("ERR usage: VMEM.RECALL <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [VEC v1 ... vN]")
 			return
 		}
 		lvs, ok := vecStore.(*vector.LeveledVectorStore)
@@ -1906,6 +1916,13 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				}
 				rreq.TypeEq = string(args[i+1])
 				i += 2
+			case "SOURCE":
+				if i+1 >= len(args) {
+					parseErr = "SOURCE requires <source>"
+					break recallParse
+				}
+				rreq.SourceEq = string(args[i+1])
+				i += 2
 			case "HALFLIFE":
 				if i+1 >= len(args) {
 					parseErr = "HALFLIFE requires <seconds>"
@@ -1930,7 +1947,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				}
 				break recallParse
 			default:
-				parseErr = fmt.Sprintf("unexpected token %q (want ASOF|ALL|TYPE|HALFLIFE|VEC)", unsafeString(args[i]))
+				parseErr = fmt.Sprintf("unexpected token %q (want ASOF|ALL|TYPE|SOURCE|HALFLIFE|VEC)", unsafeString(args[i]))
 				break recallParse
 			}
 		}

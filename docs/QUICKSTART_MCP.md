@@ -65,6 +65,13 @@ scopes. Give each project (or each agent identity) its own scope; a tool
 argument can override it per call. If the server runs with `-requirepass`,
 add `-auth <password>`.
 
+`-source` (default `mcp`) records the provenance of every fact this adapter
+writes — name it after the channel, e.g. `-source claude-code`. Unlike scope,
+it is **not** overridable by a tool argument: an agent that has been talked
+into writing a false fact must not also be able to choose which origin that
+fact is filed under. Later you can ask "what did this channel write?" with
+`VMEM.RECALL <scope> <k> <query> SOURCE claude-code`.
+
 ## 3. Try it
 
 In one session:

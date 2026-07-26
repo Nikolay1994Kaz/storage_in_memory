@@ -36,9 +36,14 @@ func (b *stubBackend) Do(args []protocol.Value) (protocol.Value, error) {
 // session прогоняет строки через Run и возвращает распарсенные ответы.
 func session(t *testing.T, be Backend, lines ...string) []map[string]any {
 	t.Helper()
+	return sessionCfg(t, be, Config{DefaultScope: "agent", StartHint: "start the server"}, lines...)
+}
+
+// sessionCfg — session с явной конфигурацией адаптера (провенанс, scope).
+func sessionCfg(t *testing.T, be Backend, cfg Config, lines ...string) []map[string]any {
+	t.Helper()
 	in := strings.NewReader(strings.Join(lines, "\n") + "\n")
 	var out bytes.Buffer
-	cfg := Config{DefaultScope: "agent", StartHint: "start the server"}
 	if err := Run(in, &out, be, cfg, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -255,5 +260,39 @@ func TestToolErrors(t *testing.T) {
 				t.Errorf("error %q must contain %q", text, tc.want)
 			}
 		})
+	}
+}
+
+// Провенанс адаптера: SOURCE берётся из конфигурации и НЕ управляется агентом.
+// Оба свойства проверяются вместе, потому что смысл только в паре: источник
+// проставлен, и подсунутый в аргументы вызова "source" его не подменил.
+func TestRememberSourceFromConfigNotArguments(t *testing.T) {
+	be := &stubBackend{reply: map[string]protocol.Value{
+		"VMEM.REMEMBER": {Typ: '$', Str: "01ABC"},
+	}}
+	cfg := Config{DefaultScope: "agent", Source: "claude-code", StartHint: "start the server"}
+	resps := sessionCfg(t, be, cfg,
+		rpc(1, "tools/call", `{"name":"memory_remember","arguments":{"text":"prefers Go","source":"trusted-admin"}}`),
+	)
+	if text, isErr := toolText(t, resps[0]); isErr {
+		t.Fatalf("unexpected isError: %s", text)
+	}
+	want := []string{"VMEM.REMEMBER", "agent", "TEXT", "prefers Go", "SOURCE", "claude-code"}
+	if fmt.Sprint(be.got[0]) != fmt.Sprint(want) {
+		t.Errorf("провенанс управляем агентом либо не проставлен:\n got %v\nwant %v", be.got[0], want)
+	}
+}
+
+// Пустой Source в конфиге → SOURCE не передаётся, штамп "unknown" ставит сервер
+// (адаптер не выдумывает происхождение за него).
+func TestRememberNoSourceWhenUnconfigured(t *testing.T) {
+	be := &stubBackend{reply: map[string]protocol.Value{
+		"VMEM.REMEMBER": {Typ: '$', Str: "01ABC"},
+	}}
+	session(t, be, rpc(1, "tools/call", `{"name":"memory_remember","arguments":{"text":"prefers Go"}}`))
+	for _, a := range be.got[0] {
+		if a == "SOURCE" {
+			t.Fatalf("SOURCE передан без настройки: %v", be.got[0])
+		}
 	}
 }
