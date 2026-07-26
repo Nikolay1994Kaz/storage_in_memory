@@ -71,6 +71,12 @@ BM25 text layer, all of which already flow through WAL / snapshot / merge.
     missing value is explicit `NaN`) rather than by a pre-filter `RANGE`, and
     leaving it absent means facts written before the feature existed keep
     reading normally — an upgrade must not hide data the user already stored.
+- **The three are measured against each other, not asserted.**
+  `scripts/poison_recovery.sh` replays one incident (legitimate work → a fact
+  planted from an untrusted channel → more legitimate work → detection) and
+  recovers from it twice on identical data: whole-store rollback vs revocation
+  by origin. The number that separates them is **collateral loss** — how much
+  legitimate work written *after* the poison did not survive the recovery.
 - **Three answers to "the memory is wrong", each with its own reach.** They are
   not alternatives to pick one of — an incident normally uses all three:
   `VMEM.QUARANTINE` revokes a belief selectively and reversibly and keeps the
