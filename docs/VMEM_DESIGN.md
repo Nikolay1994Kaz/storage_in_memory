@@ -71,6 +71,14 @@ BM25 text layer, all of which already flow through WAL / snapshot / merge.
     missing value is explicit `NaN`) rather than by a pre-filter `RANGE`, and
     leaving it absent means facts written before the feature existed keep
     reading normally — an upgrade must not hide data the user already stored.
+- **Three answers to "the memory is wrong", each with its own reach.** They are
+  not alternatives to pick one of — an incident normally uses all three:
+  `VMEM.QUARANTINE` revokes a belief selectively and reversibly and keeps the
+  record; `VMEM.FORGET` erases irreversibly, history included; point-in-time
+  restore (`-restore-to-lsn`, see `BACKUP.md`) reproduces the whole store as of
+  a moment, read-only, without touching the data directory. Restore is the
+  coarse one — it rewinds *everything*, which is exactly why it is a forensic
+  backstop and not the repair tool. The repair tool is quarantine.
 - **Two kinds of forgetting, never conflated**:
   - *supersession* (step 4): the fact is no longer true **now**, but history
     stays queryable — this is what buys temporality;

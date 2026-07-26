@@ -54,6 +54,20 @@ var version = "dev"
 
 var globalTxMu sync.Mutex
 
+// restoreLSN — режим форензического восстановления на момент (0 = выключен).
+// Выставляется один раз в main до приёма трафика и дальше только читается.
+//
+// Смысл режима: поднять состояние, каким оно было ПОСЛЕ записи с этим LSN, и
+// дать по нему походить обычными командами чтения — «что агент знал в тот
+// момент». Два свойства делают его пригодным для форензики, и оба обязательны:
+//   - запись запрещена целиком (не «по возможности»): восстановленный узел,
+//     принявший хоть одну запись, порождает вторую историю, и дальше уже
+//     неизвестно, какая из них настоящая;
+//   - каталог данных не изменяется вовсе — всё, что процесс пишет (новый WAL,
+//     снапшоты), уводится во временный каталог. Восстановление, способное
+//     испортить оригинал, в расследовании бесполезно.
+var restoreLSN uint64
+
 func unsafeString(b []byte) string {
 	if len(b) == 0 {
 		return ""
@@ -112,13 +126,24 @@ func main() {
 	logFormat := flag.String("log-format", "text", "формат логов: text (человекочитаемый) | json (для агрегаторов)")
 	enablePprof := flag.Bool("pprof", false, "включить /debug/pprof/* на metrics-порту для диагностики утечек/профилирования (НЕ для прода)")
 	dataDirFlag := flag.String("data-dir", "data", "каталог для WAL и снапшотов (относительный путь считается от рабочего каталога)")
+	restoreToLSN := flag.Uint64("restore-to-lsn", 0, "форензическое восстановление на момент: поднять состояние, каким оно было после записи с этим LSN, и обслуживать ТОЛЬКО чтение (0 = обычный старт). Каталог данных не изменяется")
+	walInspect := flag.Bool("wal-inspect", false, "напечатать журнал (LSN, операция, ключ) и выйти — как найти LSN для -restore-to-lsn")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
 	flag.Parse()
 
 	dataDir = *dataDirFlag
+	restoreLSN = *restoreToLSN
 
 	if *showVersion {
 		fmt.Println(version)
+		os.Exit(0)
+	}
+
+	if *walInspect {
+		if err := inspectWAL(dataDir, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "wal-inspect: %v\n", err)
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -171,6 +196,20 @@ func main() {
 	}
 
 	os.MkdirAll(dataDir, 0755)
+
+	// outDir — куда пишет ЭТОТ процесс. В обычном режиме = dataDir; в режиме
+	// восстановления на момент — временный каталог, поэтому оригинал остаётся
+	// нетронутым (см. restore.go): расследование не должно уметь испортить
+	// вещдок, по которому ведётся.
+	outDir, cleanupOutDir, err := restoreOutDir(dataDir)
+	if err != nil {
+		logging.Fatalf("failed to prepare restore workspace: %v", err)
+	}
+	defer cleanupOutDir()
+	if restoreLSN > 0 {
+		slog.Warn("point-in-time restore mode: read-only, data directory is not modified",
+			"restore_to_lsn", restoreLSN, "data_dir", dataDir, "scratch_dir", outDir)
+	}
 
 	// === WAL-shipping: remote + restore (до загрузки снапшотов/реплея) ===
 	// Remote открываем ДО recovery: битый -ship-url должен уронить процесс
@@ -302,6 +341,12 @@ func main() {
 		logging.Fatalf("failed to read snapshot.wal: %v", err)
 	}
 	bumpLSN(snapWatermark) // watermark: snapshot покрывает состояние до этого LSN
+
+	// Цель восстановления обязана быть достижима честно — иначе отказ с
+	// названным самым ранним LSN, а не молча «почти то состояние».
+	if err := checkRestoreReachable(vecWatermark, snapWatermark); err != nil {
+		logging.Fatalf("%v", err)
+	}
 
 	applyEntry := func(entry wal.Entry, isFromSnapshot bool) {
 		switch entry.Op {
@@ -445,6 +490,12 @@ func main() {
 			logging.Fatalf("failed to read WAL log %s: %v", path, err)
 		}
 		for _, entry := range logEntries {
+			// Условие остановки восстановления на момент: всё, что случилось
+			// ПОЗЖЕ цели, просто не применяется. Журнал append-only, поэтому
+			// «отмотать» — это перестать читать, а не откатывать назад.
+			if restoreLSN > 0 && entry.LSN > restoreLSN {
+				continue
+			}
 			bumpLSN(entry.LSN)
 			applyEntry(entry, false)
 		}
@@ -455,7 +506,7 @@ func main() {
 	}
 
 	// === 3. WAL ===
-	walPath := filepath.Join(dataDir, fmt.Sprintf("wal_%s.log", time.Now().Format("20060102_150405")))
+	walPath := filepath.Join(outDir, fmt.Sprintf("wal_%s.log", time.Now().Format("20060102_150405")))
 	rawWAL, err := wal.Open(walPath)
 	if err != nil {
 		logging.Fatalf("failed to open WAL: %v", err)
@@ -498,7 +549,7 @@ func main() {
 			lvs.SetSnapshotWatermark(rawWAL.LastLSN())
 			lvs.FlushDeltaSync()
 		}
-		graphPath := filepath.Join(dataDir, "graph_leveled.bin")
+		graphPath := filepath.Join(outDir, "graph_leveled.bin")
 		tmpPath := graphPath + ".tmp"
 		f, err := os.Create(tmpPath)
 		if err != nil {
@@ -526,10 +577,10 @@ func main() {
 		}
 		// fsync каталога: делаем rename graph_leveled.bin durable (иначе power-loss
 		// откатит замену снапшота при уже удалённых старых WAL).
-		return wal.FsyncDir(dataDir)
+		return wal.FsyncDir(outDir)
 	}
 
-	syncer := wal.NewSyncer(rawWAL, syncInterval, dataDir, iterateAll, saveVectors)
+	syncer := wal.NewSyncer(rawWAL, syncInterval, outDir, iterateAll, saveVectors)
 	// syncer.Stop() вызывается явно в упорядоченном shutdown перед bw.Close().
 
 	// === 4.5. WAL-shipping (continuous, async) ===
@@ -538,7 +589,9 @@ func main() {
 	// это внешняя durability с RPO ≈ ship-interval, наблюдаемая через метрики
 	// kvstore_ship_* (за отставанием обязан следить алёрт).
 	var shipper *ship.Shipper
-	if shipRemote != nil {
+	// В режиме восстановления шиппер молчит: отправить форензическую копию
+	// в тот же remote значило бы затереть настоящую резервную историю.
+	if shipRemote != nil && restoreLSN == 0 {
 		shipper = ship.New(shipRemote, dataDir, ship.Options{
 			Interval:        *shipInterval,
 			RetainManifests: *shipRetain,
@@ -1118,6 +1171,14 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	// полном диске нельзя записать даже удаление. Чтение остаётся доступным,
 	// чтобы клиенты могли снять данные. Аналог Redis stop-writes-on-bgsave-error:
 	// лучше явная ошибка, чем тихая потеря уже подтверждённой записи.
+	// Восстановленный на момент узел — вещдок, а не рабочая база. Любая запись
+	// породила бы вторую историю, и дальше уже не отличить её от настоящей;
+	// COMPACT отдельно, потому что он не «мутация состояния», а перезапись
+	// снапшотов в КАТАЛОГЕ ДАННЫХ — то есть порча оригинала.
+	if restoreLSN > 0 && (isWriteCmd(cmd) || cmd == "COMPACT") {
+		buf.WriteError(fmt.Sprintf("READONLY point-in-time restore to LSN %d serves reads only", restoreLSN))
+		return
+	}
 	if isWriteCmd(cmd) {
 		if err := bw.Failed(); err != nil {
 			monitoring.WalFailStop.Inc()
