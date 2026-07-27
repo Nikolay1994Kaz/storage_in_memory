@@ -1,5 +1,6 @@
 # Binaries
 kvstore-server
+vmem-mcp
 kvstore/kvstore
 kvstore-stress
 *.test
