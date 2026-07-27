@@ -111,6 +111,7 @@ RESP on a 2019 laptop.
 ## Features
 
 - **VMEM agent memory** — `VMEM.REMEMBER` / `VMEM.RECALL` / `VMEM.FORGET`: validity intervals + supersession history (`ASOF` time travel), TTL + hard erasure, recency×importance recall over BM25 or hybrid; verbatim KV anchors; MCP adapter `vmem-mcp` (Linux/macOS/Windows) for Claude Code/Desktop and any MCP host
+- **Recovery after memory corruption** — `SOURCE` provenance on every fact, `VMEM.EXPLAIN` (which facts produced this answer, from which origins, and what dropped the rest), `VMEM.QUARANTINE` (revoke one origin, keep the fact as evidence), `VMEM.COVERAGE` + `VMEM.BACKFILL` (measure and repair provenance coverage), and point-in-time `-restore-to-lsn`; measured against the real OWASP Agent Memory Guard, reproducible with one `docker compose` command
 - **BM25 full-text + hybrid** — `VSIM.SEARCHTEXT` / `VSIM.HYBRID` (RRF fusion), embedder-free known-item search, query-side common-term pruning, attribute filters on both
 - **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization; non-blocking bulk ingest (per-shard delta freeze + batched LSM merges)
 - **AI / RAG** *(optional, off by default)* — Ollama embeddings, async ingestion, semantic queries (`AI.INGEST` / `AI.ASK`); the engine itself is BYO-embeddings
@@ -388,9 +389,9 @@ kvstore/
 │   └── vmemmcp/          # MCP adapter logic (JSON-RPC loop, tool mapping)
 ├── vector/               # HNSW graph, SQ8, BM25 text index, VMEM layer, tenant/attr filtering
 └── examples/             # WASM module examples
-docs/                     # Command manifest, backup guide, benchmarks
+docs/                     # Command manifest, VMEM design, MCP quickstart, backup, benchmarks, format compat
 monitoring/               # Grafana/VictoriaMetrics provisioning for the local stack
-scripts/                  # Soak-test harness
+scripts/                  # Soak-test harness, memory-poisoning recovery comparison, live agent demo
 ```
 
 ## Commercial use
