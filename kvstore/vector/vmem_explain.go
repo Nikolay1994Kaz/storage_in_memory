@@ -218,11 +218,11 @@ func (lvs *LeveledVectorStore) Explain(req RecallRequest, now int64) (ExplainRes
 			Key: k, Rank: rank[k],
 			TextRank: tr.textRank[k], VecRank: tr.vecRank[k],
 			Base: tr.base[i], Final: tr.final[i], Drop: tr.drops[i],
-			ImpMul:    vmemImpFactor(imp),
-			Source:    sources[i], Type: types[i],
+			ImpMul: vmemImpFactor(imp),
+			Source: sources[i], Type: types[i],
 			ValidFrom: vf, ValidTo: tr.nums[i][2],
 			ExpiresAt: tr.nums[i][3], QuarantinedAt: tr.nums[i][4],
-			AgeSec:    math.NaN(),
+			AgeSec: math.NaN(),
 		}
 		// Возраст и его цена. Обе величины считаются теми же формулами, что в
 		// боевом пути (vmemRankLambda / vmemDecayImp), но здесь они РАЗЛОЖЕНЫ:
