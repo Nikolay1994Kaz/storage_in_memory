@@ -50,6 +50,59 @@ semantics in [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md)):
 - **Verbatim anchor.** Recall returns the original stored text, never a lossy
   rewrite; every derived structure is recomputable from the anchors.
 
+### Recovery after memory corruption
+
+Prevention has a ceiling: a plausible false statement arriving from a
+compromised channel is, at write time, indistinguishable from a new fact —
+both are simply a contradiction with the past. So the interesting question is
+not "can it be blocked" but "what does it cost to undo once it is in". These
+four primitives answer that:
+
+- **Provenance** (`SOURCE`) — every fact records where it came from. In the
+  MCP adapter the *adapter* stamps it, never the agent: an attacker who can
+  influence the agent must not be able to sign a fact with someone else's
+  origin.
+- **Localisation** (`VMEM.EXPLAIN`) — corruption shows up as a wrong *answer*,
+  while revocation works on *provenance*. `EXPLAIN` decomposes the ranking of
+  a query — which facts produced this answer, from which sources, and which
+  axis dropped the ones that are missing. It does not recompute the score: the
+  trace comes from the live recall path, so the explanation cannot drift from
+  the ranking it explains.
+- **Selective revocation** (`VMEM.QUARANTINE`) — revoke everything one origin
+  wrote. The facts stay: `ASOF` before the revocation still returns them (what
+  the agent believed is evidence, not noise), `ALL` always does.
+- **Point-in-time restore** (`-restore-to-lsn`) — raise the whole store as of
+  a past LSN, read-only, without touching the data directory.
+
+Measured on one incident, same data, four strategies — two of them executed by
+the real [OWASP Agent Memory Guard](https://owasp.org/www-project-agent-memory-guard/)
+(`scripts/poison_recovery_compare.py`; `docker compose -f docker-compose.recovery.yml run --rm recovery`):
+
+| | Guard `rollback()` | Guard `retire_if()` | our `-restore-to-lsn` | our `QUARANTINE` |
+|---|---|---|---|---|
+| lie no longer served | yes | yes | yes | yes |
+| lawful facts written **after** the poison | **0/4** | **4/4** | **0/4** | **4/4** |
+| revoked fact still queryable as evidence | no | no | no | **yes** |
+| `ASOF` before the revocation returns it | no | no | no | **yes** |
+
+Read the second row as an argument about *axes*, not effort: rolling back a
+linear log cannot separate a lie from the truth written next to it, because on
+that axis the distinction does not exist. Both whole-store rollbacks land on
+the same number, in two independent implementations. The third and fourth rows
+are what actually remains ours — a layer that owns no storage can delete
+selectively (Guard's `retire_if` does, and it loses nothing), but it cannot
+keep the revoked fact as queryable evidence, and it has no time axis to answer
+"what did the agent believe at 14:32".
+
+**Honesty about coverage.** Revocation selects by origin, so it is worth
+measuring how many facts *have* one — `VMEM.COVERAGE` reports exactly that.
+On our own oldest store the answer is **0%**: those facts were written before
+provenance existed, carry no `source` column at all, and mass revocation would
+therefore match nothing. Facts written since always carry a source (`unknown`
+at minimum, which *is* selectable). There is no "attribute is absent"
+predicate yet, so legacy data cannot be revoked in bulk — a known gap, not a
+detail we would rather you did not notice.
+
 Measured (reproducible canon, §7): known-item hit@1 **0.982** / MRR **0.991**;
 temporal accuracy (`ASOF`, supersession chains) **1.000**; scope isolation
 **0 violations**; end-to-end `RECALL` p99 **0.29 ms** at **64 426 QPS** over
@@ -339,6 +392,16 @@ docs/                     # Command manifest, backup guide, benchmarks
 monitoring/               # Grafana/VictoriaMetrics provisioning for the local stack
 scripts/                  # Soak-test harness
 ```
+
+## Commercial use
+
+MIT — use it in a commercial product without asking. If you need something the
+licence does not cover — support with a response time, an integration built to
+your requirements, an answer to a procurement questionnaire (data residency,
+provable erasure, "what did the agent know at time T"), a deployment in a
+closed network, or terms other than MIT — write to
+dubovoinikolai@gmail.com. The copyright is held by one person, so dual
+licensing is a conversation, not a legal project.
 
 ## License
 

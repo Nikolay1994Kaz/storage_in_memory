@@ -1,0 +1,29 @@
+# Воспроизведение сравнения стратегий восстановления после порчи памяти —
+# одним образом, без установки Go, Python и redis-cli на машину читателя.
+#
+# Условие, которое мы записали себе заранее и обязаны выполнить: «одна команда
+# → та же таблица». Без него сравнение с чужим проектом — рассказ, а не
+# результат: проверить его никто не может, а значит и спорить не с чем.
+#
+# Версия agent-memory-guard ЗАКРЕПЛЕНА. Сравнение с чужим кодом, плывущее от
+# прогона к прогону, ничего не доказывает; когда выйдет новая — цифры
+# перемеряются осознанно, а не втихую.
+FROM golang:1.25-bookworm AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY kvstore/ kvstore/
+RUN CGO_ENABLED=0 go build -o /kvstore-server ./kvstore/cmd/kvstore/
+
+FROM python:3.12-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends redis-tools \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir agent-memory-guard==0.3.0
+
+WORKDIR /app
+COPY --from=builder /kvstore-server ./kvstore-server
+COPY scripts/poison_recovery_compare.py scripts/poison_recovery.sh scripts/
+
+ENV BIN=/app/kvstore-server
+CMD ["python", "scripts/poison_recovery_compare.py"]

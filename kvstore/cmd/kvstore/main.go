@@ -2143,6 +2143,53 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 		}
 
+	case "VMEM.COVERAGE":
+		// VMEM.COVERAGE [scope]
+		// Покрытие провенансом: доля фактов с объявленным источником. Метрика
+		// честности механизма отзыва — карантин отбирает ПО ИСТОЧНИКУ, и если
+		// источник объявлен у меньшинства, восстановление декоративно.
+		//
+		// Три состояния источника, из которых предикатами доступны два:
+		// конкретное значение, литеральный unknown и — главное — ОТСУТСТВИЕ
+		// атрибута у фактов, записанных до провенанса. Последнее не выражается
+		// никаким Eq (пустота нефильтруема) и потому не видно массовому
+		// отзыву; доля таких фактов и есть слепое пятно, ради которого команда
+		// существует. Ответ: по записи на scope, поля
+		// scope/total/declared/unknown/absent/revocable_share + разбивка
+		// source:<имя>. Стоит полного скана — операция админская.
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR vmem not supported by this vector store")
+			return
+		}
+		reports := lvs.ProvenanceCoverage(arg(args, 0))
+		buf.WriteArrayHeader(len(reports))
+		for _, rep := range reports {
+			fields := [][2]string{
+				{"scope", rep.Scope},
+				{"total", strconv.Itoa(rep.Total)},
+				{"declared", strconv.Itoa(rep.Total - rep.BySource["unknown"] - rep.BySource[""])},
+				{"unknown", strconv.Itoa(rep.BySource["unknown"])},
+				{"absent", strconv.Itoa(rep.BySource[""])},
+				{"declared_share", fmt.Sprintf("%.4f", rep.Declared())},
+				{"revocable_share", fmt.Sprintf("%.4f", rep.Revocable())},
+			}
+			for src, n := range rep.BySource {
+				if src == "" || src == "unknown" {
+					continue
+				}
+				fields = append(fields, [2]string{"source:" + src, strconv.Itoa(n)})
+			}
+			sort.Slice(fields[7:], func(i, j int) bool { // разбивка в стабильном порядке
+				return fields[7+i][0] < fields[7+j][0]
+			})
+			buf.WriteArrayHeader(len(fields) * 2)
+			for _, kv := range fields {
+				buf.WriteBulkString(kv[0])
+				buf.WriteBulkString(kv[1])
+			}
+		}
+
 	case "VMEM.QUARANTINE":
 		// VMEM.QUARANTINE <scope> SOURCE <s> [SINCE <unix>] [LIMIT <n>]
 		// Массовый отзыв убеждений по происхождению: факты остаются в сторе

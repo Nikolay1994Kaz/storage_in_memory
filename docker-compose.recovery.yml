@@ -1,0 +1,18 @@
+# Одна команда — та же таблица:
+#
+#   docker compose -f docker-compose.recovery.yml run --rm recovery
+#
+# Внутри: наш движок против настоящего OWASP Agent Memory Guard 0.3.0 на одном
+# инциденте порчи памяти, четыре стратегии восстановления, одни данные.
+# Ничего наружу не слушает и никуда не ходит: RESP поднимается на localhost
+# внутри контейнера и умирает вместе с ним.
+#
+# Живое демо с настоящим агентом (scripts/poison_recovery_live.sh) сюда НЕ
+# входит осознанно: ему нужен claude CLI с твоими учётными данными, и оно
+# недетерминировано по построению — это запись демонстрации, а не измерение.
+services:
+  recovery:
+    build:
+      context: .
+      dockerfile: Dockerfile.recovery
+    init: true
