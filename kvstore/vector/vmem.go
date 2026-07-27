@@ -384,6 +384,16 @@ func recallFilter(req RecallRequest, now int64) (Filter, error) {
 // плоская против decay» из шага 5 ПОДТВЕРДИЛСЯ бенчем (hit@10 >90d = 0.003)
 // и закрыт ранговым штрафом: возраст платит там же, где живёт скор.
 func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResult, error) {
+	return lvs.recall(req, now, nil)
+}
+
+// recall — ОБЩЕЕ ядро RECALL и EXPLAIN. tr != nil → по дороге собирается
+// разложение скора (vmem_explain.go). Отдельной реализации объяснения здесь
+// быть не должно принципиально: объяснение, живущее своей функцией,
+// расходится с настоящим ранжированием ровно тогда, когда им пользуются — в
+// разборе инцидента, где цена ошибки максимальна. Поэтому EXPLAIN не
+// «повторяет» скоринг, а смотрит, как считает он сам.
+func (lvs *LeveledVectorStore) recall(req RecallRequest, now int64, tr *recallTrace) ([]VTextResult, error) {
 	f, err := recallFilter(req, now)
 	if err != nil {
 		return nil, err
@@ -454,7 +464,6 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	// колонки в общей проекции. NaN expires_at → свежайшая версия не
 	// VMEM-факт (upsert заменил факт не-фактом) → кандидат стейл, вон.
 	nums := lvs.numsForKeys(keys, vmemAttrValidFrom, vmemAttrImp, vmemAttrValidTo, vmemAttrExpiresAt, vmemAttrQuarantinedAt)
-
 	if hybrid {
 		// Слияние в ранговой шкале с возрастным штрафом: 1/(rrfK + rank + λ·hl),
 		// hl = возраст в полураспадах на момент tEff. NaN valid_from (не-VMEM
@@ -483,6 +492,11 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 		}
 	}
 
+	// Снимок ДО множителей памяти: дальше цикл домножает cands[i].Score на
+	// месте и переиспользует тот же массив под kept (cands[:0]), так что после
+	// него исходных скоров уже не существует.
+	tr.begin(keys, nums, cands, textArm, vecArm, hybrid, tEff, halfLife)
+
 	var typeOK []bool
 	if req.TypeEq != "" {
 		typeOK = lvs.catEqForKeys(keys, vmemAttrType, req.TypeEq)
@@ -498,9 +512,11 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	for i := range cands {
 		vf, imp, vt, exp, quar := nums[i][0], nums[i][1], nums[i][2], nums[i][3], nums[i][4]
 		if !(exp > float64(now)) { // erasure против now во ВСЕХ режимах; NaN → false
+			tr.drop(i, DropErasure)
 			continue
 		}
 		if !req.All && !(vf <= float64(tEff) && float64(tEff) < vt) {
+			tr.drop(i, DropValidity)
 			continue
 		}
 		// Карантин — ТРЕТЬЯ ось, отдельная и от валидности, и от erasure:
@@ -513,12 +529,15 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 		// случай, и он не требует ни штампа, ни миграции старых данных.
 		// ALL показывает всё: это форензический режим.
 		if !req.All && !math.IsNaN(quar) && float64(tEff) >= quar {
+			tr.drop(i, DropQuarantine)
 			continue
 		}
 		if typeOK != nil && !typeOK[i] {
+			tr.drop(i, DropType)
 			continue
 		}
 		if sourceOK != nil && !sourceOK[i] {
+			tr.drop(i, DropSource)
 			continue
 		}
 		if hybrid {
@@ -526,6 +545,7 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 		} else {
 			cands[i].Score *= vmemDecayImp(vf, imp, tEff, halfLife)
 		}
+		tr.keep(i, cands[i].Score)
 		kept = append(kept, cands[i])
 	}
 	cands = kept
@@ -541,6 +561,7 @@ func (lvs *LeveledVectorStore) Recall(req RecallRequest, now int64) ([]VTextResu
 	if len(cands) > req.K {
 		cands = cands[:req.K]
 	}
+	tr.finish(cands)
 	return cands, nil
 }
 

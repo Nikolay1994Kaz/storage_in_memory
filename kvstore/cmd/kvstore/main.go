@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -1142,6 +1143,76 @@ func parseAttrFilter(args [][]byte, start int) (vector.Filter, int, string) {
 	return f, i, ""
 }
 
+// parseRecallArgs — ОБЩИЙ разбор аргументов VMEM.RECALL и VMEM.EXPLAIN.
+// Общий сознательно: EXPLAIN обязан отвечать про ТОТ ЖЕ запрос, что задают
+// RECALL, а разъехавшийся разбор модификаторов даёт объяснение чужого запроса
+// — худший вид неправды в разборе инцидента (то же соображение, что заставило
+// EXPLAIN жить внутри Recall, а не рядом). Возвращает текст ошибки без
+// префикса ERR; пустой — разбор удался.
+func parseRecallArgs(args [][]byte) (vector.RecallRequest, string) {
+	var rreq vector.RecallRequest
+	if len(args) < 3 {
+		return rreq, "usage"
+	}
+	K, err := strconv.Atoi(unsafeString(args[1]))
+	if err != nil || K <= 0 || K > vector.MaxSearchK {
+		return rreq, "invalid K (must be 1..100000)"
+	}
+	rreq = vector.RecallRequest{Scope: string(args[0]), K: K, Query: string(args[2])}
+	for i := 3; i < len(args); {
+		switch strings.ToUpper(string(args[i])) {
+		case "ASOF":
+			if i+1 >= len(args) {
+				return rreq, "ASOF requires <unix seconds>"
+			}
+			v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
+			if err != nil {
+				return rreq, "ASOF not an integer"
+			}
+			rreq.AsOf = &v
+			i += 2
+		case "ALL":
+			rreq.All = true
+			i++
+		case "TYPE":
+			if i+1 >= len(args) {
+				return rreq, "TYPE requires <type>"
+			}
+			rreq.TypeEq = string(args[i+1])
+			i += 2
+		case "SOURCE":
+			if i+1 >= len(args) {
+				return rreq, "SOURCE requires <source>"
+			}
+			rreq.SourceEq = string(args[i+1])
+			i += 2
+		case "HALFLIFE":
+			if i+1 >= len(args) {
+				return rreq, "HALFLIFE requires <seconds>"
+			}
+			v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
+			if err != nil {
+				return rreq, "HALFLIFE not an integer"
+			}
+			rreq.HalfLifeSec = v
+			i += 2
+		case "VEC":
+			rreq.Vector = make([]float32, 0, len(args)-i-1)
+			for j := i + 1; j < len(args); j++ {
+				f, err := strconv.ParseFloat(unsafeString(args[j]), 32)
+				if err != nil {
+					return rreq, fmt.Sprintf("invalid float %q", unsafeString(args[j]))
+				}
+				rreq.Vector = append(rreq.Vector, float32(f))
+			}
+			return rreq, ""
+		default:
+			return rreq, fmt.Sprintf("unexpected token %q (want ASOF|ALL|TYPE|SOURCE|HALFLIFE|VEC)", unsafeString(args[i]))
+		}
+	}
+	return rreq, ""
+}
+
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
 	hub *pubsub.Hub, cl clusterNode, wasm computeRuntime,
 	vecStore vector.VectorIndex,
@@ -1936,81 +2007,15 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// Без VEC — осознанная деградация в BM25-only (ступень 0). Дефолт =
 		// валидное-сейчас; ASOF ts — машина времени (сквозь supersession, но
 		// НЕ сквозь erasure); ALL — без суда интервалов.
-		if len(args) < 3 {
-			buf.WriteError("ERR usage: VMEM.RECALL <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [VEC v1 ... vN]")
-			return
-		}
 		lvs, ok := vecStore.(*vector.LeveledVectorStore)
 		if !ok {
 			buf.WriteError("ERR vmem not supported by this vector store")
 			return
 		}
-		K, err := strconv.Atoi(unsafeString(args[1]))
-		if err != nil || K <= 0 || K > vector.MaxSearchK {
-			buf.WriteError("ERR invalid K (must be 1..100000)")
+		rreq, parseErr := parseRecallArgs(args)
+		if parseErr == "usage" {
+			buf.WriteError("ERR usage: VMEM.RECALL <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [VEC v1 ... vN]")
 			return
-		}
-		rreq := vector.RecallRequest{Scope: string(args[0]), K: K, Query: string(args[2])}
-		parseErr := ""
-	recallParse:
-		for i := 3; i < len(args); {
-			switch strings.ToUpper(string(args[i])) {
-			case "ASOF":
-				if i+1 >= len(args) {
-					parseErr = "ASOF requires <unix seconds>"
-					break recallParse
-				}
-				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
-				if err != nil {
-					parseErr = "ASOF not an integer"
-					break recallParse
-				}
-				rreq.AsOf = &v
-				i += 2
-			case "ALL":
-				rreq.All = true
-				i++
-			case "TYPE":
-				if i+1 >= len(args) {
-					parseErr = "TYPE requires <type>"
-					break recallParse
-				}
-				rreq.TypeEq = string(args[i+1])
-				i += 2
-			case "SOURCE":
-				if i+1 >= len(args) {
-					parseErr = "SOURCE requires <source>"
-					break recallParse
-				}
-				rreq.SourceEq = string(args[i+1])
-				i += 2
-			case "HALFLIFE":
-				if i+1 >= len(args) {
-					parseErr = "HALFLIFE requires <seconds>"
-					break recallParse
-				}
-				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
-				if err != nil {
-					parseErr = "HALFLIFE not an integer"
-					break recallParse
-				}
-				rreq.HalfLifeSec = v
-				i += 2
-			case "VEC":
-				rreq.Vector = make([]float32, 0, len(args)-i-1)
-				for j := i + 1; j < len(args); j++ {
-					f, err := strconv.ParseFloat(unsafeString(args[j]), 32)
-					if err != nil {
-						parseErr = fmt.Sprintf("invalid float %q", unsafeString(args[j]))
-						break recallParse
-					}
-					rreq.Vector = append(rreq.Vector, float32(f))
-				}
-				break recallParse
-			default:
-				parseErr = fmt.Sprintf("unexpected token %q (want ASOF|ALL|TYPE|SOURCE|HALFLIFE|VEC)", unsafeString(args[i]))
-				break recallParse
-			}
 		}
 		if parseErr != "" {
 			buf.WriteError("ERR " + parseErr)
@@ -2032,6 +2037,109 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				buf.WriteBulkString(string(text))
 			} else {
 				buf.WriteBulkString("")
+			}
+		}
+
+	case "VMEM.EXPLAIN":
+		// VMEM.EXPLAIN <scope> <K> <query> [те же модификаторы, что у RECALL]
+		// Разложение ТОГО ЖЕ запроса: почему факт в выдаче и почему другой —
+		// нет. Недостающее звено «обнаружили → локализовали → отозвали»:
+		// порча видна как неверный ОТВЕТ, а отзыв идёт по ПРОИСХОЖДЕНИЮ, и
+		// между этими двумя фактами нужен шаг «покажи, кто это сказал».
+		//
+		// Ответ: массив записей «имя, значение, имя, значение …». Первая
+		// запись — сводка запроса (mode/t_eff/half_life/candidates/returned),
+		// дальше по факту: сначала попавшие в выдачу по рангу, затем
+		// отсеянные по убыванию базового скора. verdict = kept | причина
+		// отсева (erasure|validity|quarantine|type|source). Отсутствующий
+		// атрибут печатается как none — это НЕ то же самое, что явный
+		// unknown у source: у фактов, записанных до провенанса, колонки нет
+		// физически.
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR vmem not supported by this vector store")
+			return
+		}
+		xreq, parseErr := parseRecallArgs(args)
+		if parseErr == "usage" {
+			buf.WriteError("ERR usage: VMEM.EXPLAIN <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [VEC v1 ... vN]")
+			return
+		}
+		if parseErr != "" {
+			buf.WriteError("ERR " + parseErr)
+			return
+		}
+		ex, err := lvs.Explain(xreq, time.Now().Unix())
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		num := func(v float64) string { // NaN = атрибута нет, а не ноль
+			if math.IsNaN(v) {
+				return "none"
+			}
+			return fmt.Sprintf("%.6f", v)
+		}
+		rankStr := func(r int) string {
+			if r == 0 {
+				return "-"
+			}
+			return strconv.Itoa(r)
+		}
+		mode := "bm25-only"
+		if ex.Hybrid {
+			mode = "hybrid"
+		}
+		returned := 0
+		for _, f := range ex.Facts {
+			if f.Drop == "" {
+				returned++
+			}
+		}
+		buf.WriteArrayHeader(len(ex.Facts) + 1)
+		buf.WriteArrayHeader(10)
+		for _, kv := range [][2]string{
+			{"mode", mode},
+			{"t_eff", strconv.FormatInt(ex.TEff, 10)},
+			{"half_life", strconv.FormatInt(ex.HalfLife, 10)},
+			{"candidates", strconv.Itoa(len(ex.Facts))},
+			{"returned", strconv.Itoa(returned)},
+		} {
+			buf.WriteBulkString(kv[0])
+			buf.WriteBulkString(kv[1])
+		}
+		for _, f := range ex.Facts {
+			verdict := "kept"
+			if f.Drop != "" {
+				verdict = string(f.Drop)
+			}
+			text := ""
+			if t, ok := s.Get("vmem:" + f.Key); ok {
+				text = string(t)
+			}
+			fields := [][2]string{
+				{"id", f.Key},
+				{"verdict", verdict},
+				{"rank", rankStr(f.Rank)},
+				{"source", f.Source},
+				{"type", f.Type},
+				{"text_rank", rankStr(f.TextRank)},
+				{"vec_rank", rankStr(f.VecRank)},
+				{"base", fmt.Sprintf("%.6f", f.Base)},
+				{"age_sec", num(f.AgeSec)},
+				{"age_penalty", fmt.Sprintf("%.6f", f.AgePenalty)},
+				{"decay_mul", fmt.Sprintf("%.6f", f.DecayMul)},
+				{"imp_mul", fmt.Sprintf("%.6f", f.ImpMul)},
+				{"final", num(f.Final)},
+				{"valid_from", num(f.ValidFrom)},
+				{"valid_to", num(f.ValidTo)},
+				{"quarantined_at", num(f.QuarantinedAt)},
+				{"text", text},
+			}
+			buf.WriteArrayHeader(len(fields) * 2)
+			for _, kv := range fields {
+				buf.WriteBulkString(kv[0])
+				buf.WriteBulkString(kv[1])
 			}
 		}
 
