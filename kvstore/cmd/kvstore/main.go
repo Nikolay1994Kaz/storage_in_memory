@@ -1048,7 +1048,8 @@ func isLoopbackBind(bind string) bool {
 func isMemoryGrowingCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC",
-		"VMEM.REMEMBER", "VMEM.QUARANTINE", "WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
+		"VMEM.REMEMBER", "VMEM.QUARANTINE", "VMEM.BACKFILL",
+		"WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
 		return true
 	}
 	return false
@@ -1065,7 +1066,7 @@ func isWriteCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "DEL", "EXPIRE", "PERSIST",
 		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC", "VSIM.DEL",
-		"VMEM.REMEMBER", "VMEM.FORGET", "VMEM.QUARANTINE",
+		"VMEM.REMEMBER", "VMEM.FORGET", "VMEM.QUARANTINE", "VMEM.BACKFILL",
 		"ZADD", "ZREM", "AI.INGEST":
 		return true
 	}
@@ -2142,6 +2143,80 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				buf.WriteBulkString(kv[1])
 			}
 		}
+
+	case "VMEM.BACKFILL":
+		// VMEM.BACKFILL <scope> SOURCE <s> [LIMIT <n>]
+		// Миграция легаси: проставить источник фактам, у которых колонки
+		// source НЕТ физически (записаны до появления провенанса). Без неё
+		// весь слой восстановления над старыми данными мёртв — отзыв идёт по
+		// источнику, а пустота нефильтруема (см. VMEM.COVERAGE).
+		//
+		// Значение задаёт ОПЕРАТОР: обычный ответ — литеральный `unknown`
+		// («никто не расписался»), но знающий происхождение корпуса вправе
+		// поставить своё. Провенанс — вход, утверждение владельца данных, а
+		// не наше суждение о факте.
+		//
+		// Уже объявленный источник НЕ перезаписывается никогда: команда,
+		// умеющая это, умеет уничтожить след того, кто наполнил память.
+		// Предикат ровно один и неотключаемый — атрибута нет; отсюда
+		// идемпотентность. Ответ: число мигрированных фактов.
+		if len(args) < 3 {
+			buf.WriteError("ERR usage: VMEM.BACKFILL <scope> SOURCE <s> [LIMIT n]")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR vmem not supported by this vector store")
+			return
+		}
+		breq := vector.BackfillSourceRequest{Scope: string(args[0])}
+		parseErr := ""
+	backfillParse:
+		for i := 1; i < len(args); {
+			switch strings.ToUpper(string(args[i])) {
+			case "SOURCE":
+				if i+1 >= len(args) {
+					parseErr = "SOURCE requires <source>"
+					break backfillParse
+				}
+				breq.Source = string(args[i+1])
+				i += 2
+			case "LIMIT":
+				if i+1 >= len(args) {
+					parseErr = "LIMIT requires <n>"
+					break backfillParse
+				}
+				v, err := strconv.Atoi(unsafeString(args[i+1]))
+				if err != nil {
+					parseErr = "LIMIT not an integer"
+					break backfillParse
+				}
+				breq.Limit = v
+				i += 2
+			default:
+				parseErr = fmt.Sprintf("unexpected token %q (want SOURCE|LIMIT)", unsafeString(args[i]))
+				break backfillParse
+			}
+		}
+		if parseErr != "" {
+			buf.WriteError("ERR " + parseErr)
+			return
+		}
+		bres, err := lvs.BackfillSource(breq, time.Now().Unix())
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR %v", err))
+			return
+		}
+		if len(bres.Docs) == 0 {
+			buf.WriteInt(0)
+			return
+		}
+		bbatch := make([]vector.BatchDoc, len(bres.Docs))
+		for i, d := range bres.Docs {
+			bbatch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
+		}
+		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: bres.Docs[0].ID, Value: vector.SerializeDocBatch(bbatch)})
+		buf.WriteInt(len(bres.Docs))
 
 	case "VMEM.COVERAGE":
 		// VMEM.COVERAGE [scope]
