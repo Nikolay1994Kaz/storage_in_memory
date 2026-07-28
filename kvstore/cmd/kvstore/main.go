@@ -2308,7 +2308,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		for i, d := range bres.Docs {
 			bbatch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
 		}
-		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: bres.Docs[0].ID, Value: vector.SerializeDocBatch(bbatch)})
+		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: bres.Docs[0].ID, Value: sealValue(breq.Scope, vector.SerializeDocBatch(bbatch))})
 		buf.WriteInt(len(bres.Docs))
 
 	case "VMEM.COVERAGE":
@@ -2437,7 +2437,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		for i, d := range res.Docs {
 			batch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
 		}
-		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Docs[0].ID, Value: vector.SerializeDocBatch(batch)})
+		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Docs[0].ID, Value: sealValue(qreq.Scope, vector.SerializeDocBatch(batch))})
 		buf.WriteInt(len(res.Docs))
 
 	case "VMEM.FORGET":

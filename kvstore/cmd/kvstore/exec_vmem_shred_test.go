@@ -305,3 +305,56 @@ func TestVMEMShred_PhasesJudgedSeparately(t *testing.T) {
 		t.Fatalf("факт, уехавший в чужой скоуп, стёрт по устаревшему приговору: %v", ids)
 	}
 }
+
+// ⭐Страж от забытой точки записи. Проверяется не «REMEMBER шифрует», а
+// инвариант: НИ ОДНА команда VMEM не должна класть в журнал открытую полезную
+// нагрузку. Первая версия интеграции закрывала только REMEMBER — QUARANTINE и
+// BACKFILL уехали бы в WAL открытым текстом, и SHRED их бы не покрыл, то есть
+// гарантия оказалась бы дырявой ровно там, где её никто не проверяет.
+func TestVMEMShred_EveryVMEMWriteIsSealed(t *testing.T) {
+	e := newExecEnv(t)
+	enableKeyring(t, e.dir)
+
+	const poison = "Aurora cancelled by an unverified email"
+	const plain = "Aurora design review approved"
+	e.wantBulk(e.do("VMEM.REMEMBER", "user:dana", "TEXT", plain, "ID", "d1", "SOURCE", "human"), "d1")
+	e.wantBulk(e.do("VMEM.REMEMBER", "user:dana", "TEXT", poison, "ID", "d2", "SOURCE", "email-agent"), "d2")
+	e.wantInt(e.do("VMEM.QUARANTINE", "user:dana", "SOURCE", "email-agent"), 1)
+	e.wantInt(e.do("VMEM.BACKFILL", "user:dana", "SOURCE", "imported"), 0)
+
+	archivePath := archiveWAL(t, e)
+	raw, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{plain, poison} {
+		if bytes.Contains(raw, []byte(leak)) {
+			t.Fatalf("открытый текст %q найден в журнале", leak)
+		}
+	}
+
+	_, entries, err := wal.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, entry := range entries {
+		switch entry.Op {
+		case wal.OpVSimAddDoc, wal.OpVSimAddDocBatch:
+			// Полезная нагрузка дока: вектор, атрибуты и термы текста.
+			if !keyring.IsEnvelope(entry.Value) {
+				t.Fatalf("%s (key=%s) уехал в журнал без конверта", walOpName(entry.Op), entry.Key)
+			}
+			checked++
+		case wal.OpSet:
+			// Якорь VMEM — дословный текст факта.
+			if len(entry.Key) > 5 && entry.Key[:5] == "vmem:" && !keyring.IsEnvelope(entry.Value) {
+				t.Fatalf("якорь %s уехал в журнал без конверта", entry.Key)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("в журнале нет ни одной VMEM-записи — предпосылка теста неверна")
+	}
+}
