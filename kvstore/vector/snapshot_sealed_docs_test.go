@@ -2,6 +2,7 @@ package vector
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"strings"
 	"testing"
@@ -293,5 +294,48 @@ func TestSealedDocsDeterministic(t *testing.T) {
 	// непустое — на двух пустых буферах оно верно всегда.
 	if a.Len() == 0 {
 		t.Fatal("секция пуста — детерминизм проверен на пустоте")
+	}
+}
+
+// TestWriteSlabMasked — маскирование обязано сохранять ДЛИНУ и ПОЗИЦИИ:
+// все слои сегмента адресуются позицией, поэтому сдвиг на один вектор
+// перепутал бы документы между собой.
+func TestWriteSlabMasked(t *testing.T) {
+	const dim, n = 2, 4
+	data := []float32{1, 1, 2, 2, 3, 3, 4, 4}
+	mask := []bool{false, true, false, true}
+
+	var buf bytes.Buffer
+	if err := writeSlabMasked(&buf, data, dim, n, mask); err != nil {
+		t.Fatalf("writeSlabMasked: %v", err)
+	}
+	if got, want := buf.Len(), n*dim*4; got != want {
+		t.Fatalf("длина слэба %d, ожидалось %d — позиции съехали", got, want)
+	}
+
+	got := make([]float32, n*dim)
+	if err := binary.Read(bytes.NewReader(buf.Bytes()), binary.LittleEndian, got); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	want := []float32{1, 1, 0, 0, 3, 3, 0, 0}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("слэб[%d] = %v, ожидалось %v", i, got[i], want[i])
+		}
+	}
+
+	// ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ: без маски путь обязан остаться прежним байт в
+	// байт — иначе «маскирование ничего не сломало» проверялось бы на коде,
+	// который вообще не тот, что работает в бою.
+	var plain bytes.Buffer
+	if err := writeSlabMasked(&plain, data, dim, n, nil); err != nil {
+		t.Fatalf("writeSlabMasked(nil): %v", err)
+	}
+	var direct bytes.Buffer
+	if err := binary.Write(&direct, binary.LittleEndian, data); err != nil {
+		t.Fatalf("binary.Write: %v", err)
+	}
+	if !bytes.Equal(plain.Bytes(), direct.Bytes()) {
+		t.Error("без маски запись разошлась с прямой сериализацией")
 	}
 }

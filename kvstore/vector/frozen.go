@@ -478,6 +478,16 @@ func (fg *FrozenGraph) searchWithIdx(query []float32, K, efSearch int, dst []Fro
 // WriteGraphTo сериализует FrozenGraph в w. Zero-alloc для data/offs/neigh слайсов
 // (используется unsafe.Slice → прямой доступ к памяти без копии в []byte).
 func (fg *FrozenGraph) WriteGraphTo(w io.Writer) error {
+	return fg.WriteGraphToMasked(w, nil)
+}
+
+// WriteGraphToMasked — то же, но векторы позиций, помеченных в mask, пишутся
+// НУЛЯМИ. Их настоящие значения уезжают в документную секцию снапшота под
+// конвертом своего скоупа (см. snapshot_sealed_docs.go): структура графа
+// содержания не раскрывает, а вектор — раскрывает.
+//
+// mask == nil → путь прежний байт в байт, одним zero-alloc Write.
+func (fg *FrozenGraph) WriteGraphToMasked(w io.Writer, mask []bool) error {
 	// Заголовок: n, dim, maxLevel, entryPointID
 	var hdr [16]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], uint32(fg.n))
@@ -490,9 +500,13 @@ func (fg *FrozenGraph) WriteGraphTo(w io.Writer) error {
 
 	// Data slab (float32 → bytes, zero-alloc)
 	if fg.n > 0 && fg.dim > 0 {
-		b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.data[0])), len(fg.data)*4)
-		if _, err := w.Write(b); err != nil {
-			return fmt.Errorf("frozen: write data: %w", err)
+		if mask == nil {
+			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.data[0])), len(fg.data)*4)
+			if _, err := w.Write(b); err != nil {
+				return fmt.Errorf("frozen: write data: %w", err)
+			}
+		} else if err := writeSlabMasked(w, fg.data, fg.dim, fg.n, mask); err != nil {
+			return err
 		}
 	}
 

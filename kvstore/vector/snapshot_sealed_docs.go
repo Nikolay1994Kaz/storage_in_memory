@@ -26,7 +26,47 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"unsafe"
 )
+
+// writeSlabMasked пишет слэб векторов, подменяя НУЛЯМИ позиции из mask —
+// те, чьи настоящие векторы уезжают в документную секцию под конвертом.
+//
+// Пишет непрерывными кусками, а не покомпонентно и не через копию всего
+// слэба: копия стоила бы столько же памяти, сколько сам индекс (гигабайты на
+// большом сторе), а замаскированных обычно меньшинство. Позиции сохраняются
+// один в один — это обязательно, потому что все слои сегмента адресуются
+// позицией, и сдвиг на единицу перепутал бы документы между собой.
+func writeSlabMasked(w io.Writer, data []float32, dim, n int, mask []bool) error {
+	zeros := make([]byte, dim*4)
+	runStart := 0 // начало текущего непрерывного немаскированного участка
+
+	flush := func(end int) error {
+		if end <= runStart {
+			return nil
+		}
+		b := unsafe.Slice((*byte)(unsafe.Pointer(&data[runStart*dim])), (end-runStart)*dim*4)
+		_, err := w.Write(b)
+		return err
+	}
+
+	for i := 0; i < n; i++ {
+		if i >= len(mask) || !mask[i] {
+			continue
+		}
+		if err := flush(i); err != nil {
+			return fmt.Errorf("frozen: write data: %w", err)
+		}
+		if _, err := w.Write(zeros); err != nil {
+			return fmt.Errorf("frozen: write masked vector: %w", err)
+		}
+		runStart = i + 1
+	}
+	if err := flush(n); err != nil {
+		return fmt.Errorf("frozen: write data tail: %w", err)
+	}
+	return nil
+}
 
 // SnapshotCrypto — точка подмены шифрования для снапшота. Пакет vector
 // НАМЕРЕННО не знает про internal/keyring: слоистость та же, что у sealValue

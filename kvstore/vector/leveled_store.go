@@ -85,7 +85,7 @@ const (
 // после segMeta, hnswSegment персистит термы по вектору (writeTerms) после
 // attrs — слой регенерируется buildSegment на load. Снапшоты v<7 читаются как
 // прежде (текста в них нет → слой nil).
-var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 7, 0, 0}
+var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 8, 0, 0}
 
 // leveledMagicPrefix — общая часть ('LVLV') для проверки формата без версии.
 var leveledMagicPrefix = [4]byte{'L', 'V', 'L', 'V'}
@@ -687,6 +687,11 @@ type compactionResult struct {
 // LeveledVectorStore — основное хранилище с leveled compaction.
 type LeveledVectorStore struct {
 	cfg LeveledConfig
+
+	// snapshotCrypto — точка подмены шифрования бинарного снапшота (v8).
+	// nil = снапшот пишется как раньше. Устанавливается один раз при старте,
+	// до загрузки и до приёма запросов, поэтому без синхронизации.
+	snapshotCrypto *SnapshotCrypto
 
 	mu    sync.RWMutex
 	delta *DeltaSegment
@@ -2262,14 +2267,30 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 				if _, err := w.Write([]byte{segTypeFrozen}); err != nil {
 					return fmt.Errorf("leveled: write segType[%d][%d]: %w", lyr, si, err)
 				}
-				if err := s.fg.WriteGraphTo(w); err != nil {
+				// v8: содержание фактов изымается из графа и слоёв и уезжает в
+				// документную секцию под конвертом своего скоупа. Форматы графа,
+				// колонок и текстового слоя при этом не меняются — меняется их
+				// наполнение (см. snapshot_sealed_segment.go).
+				entries := frozenEntries(s)
+				mask, public, anySealed := splitBySealed(entries, vmemScopeOf)
+				pubAttrs, pubText := s.attrs, s.text
+				if anySealed {
+					pubAttrs = buildSegmentAttrs(public, nil)
+					pubText = buildSegmentText(public)
+				} else {
+					mask = nil // ни одного факта — прежний zero-alloc путь записи
+				}
+				if err := s.fg.WriteGraphToMasked(w, mask); err != nil {
 					return fmt.Errorf("leveled: write frozen[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSegMeta(w, s.cat, s.attrs); err != nil {
+				if err := writeSegMeta(w, s.cat, pubAttrs); err != nil {
 					return fmt.Errorf("leveled: write frozenMeta[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSegText(w, s.text); err != nil {
+				if err := writeSegText(w, pubText); err != nil {
 					return fmt.Errorf("leveled: write frozenText[%d][%d]: %w", lyr, si, err)
+				}
+				if err := writeSealedDocs(w, sealedOnly(entries, mask), vmemScopeOf, lvs.snapshotCrypto); err != nil {
+					return fmt.Errorf("leveled: write frozenSealed[%d][%d]: %w", lyr, si, err)
 				}
 
 			case *frozenSQSegment:
@@ -2406,6 +2427,12 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	hasher := crc32.NewIEEE()
 	r = io.TeeReader(r, hasher)
 
+	// deadKeys — ключи документов, чей скоуп крипто-стёрт: их группа в снапшоте
+	// не открылась, потому что KEK уничтожен. Позиции в графе остаются (иначе
+	// поехали бы все остальные), но сами документы мертвы и уходят в tombstones
+	// после публикации сегментов. Это ШТАТНЫЙ исход, не порча.
+	var deadKeys []string
+
 	// Проверяем магию: префикс 'LVLV' обязателен, версия в байте [5].
 	var magic [8]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
@@ -2415,7 +2442,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: invalid magic header (not a graph_leveled.bin?)")
 	}
 	version := magic[5]
-	if version < 1 || version > 7 {
+	if version < 1 || version > 8 {
 		return fmt.Errorf("leveled: unsupported snapshot version %d", version)
 	}
 
@@ -2498,6 +2525,21 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 				if version >= 7 {
 					if seg.text, err = readSegText(r); err != nil {
 						return fmt.Errorf("leveled: read frozenText[%d][%d]: %w", lyr, si, err)
+					}
+				}
+				if version >= 8 {
+					sealedDocs, dead, err := readSealedDocs(r, fg.n, lvs.snapshotCrypto)
+					if err != nil {
+						return fmt.Errorf("leveled: read frozenSealed[%d][%d]: %w", lyr, si, err)
+					}
+					// Ключи стёртого скоупа — в tombstones: их позиции в графе
+					// остаются, но документов больше нет (см. deadKeys ниже).
+					deadKeys = append(deadKeys, dead...)
+					if hasAnyDoc(sealedDocs) {
+						all := mergeSealedIntoEntries(frozenEntries(seg), sealedDocs)
+						restoreSealedVectors(fg, sealedDocs)
+						seg.attrs = buildSegmentAttrs(all, nil)
+						seg.text = buildSegmentText(all)
 					}
 				}
 				staged[lyr] = append(staged[lyr], stagedSeg{seg: seg})
@@ -2652,6 +2694,14 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	if dim > 0 {
 		max := deltaMax(dim, lvs.cfg.DeltaMax)
 		lvs.delta = NewDeltaSegmentSharded(dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
+	}
+
+	// Крипто-стёртые документы: их группы не открылись, потому что KEK
+	// уничтожен. Метим tombstone'ами ЗДЕСЬ, после публикации сегментов —
+	// позиции в графе остались (иначе съехали бы все остальные), но выдавать
+	// их поиск не должен, а ближайшая консолидация вынесет физически.
+	for _, key := range deadKeys {
+		lvs.deleteLocked(key)
 	}
 
 	lvs.touchMutation()
