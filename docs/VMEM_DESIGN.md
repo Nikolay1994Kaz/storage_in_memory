@@ -198,7 +198,7 @@ this person"), because a scope *is* whose memory it is. Erasing one fact by id
 keeps the guarantee stated in the previous section — unreachable immediately,
 bytes on the old horizon — and no receipt will claim otherwise.
 
-Two limits, stated rather than discovered:
+Three limits, stated rather than discovered:
 
 - **A live process holds plaintext.** Facts are decrypted in memory by
   design; a memory dump of a running server contains them. This is the
@@ -207,6 +207,18 @@ Two limits, stated rather than discovered:
   cannot be crypto-erased, and a receipt must never imply they were — the
   coverage command exists to make that visible, exactly as `VMEM.COVERAGE`
   had to for provenance.
+- ⚠**Snapshots are not covered yet.** `-encrypt-at-rest` seals the WAL, and
+  therefore the shipped archive, which was the hole that could not be closed
+  any other way. It does **not** yet seal `snapshot.wal` or
+  `graph_leveled.bin`: both are written by walking in-memory state
+  (`snapshotIterate` reads values straight out of the store), where facts are
+  plaintext by the decision above. Consequence, stated plainly: a snapshot
+  taken *before* a `VMEM.SHRED` still contains that scope's anchors and BM25
+  terms in the clear, and destroying the key does not reach it. Snapshots
+  written *after* the shred do not, because the facts are gone from memory
+  first. Sealing the snapshot path needs the scope for each key at write time
+  and is tracked as the remaining work; until it lands, this paragraph is the
+  guarantee, and `VMEM.SHRED` must not be described as covering snapshots.
 
 ## Doors (decisions that are expensive to reverse)
 
