@@ -147,6 +147,67 @@ copies made earlier, which is the same gap every store-side "shred on delete"
 implementation has, whether or not it says so. Closing it is tracked as the
 keyring/envelope work; until that lands, this section is the guarantee.
 
+## Keyring / envelope — decisions, and the measurements behind them
+
+The section above states the gap. This one records how it is being closed and,
+more importantly, the three decisions that are expensive to reverse.
+
+**Measured first, decided after** (`internal/keyring/cost_bench_test.go`,
+i7-9750H, AES-NI). Threshold fixed before the run: decrypting `K=10` anchors
+must cost under 5% of a RECALL, i.e. under 630 ns per anchor against the
+~126 µs implied by the 7958 QPS SEARCHTEXT canon.
+
+| operation | ns/op |
+|---|---|
+| open 128 B / 512 B / 2 KB anchor | 88 / 173 / 525 |
+| open 6 KB vector (1536×f32) | 1474 |
+| decrypt K=10 anchors (512 B) | 1743 → **1.4% of a RECALL** |
+| unwrap a 32-byte DEK | 74 |
+| `cipher.NewGCM` per fact (the trap) | 336 + 1280 B allocated |
+
+**Decision 1 — encrypt at the persistence boundary, not in the read path.**
+The engine holds everything in memory; nothing is mmapped, and sealed segments
+are in-process structures. So the ciphertext boundary is where bytes leave the
+process: WAL records, snapshots, and — for free, since it ships WAL segments
+verbatim — the archive. Search, ranking and recall keep operating on
+plaintext in memory and pay **nothing**. This also settles the vector
+question the honest way: at 1474 ns an HNSW traversal touching hundreds of
+vectors could never decrypt in the hot path, but at the persistence boundary
+vectors, BM25 terms and attributes are all covered anyway, so no "is an
+embedding personal data" argument has to be made at all. Cost lands on write
+(~1.9 µs/fact sealing, ≈1% of the 188 µs insert budget) and on replay
+(~1.9 µs/fact).
+
+**Decision 2 — KEK per scope in the keyring, wrapped DEK travelling with the
+data.** The secret has to live somewhere the archive does not reach, or
+restoring an archive hands back both lock and key. But a per-fact DEK held in
+a separate keyring would need its own fsync *ordered before* the WAL write —
+and the WAL deliberately fsyncs every 100 ms rather than per record, so a
+per-fact synchronous key fsync would cost more than everything it protects,
+while an asynchronous one risks the one failure that is worse than the RPO we
+already accept: data durable, key lost, fact unreadable. So the wrapped DEK
+rides with the record (useless without the KEK) and only the KEK — one small
+object per scope, written rarely, fsynced synchronously — lives in the
+keyring, which is never shipped and never included in a snapshot.
+
+**Decision 3 — therefore crypto-erasure is scope-granular, and `FORGET` is
+not.** Destroying a scope's KEK kills every persisted copy of that scope at
+once: WAL, snapshots, shipped archives, and any restore taken from them. That
+is exactly the granularity a right-to-erasure request has ("everything about
+this person"), because a scope *is* whose memory it is. Erasing one fact by id
+keeps the guarantee stated in the previous section — unreachable immediately,
+bytes on the old horizon — and no receipt will claim otherwise.
+
+Two limits, stated rather than discovered:
+
+- **A live process holds plaintext.** Facts are decrypted in memory by
+  design; a memory dump of a running server contains them. This is the
+  standard limit of storage-level encryption, not a loophole in this one.
+- **Facts written before the keyring existed are not under any key.** They
+  cannot be crypto-erased, and a receipt must never imply they were — the
+  coverage command exists to make that visible, exactly as `VMEM.COVERAGE`
+  had to for provenance.
+
 ## Doors (decisions that are expensive to reverse)
 
 1. **Replay never looks at the clock.** Everything time-dependent is stamped as
