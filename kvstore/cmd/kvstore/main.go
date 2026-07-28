@@ -62,6 +62,41 @@ var sealValue = func(scope string, v []byte) []byte { return v }
 // Пакетная переменная по той же причине, что sealValue (см. выше).
 var activeKeyring *keyring.Keyring
 
+// snapshotCryptoFor строит шифрование бинарного снапшота (формат v8) поверх
+// кейринга. Отдельной функцией, а не внутри main: иначе проверить её можно
+// было бы только ЗЕРКАЛОМ в тесте, а зеркало расходится с оригиналом молча —
+// ровно тот разрыв харнесса, что уже есть у applyEntry.
+//
+// sealing разводит чтение и запись. Unseal подключается, как только кейринг
+// вообще есть: иначе прежние снапшоты стали бы нечитаемы от одной смены
+// флага. Seal — только под -encrypt-at-rest и вне восстановления на момент,
+// теми же условиями, что sealValue для журнала.
+func snapshotCryptoFor(ring *keyring.Keyring, sealing bool) *vector.SnapshotCrypto {
+	crypto := &vector.SnapshotCrypto{
+		Unseal: func(envelope []byte) ([]byte, bool, error) {
+			plain, err := ring.Unseal(envelope)
+			if errors.Is(err, keyring.ErrKeyDestroyed) {
+				// Скоуп крипто-стёрт. ШТАТНЫЙ исход: документы группы не
+				// восстанавливаются, их ключи уходят в tombstones.
+				return nil, true, nil
+			}
+			if err != nil {
+				return nil, false, err
+			}
+			return plain, false, nil
+		},
+	}
+	if sealing {
+		crypto.Seal = func(scope string, plain []byte) ([]byte, error) {
+			if _, err := ring.EnsureScope(scope); err != nil {
+				return nil, err
+			}
+			return ring.Seal(scope, plain)
+		}
+	}
+	return crypto
+}
+
 // vmemAnchorPrefix — префикс KV-ключа, под которым лежит дословный якорь факта
 // (`vmem:<id>`). Вынесен в константу: по нему опознаёт факт уже не только
 // запись REMEMBER, но и обход состояния при записи снапшота.
@@ -337,6 +372,19 @@ func main() {
 	// Provider вызывается только при scrape /metrics — 0 overhead на hot path.
 	if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
 		monitoring.SetVectorStateProvider(leveledStatsAdapter{lvs: lvs})
+
+		// Шифрование бинарного снапшота (формат v8). Ставится ЗДЕСЬ — до
+		// загрузки graph_leveled.bin ниже: снапшот уже может быть запечатан, и
+		// без ключей он прочитается неполно.
+		//
+		// Read-only и read-write разведены намеренно. Unseal подключается,
+		// как только кейринг вообще есть: иначе прежние снапшоты стали бы
+		// нечитаемы от одной смены флага. Seal — только под -encrypt-at-rest
+		// и вне режима восстановления на момент, теми же условиями, что
+		// sealValue для журнала.
+		if ring != nil {
+			lvs.SetSnapshotCrypto(snapshotCryptoFor(ring, *encryptAtRest && restoreLSN == 0))
+		}
 	}
 
 	// HTTP-сервер метрик/здоровья поднимаем ДО реплея WAL. Восстановление после
