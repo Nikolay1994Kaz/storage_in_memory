@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,58 +45,24 @@ func enableKeyring(t *testing.T, dir string) *keyring.Keyring {
 	return ring
 }
 
-// replaySealedWAL — зеркало applyEntry из main.go ВМЕСТЕ с разворотом конверта
-// на границе. Стёртый ключ (ErrKeyDestroyed) — штатный исход: запись
-// пропускается, реплей продолжается. Возвращает число пропущенных.
+// replaySealedWAL прогоняет журнал через БОЕВОЙ walApplier — тот самый, что
+// зовёт main при восстановлении. Раньше здесь было зеркало applyEntry, и оно
+// молча разошлось бы с оригиналом; проверять восстановление копией
+// восстановления — значит не проверять его вовсе. Возвращает число записей,
+// пропущенных из-за уничтоженного ключа.
 func replaySealedWAL(t *testing.T, path string, e *execEnv, ring *keyring.Keyring) int {
 	t.Helper()
 	_, entries, err := wal.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile(%s): %v", path, err)
 	}
-	lvs := e.vec.(*vector.LeveledVectorStore)
-	skipped := 0
-	for _, entry := range entries {
-		if ring != nil && keyring.IsEnvelope(entry.Value) {
-			plain, err := ring.Unseal(entry.Value)
-			if errors.Is(err, keyring.ErrKeyDestroyed) {
-				skipped++
-				continue
-			}
-			if err != nil {
-				t.Fatalf("Unseal(%s): %v", entry.Key, err)
-			}
-			entry.Value = plain
-		}
-		switch entry.Op {
-		case wal.OpSet:
-			e.s.Set(0, entry.Key, entry.Value)
-		case wal.OpDel:
-			e.s.Del(0, entry.Key)
-			e.vec.Delete(entry.Key)
-		case wal.OpVSimDel:
-			e.vec.Delete(entry.Key)
-		case wal.OpVSimAddDoc:
-			vec, attrs, terms, err := vector.DeserializeVectorWithDoc(entry.Value)
-			if err != nil {
-				t.Fatalf("replay OpVSimAddDoc %s: %v", entry.Key, err)
-			}
-			if err := lvs.AddDocTerms(entry.Key, vec, attrs, terms); err != nil {
-				t.Fatalf("replay AddDocTerms %s: %v", entry.Key, err)
-			}
-		case wal.OpVSimAddDocBatch:
-			docs, err := vector.DeserializeDocBatch(entry.Value)
-			if err != nil {
-				t.Fatalf("replay OpVSimAddDocBatch %s: %v", entry.Key, err)
-			}
-			for _, d := range docs {
-				if err := lvs.AddDocTerms(d.Key, d.Vec, d.Attrs, d.Terms); err != nil {
-					t.Fatalf("replay batch %s: %v", d.Key, err)
-				}
-			}
-		}
+	applier := &walApplier{
+		s: e.s, ttl: e.ttl, vec: e.vec, zsetReg: e.zset, ring: ring,
 	}
-	return skipped
+	for _, entry := range entries {
+		applier.apply(entry, false)
+	}
+	return applier.erasedByShred
 }
 
 // archiveWAL закрывает журнал среды и снимает его копию — модель сегмента,

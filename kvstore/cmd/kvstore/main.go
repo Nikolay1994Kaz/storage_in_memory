@@ -418,8 +418,6 @@ func main() {
 	}
 
 	// === 3. Восстановление состояния из WAL ===
-	restored := 0
-	vecRestored := 0
 
 	// maxLSN — наибольший встреченный номер записи (или watermark из snapshot).
 	// После recovery ставим nextLSN = maxLSN+1 до приёма трафика, чтобы номера
@@ -445,11 +443,6 @@ func main() {
 	// операции не должны переиспользовать эти номера (иначе резюмируемая
 	// репликация ломается, а skipVec ошибочно пропустит свежую запись).
 	bumpLSN(vecWatermark)
-	// skipVec решает, пропустить ли ВЕКТОРНЫЙ эффект записи как уже в снапшоте
-	// (см. shouldSkipVecReplay). Применяется и к OpVSim*, и к каскадным OpDel/OpExpire.
-	skipVec := func(entry wal.Entry, isFromSnapshot bool) bool {
-		return shouldSkipVecReplay(entry, isFromSnapshot, graphLoaded, vecWatermark)
-	}
 
 	// Шаг A: Сначала читаем и накатываем snapshot.wal (если есть)
 	snapshotPath := filepath.Join(dataDir, "snapshot.wal")
@@ -465,159 +458,13 @@ func main() {
 		logging.Fatalf("%v", err)
 	}
 
-	// erasedByShred — записи, пропущенные при реплее потому, что ключ их
-	// скоупа уничтожен. Это ШТАТНЫЙ исход криптостирания, а не порча: считаем
-	// и говорим вслух, но не падаем.
-	erasedByShred := 0
-
-	applyEntry := func(entry wal.Entry, isFromSnapshot bool) {
-		// Конверт разворачивается ЗДЕСЬ, единой точкой на границе: дальше весь
-		// движок работает с открытым текстом и о шифровании не знает. Записи,
-		// сделанные до кейринга, конвертами не являются и проходят как есть.
-		if ring != nil && keyring.IsEnvelope(entry.Value) {
-			plain, err := ring.Unseal(entry.Value)
-			switch {
-			case err == nil:
-				entry.Value = plain
-			case errors.Is(err, keyring.ErrKeyDestroyed):
-				// Ключ уничтожен — факт стёрт. Пропускаем запись целиком:
-				// именно так стирание догоняет WAL, снапшоты и архивы.
-				erasedByShred++
-				return
-			default:
-				slog.Warn("failed to open envelope during replay", "key", entry.Key, "err", err)
-				return
-			}
-		}
-		switch entry.Op {
-		case wal.OpSet:
-			s.Set(0, entry.Key, entry.Value)
-			restored++
-		case wal.OpDel:
-			s.Del(0, entry.Key)
-			// Векторный эффект гейтуем watermark'ом: старый DEL (LSN ≤ watermark),
-			// уже отражённый в снапшоте, не должен удалять вектор, воскрешённый
-			// более поздним re-add (который тоже в снапшоте).
-			if !skipVec(entry, isFromSnapshot) {
-				vecStore.Delete(entry.Key)
-			}
-			ttl.OnDelete(entry.Key)
-			restored++
-		case wal.OpExpire:
-			if len(entry.Value) == 8 {
-				expiresAt := time.Unix(0, int64(binary.BigEndian.Uint64(entry.Value)))
-				remaining := time.Until(expiresAt)
-				if remaining > 0 {
-					ttl.Set(entry.Key, remaining)
-				} else {
-					s.Del(0, entry.Key)
-					if !skipVec(entry, isFromSnapshot) {
-						vecStore.Delete(entry.Key) // Также удаляем вектор, если ключ просрочен в оффлайне
-					}
-					ttl.OnDelete(entry.Key)
-				}
-			}
-			restored++
-		case wal.OpPersist:
-			ttl.Remove(entry.Key)
-			restored++
-		case wal.OpVSimAdd:
-			// Пропускаем, если операция уже в снапшоте (snapshot.wal при graphLoaded
-			// или wal_*.log с LSN ≤ watermark) — иначе дубль вектора после рестарта.
-			if skipVec(entry, isFromSnapshot) {
-				return
-			}
-			vec := vector.DeserializeVector(entry.Value)
-			if err := vecStore.Add(entry.Key, vec); err != nil {
-				slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
-			}
-			vecRestored++
-			restored++
-		case wal.OpVSimAddAttrs:
-			// Вектор + атрибуты (P0-4): attrs/tenant восстанавливаются через
-			// AddWithAttrs, а не теряются как при голом Add.
-			if skipVec(entry, isFromSnapshot) {
-				return
-			}
-			vec, attrs, err := vector.DeserializeVectorWithAttrs(entry.Value)
-			if err != nil {
-				slog.Warn("failed to decode vector+attrs", "key", entry.Key, "err", err)
-				return
-			}
-			if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
-				if err := lvs.AddWithAttrs(entry.Key, vec, attrs); err != nil {
-					slog.Warn("failed to restore vector+attrs", "key", entry.Key, "err", err)
-				}
-			} else if err := vecStore.Add(entry.Key, vec); err != nil {
-				// Индекс без attr-слоя — восстанавливаем хотя бы вектор.
-				slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
-			}
-			vecRestored++
-			restored++
-		case wal.OpVSimAddDoc:
-			// Вектор + атрибуты + термы текста (BM25, шаг 5). Реплей через
-			// AddDocTerms: в журнале УЖЕ готовые термы, перетокенизация запрещена
-			// (бит-в-бит воспроизводимость независимо от версии стеммера).
-			if skipVec(entry, isFromSnapshot) {
-				return
-			}
-			vec, attrs, terms, err := vector.DeserializeVectorWithDoc(entry.Value)
-			if err != nil {
-				slog.Warn("failed to decode vector+doc", "key", entry.Key, "err", err)
-				return
-			}
-			if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
-				if err := lvs.AddDocTerms(entry.Key, vec, attrs, terms); err != nil {
-					slog.Warn("failed to restore vector+doc", "key", entry.Key, "err", err)
-				}
-			} else if err := vecStore.Add(entry.Key, vec); err != nil {
-				// Индекс без текстового слоя — восстанавливаем хотя бы вектор.
-				slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
-			}
-			vecRestored++
-			restored++
-		case wal.OpVSimAddDocBatch:
-			// Атомарная пара supersedes VMEM.REMEMBER (шаг 7): один CRC на всю
-			// запись — DeserializeDocBatch либо отдаёт все доки, либо ошибку;
-			// частичное применение невозможно по построению.
-			if skipVec(entry, isFromSnapshot) {
-				return
-			}
-			docs, err := vector.DeserializeDocBatch(entry.Value)
-			if err != nil {
-				slog.Warn("failed to decode doc batch", "key", entry.Key, "err", err)
-				return
-			}
-			if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
-				for _, d := range docs {
-					if err := lvs.AddDocTerms(d.Key, d.Vec, d.Attrs, d.Terms); err != nil {
-						slog.Warn("failed to restore doc from batch", "key", d.Key, "err", err)
-					}
-				}
-				vecRestored += len(docs)
-			}
-			restored++
-		case wal.OpVSimDel:
-			if skipVec(entry, isFromSnapshot) {
-				return
-			}
-			vecStore.Delete(entry.Key)
-			restored++
-		case wal.OpZAdd:
-			if len(entry.Value) >= 8 {
-				score, member := zset.DecodeZAddValue(entry.Value)
-				zsetReg.ZAdd(0, entry.Key, score, member)
-				restored++
-			}
-		case wal.OpZRem:
-			member := string(entry.Value)
-			zsetReg.ZRem(0, entry.Key, member)
-			restored++
-		}
+	applier := &walApplier{
+		s: s, ttl: ttl, vec: vecStore, zsetReg: zsetReg, ring: ring,
+		graphLoaded: graphLoaded, vecWatermark: vecWatermark,
 	}
 
 	for _, entry := range snapshotEntries {
-		applyEntry(entry, true)
+		applier.apply(entry, true)
 	}
 
 	// Шаг B: Потом читаем и накатываем все wal_*.log файлы в правильном порядке
@@ -637,12 +484,20 @@ func main() {
 				continue
 			}
 			bumpLSN(entry.LSN)
-			applyEntry(entry, false)
+			applier.apply(entry, false)
 		}
 	}
 
-	if restored > 0 {
-		slog.Info("restored from WAL", "operations", restored, "vectors", vecRestored)
+	if applier.restored > 0 {
+		slog.Info("restored from WAL", "operations", applier.restored, "vectors", applier.vecRestored)
+	}
+	// Пропущенное криптостиранием обязано быть ВИДНО оператору: молчаливая
+	// разница между «в журнале было N записей» и «восстановлено N-M» выглядит
+	// как потеря данных, а это штатное исполнение VMEM.SHRED. Счётчик считался
+	// и раньше, но никуда не выводился.
+	if applier.erasedByShred > 0 {
+		slog.Warn("skipped journal records of crypto-shredded scopes",
+			"records", applier.erasedByShred)
 	}
 
 	// === 3. WAL ===
