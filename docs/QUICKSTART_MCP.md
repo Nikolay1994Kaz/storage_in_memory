@@ -92,7 +92,7 @@ the fact is still there (WAL replay).
 |---|---|
 | `memory_remember` | Store one durable fact. `supersedes=<id>` replaces an older fact **without destroying history**; `ttl_seconds` gives it a hard expiry; `importance` biases ranking. |
 | `memory_recall` | Top-k facts valid **now**, ranked by relevance × recency × importance. `as_of=<unix>` answers "what was true then" (supersession is transparent; erased facts stay erased). `all=true` ignores validity. |
-| `memory_forget` | Permanent erasure by id — gone from history and `as_of` too (right to be forgotten). |
+| `memory_forget` | Erasure by id — the fact becomes unreachable in every read mode, `as_of` included (right to be forgotten). Unreachability is immediate; physical removal of the bytes follows on consolidation and does not reach the WAL, earlier snapshots or shipped archives — the stated horizon is in `docs/VMEM_DESIGN.md` ("Erasure guarantee"). |
 
 Semantics are the engine's frozen `VMEM.*` contract — full details and the
 design rationale: `docs/COMMANDS.md`, `docs/VMEM_DESIGN.md`.

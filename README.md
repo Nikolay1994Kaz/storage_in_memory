@@ -5,7 +5,8 @@
 
 **Self-hosted memory engine for AI agents.** One process gives your agents
 durable, queryable memory: facts with validity intervals and supersession
-history ("what was true in March?"), hard erasure (right to be forgotten), and
+history ("what was true in March?"), erasure that takes effect immediately for
+every reader (with its physical horizon stated, not glossed), and
 recency×importance-ranked recall — BM25 out of the box, hybrid BM25+vector
 when you bring embeddings. Agents plug in over **MCP** in two minutes
 ([docs/QUICKSTART_MCP.md](docs/QUICKSTART_MCP.md)); everything is also
@@ -41,9 +42,13 @@ semantics in [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md)):
 - **Validity time.** A fact that replaces another (`supersedes`) closes the
   old one's interval instead of deleting it; `RECALL … ASOF <ts>` answers
   "what was true then".
-- **Erasure beats time travel.** `FORGET` and TTL expiry remove a fact from
-  history and `ASOF` too — the right to be forgotten wins over the time
-  machine.
+- **Erasure beats time travel.** `FORGET` and TTL expiry make a fact
+  unreachable in every read mode, `ASOF` included — the right to be forgotten
+  wins over the time machine. What that does *not* mean is cryptographic
+  erasure: the bytes leave the main store at the next consolidation, and can
+  outlive the call in the WAL, in earlier snapshots and in shipped archives.
+  The horizon is stated, not glossed —
+  [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md) ("Erasure guarantee").
 - **Ranking is not truth.** Recency decay and importance reorder results but
   are mathematically floored so old facts stay reachable — judged on real
   embeddings, not vibes ([docs/BENCHMARKS.md §7](docs/BENCHMARKS.md)).
@@ -110,7 +115,7 @@ RESP on a 2019 laptop.
 
 ## Features
 
-- **VMEM agent memory** — `VMEM.REMEMBER` / `VMEM.RECALL` / `VMEM.FORGET`: validity intervals + supersession history (`ASOF` time travel), TTL + hard erasure, recency×importance recall over BM25 or hybrid; verbatim KV anchors; MCP adapter `vmem-mcp` (Linux/macOS/Windows) for Claude Code/Desktop and any MCP host
+- **VMEM agent memory** — `VMEM.REMEMBER` / `VMEM.RECALL` / `VMEM.FORGET`: validity intervals + supersession history (`ASOF` time travel), TTL + erasure (immediate unreachability, physical horizon stated in `docs/VMEM_DESIGN.md`), recency×importance recall over BM25 or hybrid; verbatim KV anchors; MCP adapter `vmem-mcp` (Linux/macOS/Windows) for Claude Code/Desktop and any MCP host
 - **Recovery after memory corruption** — `SOURCE` provenance on every fact, `VMEM.EXPLAIN` (which facts produced this answer, from which origins, and what dropped the rest), `VMEM.QUARANTINE` (revoke one origin, keep the fact as evidence), `VMEM.COVERAGE` + `VMEM.BACKFILL` (measure and repair provenance coverage), and point-in-time `-restore-to-lsn`; measured against the real OWASP Agent Memory Guard, reproducible with one `docker compose` command
 - **BM25 full-text + hybrid** — `VSIM.SEARCHTEXT` / `VSIM.HYBRID` (RRF fusion), embedder-free known-item search, query-side common-term pruning, attribute filters on both
 - **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization; non-blocking bulk ingest (per-shard delta freeze + batched LSM merges)
@@ -399,8 +404,8 @@ scripts/                  # Soak-test harness, memory-poisoning recovery compari
 MIT — use it in a commercial product without asking. If you need something the
 licence does not cover — support with a response time, an integration built to
 your requirements, an answer to a procurement questionnaire (data residency,
-provable erasure, "what did the agent know at time T"), a deployment in a
-closed network, or terms other than MIT — write to
+what the erasure guarantee is and where it ends, "what did the agent know at
+time T"), a deployment in a closed network, or terms other than MIT — write to
 dubovoinikolai@gmail.com. The copyright is held by one person, so dual
 licensing is a conversation, not a legal project.
 

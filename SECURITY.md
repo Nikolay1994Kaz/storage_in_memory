@@ -56,6 +56,15 @@ findings will only cost you time:
   every read mode including `ASOF`; a quarantined fact, by contrast, stays
   visible to `ASOF` before the revocation *on purpose* — the record of what an
   agent believed is evidence. See `docs/VMEM_DESIGN.md`.
+- **`FORGET` is revocation, not cryptographic erasure — and we say so.** The
+  fact is unreachable immediately, but its bytes can survive in sealed
+  segments until the next consolidation, in the WAL, in snapshots taken
+  earlier, and in shipped archives, which retention keeps by generation count
+  and never by content. Restoring to an LSN before the call brings the fact
+  back. This is inherent to a journalled store, the full horizon is written
+  down in `docs/VMEM_DESIGN.md` ("Erasure guarantee"), and no part of the
+  project claims GDPR Art. 17 compliance. Reporting the gap is not a finding;
+  reporting a case where the engine claims *more* than that section does is.
 - **Provenance is an input, not a verdict.** `SOURCE` records what the writer
   claims about origin; the engine never derives trust from content.
 - **Snapshot/WAL files are trusted input.** They are CRC-checked and load

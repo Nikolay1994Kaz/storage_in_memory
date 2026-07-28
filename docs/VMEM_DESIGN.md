@@ -15,7 +15,7 @@ scope here.
 - A search engine answers "which documents are similar". Memory needs more:
   **scope** (whose memory), **temporality** (facts supersede each other, old
   ones stay queryable "as of date"), **recall scoring** (relevance × recency ×
-  importance, not similarity alone), **forgetting** (TTL, GDPR erase), and
+  importance, not similarity alone), **forgetting** (TTL, erase-on-request), and
   **hybrid retrieval** (exact names/IDs where vectors are blind).
 - Every one of those maps onto machinery this engine already has: tenants,
   columnar attributes, delete-in-place, idle tasks, BM25/hybrid. VMEM is mostly
@@ -88,9 +88,11 @@ BM25 text layer, all of which already flow through WAL / snapshot / merge.
 - **Two kinds of forgetting, never conflated**:
   - *supersession* (step 4): the fact is no longer true **now**, but history
     stays queryable — this is what buys temporality;
-  - *erasure* (`VMEM.FORGET`, TTL reaper): physical delete-in-place, GDPR-style,
-    gone from history too. FORGET erases by id and does **not** walk
-    supersedes chains (documented limitation).
+  - *erasure* (`VMEM.FORGET`, TTL reaper): delete-in-place, gone from history
+    too. FORGET erases by id and does **not** walk supersedes chains
+    (documented limitation). "Gone" here means unreachable to every reader —
+    the physical horizon, and why it falls short of a GDPR Art. 17 claim, is
+    the "Erasure guarantee" section below.
 - Graceful degradation by construction: an unvectorized fact is invisible to
   the vector arm but found by the BM25 arm — hybrid gives step-0 tolerance for
   free.
@@ -110,6 +112,40 @@ BM25 text layer, all of which already flow through WAL / snapshot / merge.
     provenance. There is currently no predicate for "attribute absent"; if
     mass-revoking legacy facts ever matters, that predicate is the missing
     piece, not a relabelling of them into `unknown`.
+
+## Erasure guarantee — what `FORGET` actually promises
+
+`VMEM.FORGET` (and TTL expiry) makes a fact **unreachable through every read
+path immediately** — `ASOF` and `ALL` included — and deletes its verbatim KV
+anchor. That part is exact, idempotent and scope-checked.
+
+What it is **not** is cryptographic erasure. Removal from the API surface and
+removal of the bytes are two different events, and only the first is
+immediate:
+
+| layer | when the bytes actually go |
+|---|---|
+| active delta | immediately — hard delete, the vector is physically gone |
+| flushing delta / sealed segments | at the next consolidation that touches that segment. Compaction is driven by writes and idle ticks, so for a cold scope this horizon is **unbounded** |
+| local WAL | when `BackgroundCompact` rotates the journal and drops the old file. `FORGET` appends a deletion record; it does not remove the original `REMEMBER` |
+| shipped WAL archives (`file://` / `s3://`) | **never as a consequence of `FORGET`.** Shipper retention keeps the last *N* manifests by generation and is content-blind — it is not told that a fact was erased |
+| snapshots taken before the `FORGET` | never |
+
+Two consequences, stated here rather than left to be discovered:
+
+- **Erasure and point-in-time recovery conflict.** Restoring to an LSN before
+  the `FORGET` brings the fact back. This is inherent to a journalled store:
+  the journal is both the recovery mechanism and the surviving copy.
+- **There is no erasure receipt.** Even where the bytes are genuinely gone,
+  nothing proves it happened.
+
+So the claim this engine can defend is **immediate revocation and
+unreachability with a stated physical horizon** — not "provable erasure", and
+not GDPR Art. 17 compliance. Anything stronger requires content to have been
+encrypted *before* it was written: encrypting at deletion time cannot reach
+copies made earlier, which is the same gap every store-side "shred on delete"
+implementation has, whether or not it says so. Closing it is tracked as the
+keyring/envelope work; until that lands, this section is the guarantee.
 
 ## Doors (decisions that are expensive to reverse)
 
