@@ -58,6 +58,12 @@ var dataDir = "data"
 // функция: без -encrypt-at-rest и в тестах поведение прежнее байт в байт.
 var sealValue = func(scope string, v []byte) []byte { return v }
 
+// sealingActive — уходят ли НОВЫЕ записи в журнал под конвертом. Отдельно от
+// sealValue, потому что это нужно знать ДО записи: факт получает атрибут
+// sealed в момент создания, и по нему потом считается покрытие. Пакетная
+// переменная по той же причине, что sealValue.
+var sealingActive bool
+
 // activeKeyring — кейринг этого процесса или nil, если шифрование выключено.
 // Пакетная переменная по той же причине, что sealValue (см. выше).
 var activeKeyring *keyring.Keyring
@@ -296,6 +302,7 @@ func main() {
 	// Без кейринга (или в режиме восстановления, где писать нельзя) отдаёт
 	// значение как есть — легаси-записи и остаются легаси, о чём честно
 	// отчитывается VMEM.COVERAGE.
+	sealingActive = ring != nil && *encryptAtRest && restoreLSN == 0
 	sealValue = func(scope string, v []byte) []byte {
 		if ring == nil || !*encryptAtRest || restoreLSN > 0 {
 			return v
@@ -1872,7 +1879,10 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError("ERR vmem not supported by this vector store")
 			return
 		}
-		req := vector.RememberRequest{Scope: string(args[0])}
+		// SealedAtRest ставится ЗДЕСЬ, а не внутри движка: командный слой знает
+		// про кейринг, движок — нет. Атрибут отражает, уйдёт ли эта запись под
+		// конвертом, и потому считается в момент создания факта, а не позже.
+		req := vector.RememberRequest{Scope: string(args[0]), SealedAtRest: sealingActive}
 		textSeen := false
 		parseErr := ""
 	rememberParse:
@@ -2247,25 +2257,49 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			return
 		}
 		reports := lvs.ProvenanceCoverage(arg(args, 0))
+		// Вторая ось покрытия — ключом. Отзыв по источнику и криптостирание
+		// защищают от разного и слепые пятна имеют РАЗНЫЕ, поэтому обе доли
+		// показываются рядом: скоуп может быть полностью отзываемым и при этом
+		// полностью не стираемым.
+		keyByScope := make(map[string]vector.KeyReport)
+		for _, kr := range lvs.KeyCoverage(arg(args, 0)) {
+			keyByScope[kr.Scope] = kr
+		}
 		buf.WriteArrayHeader(len(reports))
 		for _, rep := range reports {
+			kr := keyByScope[rep.Scope]
+			// has_key говорит только о НАСТОЯЩЕМ моменте: ключ может быть уже
+			// уничтожен (скоуп стёрт) или не создаваться никогда. Сам по себе
+			// он не означает, что копии под ним, — для этого sealed_share.
+			hasKey := "0"
+			if activeKeyring != nil && activeKeyring.HasScope(rep.Scope) {
+				hasKey = "1"
+			}
 			fields := [][2]string{
 				{"scope", rep.Scope},
 				{"total", strconv.Itoa(rep.Total)},
+				{"sealed", strconv.Itoa(kr.Sealed)},
+				{"unsealed", strconv.Itoa(kr.Unsealed)},
+				{"sealed_share", fmt.Sprintf("%.4f", kr.SealedShare())},
+				{"has_key", hasKey},
 				{"declared", strconv.Itoa(rep.Total - rep.BySource["unknown"] - rep.BySource[""])},
 				{"unknown", strconv.Itoa(rep.BySource["unknown"])},
 				{"absent", strconv.Itoa(rep.BySource[""])},
 				{"declared_share", fmt.Sprintf("%.4f", rep.Declared())},
 				{"revocable_share", fmt.Sprintf("%.4f", rep.Revocable())},
 			}
+			// Граница сортируемого хвоста берётся ИЗ ДЛИНЫ, а не константой:
+			// зашитое число молча разъезжается при добавлении поля, и
+			// фиксированное поле уезжает в сортировку разбивки.
+			fixedFields := len(fields)
 			for src, n := range rep.BySource {
 				if src == "" || src == "unknown" {
 					continue
 				}
 				fields = append(fields, [2]string{"source:" + src, strconv.Itoa(n)})
 			}
-			sort.Slice(fields[7:], func(i, j int) bool { // разбивка в стабильном порядке
-				return fields[7+i][0] < fields[7+j][0]
+			sort.Slice(fields[fixedFields:], func(i, j int) bool {
+				return fields[fixedFields+i][0] < fields[fixedFields+j][0]
 			})
 			buf.WriteArrayHeader(len(fields) * 2)
 			for _, kv := range fields {

@@ -57,6 +57,12 @@ const (
 	vmemAttrValidFrom  = "valid_from"
 	vmemAttrValidTo    = "valid_to"
 	vmemAttrExpiresAt  = "expires_at"
+	// vmemAttrSealed — факт записан под конвертом скоупа, то есть его
+	// персистентные копии крипто-стираемы. ОТСУТСТВИЕ атрибута означает
+	// «записан до шифрования» и читается как «не стираем»: это разные вещи,
+	// и путать их нельзя — иначе VMEM.COVERAGE покажет покрытие ЛУЧШЕ
+	// реального, то есть соврёт в нашу пользу.
+	vmemAttrSealed = "sealed"
 )
 
 // vmemSourceUnknown — источник факта, который клиент не объявил. Решение
@@ -127,6 +133,10 @@ type RememberRequest struct {
 	Supersedes string    // id заменяемого факта (провенанс; закрытие его интервала — шаг 4)
 	Source     string    // откуда факт (канал/инструмент/документ); "" → vmemSourceUnknown
 	Vector     []float32 // BYO-эмбеддинг; nil → ступень 0 (placeholder из id)
+	// SealedAtRest — уходит ли ЭТА запись в журнал под конвертом. Ставит
+	// вызывающий (командный слой знает про кейринг, движок — нет), ровно как
+	// с провенансом: это вход, а не наше суждение о факте.
+	SealedAtRest bool
 }
 
 // RememberedDoc — материализованный факт после кухни: ровно то, что ушло в
@@ -205,6 +215,9 @@ func rememberDoc(req RememberRequest, now int64, dim int) (RememberedDoc, error)
 			vmemAttrValidTo:   float64(vmemOpenValidTo),
 			vmemAttrExpiresAt: float64(expiresAt),
 		},
+	}
+	if req.SealedAtRest {
+		attrs.Cat[vmemAttrSealed] = "1"
 	}
 	if req.Type != "" {
 		attrs.Cat[vmemAttrType] = req.Type
