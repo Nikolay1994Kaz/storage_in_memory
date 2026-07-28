@@ -207,18 +207,34 @@ Three limits, stated rather than discovered:
   cannot be crypto-erased, and a receipt must never imply they were — the
   coverage command exists to make that visible, exactly as `VMEM.COVERAGE`
   had to for provenance.
-- ⚠**Snapshots are not covered yet.** `-encrypt-at-rest` seals the WAL, and
-  therefore the shipped archive, which was the hole that could not be closed
-  any other way. It does **not** yet seal `snapshot.wal` or
-  `graph_leveled.bin`: both are written by walking in-memory state
-  (`snapshotIterate` reads values straight out of the store), where facts are
-  plaintext by the decision above. Consequence, stated plainly: a snapshot
-  taken *before* a `VMEM.SHRED` still contains that scope's anchors and BM25
-  terms in the clear, and destroying the key does not reach it. Snapshots
-  written *after* the shred do not, because the facts are gone from memory
-  first. Sealing the snapshot path needs the scope for each key at write time
-  and is tracked as the remaining work; until it lands, this paragraph is the
-  guarantee, and `VMEM.SHRED` must not be described as covering snapshots.
+- ⚠**Snapshots are covered by half.** `snapshot.wal` now seals fact anchors —
+  the verbatim text — with the scope's key, resolved at write time through
+  `vector.FactScopes` (the scope lives in the vector store, not in the
+  `vmem:<id>` key, and that missing lookup was the whole reason the path
+  stayed open). Destroying the key therefore reaches the snapshot exactly as
+  it reaches the journal: replay skips those records as a normal outcome.
+
+  `graph_leveled.bin` is **not** covered. It holds the vectors and the BM25
+  terms, and its layers — the frozen graph, the attribute columns, the
+  inverted index — are all indexed by a document's *position* in the segment,
+  with scopes interleaved. Encrypting part of such a segment is not merely
+  unimplemented but incoherent: the graph's edges would point into
+  ciphertext. Consequence, stated plainly: a snapshot taken *before* a
+  `VMEM.SHRED` still contains that scope's vectors and stemmed terms in the
+  clear — enough to reconstruct a bag of words, though not the sentence —
+  and destroying the key does not reach it. Snapshots written *after* the
+  shred do not, because the facts leave memory first.
+
+  Two paths were measured before choosing (see `snapshot_replay_cost` and
+  `snapshot_rebuild_cost`). Keeping VMEM facts out of the binary snapshot and
+  replaying them instead costs 4.9 s per start at 10k facts against 33–76 ms
+  — rejected. Making each segment single-scope would guarantee the
+  fragmentation we already paid 6× for (idle consolidation, 589→3535 QPS) —
+  rejected. What remains is to store the *documents* grouped by scope, sealed,
+  and rebuild the layers on load with the same `buildSegmentText` /
+  `buildSegmentAttrs` the delta flush already uses: measured at 18–20 ms per
+  10k facts. Until that lands, this paragraph is the guarantee, and
+  `VMEM.SHRED` must not be described as covering `graph_leveled.bin`.
 
 ## Doors (decisions that are expensive to reverse)
 
