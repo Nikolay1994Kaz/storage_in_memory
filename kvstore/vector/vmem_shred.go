@@ -68,3 +68,33 @@ func (lvs *LeveledVectorStore) ShredScopeKeys(scope string, keys []string) []str
 func (lvs *LeveledVectorStore) ShredScope(scope string) []string {
 	return lvs.ShredScopeKeys(scope, lvs.CollectScope(scope))
 }
+
+// FactScopes — карта «ключ факта → scope» по всем живым VMEM-фактам.
+//
+// Нужна тому, кто пишет снапшот. Якорь факта лежит в KV под ключом
+// `vmem:<id>`, а scope — атрибутом в векторном сторе, поэтому в момент обхода
+// KV принадлежность ключа скоупу иначе неизвестна, а без неё нечем выбрать
+// ключ шифрования. Ровно этот недостающий резолв и был причиной, по которой
+// снапшот остался вне конверта (docs/VMEM_DESIGN.md).
+//
+// Не-VMEM векторы (без атрибута scope) в карту не попадают: у них нет скоупа,
+// значит нет и ключа, и запечатывать их нечем.
+func (lvs *LeveledVectorStore) FactScopes() map[string]string {
+	// Ключи собираем ОТДЕЛЬНЫМ проходом по той же причине, что в
+	// ProvenanceCoverage и CollectScope: ForEach держит lvs.mu.RLock, а чтение
+	// атрибутов берёт его же — рекурсивный RLock с ждущим писателем даёт дедлок.
+	var keys []string
+	lvs.ForEach(func(key string, _ []float32) { keys = append(keys, key) })
+	if len(keys) == 0 {
+		return nil
+	}
+	scopes := lvs.catForKeys(keys, vmemAttrScope)
+	out := make(map[string]string, len(keys))
+	for i, sc := range scopes {
+		if sc == "" {
+			continue // не VMEM-факт
+		}
+		out[keys[i]] = sc
+	}
+	return out
+}

@@ -62,6 +62,11 @@ var sealValue = func(scope string, v []byte) []byte { return v }
 // Пакетная переменная по той же причине, что sealValue (см. выше).
 var activeKeyring *keyring.Keyring
 
+// vmemAnchorPrefix — префикс KV-ключа, под которым лежит дословный якорь факта
+// (`vmem:<id>`). Вынесен в константу: по нему опознаёт факт уже не только
+// запись REMEMBER, но и обход состояния при записи снапшота.
+const vmemAnchorPrefix = "vmem:"
+
 // version — версия сборки. Дефолт "dev" для локальных прогонов; в релизных
 // сборках проставляется через -ldflags "-X main.version=$(git describe ...)"
 // (см. Makefile/Dockerfile).
@@ -620,7 +625,15 @@ func main() {
 	// для snapshot.wal (векторы хранятся отдельно). Компакция удаляет старые
 	// WAL, поэтому всё, что не попадёт сюда, теряется после рестарта.
 	iterateAll := func(fn func(op byte, key string, value []byte)) {
-		snapshotIterate(s, ttl, zsetReg, fn)
+		// Карта «ключ факта → scope» готовится ЗДЕСЬ, один раз на снапшот:
+		// якорь `vmem:<id>` scope в себе не несёт, а без него нечем выбрать
+		// ключ шифрования. Обход векторного стора стоит O(N) и платится раз в
+		// компакцию, не на горячем пути.
+		var factScopes map[string]string
+		if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
+			factScopes = lvs.FactScopes()
+		}
+		snapshotIterateSealed(s, ttl, zsetReg, factScopes, fn)
 	}
 
 	// saveVectors — сохраняет LeveledVectorStore в graph_leveled.bin.
@@ -3366,6 +3379,45 @@ func SendVectorToNode(addr, key string, vec []float32) error {
 //     ключи с TTL становятся бессмертными (correctness + утечка памяти);
 //   - zset-деревья → OpZAdd (score+member) (S2): реплей восстанавливает И
 //     дерево, И __zidx-обратный индекс.
+//
+// snapshotIterateSealed — тот же обход, но VMEM-якоря уезжают в снапшот под
+// конвертом своего скоупа.
+//
+// ЗАЧЕМ ОТДЕЛЬНАЯ ОБЁРТКА. Конверт стоит на границе персистентности, и до сих
+// пор эта граница была закрыта только со стороны WAL: snapshot.wal пишется
+// обходом состояния В ПАМЯТИ, где факты по решению 1 лежат открытым текстом.
+// Снапшот, снятый ДО VMEM.SHRED, хранил якоря скоупа в открытом виде — и, что
+// хуже, уезжал шиппером в архив, куда удаление не дотягивается в принципе.
+// Уничтожение ключа такой снапшот не догоняло, то есть стирание было неполным
+// ровно в том месте, где оно и должно работать.
+//
+// ЧЕГО ЗДЕСЬ НЕТ. scope не выводится из ключа: якорь `vmem:<id>` его не несёт,
+// поэтому карта готовится ЗАРАНЕЕ (vector.FactScopes) одним проходом по
+// векторному стору. Ключ, которого в карте нет, — не VMEM-факт либо факт без
+// scope; такой пишется как есть, потому что запечатывать его нечем, и это
+// видно в VMEM.COVERAGE, а не замалчивается.
+//
+// Обратный путь уже готов: applyEntry разворачивает конверт единой точкой и
+// для snapshot.wal тоже, а уничтоженный ключ там — ШТАТНЫЙ пропуск записи.
+func snapshotIterateSealed(
+	s *tcmalloc.TCMallocStore,
+	ttl *store.TTLManager,
+	zsetReg *zset.ZSetRegistry,
+	factScopes map[string]string,
+	fn func(op byte, key string, value []byte),
+) {
+	snapshotIterate(s, ttl, zsetReg, func(op byte, key string, value []byte) {
+		// Только OpSet: OpExpire везёт время смерти, OpZAdd — score+member, в
+		// них содержания факта нет.
+		if op == wal.OpSet && strings.HasPrefix(key, vmemAnchorPrefix) {
+			if scope := factScopes[strings.TrimPrefix(key, vmemAnchorPrefix)]; scope != "" {
+				value = sealValue(scope, value)
+			}
+		}
+		fn(op, key, value)
+	})
+}
+
 func snapshotIterate(
 	s *tcmalloc.TCMallocStore,
 	ttl *store.TTLManager,
