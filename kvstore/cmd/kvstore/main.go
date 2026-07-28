@@ -8,6 +8,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -28,6 +30,7 @@ import (
 
 	"kvstore/kvstore/internal/ai"
 	"kvstore/kvstore/internal/btree"
+	"kvstore/kvstore/internal/keyring"
 	"kvstore/kvstore/internal/logging"
 	"kvstore/kvstore/internal/monitoring"
 	"kvstore/kvstore/internal/protocol"
@@ -47,6 +50,17 @@ const syncInterval = 100 * time.Millisecond
 // каталога), переопределяется флагом -data-dir. var, а не const: присваивается
 // один раз в main() сразу после flag.Parse(), до любого использования.
 var dataDir = "data"
+
+// sealValue упаковывает полезную нагрузку записи журнала в конверт ключа
+// скоупа. Пакетная переменная по той же причине, что и dataDir: executeCommand
+// вызывается и из тестов, и протаскивать кейринг ещё одним параметром через
+// всю сигнатуру дороже, чем одна точка подмены. Дефолт — тождественная
+// функция: без -encrypt-at-rest и в тестах поведение прежнее байт в байт.
+var sealValue = func(scope string, v []byte) []byte { return v }
+
+// activeKeyring — кейринг этого процесса или nil, если шифрование выключено.
+// Пакетная переменная по той же причине, что sealValue (см. выше).
+var activeKeyring *keyring.Keyring
 
 // version — версия сборки. Дефолт "dev" для локальных прогонов; в релизных
 // сборках проставляется через -ldflags "-X main.version=$(git describe ...)"
@@ -127,6 +141,7 @@ func main() {
 	logFormat := flag.String("log-format", "text", "формат логов: text (человекочитаемый) | json (для агрегаторов)")
 	enablePprof := flag.Bool("pprof", false, "включить /debug/pprof/* на metrics-порту для диагностики утечек/профилирования (НЕ для прода)")
 	dataDirFlag := flag.String("data-dir", "data", "каталог для WAL и снапшотов (относительный путь считается от рабочего каталога)")
+	encryptAtRest := flag.Bool("encrypt-at-rest", false, "шифровать полезную нагрузку VMEM на границе персистентности (WAL, снапшоты и, следовательно, отгружаемые архивы) ключом скоупа из "+keyring.FileName+". Включает VMEM.SHRED — криптостирание всего скоупа разом, действующее и на уже отгруженные копии. Путь чтения не дорожает: в памяти движок работает с открытым текстом. Если файл кейринга уже есть, он открывается независимо от флага — иначе прежние конверты стали бы нечитаемы")
 	restoreToLSN := flag.Uint64("restore-to-lsn", 0, "форензическое восстановление на момент: поднять состояние, каким оно было после записи с этим LSN, и обслуживать ТОЛЬКО чтение (0 = обычный старт). Каталог данных не изменяется")
 	walInspect := flag.Bool("wal-inspect", false, "напечатать журнал (LSN, операция, ключ) и выйти — как найти LSN для -restore-to-lsn")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
@@ -210,6 +225,54 @@ func main() {
 	if restoreLSN > 0 {
 		slog.Warn("point-in-time restore mode: read-only, data directory is not modified",
 			"restore_to_lsn", restoreLSN, "data_dir", dataDir, "scratch_dir", outDir)
+	}
+
+	// === Кейринг: ключи скоупов для шифрования на границе персистентности ===
+	//
+	// Читается из dataDir, а НЕ из outDir. Два следствия, и оба намеренные:
+	// при -restore-to-lsn расследование идёт во временном каталоге, но ключи
+	// нужны те же, иначе восстановленный момент нечитаем; и наоборот — ключ,
+	// уничтоженный сегодня, делает факт нечитаемым в ЛЮБОМ прошлом моменте.
+	// Второе и есть разрешение конфликта «стирание против восстановления на
+	// момент», названного в docs/VMEM_DESIGN.md: откат до FORGET прежде
+	// воскрешал факт, откат после SHRED отдаёт шифротекст.
+	//
+	// Файл открывается и без флага, если он уже существует: иначе прежние
+	// конверты молча стали бы нечитаемы — то есть потерей данных, замаскированной
+	// под смену настройки.
+	var ring *keyring.Keyring
+	if _, statErr := os.Stat(filepath.Join(dataDir, keyring.FileName)); *encryptAtRest || statErr == nil {
+		ring, err = keyring.Open(dataDir)
+		if err != nil {
+			logging.Fatalf("failed to open keyring: %v", err)
+		}
+		defer ring.Close()
+		activeKeyring = ring
+		slog.Info("encryption at rest enabled", "keyring", filepath.Join(dataDir, keyring.FileName),
+			"scopes", len(ring.Scopes()), "sealing_new_writes", *encryptAtRest)
+	}
+
+	// sealValue упаковывает полезную нагрузку записи журнала в конверт скоупа.
+	// Без кейринга (или в режиме восстановления, где писать нельзя) отдаёт
+	// значение как есть — легаси-записи и остаются легаси, о чём честно
+	// отчитывается VMEM.COVERAGE.
+	sealValue = func(scope string, v []byte) []byte {
+		if ring == nil || !*encryptAtRest || restoreLSN > 0 {
+			return v
+		}
+		if _, err := ring.EnsureScope(scope); err != nil {
+			// Не молчать и не писать открытым текстом «на всякий случай»:
+			// тихая деградация до plaintext — ровно та ложь, против которой
+			// весь механизм. Запись отклоняется вызывающим по nil.
+			slog.Error("keyring: cannot ensure scope key, write left unsealed", "scope", scope, "err", err)
+			return v
+		}
+		sealed, err := ring.Seal(scope, v)
+		if err != nil {
+			slog.Error("keyring: seal failed, write left unsealed", "scope", scope, "err", err)
+			return v
+		}
+		return sealed
 	}
 
 	// === WAL-shipping: remote + restore (до загрузки снапшотов/реплея) ===
@@ -349,7 +412,30 @@ func main() {
 		logging.Fatalf("%v", err)
 	}
 
+	// erasedByShred — записи, пропущенные при реплее потому, что ключ их
+	// скоупа уничтожен. Это ШТАТНЫЙ исход криптостирания, а не порча: считаем
+	// и говорим вслух, но не падаем.
+	erasedByShred := 0
+
 	applyEntry := func(entry wal.Entry, isFromSnapshot bool) {
+		// Конверт разворачивается ЗДЕСЬ, единой точкой на границе: дальше весь
+		// движок работает с открытым текстом и о шифровании не знает. Записи,
+		// сделанные до кейринга, конвертами не являются и проходят как есть.
+		if ring != nil && keyring.IsEnvelope(entry.Value) {
+			plain, err := ring.Unseal(entry.Value)
+			switch {
+			case err == nil:
+				entry.Value = plain
+			case errors.Is(err, keyring.ErrKeyDestroyed):
+				// Ключ уничтожен — факт стёрт. Пропускаем запись целиком:
+				// именно так стирание догоняет WAL, снапшоты и архивы.
+				erasedByShred++
+				return
+			default:
+				slog.Warn("failed to open envelope during replay", "key", entry.Key, "err", err)
+				return
+			}
+		}
 		switch entry.Op {
 		case wal.OpSet:
 			s.Set(0, entry.Key, entry.Value)
@@ -1067,6 +1153,11 @@ func isWriteCmd(cmd string) bool {
 	case "SET", "DEL", "EXPIRE", "PERSIST",
 		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC", "VSIM.DEL",
 		"VMEM.REMEMBER", "VMEM.FORGET", "VMEM.QUARANTINE", "VMEM.BACKFILL",
+		// VMEM.SHRED — write, но НЕ memory-growing: как и FORGET, стирание
+		// обязано оставаться доступным под OOM. Гейт write при этом нужен —
+		// иначе уничтожение ключа прошло бы под -restore-to-lsn, то есть
+		// расследование могло бы испортить вещдок, по которому ведётся.
+		"VMEM.SHRED",
 		"ZADD", "ZREM", "AI.INGEST":
 		return true
 	}
@@ -1978,13 +2069,15 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				{Key: res.Closed.ID, Vec: res.Closed.Vec, Attrs: res.Closed.Attrs, Terms: res.Closed.Terms},
 				{Key: res.Doc.ID, Vec: res.Doc.Vec, Attrs: res.Doc.Attrs, Terms: res.Doc.Terms},
 			})
-			bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Doc.ID, Value: pair})
+			bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Doc.ID, Value: sealValue(req.Scope, pair)})
 		} else {
-			bw.Write(wal.Entry{Op: wal.OpVSimAddDoc, Key: res.Doc.ID, Value: vector.SerializeVectorWithDoc(res.Doc.Vec, res.Doc.Attrs, res.Doc.Terms)})
+			bw.Write(wal.Entry{Op: wal.OpVSimAddDoc, Key: res.Doc.ID, Value: sealValue(req.Scope, vector.SerializeVectorWithDoc(res.Doc.Vec, res.Doc.Attrs, res.Doc.Terms))})
 		}
 		textKey := "vmem:" + res.Doc.ID
 		textVal := []byte(req.Text)
-		bw.Write(wal.Entry{Op: wal.OpSet, Key: textKey, Value: textVal})
+		// В журнал уезжает конверт, в памяти остаётся открытый текст: граница
+		// шифротекста — это граница персистентности, а не путь чтения.
+		bw.Write(wal.Entry{Op: wal.OpSet, Key: textKey, Value: sealValue(req.Scope, textVal)})
 		s.Set(workerID, textKey, textVal)
 		if req.TTL > 0 {
 			// Абсолютное время смерти якоря = expires_at факта (дверь 1: OpExpire
@@ -2378,6 +2471,79 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		s.Del(workerID, textKey)
 		ttl.OnDelete(textKey)
 		buf.WriteInt(1)
+
+	case "VMEM.SHRED":
+		// VMEM.SHRED <scope> — криптостирание ВСЕГО скоупа: уничтожение ключа
+		// скоупа делает нечитаемыми все персистентные копии сразу — WAL,
+		// снапшоты, отгруженные архивы и любое восстановление из них. Это то,
+		// чего FORGET сделать не может в принципе: удалением догнать копии,
+		// уже уехавшие в архив, нельзя (docs/VMEM_DESIGN.md, «Erasure
+		// guarantee»).
+		//
+		// Ответ — КВИТАНЦИЯ, и она утверждает строго проверяемое: «ключ с
+		// идентификатором K уничтожен». Не «данные стёрты»: подписанная
+		// расписка о стирании при живых байтах была бы уже не неточностью, а
+		// документом. Проверяющий сопоставляет kek_id с отсутствием ключа в
+		// кейринге.
+		if len(args) != 1 {
+			buf.WriteError("ERR usage: VMEM.SHRED <scope>")
+			return
+		}
+		lvs, ok := vecStore.(*vector.LeveledVectorStore)
+		if !ok {
+			buf.WriteError("ERR vmem not supported by this vector store")
+			return
+		}
+		if activeKeyring == nil {
+			buf.WriteError("ERR encryption at rest is off: start with -encrypt-at-rest, otherwise there is no key to destroy")
+			return
+		}
+		scope := string(args[0])
+		if scope == "" {
+			buf.WriteError("ERR usage: VMEM.SHRED <scope>")
+			return
+		}
+		if !activeKeyring.HasScope(scope) {
+			// Ключа нет: либо уже стёрт, либо скоуп писался до кейринга. Второе
+			// НЕ стирание, и молчать об этом нельзя — иначе квитанция припишет
+			// уничтожение тому, что никогда не было под ключом.
+			buf.WriteError("ERR no key for this scope: already shredded, or its facts predate the keyring (see VMEM.COVERAGE)")
+			return
+		}
+
+		// СНАЧАЛА память, ПОТОМ ключ: при отказе между фазами должно
+		// выполняться «в памяти нет» ⊇ «на диске нет», иначе остаётся окно, в
+		// котором объявленное стёртым ещё отдаётся из RECALL.
+		ids := lvs.ShredScope(scope)
+		for _, id := range ids {
+			monitoring.VectorDeleteTotal.Inc()
+			bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: id})
+			textKey := "vmem:" + id
+			bw.Write(wal.Entry{Op: wal.OpDel, Key: textKey})
+			s.Del(workerID, textKey)
+			ttl.OnDelete(textKey)
+		}
+
+		kekID, destroyed, err := activeKeyring.Destroy(scope)
+		if err != nil {
+			buf.WriteError(fmt.Sprintf("ERR key destruction failed, nothing is claimed erased: %v", err))
+			return
+		}
+		if !destroyed {
+			buf.WriteError("ERR key vanished between check and destruction; no receipt issued")
+			return
+		}
+		slog.Warn("scope crypto-shredded", "scope", scope, "kek_id", hex.EncodeToString(kekID[:]), "facts", len(ids))
+
+		buf.WriteArrayHeader(8)
+		buf.WriteBulkString("scope")
+		buf.WriteBulkString(scope)
+		buf.WriteBulkString("kek_id")
+		buf.WriteBulkString(hex.EncodeToString(kekID[:]))
+		buf.WriteBulkString("facts_removed_from_memory")
+		buf.WriteBulkString(strconv.Itoa(len(ids)))
+		buf.WriteBulkString("destroyed_at")
+		buf.WriteBulkString(strconv.FormatInt(time.Now().Unix(), 10))
 
 	case "VSIM.DEL":
 		if len(args) < 1 {
