@@ -5,8 +5,10 @@
 
 **Self-hosted memory engine for AI agents.** One process gives your agents
 durable, queryable memory: facts with validity intervals and supersession
-history ("what was true in March?"), erasure that takes effect immediately for
-every reader (with its physical horizon stated, not glossed), and
+history ("what was true in March?"), erasure at two levels — immediate
+revocation with its physical horizon stated, and cryptographic erasure of a
+whole scope that reaches copies already shipped to an archive — an optional
+tamper-evident audit chain over every memory-changing command, and
 recency×importance-ranked recall — BM25 out of the box, hybrid BM25+vector
 when you bring embeddings. Agents plug in over **MCP** in two minutes
 ([docs/QUICKSTART_MCP.md](docs/QUICKSTART_MCP.md)); everything is also
@@ -44,11 +46,29 @@ semantics in [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md)):
   "what was true then".
 - **Erasure beats time travel.** `FORGET` and TTL expiry make a fact
   unreachable in every read mode, `ASOF` included — the right to be forgotten
-  wins over the time machine. What that does *not* mean is cryptographic
-  erasure: the bytes leave the main store at the next consolidation, and can
-  outlive the call in the WAL, in earlier snapshots and in shipped archives.
-  The horizon is stated, not glossed —
+  wins over the time machine. That is *revocation*: the bytes leave the main
+  store at the next consolidation and can outlive the call in the WAL, in
+  earlier snapshots and in shipped archives.
+- **Cryptographic erasure, for the stronger claim.** With `-encrypt-at-rest`
+  facts are sealed under a per-scope key at the persistence boundary, so
+  `VMEM.SHRED` destroying that key makes the journal, the snapshots and **the
+  archives already shipped to S3 unreadable at once** — including a
+  point-in-time restore to before the call. This is the thing deletion cannot
+  do in principle: it never catches copies that already left. It is
+  scope-granular (a scope *is* whose memory it is), it cannot reach facts
+  written before the keyring existed (`VMEM.RESEAL` migrates those forward,
+  `VMEM.COVERAGE` measures what is genuinely covered), and the receipt claims
+  only what is checkable — *this key id was destroyed*, never "the data is
+  gone". Both horizons are stated, not glossed —
   [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md) ("Erasure guarantee").
+- **Evidence, not just state.** With `-audit-chain` every memory-changing
+  command leaves a record in a hash-chained, Merkle-batched journal — a
+  fingerprint, never the content, since putting fact text in an append-only
+  log would keep alive exactly what `SHRED` destroys. `VMEM.AUDIT EXPORT`
+  signs the head with **Ed25519**, so an auditor verifies without holding your
+  secret; `PROVE` gives an inclusion proof for one event without disclosing
+  the others; `RECONCILE` compares live memory against the journal and names
+  what disagrees (`resurrected`, `missing`, `unrecorded`).
 - **Ranking is not truth.** Recency decay and importance reorder results but
   are mathematically floored so old facts stay reachable — judged on real
   embeddings, not vibes ([docs/BENCHMARKS.md §7](docs/BENCHMARKS.md)).
@@ -99,14 +119,24 @@ selectively (Guard's `retire_if` does, and it loses nothing), but it cannot
 keep the revoked fact as queryable evidence, and it has no time axis to answer
 "what did the agent believe at 14:32".
 
-**Honesty about coverage.** Revocation selects by origin, so it is worth
-measuring how many facts *have* one — `VMEM.COVERAGE` reports exactly that.
-On our own oldest store the answer is **0%**: those facts were written before
-provenance existed, carry no `source` column at all, and mass revocation would
-therefore match nothing. Facts written since always carry a source (`unknown`
-at minimum, which *is* selectable). There is no "attribute is absent"
-predicate yet, so legacy data cannot be revoked in bulk — a known gap, not a
-detail we would rather you did not notice.
+**Honesty about coverage.** Both recovery levers select on something a fact
+must actually carry, so `VMEM.COVERAGE` reports two independent axes — and a
+scope can be fully revocable while not being erasable at all. Revocation
+selects **by origin**: a fact written before provenance existed carries no
+`source` column and mass revocation matches nothing (`VMEM.BACKFILL` stamps
+those forward — its one predicate is exactly "attribute absent" — and it never
+overwrites a source someone already declared). Crypto-erasure reaches only
+what went to disk **under an envelope**, which is measured by a stamp taken at
+write time rather than by asking the keyring whether a key exists now: a scope
+half-written before encryption would otherwise report as covered, an error in
+our own favour.
+
+We ran it against our own personal store and it reported **0 on both axes** —
+every fact predated both features. The honest repair was not a migration: a
+`RESEAL` cannot reach copies that already left, so the plaintext sitting in
+old WAL segments would have stayed readable whatever the coverage report said
+afterwards. The store was rebuilt from scratch under both flags instead. That
+is the shape of the limit, stated rather than left to be discovered.
 
 Measured (reproducible canon, §7): known-item hit@1 **0.982** / MRR **0.991**;
 temporal accuracy (`ASOF`, supersession chains) **1.000**; scope isolation
@@ -117,6 +147,8 @@ RESP on a 2019 laptop.
 
 - **VMEM agent memory** — `VMEM.REMEMBER` / `VMEM.RECALL` / `VMEM.FORGET`: validity intervals + supersession history (`ASOF` time travel), TTL + erasure (immediate unreachability, physical horizon stated in `docs/VMEM_DESIGN.md`), recency×importance recall over BM25 or hybrid; verbatim KV anchors; MCP adapter `vmem-mcp` (Linux/macOS/Windows) for Claude Code/Desktop and any MCP host
 - **Recovery after memory corruption** — `SOURCE` provenance on every fact, `VMEM.EXPLAIN` (which facts produced this answer, from which origins, and what dropped the rest), `VMEM.QUARANTINE` (revoke one origin, keep the fact as evidence), `VMEM.COVERAGE` + `VMEM.BACKFILL` (measure and repair provenance coverage), and point-in-time `-restore-to-lsn`; measured against the real OWASP Agent Memory Guard, reproducible with one `docker compose` command
+- **Cryptographic erasure** *(opt-in)* — `-encrypt-at-rest` seals VMEM payload at the persistence boundary under a per-scope key (envelope: the wrapped DEK rides with the record, the KEK lives in a keyring that is never shipped and never snapshotted); `VMEM.SHRED` destroys that key and takes the WAL, the snapshots and the shipped archives with it; `VMEM.RESEAL` migrates pre-keyring facts forward. The read path pays nothing — the engine works on plaintext in memory; cost lands on write (~1.9 µs/fact, ≈1% of the insert budget)
+- **Tamper-evident audit chain** *(opt-in)* — `-audit-chain` records every memory-changing command in a hash-chained journal (Merkle-batched, one link per second; fingerprints, never content), so a `SHRED` receipt is producible months later rather than read once; `VMEM.AUDIT VERIFY / EXPORT / PROVE / RECONCILE` — Ed25519-signed statements an auditor checks without holding your secret, inclusion proofs that disclose one event and not its batch, and a live-memory-vs-journal reconciliation
 - **BM25 full-text + hybrid** — `VSIM.SEARCHTEXT` / `VSIM.HYBRID` (RRF fusion), embedder-free known-item search, query-side common-term pruning, attribute filters on both
 - **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization; non-blocking bulk ingest (per-shard delta freeze + batched LSM merges)
 - **AI / RAG** *(optional, off by default)* — Ollama embeddings, async ingestion, semantic queries (`AI.INGEST` / `AI.ASK`); the engine itself is BYO-embeddings
@@ -230,7 +262,9 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 | `--bind` | `127.0.0.1` | Listen interface for both the data port and the metrics port. Localhost-only by default — to accept remote connections set `--bind 0.0.0.0` **and configure AUTH (+TLS)** |
 | `--port` | `6380` | Listen port |
 | `--metrics-port` | `9090` | HTTP port for `/metrics`, `/health`, `/ready` |
-| `--data-dir` | `data` | Directory for WAL and snapshots (a relative path is resolved against the working directory) |
+| `--data-dir` | `data` | Directory for WAL, snapshots, the keyring and the audit chain (a relative path is resolved against the working directory) |
+| `--encrypt-at-rest` | `false` | Seal VMEM payload at the persistence boundary with a per-scope key from `keyring.dat`, and enable `VMEM.SHRED`. An existing keyring is opened regardless of the flag — otherwise earlier envelopes would become unreadable |
+| `--audit-chain` | `false` | Record memory-changing commands in a hash-chained journal under `<data-dir>/auditchain/`. Never compacted (it is evidence): ≈3.6 GB/year |
 | `--maxmemory` | `0` | Memory limit in MB (0 = unlimited); writes are rejected above the limit |
 | `--max-connections` | `10000` | Cap on concurrent connections (0 = unlimited) |
 | `--idle-timeout` | `5m` | Close connections idle longer than this (pub/sub subscribers are exempt); 0 = off |
@@ -243,6 +277,8 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 | `--ship-interval` | `1s` | Shipping period (≈ crash RPO) |
 | `--ship-retain` | `3` | Restore points kept on the remote |
 | `--ship-restore` | `false` | Restore data dir from `--ship-url` before start |
+| `--restore-to-lsn` | `0` | Forensic point-in-time start: raise the store as it was after this LSN and serve **reads only**; the data directory is not modified (0 = normal start) |
+| `--wal-inspect` | `false` | Print the journal (LSN, op, key) and exit — how you find the LSN for `--restore-to-lsn` |
 | `--log-level` / `--log-format` | `info` / `text` | Structured logging level and format (`text`/`json`) |
 | `--pprof` | `false` | Expose `/debug/pprof/*` on the metrics port — **never in production** |
 
@@ -250,7 +286,8 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 
 The full command manifest (syntax, replies, gate semantics, WAL ops) lives in
 [docs/COMMANDS.md](docs/COMMANDS.md) — the surface is deliberately small and frozen.
-Families: agent memory (`VMEM.*`), vector + full-text search (`VSIM.*`, incl.
+Families: agent memory (`VMEM.*`, incl. `SHRED`/`RESEAL`/`AUDIT`), vector +
+full-text search (`VSIM.*`, incl.
 `SEARCHTEXT`/`HYBRID`), KV/TTL (`SET`/`GET`/`DEL`/`EXPIRE`/…), transactions
 (`MULTI`/`EXEC`/`DISCARD`), Pub/Sub, sorted sets (`ZADD`/…), AI/RAG (`AI.*`,
 optional — requires a reachable Ollama).
@@ -283,6 +320,9 @@ optional — requires a reachable Ollama).
 ├──────────────────────────────────────────────┤
 │   VMEM memory layer (validity / erasure /    │
 │   recency-ranked recall; MCP via vmem-mcp)   │
+├──────────────────────────────────────────────┤
+│  Persistence boundary: keyring envelope seal │
+│  + audit chain (both opt-in)                 │
 ├──────────────┬───────────────────────────────┤
 │   TCMalloc   │  TTL    │ WAL    │ Pub/Sub   │
 │   Store      │  Heap   │ Batch  │ Hub       │
@@ -379,9 +419,12 @@ kvstore/
 ├── internal/
 │   ├── server/           # Epoll server, ConnBuf, Handler
 │   ├── store/            # KV store, TTL manager
-│   │   └── tcmalloc/     # TCMalloc-style allocator (MCache, MCentral, MHeap)
+│   │   ├── tcmalloc/     # TCMalloc-style allocator (MCache, MCentral, MHeap)
+│   │   └── zset/         # Sorted-set registry
 │   ├── wal/              # Write-Ahead Log, snapshots, batch writer
 │   ├── ship/             # Continuous WAL-shipping (file://, s3://) + restore
+│   ├── keyring/          # Per-scope KEK, envelope seal/unseal, crypto-erasure
+│   ├── auditchain/       # Hash-chained journal, Merkle batching, Ed25519 export
 │   ├── pubsub/           # Pub/Sub hub (classic + semantic)
 │   ├── btree/            # Sorted-set backing structure
 │   ├── compute/          # WASM engine (wazero), triggers, worker slots
@@ -396,7 +439,7 @@ kvstore/
 └── examples/             # WASM module examples
 docs/                     # Command manifest, VMEM design, MCP quickstart, backup, benchmarks, format compat
 monitoring/               # Grafana/VictoriaMetrics provisioning for the local stack
-scripts/                  # Soak-test harness, memory-poisoning recovery comparison, live agent demo
+scripts/                  # Soak harness, backup/restore, poisoning-recovery comparison, live drills (shred, audit chain, agent)
 ```
 
 ## Commercial use

@@ -143,16 +143,21 @@ Two consequences, stated here rather than left to be discovered:
 - **Erasure and point-in-time recovery conflict.** Restoring to an LSN before
   the `FORGET` brings the fact back. This is inherent to a journalled store:
   the journal is both the recovery mechanism and the surviving copy.
-- **There is no erasure receipt.** Even where the bytes are genuinely gone,
-  nothing proves it happened.
+- **`FORGET` issues no receipt.** Even where the bytes are genuinely gone,
+  nothing proves it happened. (`VMEM.SHRED` does issue one, and `-audit-chain`
+  makes it producible months later — but that is the scope-granular
+  crypto-erasure path below, not this one.)
 
 So the claim this engine can defend is **immediate revocation and
 unreachability with a stated physical horizon** — not "provable erasure", and
 not GDPR Art. 17 compliance. Anything stronger requires content to have been
 encrypted *before* it was written: encrypting at deletion time cannot reach
 copies made earlier, which is the same gap every store-side "shred on delete"
-implementation has, whether or not it says so. Closing it is tracked as the
-keyring/envelope work; until that lands, this section is the guarantee.
+implementation has, whether or not it says so. That is what the keyring/envelope
+work below now does for scopes written under `-encrypt-at-rest`: `VMEM.SHRED`
+destroys the key instead of chasing the bytes. For erasure of a single fact by
+id, and for anything written before the keyring existed, this section remains
+the guarantee.
 
 ## Keyring / envelope — decisions, and the measurements behind them
 

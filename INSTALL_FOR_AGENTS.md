@@ -53,6 +53,21 @@ Verify: `redis-cli -p 6380 PING` replies `PONG` (or open a TCP connection to
 127.0.0.1:6380 — it must accept). For a durable setup suggest the user add a
 systemd unit later; do not create one without asking.
 
+**Two optional flags worth naming to the user — do not enable either without
+asking.** Both are one-way in practice: turning them on later does not cover
+what was already written.
+
+- `--encrypt-at-rest` — seals stored facts under a per-scope key in
+  `<data-dir>/keyring.dat` and enables `VMEM.SHRED` (erase a whole scope by
+  destroying its key, reaching backups too). The trade-off is real: **lose
+  `keyring.dat` and those facts are unrecoverable from any backup**, and the
+  file must be backed up separately from the data directory to be worth
+  anything (`docs/BACKUP.md`).
+- `--audit-chain` — journals every memory-changing command, hash-chained, so
+  erasure receipts can be produced later. It is never compacted and grows
+  roughly **3.6 GB/year** regardless of traffic. Do not switch this on for a
+  laptop install without saying that out loud.
+
 ## Step 3 — register the MCP server
 
 Choose a scope: the project name for a project-bound agent, or `personal`.
