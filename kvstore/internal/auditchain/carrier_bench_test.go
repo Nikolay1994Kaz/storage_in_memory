@@ -143,9 +143,7 @@ package auditchain
 
 import (
 	"crypto/rand"
-	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -249,32 +247,13 @@ func sampleRecord(typ EventType) Record {
 	}
 }
 
-// frameRecord — кадр записи в журнале: длина, тело, CRC. Хеш цепи защищает от
-// подмены, но не от ОБОРВАННОЙ записи в хвосте — её надо уметь отличить от
-// подмены, иначе каждая авария будет выглядеть как атака.
-func frameRecord(r Record) []byte {
-	body := encodeForHash(r)
-	out := make([]byte, 0, 8+len(body))
-	var n [4]byte
-	binary.BigEndian.PutUint32(n[:], uint32(len(body)))
-	out = append(out, n[:]...)
-	out = append(out, body...)
-	binary.BigEndian.PutUint32(n[:], crc32.ChecksumIEEE(body))
-	return append(out, n[:]...)
-}
-
-// headSlotSize — голова: seq + хеш + CRC + выравнивание. Две копии в одном
-// файле, пишутся попеременно: перезапись на месте не атомарна при отказе
-// питания, а два слота с CRC дают правило «взять валидный с большим seq».
-const headSlotSize = 48
-
-func encodeHead(h Head) []byte {
-	buf := make([]byte, headSlotSize)
-	binary.BigEndian.PutUint64(buf[0:8], h.Seq)
-	copy(buf[8:40], h.Hash[:])
-	binary.BigEndian.PutUint32(buf[40:44], crc32.ChecksumIEEE(buf[0:40]))
-	return buf
-}
+// ⭐КАДРИРОВАНИЕ, ГОЛОВА И ЕЁ РАЗМЕР ЖИВУТ В carrier.go, А НЕ ЗДЕСЬ.
+//
+// Пока носителя не было, бенч держал их у себя. Теперь носитель написан, и
+// копии удалены намеренно: бенч, меряющий собственную копию кода, меряет не
+// то, что выполняется в проде, и расходится с ним молча. Ровно этот разрыв
+// чинил П11 (`applyEntry` против зеркала `replaySealedWAL`). Все числа в шапке
+// сняты с этих же frameRecord/encodeHead/headSlotSize.
 
 // ---------------------------------------------------------------------------
 // 1. CPU: связывание и хеширование. Нужно, чтобы видеть, что дальше меряется
