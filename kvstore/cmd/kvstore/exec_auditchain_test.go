@@ -123,6 +123,19 @@ func TestAuditChain_EveryWritingCommandIsRecorded(t *testing.T) {
 			}
 			return ""
 		}},
+		{"VMEM.RESEAL", auditchain.EventReseal, func() string {
+			// Скоуп, чьи факты записаны без конверта: среда до enableKeyring
+			// уже создала такие, поэтому берём отдельный и пишем его ДО того,
+			// как в этом тесте включится sealingActive.
+			e.do("VMEM.REMEMBER", "frank", "TEXT", "легаси по шифрованию", "SOURCE", "agent-a")
+			sealingActive = true
+			defer func() { sealingActive = false }()
+			v := e.do("VMEM.RESEAL", "frank")
+			if v.Typ == '-' {
+				t.Fatalf("RESEAL: %v", v.Str)
+			}
+			return ""
+		}},
 		{"VMEM.SHRED", auditchain.EventShred, func() string {
 			e.do("VMEM.REMEMBER", "dave", "TEXT", "всё про дейва", "SOURCE", "agent-a")
 			v := e.do("VMEM.SHRED", "dave")
