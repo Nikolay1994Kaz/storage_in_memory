@@ -141,8 +141,12 @@ func TestVMEMShred_FactDoesNotSurviveReplay(t *testing.T) {
 	if rec.Typ == '-' {
 		t.Fatalf("SHRED: %v", rec.Str)
 	}
-	if len(rec.Array) != 8 {
-		t.Fatalf("квитанция из %d полей, ожидалось 8", len(rec.Array))
+	// Десять полей — пять пар. Пятая, chain_seq, это номер звена цепи аудита,
+	// по которому квитанцию потом находят. Форма ответа ФИКСИРОВАННАЯ и при
+	// выключенной цепи тоже (поле отдаёт "off"): переменная длина заставила бы
+	// клиента угадывать, а квитанция — документ.
+	if len(rec.Array) != 10 {
+		t.Fatalf("квитанция из %d полей, ожидалось 10", len(rec.Array))
 	}
 	if rec.Array[0].Str != "scope" || rec.Array[1].Str != "user:dana" {
 		t.Fatalf("квитанция не про тот скоуп: %v %v", rec.Array[0].Str, rec.Array[1].Str)

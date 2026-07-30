@@ -188,6 +188,7 @@ func main() {
 	enablePprof := flag.Bool("pprof", false, "включить /debug/pprof/* на metrics-порту для диагностики утечек/профилирования (НЕ для прода)")
 	dataDirFlag := flag.String("data-dir", "data", "каталог для WAL и снапшотов (относительный путь считается от рабочего каталога)")
 	encryptAtRest := flag.Bool("encrypt-at-rest", false, "шифровать полезную нагрузку VMEM на границе персистентности (WAL, снапшоты и, следовательно, отгружаемые архивы) ключом скоупа из "+keyring.FileName+". Включает VMEM.SHRED — криптостирание всего скоупа разом, действующее и на уже отгруженные копии. Путь чтения не дорожает: в памяти движок работает с открытым текстом. Если файл кейринга уже есть, он открывается независимо от флага — иначе прежние конверты стали бы нечитаемы")
+	auditChainOn := flag.Bool("audit-chain", false, "вести журнал событий памяти, связанный цепью хешей ("+auditChainDir+"/ внутри каталога данных): создание, отзыв, карантин, криптостирание. Делает квитанцию VMEM.SHRED предъявляемой позже, а не только в ответе команде. Рядовые события пишутся батчем раз в "+auditTickInterval.String()+"; SHRED и QUARANTINE форсируют запись до себя. Цепь НЕ компактится — это улика, и растёт она навсегда (≈3.6 ГБ/год)")
 	restoreToLSN := flag.Uint64("restore-to-lsn", 0, "форензическое восстановление на момент: поднять состояние, каким оно было после записи с этим LSN, и обслуживать ТОЛЬКО чтение (0 = обычный старт). Каталог данных не изменяется")
 	walInspect := flag.Bool("wal-inspect", false, "напечатать журнал (LSN, операция, ключ) и выйти — как найти LSN для -restore-to-lsn")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
@@ -296,6 +297,23 @@ func main() {
 		activeKeyring = ring
 		slog.Info("encryption at rest enabled", "keyring", filepath.Join(dataDir, keyring.FileName),
 			"scopes", len(ring.Scopes()), "sealing_new_writes", *encryptAtRest)
+	}
+
+	// === Цепь аудита: журнал того, ЧТО с памятью делали ===
+	//
+	// ⚠В режиме -restore-to-lsn не открывается вовсе, и это не экономия.
+	// Открытие носителя чинит оборванный хвост — то есть ПИШЕТ в журнал; на
+	// форензической сессии, которая обязана только смотреть, это была бы
+	// правка улики при попытке её прочесть. Расследование и так идёт во
+	// временном каталоге, а цепь лежит в настоящем.
+	var stopAuditChain func()
+	if *auditChainOn && restoreLSN == 0 {
+		stopAuditChain, err = startAuditChain(dataDir)
+		if err != nil {
+			logging.Fatalf("failed to open audit chain: %v", err)
+		}
+	} else if *auditChainOn {
+		slog.Warn("audit chain not opened: -restore-to-lsn is a read-only forensic session")
 	}
 
 	// sealValue упаковывает полезную нагрузку записи журнала в конверт скоупа.
@@ -922,6 +940,14 @@ func main() {
 		w.Stop()
 	}
 	syncer.Stop()
+	// Цепь закрывается ПОСЛЕ srv.Stop(): её пишут только обработчики команд, и
+	// к этому моменту их уже нет. Close сбрасывает остаток буфера — без него
+	// штатная остановка теряла бы доказуемость последних событий ровно так же,
+	// как авария, и «выключили аккуратно» ничем не отличалось бы от «выдернули
+	// шнур».
+	if stopAuditChain != nil {
+		stopAuditChain()
+	}
 	if err := bw.Close(); err != nil {
 		slog.Error("WAL close error", "err", err)
 	}
@@ -2017,6 +2043,9 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		} else {
 			ttl.Remove(textKey) // upsert без TTL снимает прежний таймер якоря
 		}
+		// В цепь — ПОСЛЕ того, как факт создан: запись о том, чего не было,
+		// хуже отсутствия записи.
+		auditRemember(req.Scope, res.Doc.ID, req.Source, sealingActive, req.Supersedes, textVal)
 		buf.WriteBulkString(res.Doc.ID)
 
 	case "VMEM.RECALL":
@@ -2235,6 +2264,11 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			bbatch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
 		}
 		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: bres.Docs[0].ID, Value: sealValue(breq.Scope, vector.SerializeDocBatch(bbatch))})
+		// Батчем: миграция провенанса — администраторская правка прошлого, а не
+		// доказываемый момент. Но в журнале она обязана быть: ОПЕРАТОР объявил
+		// источник задним числом, и следующий отзыв по источнику опирается на
+		// его утверждение, а не на наблюдение.
+		auditBackfill(breq.Scope, breq.Source, len(bres.Docs))
 		buf.WriteInt(len(bres.Docs))
 
 	case "VMEM.COVERAGE":
@@ -2388,6 +2422,17 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			batch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
 		}
 		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Docs[0].ID, Value: sealValue(qreq.Scope, vector.SerializeDocBatch(batch))})
+		// Карантин — доказываемый момент: поимённо в цепь и синхронно. Отказ
+		// записи в цепь не отменяет самого отзыва (он уже в WAL), поэтому
+		// команда не падает, но пробел в журнале называется вслух.
+		qids := make([]string, len(res.Docs))
+		for i, d := range res.Docs {
+			qids[i] = d.ID
+		}
+		if _, err := auditQuarantine(qreq.Scope, qreq.Source, qreq.Since, qids); err != nil {
+			slog.Error("audit chain: quarantine not recorded, retirement itself succeeded",
+				"scope", qreq.Scope, "source", qreq.Source, "facts", len(qids), "err", err)
+		}
 		buf.WriteInt(len(res.Docs))
 
 	case "VMEM.FORGET":
@@ -2420,6 +2465,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		bw.Write(wal.Entry{Op: wal.OpDel, Key: textKey})
 		s.Del(workerID, textKey)
 		ttl.OnDelete(textKey)
+		auditForget(scope, id)
 		buf.WriteInt(1)
 
 	case "VMEM.SHRED":
@@ -2485,7 +2531,17 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		slog.Warn("scope crypto-shredded", "scope", scope, "kek_id", hex.EncodeToString(kekID[:]), "facts", len(ids))
 
-		buf.WriteArrayHeader(8)
+		// Квитанция ложится в цепь — ради этого цепь и строилась. Ключ уже
+		// уничтожен, стирание ПРОИЗОШЛО; отказ записи не отменяет его и не
+		// имеет права отменить ответ. Поэтому исход записи не схлопывается в
+		// молчание, а едет отдельным полем.
+		chainSeq, chainErr := auditShred(scope, kekID[:], len(ids))
+		if chainErr != nil {
+			slog.Error("audit chain: shred receipt not recorded, the erasure itself did happen",
+				"scope", scope, "err", chainErr)
+		}
+
+		buf.WriteArrayHeader(10)
 		buf.WriteBulkString("scope")
 		buf.WriteBulkString(scope)
 		buf.WriteBulkString("kek_id")
@@ -2494,6 +2550,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		buf.WriteBulkString(strconv.Itoa(len(ids)))
 		buf.WriteBulkString("destroyed_at")
 		buf.WriteBulkString(strconv.FormatInt(time.Now().Unix(), 10))
+		buf.WriteBulkString("chain_seq")
+		buf.WriteBulkString(auditSeqField(chainSeq, chainErr))
 
 	case "VSIM.DEL":
 		if len(args) < 1 {
