@@ -392,8 +392,19 @@ from its `head_seq`.
 **Reconciliation is the piece the chain cannot supply.** The chain proves the
 journal was not rewritten; it says nothing about whether memory matches it.
 `VMEM.AUDIT RECONCILE` compares the two independent sources and separates
-*resurrected* (journal says revoked, fact is present — revocation did not take)
-from *unrecorded* (present, never journalled) from *missing*. ⚠It has to
+*resurrected* (the fact is present when it should not be) from *revoked*
+(quarantined and correctly still present, carrying `quarantined_at`) from
+*unrecorded* (present, never journalled) from *missing*. ⭐**Deletion and
+quarantine impose opposite requirements on memory** and must not share a
+branch: `FORGET`/`SHRED` must make the fact go away, while `QUARANTINE`
+deliberately keeps it — the belief is evidence, and `ASOF` before the
+revocation has to keep showing it. While both were treated as removal, every
+*successful* mass revocation reported `resurrected` equal to the number of
+facts revoked, firing the heaviest alarm class in exactly the situation the
+reconciliation exists for: right after an incident response. The one physical
+signal that tells them apart is the `quarantined_at` mark, and it is also what
+turns the check into a real one — journal says revoked, fact present, mark
+missing means the revocation never landed. ⚠It has to
 replay the journal **in order** rather than build sets, because a scope can be
 shredded and then written to again, and a fact created after a shred is not a
 resurrection. And it must know each fact's TTL, because the reaper deletes
