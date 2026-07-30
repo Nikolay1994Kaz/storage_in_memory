@@ -98,7 +98,42 @@ SIZE_AFTER_SHRED=$(stat -c%s "$CHAIN/chain.log")
   || bad "цепь пуста сразу после SHRED — форс-флаш не сработал"
 
 # ---------------------------------------------------------------------------
-say "3. штатная остановка досбрасывает буфер"
+say "3. заявление проверяется БЕЗ секрета, доказательство не раскрывает соседей"
+# Публичный ключ печатается при старте — аудитор закрепляет именно его.
+PUB=$(grep -o 'public_key=[^ ]*' "$DIR/server.log" | head -1 | cut -d= -f2)
+[ -n "$PUB" ] && ok "публичный ключ напечатан при старте" || bad "публичного ключа нет в логе"
+
+ID_A=$(call VMEM.REMEMBER erin TEXT "мой факт" SOURCE agent-a)
+call VMEM.REMEMBER erin TEXT "чужой факт в том же батче" SOURCE agent-b >/dev/null
+sleep 1.5   # тик агрегации — 1 с
+
+cli VMEM.AUDIT EXPORT > "$DIR/statement.json"
+if grep -q '"sig"' "$DIR/statement.json" && grep -q "$PUB" "$DIR/statement.json"; then
+  ok "заявление подписано ключом, объявленным при старте"
+else
+  bad "заявление не содержит подписи либо подписано другим ключом"
+fi
+
+cli VMEM.AUDIT PROVE erin ID "$ID_A" > "$DIR/proof.json"
+if grep -q "$ID_A" "$DIR/proof.json"; then ok "доказательство про запрошенный факт"; else bad "в доказательстве нет запрошенного факта"; fi
+if grep -q "чужой факт" "$DIR/proof.json"; then bad "в доказательстве виден соседний факт"; else ok "соседние события не раскрыты"; fi
+
+VER=$(cli VMEM.AUDIT VERIFY | grep -A1 '^status$' | tail -1)
+[ "$VER" = "ok" ] && ok "сверка цепи проходит" || bad "VERIFY вернула status=$VER"
+
+# ---------------------------------------------------------------------------
+say "4. сверка состояния с журналом"
+REC=$(cli VMEM.AUDIT RECONCILE erin)
+UNREC=$(printf '%s\n' "$REC" | grep -A1 '^unrecorded$' | tail -1)
+RES=$(printf '%s\n' "$REC" | grep -A1 '^resurrected$' | tail -1)
+if [ "$UNREC" = "0" ] && [ "$RES" = "0" ]; then
+  ok "на согласованном состоянии расхождений нет"
+else
+  bad "сверка нашла расхождения там, где их нет: unrecorded=$UNREC resurrected=$RES"
+fi
+
+# ---------------------------------------------------------------------------
+say "5. штатная остановка досбрасывает буфер"
 call VMEM.REMEMBER carol TEXT "факт после стирания" SOURCE agent-c >/dev/null
 BEFORE=$(stat -c%s "$CHAIN/chain.log")
 stop_server
@@ -107,7 +142,7 @@ AFTER=$(stat -c%s "$CHAIN/chain.log")
   || bad "остановка не сбросила буфер ($BEFORE → $AFTER Б): штатный стоп теряет доказуемость как авария"
 
 # ---------------------------------------------------------------------------
-say "4. перезапуск: цепь продолжается, а не начинается заново"
+say "6. перезапуск: цепь продолжается, а не начинается заново"
 LINKS_BEFORE=$AFTER
 start_server -audit-chain
 grep -q "audit chain opened" "$DIR/server.log" && ok "носитель поднят при старте" \
@@ -125,7 +160,7 @@ LINKS_AFTER=$(stat -c%s "$CHAIN/chain.log")
   || bad "цепь после перезапуска не выросла"
 
 # ---------------------------------------------------------------------------
-say "5. форензическая сессия НЕ ЧИНИТ улику"
+say "7. форензическая сессия НЕ ЧИНИТ улику"
 # Открытие носителя отрезает оборванный хвост, то есть ПИШЕТ в журнал. На
 # сессии -restore-to-lsn, которая обязана только смотреть, это была бы правка
 # улики при попытке её прочесть. Проверяем на настоящем оборванном хвосте, а
@@ -151,7 +186,7 @@ grep -q "torn_tail_bytes=7" "$DIR/server.log" && ok "об оборванном �
 stop_server
 
 # ---------------------------------------------------------------------------
-say "6. без флага не пишется ничего и квитанция это признаёт"
+say "8. без флага не пишется ничего и квитанция это признаёт"
 DIR2=$(mktemp -d); trap 'rm -rf "$DIR2"' EXIT
 "$BIN" -port "$PORT" -data-dir "$DIR2" -encrypt-at-rest -idle-consolidate 0 \
   >"$DIR2/server.log" 2>&1 &

@@ -180,6 +180,7 @@ is stamped **before** the WAL write (replay never looks at the clock).
 | `VMEM.QUARANTINE` | `VMEM.QUARANTINE scope SOURCE s [SINCE unix] [LIMIT n]` | `:n` beliefs revoked. Mass revocation **by origin**: matching facts keep everything (text, vector, application time) and gain a `quarantined_at` axis — `RECALL` stops returning them, `ASOF` *before* the revocation still does (the record of what the agent believed is evidence, not noise), `ALL` always does. Selective by construction: neighbouring sources and facts written *after* the poison are untouched, which whole-store rollback cannot achieve. `SOURCE` is mandatory — "revoke everything" must not be expressible. `SINCE` bounds by `valid_from`. Idempotent: a repeat revokes nothing and never moves the original moment. The whole batch is **one** `OpVSimAddDocBatch` record (a crash cannot leave half the lies revoked), hence `LIMIT` (default/cap 4096); take the tail with another call |
 | `VMEM.EXPLAIN` | `VMEM.EXPLAIN scope K query [same modifiers as RECALL]` | one record of `name, value, …` pairs per candidate, preceded by a query summary (`mode`, `t_eff`, `half_life`, `candidates`, `returned`); kept facts first by rank, then the rest by base score. Per fact: `verdict` (`kept` or the axis that dropped it), `rank`, `source`, `type`, `text_rank`/`vec_rank` (position in each arm *before* fusion), `base`, `age_sec`, `age_penalty`, `decay_mul`, `imp_mul`, `final`, `valid_from`/`valid_to`/`quarantined_at`, `text`. **The missing link between "the answer is wrong" and "revoke this origin":** poisoning shows up as a bad *answer*, revocation works on *provenance*, and this is the step that turns one into the other. It does **not** recompute the score — the trace is filled by the live `Recall` path, so an explanation cannot drift from the ranking it explains. Absent numeric attributes print as `none` (not the same as the literal `unknown` source). Reachable verdicts: `quarantine` and `below_k` always; `validity`/`erasure`/`type`/`source` only for a stale copy whose freshest version disagrees — everything the index pre-filter removed never becomes a candidate and is simply absent (use `ALL` / drop `TYPE`/`SOURCE` to see those; an erased fact is invisible in **every** mode by design) |
 | `VMEM.BACKFILL` | `VMEM.BACKFILL scope SOURCE s [LIMIT n]` | `:n` facts migrated. Legacy migration: stamp a source on facts that have **no `source` column at all** (written before provenance existed). Without it the whole recovery layer is dead over old data — revocation selects by origin and absence is unfilterable (see `VMEM.COVERAGE`). The value is the **operator's** assertion: `unknown` ("nobody vouched for this") is the usual answer, but someone who knows the corpus may declare it (`crm-import`); provenance is an input, never our judgement. An **already declared source is never overwritten** — a command that could do that could erase the trace of who filled the memory, which is the property this layer exists for. The single, non-optional predicate is "attribute absent", hence idempotence; the freshest version is re-checked under the write lock, so a source declared by a concurrent upsert survives. Nothing but provenance is touched: application time, importance, quarantine axis and text stay bit-for-bit. Deliberately a command and not a startup migration — writing *meaning* into someone's memory during an upgrade is exactly what we criticise elsewhere. Costs a full scan; batched under `LIMIT` (default/cap 4096) as one atomic WAL record |
+| `VMEM.RESEAL` | `VMEM.RESEAL scope [LIMIT n]` | a **receipt**: `scope`, `resealed`, `sealed_share`, `earlier_copies`. Rewrites the facts of a scope that were written before `-encrypt-at-rest` so that they are finally under the scope key — including the verbatim anchor in KV, which is the most readable thing there is. Without it `VMEM.SHRED` over a legacy corpus succeeds honestly and achieves **nothing**: there is no key those bytes were written under (`sealed_share` in `VMEM.COVERAGE` is how you see it). ⭐Unlike `VMEM.BACKFILL`, stamping is legitimate here: `source` is the operator's *assertion* about the past, while `sealed` is a *physical fact*, and this command actually re-writes the bytes it stamps. Refused without `-encrypt-at-rest` rather than degrading — stamping `sealed` on facts it did not seal would be a lie in the coverage report, not a reduced service. ⚠`earlier_copies` is always `not_covered` and is not decoration: resealing **cannot reach copies that already left** — WAL segments, snapshots and archives taken earlier stay in the clear, and destroying the key will not touch them. A share that rises to 1.0 means erasable *from now on*. Idempotent (the predicate is "no envelope", re-checked under the write lock); batched under `LIMIT` (default/cap 4096); recorded in the audit chain, because after it `VMEM.SHRED` promises more than it did yesterday |
 | `VMEM.COVERAGE` | `VMEM.COVERAGE [scope]` | one record per scope: `scope`, `total`, **`sealed`, `unsealed`, `sealed_share`, `has_key`**, `declared`, `unknown`, `absent`, `declared_share`, `revocable_share`, plus a `source:<name>` breakdown. Two independent axes of coverage, shown side by side because they have **different** blind spots: a scope can be fully revocable and at the same time not erasable at all.
 
 **Key axis** — how much of the scope crypto-erasure can actually reach. `sealed` counts facts written *under an envelope*; the absence of that stamp means the fact predates encryption and its bytes sit in the clear in old journal segments and archives, where destroying the key does not reach them. Deliberately measured by a stamp taken **at write time**, not by asking the keyring: `has_key` says only that a key exists *now*, so a scope half-written before encryption would report as covered — an error that would overstate coverage in our own favour, which is precisely what this command exists to prevent. There is no backfill for it, and there must not be: stamping `sealed` on a fact whose bytes were never encrypted would be a lie about the past, not a migration.
@@ -189,9 +190,10 @@ is stamped **before** the WAL write (replay never looks at the clock).
 
 | `VMEM.SHRED` | `VMEM.SHRED scope` | a **receipt**: `scope`, `kek_id`, `facts_removed_from_memory`, `destroyed_at`, `chain_seq` (see «The audit chain» below; `off` without `-audit-chain`). Crypto-erasure of a whole scope: destroying its key makes the **WAL, the shipped archives and any restore taken from them unreadable at once**, including a point-in-time restore to before the call. This is the one thing `FORGET` cannot do in principle: deletion cannot catch copies that already left for the archive. Covers `snapshot.wal` (anchors are sealed at write time) and `graph_leveled.bin` for frozen segments (format v8: vectors, attributes and terms travel in a per-scope sealed section). ⚠Not yet covered: `frozenSQ` and flat-HNSW segments, which appear with `-hnsw-use-sq` or at fp32 dimensions above 256 — facts there stay readable in a snapshot taken *before* the shred; see `docs/VMEM_DESIGN.md`. Requires `-encrypt-at-rest`; errors if the scope has no key, which means either "already shredded" or "its facts predate the keyring" — the second is **not** erasure and must not be reported as one (`VMEM.COVERAGE` is how you see that blind spot). ⚠The receipt claims only what is checkable: *this key id was destroyed*, never "the data is gone" — a signed claim of erasure over bytes that still exist would be a document asserting something untrue. Order inside the command is fixed: memory first, key second, so a failure between them can only leave *less* readable, never more |
 
-Notes per the unfreeze checklist: gates — `VMEM.REMEMBER`, `VMEM.QUARANTINE`
-and `VMEM.BACKFILL` are memory-growing + write (both revocation and migration
-append a new version rather than mutating in place, so they genuinely grow),
+Notes per the unfreeze checklist: gates — `VMEM.REMEMBER`, `VMEM.QUARANTINE`,
+`VMEM.BACKFILL` and `VMEM.RESEAL` are memory-growing + write (revocation,
+migration and resealing all append a new version rather than mutating in place,
+so they genuinely grow), `VMEM.AUDIT` is read-only in every subcommand,
 `VMEM.FORGET` and `VMEM.SHRED` are write-only
 (erasure must stay available under OOM), `VMEM.RECALL`, `VMEM.EXPLAIN` and
 `VMEM.COVERAGE` are read-only (they therefore stay available under
@@ -240,6 +242,49 @@ journal and the head file can truncate the tail and recompute the head;
 local tamper-evidence is evidence against everyone except the owner. Under
 `-restore-to-lsn` the chain is not opened at all, because opening it repairs a
 torn tail — a write, and a forensic session must not write to the evidence.
+
+#### `VMEM.AUDIT` — reading the chain
+
+| subcommand | reply | notes |
+|---|---|---|
+| `VMEM.AUDIT VERIFY [FROM seq]` | `from`, `links_checked`, `head_seq`, `head_hash`, `status` | Walks the chain and matches it against the stored head. **Defaults to a window of 10 000 000 links**, not the whole chain: a full pass was measured at 27–40 s per year of chain (415–453 ns to verify plus 442–813 ns to read, per link) and grows forever. `FROM 0` asks for the full pass explicitly; `FROM <seq>` starts from a link you already attested. |
+| `VMEM.AUDIT EXPORT` | a signed JSON statement | Ed25519 over `{version, pubkey, head_seq, head_hash, links, signed_at}`, canonically encoded with length prefixes so a third-party checker can reproduce the bytes without our code. The public key is printed at startup — pin it there. |
+| `VMEM.AUDIT PROVE <scope> [ID id] [TYPE t]` | a signed JSON inclusion proof | Leaf + Merkle path + root + link seq + a fresh statement. **Reveals only your own event**: the path proves membership without disclosing the other leaves in the batch. `TYPE` is one of `remember` (default), `forget`, `quarantine`, `shred`, `backfill`. Searches the last 100 000 links and says so on a miss. |
+| `VMEM.AUDIT RECONCILE [scope]` | two elements: journal coverage, then per-scope discrepancies | See below. Full scan — an admin operation, like `VMEM.COVERAGE`. |
+
+**Why the signature is asymmetric.** An HMAC-sealed journal — which is what the
+nearest comparable product uses — can only be checked by the holder of the
+secret, and that holder is the party whose claims are under review. Handing the
+auditor the secret makes the attestation prove nothing about anyone. Ed25519
+breaks the loop: the private key never leaves the machine, the public key goes
+in an email. ⚠What it proves is *this key signed this head*, **not** that the
+owner did not rewrite the journal — someone holding both would rewrite and
+re-sign. What it adds is checking without a secret, and binding to an
+**instance**: a party that pinned the key earlier detects a swapped server or a
+freshly-minted "clean" journal, because the signature stops matching. Verify a
+proof in three steps: check the statement's signature against your pinned key,
+check the Merkle path against the root, then take `chain.log` and confirm the
+link at `link_seq` carries that root and chains up to the signed head.
+
+**Reconcile** answers what the chain alone cannot: does the live memory match
+the record of how it got that way? Proving a journal with the journal is
+circular; the value appears only when two independent sources are compared.
+
+| field | meaning |
+|---|---|
+| `recorded` | in memory, creation is journalled — normal |
+| `unrecorded` | in memory, **no** creation record: either older than the chain, or it entered memory outside the commands |
+| `resurrected` | ⚠the journal says revoked and the fact **is still there** — revocation did not take, or state was rolled back |
+| `missing` | the journal says alive, memory does not have it, and no TTL explains it |
+| `expired` | absent, but it had a deadline and the deadline passed |
+
+That last row exists because the TTL reaper runs inside the engine and writes
+nothing to the chain; without separating it, every expired fact would be
+reported as loss and the check would cry corruption over normal operation. The
+first reply element (`journal_links`, `head_seq`, `leaves_read`,
+`leaves_expired`) must be read first: leaves expire under retention while links
+live forever, so a year-old instance legitimately cannot account for its early
+facts, and `unrecorded` has to be read against how much journal survives.
 
 ## Demand-driven tier — `AI.*` (optional, requires a reachable Ollama)
 

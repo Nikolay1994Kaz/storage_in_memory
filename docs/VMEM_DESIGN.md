@@ -362,10 +362,51 @@ collapsed into one, because "there is no chain" and "the chain write failed
 after the key was already destroyed" are different things to have to explain.
 `docs/COMMANDS.md` has the per-command table.
 
-Two numbers here are **not** measured, and should not be quoted as if they
-were: the cost of building the tree over a batch (estimated ~0.4 ms/s from the
-571 ns `Link`+`Hash`), and `Verify` over a long chain — a linear pass, which at
-3.5 GB/year will need a checkpoint before it is honest to call it a command.
+**Attestation is asymmetric, and the reason is not cryptographic taste.** An
+HMAC-sealed journal can only be checked by whoever holds the secret — the same
+party whose claims are being reviewed. Ed25519 lets the auditor check without
+receiving anything, and binds the statement to an **instance**: a pinned public
+key exposes a swapped server or a freshly-minted "clean" journal. What it does
+*not* prove is that the owner did not rewrite the chain and re-sign; that limit
+is unchanged and stated in the command docs.
+
+⭐**The signed statement is also the checkpoint, which is why no separate
+checkpoint exists.** Verifying the chain from zero was measured at 27–40 s per
+year of chain (415–453 ns to verify plus 442–813 ns to read, per link), against
+a 10 s budget for a command an operator waits on. The threshold was not met, so
+the *command* changed rather than the threshold: `VERIFY` walks a window of
+10 000 000 links by default — 10 s divided by the measured per-link cost — and
+a full pass must be asked for explicitly. A checkpoint of our own next to the
+journal would not have helped the part that matters: whoever can rewrite the
+chain can rewrite the checkpoint. A statement held *outside*, by the auditor,
+is the one artifact that survives that, and every verification after it starts
+from its `head_seq`.
+
+**Reconciliation is the piece the chain cannot supply.** The chain proves the
+journal was not rewritten; it says nothing about whether memory matches it.
+`VMEM.AUDIT RECONCILE` compares the two independent sources and separates
+*resurrected* (journal says revoked, fact is present — revocation did not take)
+from *unrecorded* (present, never journalled) from *missing*. ⚠It has to
+replay the journal **in order** rather than build sets, because a scope can be
+shredded and then written to again, and a fact created after a shred is not a
+resurrection. And it must know each fact's TTL, because the reaper deletes
+without journalling — so `expires_at` rides in the leaf purely to keep normal
+expiry from being reported as corruption.
+
+**Legacy re-encryption (`VMEM.RESEAL`) is allowed to stamp, and `BACKFILL` is
+not.** The distinction is what the attribute *is*: `source` is the operator's
+assertion about the past, so writing it where a value already exists would
+rewrite history; `sealed` is a physical fact about bytes, and resealing
+actually re-writes those bytes — including the verbatim KV anchor, without
+which coverage would rise while the most readable copy stayed in the clear.
+⚠What it cannot do is reach copies that already left, so its receipt carries
+`earlier_copies: not_covered` permanently. A share risen to 1.0 means erasable
+*from now on*, and reading it as "everything is erasable" would be exactly the
+mistake `VMEM.COVERAGE` exists to prevent.
+
+One number here is **not** measured, and should not be quoted as if it were:
+the cost of building the tree over a batch (estimated ~0.4 ms/s from the 571 ns
+`Link`+`Hash`).
 
 ⚠**And the limit that no amount of local engineering removes:** whoever owns
 both the journal and the head can truncate the tail and recompute the head.
