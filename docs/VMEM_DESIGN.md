@@ -352,6 +352,16 @@ forever, leaves expire. Once leaves are gone it remains provable that *N*
 operations occurred and unprovable *which* — an honest and useful position, and
 the only one that is compatible with erasure at all.
 
+**Wired behind `-audit-chain`, off by default.** The chain costs a second file
+and a second fsync per tick; a store used as a plain KV or vector index should
+not pay for a journal it will never read. With the flag, all five writing
+`VMEM.*` commands record — creation included — and `SHRED`/`QUARANTINE` flush
+synchronously. The receipt gains a `chain_seq` field whose value is `off`,
+`unrecorded`, or a link number; those three outcomes are deliberately not
+collapsed into one, because "there is no chain" and "the chain write failed
+after the key was already destroyed" are different things to have to explain.
+`docs/COMMANDS.md` has the per-command table.
+
 Two numbers here are **not** measured, and should not be quoted as if they
 were: the cost of building the tree over a batch (estimated ~0.4 ms/s from the
 571 ns `Link`+`Hash`), and `Verify` over a long chain — a linear pass, which at

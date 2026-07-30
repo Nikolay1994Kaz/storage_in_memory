@@ -187,7 +187,7 @@ is stamped **before** the WAL write (replay never looks at the clock).
 **Provenance axis** — the honesty metric behind revocation: quarantine selects **by origin**, so if origin is declared for a minority the whole recovery story is decorative. Three states exist and only two are expressible as predicates: a concrete source, the literal `unknown`, and — the one that matters — **no attribute at all** (facts written before provenance existed). The last is unfilterable, therefore invisible to mass revocation; `absent`/`revocable_share` are the only way to see that blind spot. Costs a full scan: an admin/forensic operation, not a hot path |
 | `VMEM.FORGET` | `VMEM.FORGET scope id` | `:1` erased / `:0` no such fact (idempotent). Makes the fact **unreachable in every read mode** including `ASOF`, does **not** walk supersedes chains; deletes the KV anchor. Cross-scope forget is an error and leaves the fact intact. ⚠Unreachability is immediate; *physical* removal is not: bytes leave sealed segments only at the next consolidation touching them (unbounded for a cold scope) and are not reached at all in the WAL, in earlier snapshots or in shipped archives — restoring to an LSN before the call brings the fact back. The full horizon, and why it is inherent rather than a bug, is `docs/VMEM_DESIGN.md` ("Erasure guarantee") |
 
-| `VMEM.SHRED` | `VMEM.SHRED scope` | a **receipt**: `scope`, `kek_id`, `facts_removed_from_memory`, `destroyed_at`. Crypto-erasure of a whole scope: destroying its key makes the **WAL, the shipped archives and any restore taken from them unreadable at once**, including a point-in-time restore to before the call. This is the one thing `FORGET` cannot do in principle: deletion cannot catch copies that already left for the archive. Covers `snapshot.wal` (anchors are sealed at write time) and `graph_leveled.bin` for frozen segments (format v8: vectors, attributes and terms travel in a per-scope sealed section). ⚠Not yet covered: `frozenSQ` and flat-HNSW segments, which appear with `-hnsw-use-sq` or at fp32 dimensions above 256 — facts there stay readable in a snapshot taken *before* the shred; see `docs/VMEM_DESIGN.md`. Requires `-encrypt-at-rest`; errors if the scope has no key, which means either "already shredded" or "its facts predate the keyring" — the second is **not** erasure and must not be reported as one (`VMEM.COVERAGE` is how you see that blind spot). ⚠The receipt claims only what is checkable: *this key id was destroyed*, never "the data is gone" — a signed claim of erasure over bytes that still exist would be a document asserting something untrue. Order inside the command is fixed: memory first, key second, so a failure between them can only leave *less* readable, never more |
+| `VMEM.SHRED` | `VMEM.SHRED scope` | a **receipt**: `scope`, `kek_id`, `facts_removed_from_memory`, `destroyed_at`, `chain_seq` (see «The audit chain» below; `off` without `-audit-chain`). Crypto-erasure of a whole scope: destroying its key makes the **WAL, the shipped archives and any restore taken from them unreadable at once**, including a point-in-time restore to before the call. This is the one thing `FORGET` cannot do in principle: deletion cannot catch copies that already left for the archive. Covers `snapshot.wal` (anchors are sealed at write time) and `graph_leveled.bin` for frozen segments (format v8: vectors, attributes and terms travel in a per-scope sealed section). ⚠Not yet covered: `frozenSQ` and flat-HNSW segments, which appear with `-hnsw-use-sq` or at fp32 dimensions above 256 — facts there stay readable in a snapshot taken *before* the shred; see `docs/VMEM_DESIGN.md`. Requires `-encrypt-at-rest`; errors if the scope has no key, which means either "already shredded" or "its facts predate the keyring" — the second is **not** erasure and must not be reported as one (`VMEM.COVERAGE` is how you see that blind spot). ⚠The receipt claims only what is checkable: *this key id was destroyed*, never "the data is gone" — a signed claim of erasure over bytes that still exist would be a document asserting something untrue. Order inside the command is fixed: memory first, key second, so a failure between them can only leave *less* readable, never more |
 
 Notes per the unfreeze checklist: gates — `VMEM.REMEMBER`, `VMEM.QUARANTINE`
 and `VMEM.BACKFILL` are memory-growing + write (both revocation and migration
@@ -203,6 +203,43 @@ reaper; the KV anchor carries its own mirrored TTL. Cluster: not routed or
 replicated in v1 (single-node product; ids may be server-generated); a future
 replication alphabet must carry `OpVSimAddDocBatch` as one atomic unit.
 Soak-oracle modelling of `VMEM.*` is deferred to the step-8 corpus bench.
+
+### The audit chain (`-audit-chain`)
+
+Off by default. With the flag, every command that changes memory leaves a
+record in a hash-chained journal under `<data-dir>/auditchain/`, which is what
+makes a `VMEM.SHRED` receipt something you can produce six months later rather
+than only read once in the reply.
+
+| event | when it reaches the disk |
+|---|---|
+| `VMEM.REMEMBER` — **fact created** | batched, one Merkle-rooted link per second |
+| `VMEM.FORGET` | batched (measured at ~118/s in a mixed run; synchronous would spend a third of all wall-clock on one command) |
+| `VMEM.BACKFILL` | batched — a migration, not a moment anyone will dispute |
+| `VMEM.QUARANTINE` | **synchronous**, one leaf per retired fact plus a summary |
+| `VMEM.SHRED` | **synchronous** |
+
+Recording creation is the part usually missing: a journal that logs only
+deletions cannot show that a fact was not slipped in after the fact. What each
+record holds is a **fingerprint, never the content** — a `sha256` of the text,
+its source, and whether it went to disk sealed. Putting fact text into an
+append-only journal would keep alive exactly what `VMEM.SHRED` destroys.
+
+Synchronous events flush the chain **up to themselves**, so a receipt always
+covers everything that came before it and the batching window never covers the
+moment being proved. Accordingly the `VMEM.SHRED` receipt carries a fifth pair,
+`chain_seq` — the link number to look it up by. Its value is `off` when the
+chain is not enabled and `unrecorded` if the chain write failed: the erasure
+still happened, and saying nothing would be worse than admitting a gap in the
+journal.
+
+Two limits worth stating. The chain is **never compacted** — compacting
+evidence destroys it — so it grows forever, at roughly 3.6 GB/year at the
+default one-second period regardless of traffic. And whoever owns both the
+journal and the head file can truncate the tail and recompute the head;
+local tamper-evidence is evidence against everyone except the owner. Under
+`-restore-to-lsn` the chain is not opened at all, because opening it repairs a
+torn tail — a write, and a forensic session must not write to the evidence.
 
 ## Demand-driven tier — `AI.*` (optional, requires a reachable Ollama)
 
