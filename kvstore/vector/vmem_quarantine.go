@@ -298,3 +298,32 @@ func (lvs *LeveledVectorStore) vmemQuarantinedAt(key string) float64 {
 	}
 	return math.NaN()
 }
+
+// QuarantinedFacts — множество фактов, у которых проставлена ось
+// quarantined_at, то есть отозванных и намеренно оставленных в памяти.
+//
+// ⭐ЗАЧЕМ ОТДЕЛЬНЫМ МЕТОДОМ. Сверка состояния с журналом обязана отличать
+// ОТОЗВАННЫЙ факт от ВОСКРЕСШЕГО, и отличие между ними ровно одно: у
+// отозванного эта ось есть. Без неё «карантин сработал» и «отзыв не сработал»
+// выглядят одинаково — факт записан в журнал как снятый и при этом лежит в
+// памяти, — и самый тяжёлый класс тревоги срабатывал бы на КАЖДОМ успешном
+// массовом отзыве, то есть ровно в том сценарии, ради которого сверка нужна.
+func (lvs *LeveledVectorStore) QuarantinedFacts() map[string]bool {
+	// Ключи собираем ОТДЕЛЬНЫМ проходом по той же причине, что FactScopes и
+	// ProvenanceCoverage: ForEach держит lvs.mu.RLock, а чтение атрибутов
+	// берёт его же — рекурсивный RLock с ждущим писателем даёт дедлок.
+	var keys []string
+	lvs.ForEach(func(key string, _ []float32) { keys = append(keys, key) })
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(keys))
+	lvs.mu.RLock()
+	defer lvs.mu.RUnlock()
+	for _, key := range keys {
+		if _, ok := lvs.factNumAttrLocked(key, vmemAttrQuarantinedAt); ok {
+			out[key] = true
+		}
+	}
+	return out
+}

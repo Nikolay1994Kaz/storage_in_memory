@@ -2488,6 +2488,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 					{"scope", r.Scope},
 					{"in_memory", strconv.Itoa(r.InMemory)},
 					{"recorded", strconv.Itoa(r.Recorded)},
+					{"revoked", strconv.Itoa(r.Revoked)},
 					{"unrecorded", strconv.Itoa(r.Unrecorded)},
 					{"resurrected", strconv.Itoa(r.Resurrected)},
 					{"missing", strconv.Itoa(r.Missing)},

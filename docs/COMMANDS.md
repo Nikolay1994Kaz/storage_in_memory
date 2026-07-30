@@ -273,8 +273,9 @@ circular; the value appears only when two independent sources are compared.
 | field | meaning |
 |---|---|
 | `recorded` | in memory, creation is journalled — normal |
+| `revoked` | the journal says quarantined, the fact **is still there and carries `quarantined_at`** — also normal, and deliberately so: quarantine keeps the belief as evidence so `ASOF` before the revocation can still show it |
 | `unrecorded` | in memory, **no** creation record: either older than the chain, or it entered memory outside the commands |
-| `resurrected` | ⚠the journal says revoked and the fact **is still there** — revocation did not take, or state was rolled back |
+| `resurrected` | ⚠the fact is in memory when it should not be: either the journal says **deleted** (`FORGET`/`SHRED` must remove it), or it says **quarantined** but the `quarantined_at` mark is absent — the revocation did not take while the journal already claims otherwise |
 | `missing` | the journal says alive, memory does not have it, and no TTL explains it |
 | `expired` | absent, but it had a deadline and the deadline passed |
 

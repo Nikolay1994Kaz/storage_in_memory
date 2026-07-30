@@ -316,3 +316,80 @@ func TestAudit_ChainOffRejectsCommand(t *testing.T) {
 		}
 	}
 }
+
+// ⭐TestAudit_ReconcileCountsQuarantineAsRevoked — сработавший карантин это
+// НОРМА, а не воскресший факт.
+//
+// Дефект, который тест закрепляет: EventQuarantine лежал в одной ветке с
+// EventForget и помечал факт в журнале как снятый, а состояние памяти
+// собиралось через FactScopes(), где quarantined_at не виден. Но карантин по
+// построению ОСТАВЛЯЕТ факт в памяти — ASOF до момента отзыва обязан его
+// показывать, это улика. Итог: каждый УСПЕШНЫЙ массовый отзыв давал
+// resurrected = числу отозванных, то есть самый тяжёлый класс тревоги
+// срабатывал ложно ровно там, где сверку и запускают, — сразу после разбора
+// инцидента. Найдено многоагентным прогоном (scripts/multiagent_sim.py):
+// 15 отозванных фактов дали resurrected 15.
+func TestAudit_ReconcileCountsQuarantineAsRevoked(t *testing.T) {
+	e := newExecEnv(t)
+	enableAuditChainAt(t, e)
+
+	e.do("VMEM.REMEMBER", "alice", "TEXT", "ложь из канала", "ID", "bad", "SOURCE", "web")
+	e.do("VMEM.REMEMBER", "alice", "TEXT", "честный факт", "ID", "ok", "SOURCE", "human")
+	auditChain.Flush()
+
+	// ПАРНЫЙ КОНТРОЛЬ: до отзыва расхождений нет.
+	rep := fieldsOf(t, e.do("VMEM.AUDIT", "RECONCILE", "alice").Array[1].Array[0])
+	if rep["recorded"] != "2" || rep["revoked"] != "0" || rep["resurrected"] != "0" {
+		t.Fatalf("на согласованном состоянии сверка нашла расхождения: %+v", rep)
+	}
+
+	if n := e.do("VMEM.QUARANTINE", "alice", "SOURCE", "web").Num; n != 1 {
+		t.Fatalf("отозвано %d, ожидался 1", n)
+	}
+	if _, err := auditChain.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	rep = fieldsOf(t, e.do("VMEM.AUDIT", "RECONCILE", "alice").Array[1].Array[0])
+	if rep["revoked"] != "1" {
+		t.Errorf("revoked=%s, ожидался 1 — сработавший отзыв не опознан: %+v", rep["revoked"], rep)
+	}
+	if rep["resurrected"] != "0" {
+		t.Errorf("resurrected=%s — успешный карантин посчитан порчей, "+
+			"ложная тревога в главном сценарии сверки: %+v", rep["resurrected"], rep)
+	}
+	if rep["recorded"] != "1" {
+		t.Errorf("recorded=%s, ожидался 1 (нетронутый факт): %+v", rep["recorded"], rep)
+	}
+}
+
+// ⭐TestAudit_ReconcileFindsQuarantineThatDidNotTake — обратная сторона того же
+// разделения: журнал говорит «отозван», факт в памяти есть, но метки
+// quarantined_at на нём НЕТ. Изъятие не доехало, а журнал уже утверждает
+// обратное. Без этой проверки исправление предыдущего теста просто выключило
+// бы тревогу вместо того, чтобы её уточнить.
+func TestAudit_ReconcileFindsQuarantineThatDidNotTake(t *testing.T) {
+	e := newExecEnv(t)
+	enableAuditChainAt(t, e)
+
+	e.do("VMEM.REMEMBER", "alice", "TEXT", "факт", "ID", "x", "SOURCE", "web")
+	auditChain.Flush()
+
+	// Событие отзыва записано в цепь, а сам факт НЕ отозван — метки нет.
+	if _, err := auditQuarantine("alice", "web", 0, []string{"x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditChain.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := fieldsOf(t, e.do("VMEM.AUDIT", "RECONCILE", "alice").Array[1].Array[0])
+	if rep["resurrected"] != "1" {
+		t.Errorf("resurrected=%s, ожидался 1 — несработавший отзыв не пойман: %+v",
+			rep["resurrected"], rep)
+	}
+	if rep["revoked"] != "0" {
+		t.Errorf("revoked=%s — факт без метки зачтён как успешно отозванный: %+v",
+			rep["revoked"], rep)
+	}
+}
