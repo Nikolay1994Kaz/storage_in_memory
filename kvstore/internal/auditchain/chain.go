@@ -51,13 +51,46 @@ const (
 	EventQuarantine EventType = 3 // массовый отзыв по происхождению
 	EventShred      EventType = 4 // криптостирание скоупа (носитель квитанции)
 	EventBackfill   EventType = 5 // миграция провенанса легаси
+	EventBatch      EventType = 6 // звено-агрегат: корень Меркла над батчем листьев
 )
 
-// Record — одно событие цепи.
+// ⭐ЛИСТ И ЗВЕНО — ПОЧЕМУ ЭТО РАЗНЫЕ ТИПЫ.
 //
-// Payload держит то, что специфично для события (например, поля квитанции
-// SHRED), и входит в хеш целиком. Цепь не разбирает его содержимое: её дело —
-// доказать, что запись не менялась, а не понимать её.
+// Сначала каждое событие было записью цепи. Замер темпа это отменил: событие
+// весит 171 Б, а порог 10 ГБ/год пробивается уже при 1.85 события в секунду —
+// измеренный темп 942…1175/с превышает его в 500–630 раз. Цепь при этом
+// НЕЛЬЗЯ компактить (компакция улики — уничтожение улики), значит рост
+// монотонен навсегда. Поэтому в цепь идёт одно звено на тик, а события лежат
+// листьями под корнем Меркла.
+//
+// Отсюда и разделение типов: у листа НЕТ Seq и PrevHash. Листья не сцеплены
+// между собой — их позицию задаёт порядок в батче, а неизменность доказывает
+// корень. Сорок байт на событие, которые незачем платить.
+
+// Leaf — одно событие памяти. Хранится в файле листьев, в цепь попадает
+// только через корень Меркла над батчем.
+//
+// Payload держит специфичное для события (например, поля квитанции SHRED) и
+// входит в хеш целиком. Цепь не разбирает его содержимое: её дело — доказать,
+// что запись не менялась, а не понимать её.
+//
+// ⚠В Payload кладётся ОТПЕЧАТОК, А НЕ СОДЕРЖАНИЕ факта. Текст факта в
+// append-only журнале пережил бы SHRED — стёртое жило бы вечно в том, что
+// нельзя переписать. Та же логика, по которой кейринг сделан не append-only.
+type Leaf struct {
+	UnixNano int64
+	Type     EventType
+	Scope    string
+	Subject  string // id факта либо иной предмет события; может быть пустым
+	Payload  []byte
+}
+
+// Record — звено цепи: одна запись на тик агрегации.
+//
+// Для звена-агрегата (EventBatch) Scope пуст осознанно: батч охватывает
+// события РАЗНЫХ скоупов, и указать один из них означало бы соврать про
+// остальные. Предмет звена лежит в Payload — корень, число листьев и индекс
+// первого из них.
 type Record struct {
 	Seq      uint64
 	PrevHash [32]byte
@@ -127,6 +160,82 @@ func Link(head Head, unixNano int64, typ EventType, scope, subject string, paylo
 		Subject:  subject,
 		Payload:  payload,
 	}
+}
+
+// encodeLeafForHash кодирует лист теми же полями с префиксом длины, что и
+// запись, — но без Seq и PrevHash, которых у листа нет.
+//
+// ⚠Первым байтом идёт domainLeaf, и это не украшение: без разделения доменов
+// хеш листа и хеш внутреннего узла дерева живут в одном пространстве, и узел
+// можно предъявить как лист (классическая атака на второй прообраз в дереве
+// Меркла). Проверяется тестом TestMerkle_NodeCannotPassAsLeaf.
+func encodeLeafForHash(l Leaf) []byte {
+	buf := make([]byte, 0, 32+len(l.Scope)+len(l.Subject)+len(l.Payload))
+	var u8 [8]byte
+
+	buf = append(buf, domainLeaf)
+	binary.BigEndian.PutUint64(u8[:], uint64(l.UnixNano))
+	buf = append(buf, u8[:]...)
+	buf = append(buf, byte(l.Type))
+
+	buf = appendField(buf, []byte(l.Scope))
+	buf = appendField(buf, []byte(l.Subject))
+	buf = appendField(buf, l.Payload)
+	return buf
+}
+
+// batchPayloadSize — корень (32) + число листьев (4) + индекс первого листа (8).
+const batchPayloadSize = 44
+
+// BatchPayload — предмет звена-агрегата.
+//
+// FirstLeaf — сквозной номер первого листа батча. Он нужен, чтобы найти листья
+// ПОСЛЕ ротации: файлы листьев именуются по стартовому номеру, retention
+// выбрасывает их целиком, и без этого номера уцелевшее звено указывало бы
+// «куда-то в прошлое». Count вместе с ним задаёт полуинтервал.
+type BatchPayload struct {
+	Root      [32]byte
+	Count     uint32
+	FirstLeaf uint64
+}
+
+func encodeBatchPayload(p BatchPayload) []byte {
+	buf := make([]byte, batchPayloadSize)
+	copy(buf[0:32], p.Root[:])
+	binary.BigEndian.PutUint32(buf[32:36], p.Count)
+	binary.BigEndian.PutUint64(buf[36:44], p.FirstLeaf)
+	return buf
+}
+
+// DecodeBatchPayload разбирает предмет звена-агрегата.
+func DecodeBatchPayload(b []byte) (BatchPayload, error) {
+	if len(b) != batchPayloadSize {
+		return BatchPayload{}, fmt.Errorf("auditchain: предмет звена %d Б, ожидалось %d", len(b), batchPayloadSize)
+	}
+	var p BatchPayload
+	copy(p.Root[:], b[0:32])
+	p.Count = binary.BigEndian.Uint32(b[32:36])
+	p.FirstLeaf = binary.BigEndian.Uint64(b[36:44])
+	return p, nil
+}
+
+// LinkBatch строит звено над батчем листьев: считает корень и связывает с
+// головой. Единственный способ получить корректное звено — чтобы «сложить
+// корень мимо цепи» было нельзя.
+//
+// Пустой батч звена не даёт: писать «за эту секунду ничего не было» тридцать
+// миллионов раз в год — это 3.5 ГБ пустоты и весь бюджет объёма, потраченный
+// на простаивающий инстанс (на живом :6381 темп 2.2 факта в СУТКИ).
+func LinkBatch(head Head, unixNano int64, firstLeaf uint64, leaves []Leaf) (Record, error) {
+	if len(leaves) == 0 {
+		return Record{}, fmt.Errorf("auditchain: звено над пустым батчем не строится")
+	}
+	payload := encodeBatchPayload(BatchPayload{
+		Root:      MerkleRoot(leaves),
+		Count:     uint32(len(leaves)),
+		FirstLeaf: firstLeaf,
+	})
+	return Link(head, unixNano, EventBatch, "", "", payload), nil
 }
 
 // Verify проходит цепь целиком и возвращает её голову.
