@@ -240,6 +240,123 @@ Three limits, stated rather than discovered:
   fragmentation already paid for at 6× (idle consolidation, 589→3535 QPS).
   The chosen path costs 18–20 ms per 10k facts on load.
 
+## Audit chain — the carrier, and the six decisions measured into it
+
+`VMEM.SHRED` returns a receipt. Until it is stored somewhere that cannot be
+rewritten, that receipt proves nothing six months later, which is why the
+chain (`internal/auditchain`) exists and why creating a fact is a first-class
+event in it rather than only destroying one. The hashing core is written; what
+follows is how the *carrier* — the part that touches the disk — was decided.
+
+Two runs, both before the carrier code:
+`internal/auditchain/carrier_bench_test.go` for the price of durability, and a
+`vmemload` run against a real server (27 561 events, 200 scopes, workers=8,
+ext4, `-encrypt-at-rest`) for the rate that price gets multiplied by.
+
+**Thresholds fixed in advance.** Per-event cost under 5% of the 188 µs insert
+budget = 9.4 µs — the same 5% already applied to RECALL for encryption. Chain
+growth under 10 GB/year, since **the chain can never be compacted**: compaction
+of evidence is destruction of evidence, so its growth is monotonic forever.
+
+| operation | ms (mains) |
+|---|---|
+| `Link` + `Hash` | 0.000571 |
+| journal append + fsync | 0.65–0.80 |
+| head, 2 slots + CRC + `fdatasync` | **0.42** |
+| head, tmp → rename → dir fsync | 2.16 |
+| one event, fully synchronous | **1.49** |
+| batch of 532 (a 100 ms tick), per event | 0.0059–0.0073 |
+| `SHRED` | 2.78 |
+
+| measured rate | events/s |
+|---|---|
+| load ceiling (remember 1059 + super 89 + forget 27) | **1175** |
+| 5-minute mix, 8 readers + 2 writers | **942** (reads: 3468 RECALL/s, costing the chain nothing) |
+| the live personal instance, 11 facts over 5 days | 0.000025 (≈2.2 facts/day) |
+
+**Decision 1 — `REMEMBER` is never written to the chain synchronously.** At
+1.49 ms it is eight full insert budgets; throughput would fall 5324 → 670/s.
+Durability costs ~1.5 ms regardless of how many bytes are written, because what
+is paid for is the trip to the device. Events batch on the WAL syncer's tick,
+at 6.4 µs each — 3.4% of the budget, inside the threshold.
+
+**Decision 2 — the head is two slots with a CRC and `fdatasync`, not the
+`keyring.persistLocked` pattern.** 0.42 ms against 2.16 ms for the same
+protection, resolved by "the valid slot with the higher seq wins". Rename is
+what a file of *varying* size needs; the head is 48 fixed bytes. The 5.1× ratio
+held on battery (4.9×), so it is not a power-state artefact.
+
+**Decision 3 — `fdatasync` instead of `fsync` only for the head.** It halves
+the cost solely on a file of constant size (0.42 vs 0.82 ms); on the growing
+journal there is no win, because the file's size is metadata too.
+
+**Decision 4 — the chain stores a Merkle root per tick, not one record per
+event.** The decisive number is the inverse one: at 171 B per event, **10 GB/year
+is reached at 1.85 events per second**. Not thousands — two. Every measured
+productive rate is 500–630× past it (5.1–6.3 TB/year), so direct writing is out.
+That the measured points span seven orders of magnitude does not weaken the
+conclusion; it is what makes the threshold decisive rather than borderline.
+
+**Decision 5 — the aggregation period is ≥ 1 s.** ⚠"Use a Merkle tree" does not
+by itself solve anything, and the earlier estimate that assumed a 100 ms tick
+was wrong by 5.4×: one link per 100 ms is still 54 GB/year. The numbers changed
+the *parameter*, not the structure.
+
+| link period | chain per year |
+|---|---|
+| 100 ms | 54 GB ✗ |
+| **1 s** | **5.4 GB** ✓ (3.1 GB at the 97 B link size) |
+| 5 s | 1.1 GB |
+
+A proof that a given fact is in the chain is then a Merkle path — about
+log₂N ≈ 10 hashes ≈ 350 B — which has a second property worth having: it proves
+*your* fact was recorded without revealing anyone else's.
+
+**Decision 6 — `FORGET` batches as well.** It is not the rare operator command
+`SHRED` is: the mix run showed ~118 FORGETs/s, and at 2.78 ms each that is a
+third of all wall-clock time spent on one command. `SHRED` and `QUARANTINE`
+stay synchronous, and they **force a flush of the chain up to themselves** — so
+a receipt always covers everything that came before it, and the batching window
+never covers the moment being proved. That costs nothing, because those
+commands already pay a synchronous keyring write.
+
+**The carrier is three files**, and the order of writes within a tick is fixed:
+
+    leaves_*.log   ordinary event data — rotatable, compressible, subject to retention
+    chain.log      the aggregate links, append-only, never touched
+    head.dat       48 bytes, two slots, fdatasync
+
+    leaves → fsync → link → fsync → head
+
+This is the same rule as `SHRED`'s "memory first, then the key": a crash must
+leave behind something **less proved, never less provable**. Leaves without a
+root can be replayed once the root arrives; a root whose leaves never landed is
+permanently "something happened, and what it was is unknowable". The ordering
+costs 1.2 ms per second — 0.12%.
+
+⚠**What is deliberately not in the chain: content.** Records hold a fingerprint,
+never the fact itself. An append-only journal containing fact text would
+resurrect exactly what `SHRED` destroys — the same reason the keyring is the one
+structure in this project that is *not* append-only.
+
+**A consequence worth stating as a property, not a defect:** because links and
+leaves are separate files, they can have separate retention. Roots are kept
+forever, leaves expire. Once leaves are gone it remains provable that *N*
+operations occurred and unprovable *which* — an honest and useful position, and
+the only one that is compatible with erasure at all.
+
+Three numbers here are **not** measured, and should not be quoted as if they
+were: the cost of building the tree over a batch (estimated ~0.4 ms/s from the
+571 ns `Link`+`Hash`), `Verify` over a long chain (a linear pass — at 3 GB/year
+it will need a checkpoint), and the 97 B link size, which is computed from the
+struct rather than read off a file.
+
+⚠**And the limit that no amount of local engineering removes:** whoever owns
+both the journal and the head can truncate the tail and recompute the head.
+Tamper-evidence without an external witness is evidence against everyone except
+the owner. Publishing the root outside the machine is what closes it, and until
+that exists this section is the guarantee.
+
 ## Doors (decisions that are expensive to reverse)
 
 1. **Replay never looks at the clock.** Everything time-dependent is stamped as
