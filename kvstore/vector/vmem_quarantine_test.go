@@ -190,3 +190,77 @@ func TestVMEMQuarantineErasureWins(t *testing.T) {
 		t.Errorf("истёкший по TTL факт отозван (%d) — карантин зависит от жнеца", len(res.Docs))
 	}
 }
+
+// TestVMEMQuarantineSkipsRacedUpsert — проверка предиката SOURCE в фазе
+// ПРИГОВОРА, а не только в скане. Между фазами блокировка ОТПУЩЕНА:
+// collectBySource берёт mu.RLock и снимает его по defer, quarantineKeys берёт
+// mu.Lock заново. В это окно параллельный клиент может перезаписать факт,
+// объявив другой источник, — и без перепроверки по свежайшей версии отзыв
+// «источника A» унесёт факт, который сейчас принадлежит источнику B. Это
+// прямое нарушение того единственного свойства, ради которого карантин
+// существует: соседние источники обязаны остаться нетронутыми.
+//
+// Гонка воспроизводится детерминированно: фазы вызываются раздельно, а между
+// ними делается upsert. Написан после того, как мутация «снять предикат в
+// приговоре» прошла мимо ВСЕХ тестов пакета — они проверяли только скан, и
+// один и тот же фильтр в двух фазах маскировал её. Тот же класс и тот же
+// приём, что TestVMEMBackfillSkipsRacedUpsert: правило «двухфазная операция
+// требует теста, вызывающего фазы раздельно» было выведено для BACKFILL и не
+// перенесено на вторую такую операцию.
+func TestVMEMQuarantineSkipsRacedUpsert(t *testing.T) {
+	lvs := NewLeveledVectorStore(bm25TestConfig())
+	defer lvs.Close()
+
+	if _, err := lvs.Remember(RememberRequest{
+		ID: "raced", Scope: "user:a", Text: "дедлайн проекта март", Source: "web-scraper",
+	}, 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	// Фаза скана: кандидат отобран, источник у него ещё отравленный.
+	cands := lvs.collectBySource("web-scraper", 100)
+	if len(cands) != 1 || cands[0] != "raced" {
+		t.Fatalf("скан отобрал %v, ожидался ровно [raced]", cands)
+	}
+
+	// ...и тут параллельный клиент перезаписывает факт другим источником.
+	if _, err := lvs.Remember(RememberRequest{
+		ID: "raced", Scope: "user:a", Text: "дедлайн проекта март", Source: "human",
+	}, 1500); err != nil {
+		t.Fatal(err)
+	}
+
+	// Фаза приговора обязана его отбросить: сейчас это факт от human.
+	res, err := lvs.quarantineKeys(cands, QuarantineRequest{
+		Scope: "user:a", Source: "web-scraper",
+	}, 2000)
+	if err != nil {
+		t.Fatalf("quarantineKeys: %v", err)
+	}
+	if len(res.Docs) != 0 {
+		t.Errorf("отозвано %d фактов — приговор не перепроверил свежайшую версию, "+
+			"отзыв web-scraper унёс факт, принадлежащий human", len(res.Docs))
+	}
+	if q := lvs.vmemQuarantinedAt("raced"); !math.IsNaN(q) {
+		t.Errorf("quarantined_at=%v — факт соседнего источника отозван", q)
+	}
+
+	// ⭐Парный ПОЛОЖИТЕЛЬНЫЙ контроль: без гонки тот же путь обязан отозвать.
+	// Без него «0 отозвано» зачлось бы и в случае, когда приговор отвергает
+	// вообще всё — то есть тест был бы зелёным по неверной причине.
+	if _, err := lvs.Remember(RememberRequest{
+		ID: "plain", Scope: "user:a", Text: "дедлайн проекта апрель", Source: "web-scraper",
+	}, 1000); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := lvs.quarantineKeys(lvs.collectBySource("web-scraper", 100), QuarantineRequest{
+		Scope: "user:a", Source: "web-scraper",
+	}, 2000)
+	if err != nil {
+		t.Fatalf("quarantineKeys (контроль): %v", err)
+	}
+	if len(ok.Docs) != 1 || ok.Docs[0].ID != "plain" {
+		t.Fatalf("положительный контроль: отозвано %d — путь не работает вовсе, "+
+			"нулевой результат выше ничего не доказывает", len(ok.Docs))
+	}
+}
