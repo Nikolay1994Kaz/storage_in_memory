@@ -5,12 +5,15 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"kvstore/kvstore/internal/auditchain"
+	"kvstore/kvstore/internal/server"
 )
 
 // Подключение цепи аудита к серверу.
@@ -50,11 +53,26 @@ const auditChainDir = "auditchain"
 // startAuditChain поднимает носитель и фоновый тик. Возвращает функцию
 // остановки: она глушит тик и закрывает носитель, сбрасывая остаток буфера.
 func startAuditChain(dataDir string) (func(), error) {
-	c, err := auditchain.Open(filepath.Join(dataDir, auditChainDir))
+	dir := filepath.Join(dataDir, auditChainDir)
+	c, err := auditchain.Open(dir)
 	if err != nil {
 		return nil, err
 	}
 	auditChain = c
+
+	// Ключ подписи поднимается ЗДЕСЬ, а не при первом EXPORT: его создание —
+	// запись на диск, и делать её по запросу означало бы, что читающая команда
+	// умеет менять каталог данных.
+	signer, err := auditchain.LoadOrCreateSigner(dir)
+	if err != nil {
+		c.Close()
+		auditChain = nil
+		return nil, err
+	}
+	auditSigner = signer
+	// Публичный ключ печатается при старте: аудитор закрепляет именно его, и
+	// взять его должно быть нечего искать.
+	slog.Info("audit chain signing key", "public_key", signer.PublicKeyString())
 
 	// ⭐О НАЙДЕННОМ ПРИ ВОССТАНОВЛЕНИИ ГОВОРИМ ВСЛУХ И РАЗНЫМИ УРОВНЯМИ.
 	// «Голова отставала» — след обычной аварии, «листья без корня» — тоже;
@@ -93,8 +111,19 @@ func startAuditChain(dataDir string) (func(), error) {
 		if err := c.Close(); err != nil {
 			slog.Error("audit chain close error", "err", err)
 		}
-		auditChain = nil
+		auditChain, auditSigner = nil, nil
 	}, nil
+}
+
+// writePairs пишет плоский массив «имя, значение» — форма ответа, уже принятая
+// у VMEM.COVERAGE. Общий хелпер, чтобы соседние команды не разъехались по
+// форме ответа при добавлении полей.
+func writePairs(buf *server.ConnBuf, fields [][2]string) {
+	buf.WriteArrayHeader(len(fields) * 2)
+	for _, f := range fields {
+		buf.WriteBulkString(f[0])
+		buf.WriteBulkString(f[1])
+	}
 }
 
 // auditAppend кладёт событие в буфер цепи. Вне тика на диск не ходит: цена
@@ -145,6 +174,14 @@ type rememberPayload struct {
 	Source     string `json:"src,omitempty"` // происхождение — то, по чему идёт отзыв
 	Sealed     bool   `json:"sealed"`        // ушёл ли факт на диск под конвертом
 	Supersedes string `json:"sup,omitempty"`
+	// ⭐ExpiresAt — абсолютный срок жизни, если он был задан.
+	//
+	// Нужен не цепи, а СВЕРКЕ. TTL-жнец удаляет факты физически и в цепь не
+	// пишет (он живёт внутри движка и вызывается с idle-тика). Без этого поля
+	// сверка объявила бы каждый истёкший факт пропавшим — то есть обвинила бы
+	// систему в порче ровно там, где всё работало как задумано. Со сроком
+	// отсутствие ОБЪЯСНИМО, и в отчёте оно отделено от необъяснимого.
+	ExpiresAt int64 `json:"exp,omitempty"`
 }
 
 type quarantinePayload struct {
@@ -163,6 +200,10 @@ type backfillPayload struct {
 	Facts  int    `json:"n"`
 }
 
+type resealPayload struct {
+	Facts int `json:"n"`
+}
+
 func auditJSON(v any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -178,13 +219,14 @@ func auditJSON(v any) []byte {
 // auditRemember — создание факта. ⭐Событие первого класса: журнал, который
 // фиксирует только удаления, не может доказать, что факт не подсунули задним
 // числом.
-func auditRemember(scope, id, source string, sealed bool, supersedes string, text []byte) {
+func auditRemember(scope, id, source string, sealed bool, supersedes string, expiresAt int64, text []byte) {
 	sum := sha256.Sum256(text)
 	auditAppend(auditchain.EventRemember, scope, id, auditJSON(rememberPayload{
 		Hash:       base64.RawStdEncoding.EncodeToString(sum[:]),
 		Source:     source,
 		Sealed:     sealed,
 		Supersedes: supersedes,
+		ExpiresAt:  expiresAt,
 	}))
 }
 
@@ -221,6 +263,16 @@ func auditShred(scope string, kekID []byte, facts int) (uint64, error) {
 	}))
 }
 
+// auditReseal — перешифровка легаси.
+//
+// Батчем: как и бэкфилл, это администраторская операция над прошлым. Но в
+// журнале она обязана быть, и по более острой причине: после неё покрытие
+// ключом растёт, а значит меняется то, что VMEM.SHRED сможет пообещать. Кто и
+// когда сдвинул эту границу — вопрос, который зададут первым.
+func auditReseal(scope string, facts int) {
+	auditAppend(auditchain.EventReseal, scope, "", auditJSON(resealPayload{Facts: facts}))
+}
+
 // auditBackfill — миграция провенанса легаси. Батчем: это администраторская
 // операция над прошлым, а не доказываемый момент.
 func auditBackfill(scope, source string, facts int) {
@@ -228,6 +280,105 @@ func auditBackfill(scope, source string, facts int) {
 		Source: source,
 		Facts:  facts,
 	}))
+}
+
+// ---------------------------------------------------------------------------
+// Чтение цепи: сверка, заявление, доказательство
+// ---------------------------------------------------------------------------
+
+// auditSigner — ключ подписи инстанса. Поднимается вместе с носителем, чтобы
+// EXPORT оставался операцией ТОЛЬКО ЧТЕНИЯ: создание ключа — запись на диск, и
+// делать её по запросу означало бы, что доступная под -restore-to-lsn команда
+// умеет менять каталог данных.
+var auditSigner *auditchain.Signer
+
+// auditChainPath — каталог носителя. Отдельной функцией, потому что зовётся
+// и из команд, и из сверки, а собирать путь в двух местах — способ однажды
+// собрать его по-разному.
+func auditChainPath() string { return filepath.Join(dataDir, auditChainDir) }
+
+// auditChainVerify сверяет цепь с головой, начиная со звена from.
+//
+// ⚠from=0 означает полный проход, а он измерен: 27-40 с на годовой цепи
+// (verify_bench_test.go). Поэтому умолчание в команде — ОКНО, а не ноль.
+func auditChainVerify(from uint64, head auditchain.Head) (auditchain.Head, int, error) {
+	if from == 0 {
+		// Окно по умолчанию не применяется, когда цепь короче него: тогда
+		// «полный проход» и «окно» — одно и то же, и опора не нужна.
+		if head.Seq > auditVerifyWindow {
+			from = head.Seq - auditVerifyWindow
+		}
+	}
+	return auditchain.VerifyRange(auditChainPath(), from, &head)
+}
+
+// auditVerifyWindow — сколько звеньев проверяет VERIFY без явного FROM.
+//
+// Число взято из замера: бюджет команды 10 с ÷ (415 нс проверки + 442 нс
+// чтения на звено) ≈ 11.6 млн, округлено вниз. При тике 1 с это ~116 суток.
+// Полный проход остаётся доступен явным FROM 0 и честно назван в доках
+// операцией на десятки секунд.
+const auditVerifyWindow = 10_000_000
+
+// auditChainExport выпускает подписанное заявление о голове.
+func auditChainExport(nowSec int64) ([]byte, error) {
+	if auditSigner == nil {
+		return nil, errors.New("audit chain signing key is not loaded")
+	}
+	links, err := auditchain.ReadChain(auditChainPath())
+	if err != nil {
+		return nil, err
+	}
+	// Голова берётся ИЗ ЖУРНАЛА, а не из памяти носителя: заявление
+	// удостоверяет то, что лежит на диске и что аудитор сможет проверить сам.
+	head, err := auditchain.Verify(links, nil)
+	if err != nil {
+		return nil, err
+	}
+	return auditSigner.Sign(head, len(links), nowSec).JSON()
+}
+
+// auditChainProve собирает доказательство включения события.
+func auditChainProve(q auditchain.LeafQuery, nowSec int64) ([]byte, error) {
+	if auditSigner == nil {
+		return nil, errors.New("audit chain signing key is not loaded")
+	}
+	dir := auditChainPath()
+	link, leaves, idx, err := auditchain.FindLeaf(dir, q)
+	if err != nil {
+		return nil, err
+	}
+	links, err := auditchain.ReadChain(dir)
+	if err != nil {
+		return nil, err
+	}
+	head, err := auditchain.Verify(links, nil)
+	if err != nil {
+		return nil, err
+	}
+	proof, err := auditchain.BuildProof(link, leaves, idx, auditSigner.Sign(head, len(links), nowSec))
+	if err != nil {
+		return nil, err
+	}
+	return proof.JSON()
+}
+
+// auditEventTypeByName — имена событий для команды. Числа наружу не выдаём:
+// они входят в хеш и потому неизменны, но пользователю знать их незачем.
+func auditEventTypeByName(s string) (auditchain.EventType, bool) {
+	switch strings.ToLower(s) {
+	case "remember":
+		return auditchain.EventRemember, true
+	case "forget":
+		return auditchain.EventForget, true
+	case "quarantine":
+		return auditchain.EventQuarantine, true
+	case "shred":
+		return auditchain.EventShred, true
+	case "backfill":
+		return auditchain.EventBackfill, true
+	}
+	return 0, false
 }
 
 // auditSeqField — значение поля chain_seq в квитанции.
