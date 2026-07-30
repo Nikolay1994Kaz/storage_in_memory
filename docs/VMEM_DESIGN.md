@@ -54,6 +54,13 @@ BM25 text layer, all of which already flow through WAL / snapshot / merge.
 - **RECALL default = valid-now**: facts with `valid_to <= now` or
   `expires_at <= now` are excluded. History is explicit: `AS_OF ts` evaluates
   validity at `ts`; `ALL` disables the validity filter.
+  - ⚠**`AS_OF` reconstructs what was *true*, not what the agent had *seen*.**
+    A fact written today with `VALIDFROM` set to April is returned by an
+    `AS_OF` query for April — measured on a live instance, not inferred. That
+    is correct behaviour for an application-time axis and a documented feature
+    for importing old logs, but it means `AS_OF` alone cannot answer "on what
+    basis did it decide", because a fact backdated *after* an incident makes
+    the past look like the agent knew it. See door 4.
 - **Revocation is a third axis, not a third meaning of `valid_to`.**
   `VMEM.QUARANTINE` stamps `quarantined_at` and touches nothing else. The two
   tempting alternatives are both wrong, and naming what each axis *means* shows
@@ -430,6 +437,36 @@ that exists this section is the guarantee.
    re-vectorization queue is deferred, demand-driven — it is the only piece
    with an external dependency and background state, and the demo value is
    already delivered by step 0.
+4. **Application time is queryable; system time is recorded but not
+   queryable.** `AS_OF` walks `valid_from`/`valid_to` only. There is no
+   `AS OF SYSTEM TIME` — no way to ask "which facts were *in memory* at 14:32",
+   as distinct from "which facts were *true* at 14:32".
+
+   The gap is not theoretical and has a measurement: a fact written now with
+   `VALIDFROM` backdated is returned by `AS_OF` for that past moment. Nothing
+   in the store distinguishes "the agent believed this in April" from "someone
+   asserted in July that it had been so since April". For the question
+   regulation actually asks — the EU AI Act's *"post-hoc reconstruction of
+   individual AI-assisted decisions"* — that distinction is the whole point,
+   because what matters is not how long ago the decision was but **whether
+   memory changed between the decision and the review**.
+
+   ⭐**The missing half already exists as data.** Every `REMEMBER` leaf in the
+   audit chain carries the real wall-clock write time, the content fingerprint
+   and the source, in a structure that cannot be rewritten without breaking the
+   chain. So "was this fact in memory at T, and did anyone backdate it" is
+   answerable *today* by reading `auditchain/` — it is simply not answerable
+   from `RECALL`. Closing that means an index over chain write times: `RECALL`
+   cannot consult the chain inline, since walking it is linear and was measured
+   at 27–40 s per year of chain.
+
+   **Not built, and the trigger to build it is external.** Three neighbouring
+   projects already expose a time axis and one carries full bitemporality in
+   its schema, so this is not a differentiator and must not be sold as one; the
+   reason to build it would be a specific question from someone who has to
+   answer for an incident, not our own sense of completeness. Until then the
+   limitation is stated here and in `docs/COMMANDS.md` rather than left for an
+   auditor to discover.
 
 ## Deliberately NOT built (v1)
 
