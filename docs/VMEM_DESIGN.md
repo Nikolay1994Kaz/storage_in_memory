@@ -305,8 +305,15 @@ the *parameter*, not the structure.
 | link period | chain per year |
 |---|---|
 | 100 ms | 54 GB ✗ |
-| **1 s** | **5.4 GB** ✓ (3.1 GB at the 97 B link size) |
-| 5 s | 1.1 GB |
+| **1 s** | **3.56 GB** ✓ — a link is a measured 113 B, fixed regardless of batch size |
+| 5 s | 0.7 GB |
+
+That 113 B is now asserted by a test (`TestCarrier_LinkSizeFitsVolumeBudget`),
+because it is the single number holding the whole structure inside its budget:
+any field added to a link multiplies by 31.5 million. ⚠It also corrects the
+estimate this design was written from — 97 B, computed from the struct, which
+had counted neither the frame nor the leaf index needed to locate leaves after
+rotation.
 
 A proof that a given fact is in the chain is then a Merkle path — about
 log₂N ≈ 10 hashes ≈ 350 B — which has a second property worth having: it proves
@@ -345,11 +352,10 @@ forever, leaves expire. Once leaves are gone it remains provable that *N*
 operations occurred and unprovable *which* — an honest and useful position, and
 the only one that is compatible with erasure at all.
 
-Three numbers here are **not** measured, and should not be quoted as if they
+Two numbers here are **not** measured, and should not be quoted as if they
 were: the cost of building the tree over a batch (estimated ~0.4 ms/s from the
-571 ns `Link`+`Hash`), `Verify` over a long chain (a linear pass — at 3 GB/year
-it will need a checkpoint), and the 97 B link size, which is computed from the
-struct rather than read off a file.
+571 ns `Link`+`Hash`), and `Verify` over a long chain — a linear pass, which at
+3.5 GB/year will need a checkpoint before it is honest to call it a command.
 
 ⚠**And the limit that no amount of local engineering removes:** whoever owns
 both the journal and the head can truncate the tail and recompute the head.
