@@ -214,6 +214,42 @@ func stringIndex(hay, needle string) int {
 	return -1
 }
 
+// ⭐TestAuditChain_ExpiryRecordedOnlyWhenSet — регрессия, найденная ГЛАЗАМИ на
+// живой службе, а не тестом.
+//
+// У факта без TTL в атрибуте expires_at лежит не срок, а сентинел «открытого
+// интервала» (1<<53). Первая версия клала его в лист как есть: поведение не
+// ломалось — такой «срок» не наступит никогда, — но каждый лист нёс лишние
+// байты и утверждал про факт то, чего у него нет. Мутационный прогон такое не
+// ловит: ошибка не в ветвлении, а в значении, и все ветки работали.
+func TestAuditChain_ExpiryRecordedOnlyWhenSet(t *testing.T) {
+	dir := enableAuditChain(t)
+	e := newExecEnv(t)
+
+	forever := e.do("VMEM.REMEMBER", "alice", "TEXT", "вечный факт", "SOURCE", "agent-a").Str
+	mortal := e.do("VMEM.REMEMBER", "alice", "TEXT", "недолгий факт", "SOURCE", "agent-a", "TTL", "3600").Str
+
+	got := map[string]int64{}
+	for _, l := range chainLeaves(t, dir) {
+		if l.Type != auditchain.EventRemember {
+			continue
+		}
+		var p rememberPayload
+		if err := json.Unmarshal(l.Payload, &p); err != nil {
+			t.Fatalf("предмет листа не разбирается: %v", err)
+		}
+		got[l.Subject] = p.ExpiresAt
+	}
+	if got[forever] != 0 {
+		t.Errorf("у факта без TTL в листе срок %d, ожидался 0 — это сентинел, а не срок", got[forever])
+	}
+	// ПАРНЫЙ КОНТРОЛЬ: у факта С TTL срок обязан быть, иначе сверка перестанет
+	// объяснять штатное истечение и начнёт звать его пропажей.
+	if got[mortal] <= 0 {
+		t.Errorf("у факта с TTL срок в листе %d — сверка не сможет объяснить его исчезновение", got[mortal])
+	}
+}
+
 // ⭐TestAuditChain_ShredForcesFlush — квитанция обязана покрывать всё, что было
 // раньше. Если события до SHRED остались в буфере, окно агрегации накрывает
 // ровно тот момент, который продаётся как доказанный.
