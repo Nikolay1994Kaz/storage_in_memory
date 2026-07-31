@@ -128,46 +128,34 @@ func TestSealedSQSegmentHidesContent(t *testing.T) {
 	}
 }
 
-// TestSealedSQSegmentRoundTripMatchesPlain — самое рискованное место правки.
-//
-// У SQ8 вектор не хранится, а вычисляется из кода. Запечатывание проводит его
-// через деквантование → конверт → переквантование, и если формула
-// восстановления разойдётся с формулой заморозки хоть на округление, факт
-// вернётся СДВИНУТЫМ. Тихо: поиск деградирует только для запечатанных скоупов,
-// на глаз это не видно.
-//
-// Поэтому сравнение не с исходным вектором (он и так теряется при квантовании),
-// а с тем же стором БЕЗ шифрования: шифрование не должно менять ничего, кроме
-// читаемости байтов на диске. Эталон — поведение, а не константа.
-func TestSealedSQSegmentRoundTripMatchesPlain(t *testing.T) {
-	load := func(crypto *SnapshotCrypto) *LeveledVectorStore {
-		t.Helper()
-		src := sealedStoreWithCfg(t, sqSealedConfig(), crypto)
-		defer src.Clear()
-		requireSQSegment(t, src)
-		var buf bytes.Buffer
-		if err := src.SaveBinary(&buf); err != nil {
-			t.Fatalf("SaveBinary: %v", err)
-		}
-		dst := NewLeveledVectorStore(sqSealedConfig())
-		dst.SetSnapshotCrypto(crypto)
-		if err := dst.LoadBinary(bytes.NewReader(buf.Bytes())); err != nil {
-			t.Fatalf("LoadBinary: %v", err)
-		}
-		return dst
+// sqRoundTrip — сохранить стор и поднять его обратно. Возвращает ОБА: исходный
+// и восстановленный, потому что эталон для сравнения — именно исходный.
+func sqRoundTrip(t *testing.T, cfg LeveledConfig, crypto *SnapshotCrypto,
+	fill func(t *testing.T, cfg LeveledConfig, crypto *SnapshotCrypto) *LeveledVectorStore,
+) (src, dst *LeveledVectorStore, snap []byte) {
+	t.Helper()
+	src = fill(t, cfg, crypto)
+	requireSQSegment(t, src)
+	var buf bytes.Buffer
+	if err := src.SaveBinary(&buf); err != nil {
+		t.Fatalf("SaveBinary: %v", err)
 	}
+	dst = NewLeveledVectorStore(cfg)
+	dst.SetSnapshotCrypto(crypto)
+	if err := dst.LoadBinary(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("LoadBinary: %v", err)
+	}
+	return src, dst, buf.Bytes()
+}
 
-	fc := newFakeCrypto()
-	sealed := load(fc.crypto())
-	defer sealed.Clear()
-	plain := load(nil)
-	defer plain.Clear()
-
-	for _, key := range []string{"f-alice-1", "f-alice-2", "f-bob-1", "plain-1"} {
-		want, okPlain := plain.Get(key)
-		got, okSealed := sealed.Get(key)
-		if !okPlain || !okSealed {
-			t.Errorf("документ %s: без шифрования ok=%v, с шифрованием ok=%v", key, okPlain, okSealed)
+// assertSameVectors — восстановленные векторы совпадают с исходными.
+func assertSameVectors(t *testing.T, src, dst *LeveledVectorStore, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		want, okSrc := src.Get(key)
+		got, okDst := dst.Get(key)
+		if !okSrc || !okDst {
+			t.Errorf("документ %s: в исходном ok=%v, в восстановленном ok=%v", key, okSrc, okDst)
 			continue
 		}
 		if len(got) != len(want) {
@@ -176,17 +164,150 @@ func TestSealedSQSegmentRoundTripMatchesPlain(t *testing.T) {
 		}
 		for j := range want {
 			if got[j] != want[j] {
-				t.Errorf("вектор %s[%d] = %v, без шифрования %v — переквантование разошлось с заморозкой",
+				t.Errorf("вектор %s[%d] = %v, в исходном сторе %v — переквантование разошлось с заморозкой",
 					key, j, got[j], want[j])
 				break
 			}
 		}
 	}
+}
+
+// TestSealedSQSegmentRoundTrip — самое рискованное место правки.
+//
+// У SQ8 вектор не хранится, а вычисляется из кода. Запечатывание проводит его
+// через деквантование → конверт → переквантование, и если формула
+// восстановления разойдётся с формулой заморозки хоть на округление, факт
+// вернётся СДВИНУТЫМ. Тихо: поиск деградирует только для запечатанных скоупов.
+//
+// ⭐ЭТАЛОН — ИСХОДНЫЙ СТОР, а не «тот же стор без шифрования». Первая версия
+// теста сравнивала именно так и была слепа: при crypto=nil факты со скоупом всё
+// равно идут через деквантование → секцию → переквантование (группа просто
+// пишется открытой), то есть оба сравниваемых пути делят ОДИН код. Мутация,
+// ломающая деквантование, сдвигала обе стороны одинаково, и сверка молчала.
+// Взаимная сверка двух реализаций слепа к синхронной поломке; исходный стор
+// читает коды напрямую и через запечатывание не проходит вовсе.
+func TestSealedSQSegmentRoundTrip(t *testing.T) {
+	fc := newFakeCrypto()
+	src, dst, _ := sqRoundTrip(t, sqSealedConfig(), fc.crypto(), sealedStoreWithCfg)
+	defer src.Clear()
+	defer dst.Clear()
+
+	assertSameVectors(t, src, dst, "f-alice-1", "f-alice-2", "f-bob-1", "plain-1")
 	// Термы и скоуп тоже обязаны пережить дорогу: без них факт перестаёт быть
 	// находимым, то есть шифрование обернулось бы потерей.
-	assertScope(t, sealed, "f-alice-1", "alice")
-	assertTerm(t, sealed, "f-alice-1", "aurora")
-	assertTerm(t, sealed, "f-bob-1", "standup")
+	assertScope(t, dst, "f-alice-1", "alice")
+	assertTerm(t, dst, "f-alice-1", "aurora")
+	assertTerm(t, dst, "f-bob-1", "standup")
+}
+
+// TestSealedSQSegmentMasksCodes — коды запечатанных позиций обязаны уехать в
+// снапшот нулями. Проверка байтовая, потому что содержательная (round-trip) её
+// не заменяет: если маску вовсе не применить, восстановление перезапишет коды
+// теми же значениями и всё сойдётся — при полностью открытом векторе на диске.
+//
+// Пробы взяты из реальной калибровки фикстуры: коды распределяются
+// 0 / 85 / 170 / 255 по четырём документам. Нули как пробу использовать нельзя
+// (ими же маскируем), поэтому проверяются 85 и 170 — запечатанные, а 255
+// (посторонний документ) служит парным положительным контролем.
+func TestSealedSQSegmentMasksCodes(t *testing.T) {
+	fc := newFakeCrypto()
+	src, dst, snap := sqRoundTrip(t, sqSealedConfig(), fc.crypto(), sealedStoreWithCfg)
+	defer src.Clear()
+	defer dst.Clear()
+
+	const dim = 8
+	run := func(b byte) []byte { return bytes.Repeat([]byte{b}, dim) }
+
+	// ПАРНЫЙ ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ — первым: коды постороннего документа
+	// обязаны лежать открыто, иначе проверки ниже искали бы в неверном месте.
+	if !bytes.Contains(snap, run(255)) {
+		t.Fatal("коды постороннего документа не найдены — проба неверна, проверки ниже бессмысленны")
+	}
+	for _, probe := range []byte{85, 170} {
+		if bytes.Contains(snap, run(probe)) {
+			t.Errorf("коды запечатанного факта (%d×%d) лежат в снапшоте — маскирование слэба не сработало", probe, dim)
+		}
+	}
+}
+
+// awkwardVec — вектор, специально неудобный для квантования.
+//
+// ЗАЧЕМ. Основная фикстура благополучна до бесполезности: её значения ложатся
+// ровно в коды 0/85/170/255, поэтому округление никогда не спорит с усечением,
+// а константных размерностей нет вовсе. Мутации «округлять вниз» и «убрать
+// защиту от scale==0» на таких данных невидимы — код исполняется, но ветка,
+// где он неправ, не достигается. Нейтральные данные дают зелёный, ничего не
+// проверив.
+//
+//	d0        — КОНСТАНТА у всех документов ⇒ sqScale[0]==0 (деление на ноль,
+//	            если снять защиту).
+//	d1..d7    — шаги {0,2,5,7} на ненулевой базе. Шаг 2 даёт q=2*255/7=72.857:
+//	            к ближайшему 73, вниз 72 — округление начинает спорить.
+//	            База ненулевая ⇒ потеря sqMin меняет результат.
+func awkwardVec(i int) []float32 {
+	steps := []float32{0, 2, 5, 7}
+	out := make([]float32, 8)
+	out[0] = 7.0 // константная размерность
+	for d := 1; d < 8; d++ {
+		out[d] = float32(d)*1.5 + steps[i]
+	}
+	return out
+}
+
+// awkwardSQStore — фикстура на неудобных значениях.
+func awkwardSQStore(t *testing.T, cfg LeveledConfig, crypto *SnapshotCrypto) *LeveledVectorStore {
+	t.Helper()
+	lvs := NewLeveledVectorStore(cfg)
+	lvs.SetSnapshotCrypto(crypto)
+	docs := []struct{ key, scope, term string }{
+		{"f-alice-1", "alice", "aurora"},
+		{"f-alice-2", "alice", "steering"},
+		{"f-bob-1", "bob", "standup"},
+		{"plain-1", "", "weather"},
+	}
+	for i, d := range docs {
+		attrs := Attributes{Cat: map[string]string{}}
+		if d.scope != "" {
+			attrs.Cat[vmemAttrScope] = d.scope
+			attrs.Cat[vmemAttrSealed] = "1"
+		} else {
+			attrs.Cat["lang"] = "en"
+		}
+		if err := lvs.AddDocTerms(d.key, awkwardVec(i), attrs, []TermTF{{Term: d.term, TF: 1}}); err != nil {
+			t.Fatalf("AddDocTerms(%s): %v", d.key, err)
+		}
+	}
+	lvs.FlushDeltaSync()
+	return lvs
+}
+
+// TestSealedSQSegmentRoundTripAwkwardValues — та же дорога, но по данным, на
+// которых формулы квантования обязаны спорить.
+func TestSealedSQSegmentRoundTripAwkwardValues(t *testing.T) {
+	fc := newFakeCrypto()
+	src, dst, _ := sqRoundTrip(t, sqSealedConfig(), fc.crypto(), awkwardSQStore)
+	defer src.Clear()
+	defer dst.Clear()
+
+	// КОНТРОЛЬ ДАННЫХ, а не только кода: убеждаемся, что фикстура
+	// действительно создала константную размерность. Иначе тест «на неудобные
+	// значения» проверял бы удобные и был бы зелёным ни о чём.
+	src.mu.RLock()
+	var sawConstDim bool
+	for _, level := range src.levels {
+		for _, seg := range level {
+			if s, ok := seg.(*frozenSQSegment); ok && len(s.fg.sqScale) > 0 && s.fg.sqScale[0] == 0 {
+				sawConstDim = true
+			}
+		}
+	}
+	src.mu.RUnlock()
+	if !sawConstDim {
+		t.Fatal("константная размерность не образовалась — фикстура не бьёт в защиту от scale==0")
+	}
+
+	assertSameVectors(t, src, dst, "f-alice-1", "f-alice-2", "f-bob-1", "plain-1")
+	assertTerm(t, dst, "f-alice-1", "aurora")
 }
 
 // TestSealedSQSegmentShredDoesNotResurrect — следствие, ради которого всё:
