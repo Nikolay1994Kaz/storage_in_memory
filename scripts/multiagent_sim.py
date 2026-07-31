@@ -145,16 +145,21 @@ class Server:
         self.log = os.path.join(self.work, "server.log")
         self.proc: subprocess.Popen | None = None
 
-    def start(self) -> None:
+    def start(self, *extra: str) -> None:
         # ⚠log-level=info НУЖЕН: публичный ключ цепи печатается при старте, и
         # аудитор обязан взять его ИМЕННО ОТТУДА — «другим каналом», а не из
         # самого заявления. Ключ из документа ничего не доказывает: кто угодно
         # сгенерирует пару и подпишет любую голову (так и написано в export.go).
-        with open(self.log, "wb") as fh:
+        #
+        # extra — дополнительные флаги (нужны отрицательному контролю, который
+        # поднимает ТОТ ЖЕ каталог с -restore-to-lsn). Лог открывается на
+        # ДОПИСЫВАНИЕ: перезапуск не имеет права затирать строку с публичным
+        # ключом, снятую на первом старте, иначе аудитор потеряет свой канал.
+        with open(self.log, "ab") as fh:
             self.proc = subprocess.Popen(
                 [BIN, "-port", str(self.port), "-data-dir", self.data,
                  "-metrics-port", "0", "-log-level", "info",
-                 "-encrypt-at-rest", "-audit-chain"],
+                 "-encrypt-at-rest", "-audit-chain", *extra],
                 stdout=fh, stderr=subprocess.STDOUT,
             )
 
