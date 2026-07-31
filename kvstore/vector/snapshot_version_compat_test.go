@@ -80,6 +80,51 @@ func TestLoadV8FrozenSnapshot(t *testing.T) {
 	assertTerm(t, dst, "f-alice-1", "aurora")
 }
 
+// TestSnapshotFormatVersionReported — условие, по которому оболочка решает,
+// предупреждать ли оператора о снапшоте с открытыми фактами.
+//
+// Сам slog.Warn живёт в main и тестом отсюда не достаётся, но его ТРИГГЕР —
+// достаётся, и он единственное, что тут можно ошибиться. Без этой проверки
+// предупреждение молча перестало бы срабатывать от любой правки в фазе коммита
+// LoadBinary, и никто бы не заметил: отсутствие лога выглядит как «всё хорошо».
+func TestSnapshotFormatVersionReported(t *testing.T) {
+	fc := newFakeCrypto()
+	src := sealedStoreWithCfg(t, bm25TestConfig(), fc.crypto())
+	defer src.Clear()
+
+	var buf bytes.Buffer
+	if err := src.SaveBinary(&buf); err != nil {
+		t.Fatalf("SaveBinary: %v", err)
+	}
+
+	load := func(snap []byte) int {
+		t.Helper()
+		dst := NewLeveledVectorStore(bm25TestConfig())
+		dst.SetSnapshotCrypto(fc.crypto())
+		defer dst.Clear()
+		if err := dst.LoadBinary(bytes.NewReader(snap)); err != nil {
+			t.Fatalf("LoadBinary: %v", err)
+		}
+		return dst.SnapshotFormatVersion()
+	}
+
+	if got := load(buf.Bytes()); got != SealedSegmentsFormatVersion {
+		t.Errorf("свежий снапшот: версия %d, ожидалась %d — оболочка предупредила бы зря",
+			got, SealedSegmentsFormatVersion)
+	}
+	if got := load(downgradeToV8(t, buf.Bytes())); got != 8 {
+		t.Errorf("старый снапшот: версия %d, ожидалась 8 — оболочка промолчала бы там, где факты открыты", got)
+	}
+
+	// Стор без загрузки обязан давать 0: «снапшота не было» — не то же самое,
+	// что «снапшот старый», и предупреждать в этом случае не о чем.
+	fresh := NewLeveledVectorStore(bm25TestConfig())
+	defer fresh.Clear()
+	if got := fresh.SnapshotFormatVersion(); got != 0 {
+		t.Errorf("стор без снапшота: версия %d, ожидался 0", got)
+	}
+}
+
 // TestV8SnapshotStillShreds — стирание работает и по старому файлу: у frozen
 // документная секция была уже в v8, и гейт v9 не должен был её отобрать.
 func TestV8SnapshotStillShreds(t *testing.T) {

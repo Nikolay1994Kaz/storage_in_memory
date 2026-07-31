@@ -830,6 +830,13 @@ type LeveledVectorStore struct {
 	// snapshotTime — UnixNano момента последнего успешного LoadBinary (для диагностики).
 	snapshotTime int64
 
+	// snapshotFormatVersion — версия формата ПРОЧИТАННОГО снапшота (0, если
+	// снапшота не было). Нужна не для диагностики: до v9 запечатанной секции у
+	// SQ8- и hnsw-сегментов не было, и файл, записанный такой сборкой при
+	// включённом шифровании, содержит факты открытым текстом. В памяти после
+	// загрузки этого уже не видно — оболочка предупреждает по этому числу.
+	snapshotFormatVersion int
+
 	// snapshotLSN — LSN-watermark снапшота: «graph_leveled.bin покрывает все
 	// векторные операции с LSN ≤ snapshotLSN». Пишется в заголовок при SaveBinary
 	// (значение выставляется SetSnapshotWatermark перед сохранением), читается при
@@ -2141,6 +2148,16 @@ func (lvs *LeveledVectorStore) SnapshotTime() int64 { return lvs.snapshotTime }
 // с LSN ≤ этого значения — они уже в снапшоте.
 func (lvs *LeveledVectorStore) SnapshotLSN() uint64 { return lvs.snapshotLSN }
 
+// SnapshotFormatVersion — версия формата прочитанного снапшота (0 — снапшота не
+// было). Оболочка предупреждает по ней о файле, записанном до v9: там факты
+// SQ8- и hnsw-сегментов лежат открытым текстом, а после загрузки в памяти это
+// уже неразличимо.
+func (lvs *LeveledVectorStore) SnapshotFormatVersion() int { return lvs.snapshotFormatVersion }
+
+// SealedSegmentsFormatVersion — версия, начиная с которой запечатаны ВСЕ типы
+// сегмента. Снапшот старее хранит часть фактов открытым текстом.
+const SealedSegmentsFormatVersion = 9
+
 // SetSnapshotWatermark выставляет LSN-watermark, записываемый следующим SaveBinary.
 //
 // Вызывать ПЕРЕД SaveBinary со значением LastLSN() на момент НАЧАЛА сохранения
@@ -2336,11 +2353,31 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 				// На load buildSegment регенерирует segmentText из entries[].Terms
 				// (как колонки из Attrs). decTerms==nil (текстов нет) → nTerms=0.
 				decTerms := s.text.decodeTerms()
-				// v9: живые документы собираются СПИСКОМ до записи — иначе не
-				// узнать скоуп, не прочитав атрибуты, а без скоупа нечего
-				// изымать. Позиция в этом списке и есть позиция запечатанной
-				// секции: читатель складывает entries в том же порядке.
-				live := make([]DeltaEntry, 0, len(s.keys))
+				// Считаем живые векторы
+				nVecs := 0
+				for id, key := range s.keys {
+					if key != "" && s.g.nodes[id].Alive {
+						nVecs++
+					}
+				}
+				binary.LittleEndian.PutUint32(u4[:], uint32(nVecs))
+				if _, err := w.Write(u4[:]); err != nil {
+					s.mu.RUnlock()
+					return fmt.Errorf("leveled: write nVecs[%d][%d]: %w", lyr, si, err)
+				}
+
+				// v9: содержание фактов изымается НА ЛЕТУ. Скоуп читается из
+				// колонки за O(1) (scopeColumnReader) — собирать список всех
+				// документов только ради решения «маскировать ли» не нужно, а
+				// nil-читатель (колонки нет) означает не-VMEM-стор, который
+				// пишется потоком ровно как до v9 и за чужую фичу не платит.
+				scopeAt := scopeColumnReader(s.attrs)
+				var sealedDocs []DeltaEntry // выделяется, только если есть что изымать
+				var zeroVec []byte
+
+				var klen [2]byte
+				var writeErr error
+				pos := 0
 				for id, key := range s.keys {
 					if key == "" || !s.g.nodes[id].Alive {
 						continue
@@ -2349,65 +2386,66 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 					if int(id) < len(decTerms) {
 						entryTerms = decTerms[id]
 					}
-					live = append(live, DeltaEntry{
-						Key: key,
-						Vec: s.g.arena.Get(s.g.nodes[id].VectorOffset),
-						// Атрибуты вектора (v3): node id = индекс колонки.
-						Attrs: s.attrs.decodeAt(int(id)),
-						Terms: entryTerms,
-					})
-				}
-				hMask, hPublic, hAnySealed := splitBySealed(live, vmemScopeOf)
-				if !hAnySealed {
-					hMask = nil
-				}
+					vec := s.g.arena.Get(s.g.nodes[id].VectorOffset)
 
-				binary.LittleEndian.PutUint32(u4[:], uint32(len(live)))
-				if _, err := w.Write(u4[:]); err != nil {
-					s.mu.RUnlock()
-					return fmt.Errorf("leveled: write nVecs[%d][%d]: %w", lyr, si, err)
-				}
-				var klen [2]byte
-				zeroVec := make([]byte, dim*4)
-				var writeErr error
-				for _, e := range hPublic {
-					binary.LittleEndian.PutUint16(klen[:], uint16(len(e.Key)))
+					sealed := scopeAt != nil && scopeAt(int(id)) != ""
+					if sealed {
+						if sealedDocs == nil {
+							sealedDocs = make([]DeltaEntry, nVecs)
+							zeroVec = make([]byte, dim*4)
+						}
+						// Позиция в секции = порядковый номер живого документа:
+						// читатель складывает entries тем же порядком.
+						sealedDocs[pos] = DeltaEntry{
+							Key: key, Vec: vec,
+							Attrs: s.attrs.decodeAt(int(id)), Terms: entryTerms,
+						}
+					}
+					pos++
+
+					binary.LittleEndian.PutUint16(klen[:], uint16(len(key)))
 					if _, err := w.Write(klen[:]); err != nil {
 						writeErr = err
 						break
 					}
-					if _, err := io.WriteString(w, e.Key); err != nil {
+					if _, err := io.WriteString(w, key); err != nil {
 						writeErr = err
 						break
 					}
 					// Вектор запечатанного документа уходит нулями: читатель
 					// всегда берёт ровно dim*4 байта, поэтому подменяется
 					// содержимое, а не длина — позиции не должны разъехаться.
-					if len(e.Vec) == dim && dim > 0 {
-						b := unsafe.Slice((*byte)(unsafe.Pointer(&e.Vec[0])), dim*4)
+					if dim > 0 {
+						b := zeroVec
+						if !sealed && len(vec) > 0 {
+							b = unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), len(vec)*4)
+						}
 						if _, err := w.Write(b); err != nil {
 							writeErr = err
 							break
 						}
-					} else if dim > 0 {
-						if _, err := w.Write(zeroVec); err != nil {
-							writeErr = err
-							break
-						}
 					}
+					// Атрибуты вектора (v3): node id = индекс колонки → decodeAt(id).
 					// hnsw-сегмент на load перестраивается buildSegment(entries), который
 					// регенерирует колонки+каталог из entries[].Attrs (см. readAttrs ниже).
-					if err := writeAttrs(w, e.Attrs); err != nil {
+					attrs := Attributes{}
+					if !sealed {
+						attrs = s.attrs.decodeAt(int(id))
+					}
+					if err := writeAttrs(w, attrs); err != nil {
 						writeErr = err
 						break
 					}
-					if err := writeTerms(w, e.Terms); err != nil {
+					if sealed {
+						entryTerms = nil
+					}
+					if err := writeTerms(w, entryTerms); err != nil {
 						writeErr = err
 						break
 					}
 				}
 				if writeErr == nil {
-					writeErr = writeSealedDocs(w, sealedOnly(live, hMask), vmemScopeOf, lvs.snapshotCrypto)
+					writeErr = writeSealedDocs(w, sealedDocs, vmemScopeOf, lvs.snapshotCrypto)
 				}
 				s.mu.RUnlock()
 				if writeErr != nil {
@@ -2736,6 +2774,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 
 	lvs.snapshotTime = snapTime
 	lvs.snapshotLSN = snapLSN
+	lvs.snapshotFormatVersion = int(version)
 	lvs.dim = dim
 
 	for i := range lvs.levels {

@@ -439,6 +439,7 @@ func main() {
 			} else {
 				slog.Info("leveled vector store loaded from snapshot")
 				graphLoaded = true
+				warnPreSealedSnapshot(vecStore, *encryptAtRest, graphPath)
 			}
 			f.Close()
 		}
@@ -960,6 +961,39 @@ func main() {
 		slog.Info("WAL-shipping: финальная доставка завершена")
 	}
 	slog.Info("shutdown complete: WAL flushed and fsynced")
+}
+
+// warnPreSealedSnapshot предупреждает о снапшоте, записанном ДО формата v9.
+//
+// ЗАЧЕМ ЛОГ, А НЕ СТРОЧКА В ДОКАХ. До v9 запечатанная секция была только у
+// frozen-сегмента: факт, записанный под шифрованием, но осевший в SQ8- или
+// flat-HNSW-сегменте, уезжал в graph_leveled.bin ОТКРЫТЫМ ТЕКСТОМ. После
+// загрузки в памяти это уже неразличимо, а VMEM.COVERAGE смотрит на текущее
+// место хранения и покажет полное покрытие — правдиво про то, что будет
+// записано дальше, и обманчиво про файл, который уже лежит на диске.
+//
+// Предупреждение в документации не путешествует вместе с квитанцией, а лог при
+// старте — путешествует: он попадает туда же, куда смотрит оператор, когда
+// разбирается, почему стирание не сработало.
+//
+// Починка forward-only: пересохранить снапшот. Старый файл своих открытых
+// байтов не теряет, и уничтожение ключа скоупа до них не достаёт.
+func warnPreSealedSnapshot(vs any, encryptAtRest bool, path string) {
+	if !encryptAtRest {
+		return // без шифрования запечатывать было нечего, претензий к файлу нет
+	}
+	lvs, ok := vs.(*vector.LeveledVectorStore)
+	if !ok {
+		return
+	}
+	v := lvs.SnapshotFormatVersion()
+	if v == 0 || v >= vector.SealedSegmentsFormatVersion {
+		return
+	}
+	slog.Warn("snapshot predates sealed SQ8/flat-HNSW segments: facts that settled in those segment types were written in the clear, and destroying a scope key will not reach them. Re-save the snapshot to seal them going forward — the existing file keeps its plaintext",
+		"path", path,
+		"snapshot_format", v,
+		"sealed_since", vector.SealedSegmentsFormatVersion)
 }
 
 // writeValue — helper для записи protocol.Value в ConnBuf.

@@ -84,6 +84,37 @@ func writeCodesMasked(w io.Writer, codes []uint8, dim, n int, mask []bool) error
 	return nil
 }
 
+// scopeColumnReader возвращает функцию «скоуп документа на позиции i»,
+// читающую ТОЛЬКО колонку scope. nil, если колонки нет вовсе.
+//
+// ЗАЧЕМ ОТДЕЛЬНО ОТ decodeAt. Решение «маскировать ли этот документ» нужно
+// принять для каждой позиции, а decodeAt на каждый вызов собирает Attributes
+// целиком — с мапами по всем атрибутам. Колонка отвечает на тот же вопрос за
+// O(1) и не выделяет ничего.
+//
+// nil-результат — это и есть быстрый путь не-VMEM-стора: скоупов нет,
+// запечатывать нечего, запись идёт потоком, как до v9.
+func scopeColumnReader(sa *segmentAttrs) func(int) string {
+	if sa == nil {
+		return nil
+	}
+	col, ok := sa.cat[vmemAttrScope]
+	if !ok {
+		return nil
+	}
+	vals := sa.dict[vmemAttrScope].vals
+	return func(i int) string {
+		if i < 0 || i >= len(col.codes) {
+			return ""
+		}
+		c := col.codes[i]
+		if c == attrMissing || int(c) >= len(vals) {
+			return ""
+		}
+		return vals[c]
+	}
+}
+
 // frozenSQEntries разворачивает SQ8-сегмент в документы — зеркало
 // frozenEntries. Отличие одно и существенное: вектор не берётся видом в слэб, а
 // ДЕКВАНТУЕТСЯ в новый слайс (в кодах его иначе не достать). Позиция
