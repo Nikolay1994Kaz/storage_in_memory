@@ -226,8 +226,8 @@ Three limits, stated rather than discovered:
   stayed open). Destroying the key therefore reaches the snapshot exactly as
   it reaches the journal: replay skips those records as a normal outcome.
 
-  `graph_leveled.bin` is covered for **frozen segments** (snapshot format v8),
-  which is where facts live at the default dimension. The layers themselves —
+  `graph_leveled.bin` is covered for **all three segment types** — `frozen`
+  since format v8, `frozenSQ` and flat-HNSW since v9. The layers themselves —
   frozen graph, attribute columns, inverted index — are indexed by a
   document's *position*, with scopes interleaved, so encrypting part of a
   segment is not merely unimplemented but incoherent: the graph's edges would
@@ -241,9 +241,30 @@ Three limits, stated rather than discovered:
   tombstoned, and a position with no key would surface in results. What that
   leaks is "a fact with this id existed", never whose or what.
 
-  ⚠**`frozenSQ` and flat-HNSW segments are still written as before** — facts
-  inside them stay in the clear. These appear with `-hnsw-use-sq` or at fp32
-  dimensions above 256.
+  The same treatment reaches the other two types, with one difference each.
+  `frozenSQ` stores no vector — only a quantised code — so a sealed fact is
+  dequantised on the way into the envelope and **re-quantised with the
+  segment's own calibration** on the way back; the calibration (`sqMin`,
+  `sqScale`) therefore stays outside the envelope, because hiding it would cost
+  reversibility. What that leaks is the per-dimension range of the segment: an
+  aggregate over thousands of vectors, attached to no document. Flat-HNSW is
+  already document-shaped on both write and read, so it needs no unpacking —
+  the vector is written as zeros and the real one travels in the section.
+
+  ⚠**Before v9 those two types were written in the clear**, and the exposure
+  was larger than the smaller-sounding name suggests: flat-HNSW is what the
+  *default* configuration produces at real embedding dimensions (768, 1536 —
+  anything above 256 without `-hnsw-use-sq`), and it wrote the raw fp32 vector
+  alongside the attributes and terms. The fix is forward-only: a snapshot taken
+  by an older build keeps those bytes, and no command repairs them, so
+  re-snapshot after upgrading. `VMEM.COVERAGE` counts such facts as `exposed`.
+
+  This was found by making coverage **fail closed** rather than by reading the
+  code: the metric was taught to ask whether the segment a fact rests in can
+  seal at all, with an unrecognised type counting as "cannot". The `frozenSQ`
+  gap was the one being chased; flat-HNSW — the more damaging of the two —
+  surfaced on the whitelist's first run. A metric that reads a flag written by
+  someone else is a declaration; this one is a measurement.
 
   Two cheaper paths were measured and rejected before this one (see
   `snapshot_replay_cost` and `snapshot_rebuild_cost`). Keeping facts out of

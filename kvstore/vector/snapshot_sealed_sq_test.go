@@ -128,6 +128,67 @@ func TestSealedSQSegmentHidesContent(t *testing.T) {
 	}
 }
 
+// TestSealedSQSegmentRoundTripMatchesPlain — самое рискованное место правки.
+//
+// У SQ8 вектор не хранится, а вычисляется из кода. Запечатывание проводит его
+// через деквантование → конверт → переквантование, и если формула
+// восстановления разойдётся с формулой заморозки хоть на округление, факт
+// вернётся СДВИНУТЫМ. Тихо: поиск деградирует только для запечатанных скоупов,
+// на глаз это не видно.
+//
+// Поэтому сравнение не с исходным вектором (он и так теряется при квантовании),
+// а с тем же стором БЕЗ шифрования: шифрование не должно менять ничего, кроме
+// читаемости байтов на диске. Эталон — поведение, а не константа.
+func TestSealedSQSegmentRoundTripMatchesPlain(t *testing.T) {
+	load := func(crypto *SnapshotCrypto) *LeveledVectorStore {
+		t.Helper()
+		src := sealedStoreWithCfg(t, sqSealedConfig(), crypto)
+		defer src.Clear()
+		requireSQSegment(t, src)
+		var buf bytes.Buffer
+		if err := src.SaveBinary(&buf); err != nil {
+			t.Fatalf("SaveBinary: %v", err)
+		}
+		dst := NewLeveledVectorStore(sqSealedConfig())
+		dst.SetSnapshotCrypto(crypto)
+		if err := dst.LoadBinary(bytes.NewReader(buf.Bytes())); err != nil {
+			t.Fatalf("LoadBinary: %v", err)
+		}
+		return dst
+	}
+
+	fc := newFakeCrypto()
+	sealed := load(fc.crypto())
+	defer sealed.Clear()
+	plain := load(nil)
+	defer plain.Clear()
+
+	for _, key := range []string{"f-alice-1", "f-alice-2", "f-bob-1", "plain-1"} {
+		want, okPlain := plain.Get(key)
+		got, okSealed := sealed.Get(key)
+		if !okPlain || !okSealed {
+			t.Errorf("документ %s: без шифрования ok=%v, с шифрованием ok=%v", key, okPlain, okSealed)
+			continue
+		}
+		if len(got) != len(want) {
+			t.Errorf("документ %s: длина вектора %d, ожидалась %d", key, len(got), len(want))
+			continue
+		}
+		for j := range want {
+			if got[j] != want[j] {
+				t.Errorf("вектор %s[%d] = %v, без шифрования %v — переквантование разошлось с заморозкой",
+					key, j, got[j], want[j])
+				break
+			}
+		}
+	}
+	// Термы и скоуп тоже обязаны пережить дорогу: без них факт перестаёт быть
+	// находимым, то есть шифрование обернулось бы потерей.
+	assertScope(t, sealed, "f-alice-1", "alice")
+	assertTerm(t, sealed, "f-alice-1", "aurora")
+	assertTerm(t, sealed, "f-bob-1", "standup")
+}
+
 // TestSealedSQSegmentShredDoesNotResurrect — следствие, ради которого всё:
 // после уничтожения ключа скоупа его факты не должны подниматься из снапшота.
 // Парный к TestSealedSegmentShredDoesNotResurrect, который для float32 зелёный.

@@ -615,6 +615,24 @@ func (fg *FrozenGraphSQ) searchWithIdx(query []float32, K, efSearch int, dst []F
 
 // WriteGraphToSQ сериализует FrozenGraphSQ. Zero-alloc для codes (unsafe.Slice).
 func (fg *FrozenGraphSQ) WriteGraphToSQ(w io.Writer) error {
+	return fg.WriteGraphToSQMasked(w, nil)
+}
+
+// WriteGraphToSQMasked — то же, но КОДЫ позиций, помеченных в mask, пишутся
+// нулями: их настоящие значения уезжают в документную секцию под конвертом
+// своего скоупа (зеркало FrozenGraph.WriteGraphToMasked). Структура графа
+// содержания не раскрывает, а вектор — раскрывает, пусть и квантованный:
+// эмбеддинг восстанавливается в текст.
+//
+// mask == nil → путь прежний байт в байт, одним zero-alloc Write.
+//
+// ЧТО ОСТАЁТСЯ ОТКРЫТЫМ. sqMin/sqScale не маскируются, и это вынужденно:
+// калибровка посчитана по ВСЕМУ сегменту, включая запечатанные векторы, и
+// именно ею восстановленные из конверта float32 переквантуются обратно в те же
+// коды (restoreSealedVectorsSQ). Спрятав её, мы потеряли бы обратимость. След,
+// который при этом остаётся, — покомпонентные min/max по сегменту: диапазон
+// значений эмбеддингов, агрегат по тысячам векторов, без привязки к документу.
+func (fg *FrozenGraphSQ) WriteGraphToSQMasked(w io.Writer, mask []bool) error {
 	var hdr [16]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], uint32(fg.n))
 	binary.LittleEndian.PutUint32(hdr[4:8], uint32(fg.dim))
@@ -640,9 +658,13 @@ func (fg *FrozenGraphSQ) WriteGraphToSQ(w io.Writer) error {
 	}
 	// codes [n*dim] — 1 байт/элемент (int8 = byte по размеру)
 	if fg.n > 0 && fg.dim > 0 {
-		b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.codes[0])), len(fg.codes))
-		if _, err := w.Write(b); err != nil {
-			return fmt.Errorf("frozenSQ: write codes: %w", err)
+		if mask == nil {
+			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.codes[0])), len(fg.codes))
+			if _, err := w.Write(b); err != nil {
+				return fmt.Errorf("frozenSQ: write codes: %w", err)
+			}
+		} else if err := writeCodesMasked(w, fg.codes, fg.dim, fg.n, mask); err != nil {
+			return err
 		}
 	}
 

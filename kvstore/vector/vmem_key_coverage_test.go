@@ -39,9 +39,32 @@ func TestKeyCoverageSealedPathStaysFull(t *testing.T) {
 	}
 }
 
-// TestKeyCoverageCountsExposed — тот же набор фактов на SQ8: намерение было,
-// место хранения конверта не пишет. Отчёт обязан это показать, а не молчать.
-func TestKeyCoverageCountsExposed(t *testing.T) {
+// unknownSegment — сегмент типа, о котором метрика не знает. Встроенный
+// интерфейс делает заглушку валидным segment, не заставляя писать девять
+// методов: segmentSealsScopes только различает тип и ничего не вызывает.
+type unknownSegment struct{ segment }
+
+// TestSegmentSealsScopesFailsClosed — главный страж белого списка.
+//
+// Все три известных типа сегмента запечатывать умеют — но каждый научился
+// ОТДЕЛЬНОЙ правкой: frozen в v8, SQ8 и hnsw только в v9, и между этими
+// версиями отчёт по двум последним показывал 1.0000. Четвёртый тип, добавленный
+// так же тихо (новый case в switch чужие case не ломает), обязан провалиться в
+// default и опустить долю, а не унаследовать доверие соседей.
+func TestSegmentSealsScopesFailsClosed(t *testing.T) {
+	for _, seg := range []segment{&frozenSegment{}, &frozenSQSegment{}, &hnswSegment{}} {
+		if !segmentSealsScopes(seg) {
+			t.Errorf("%T: известный тип обязан уметь запечатывать", seg)
+		}
+	}
+	if segmentSealsScopes(unknownSegment{}) {
+		t.Error("незнакомый тип сегмента получил доверие по умолчанию — это fail-open, ровно то, как проехали SQ8 и hnsw")
+	}
+}
+
+// TestKeyCoverageSQPathStaysFull — SQ8 после v9 покрыт так же, как float32.
+// Тот же набор фактов, отличается ровно cfg.UseSQ.
+func TestKeyCoverageSQPathStaysFull(t *testing.T) {
 	fc := newFakeCrypto()
 	lvs := sealedSQStore(t, fc.crypto())
 	defer lvs.Clear()
@@ -52,12 +75,9 @@ func TestKeyCoverageCountsExposed(t *testing.T) {
 		t.Fatalf("KeyCoverage вернул %d отчётов, ожидался 1", len(reps))
 	}
 	r := reps[0]
-	if r.Total != 2 || r.Sealed != 0 || r.Exposed != 2 || r.Unsealed != 0 {
-		t.Errorf("SQ8-путь: total=%d sealed=%d exposed=%d unsealed=%d, ожидалось 2/0/2/0",
+	if r.Total != 2 || r.Sealed != 2 || r.Exposed != 0 || r.Unsealed != 0 {
+		t.Errorf("SQ8-путь: total=%d sealed=%d exposed=%d unsealed=%d, ожидалось 2/2/0/0",
 			r.Total, r.Sealed, r.Exposed, r.Unsealed)
-	}
-	if got := r.SealedShare(); got != 0 {
-		t.Errorf("SealedShare=%.4f, ожидался 0 — квитанция снова подтверждает несделанное", got)
 	}
 }
 
@@ -119,15 +139,16 @@ func TestKeyCoverageDeltaCountsSealed(t *testing.T) {
 		t.Errorf("факт в дельте: sealed=%d exposed=%d, ожидалось 1/0", r.Sealed, r.Exposed)
 	}
 
-	// А после заморозки в SQ8 — тот же факт обязан переехать в Exposed.
-	// Это и есть «риск будущий, а не текущий», сделанное проверяемым.
+	// И после заморозки в SQ8 покрытие обязано СОХРАНИТЬСЯ. До v9 здесь факт
+	// переезжал в Exposed — снапшот принимал его открытым; тест остаётся на
+	// месте как страж, что заморозка снова не начнёт терять конверт по дороге.
 	lvs.FlushDeltaSync()
 	requireSQSegment(t, lvs)
 	reps = lvs.KeyCoverage("alice")
 	if len(reps) != 1 {
 		t.Fatalf("KeyCoverage после заморозки вернул %d отчётов, ожидался 1", len(reps))
 	}
-	if r := reps[0]; r.Sealed != 0 || r.Exposed != 1 {
-		t.Errorf("после заморозки в SQ8: sealed=%d exposed=%d, ожидалось 0/1", r.Sealed, r.Exposed)
+	if r := reps[0]; r.Sealed != 1 || r.Exposed != 0 {
+		t.Errorf("после заморозки в SQ8: sealed=%d exposed=%d, ожидалось 1/0", r.Sealed, r.Exposed)
 	}
 }

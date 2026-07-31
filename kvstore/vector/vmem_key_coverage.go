@@ -68,14 +68,18 @@ func (r KeyReport) SealedShare() float64 {
 // обязано быть «не умеет»: незнакомый тип считается непокрытым, и отчёт
 // падает ниже 1.0000 сам, без чьего-либо участия.
 //
-// Умеет только frozenSegment: его запись идёт через WriteGraphToMasked +
-// writeSealedDocs (leveled_store.go:2283), а чтение через restoreSealedVectors.
-// У frozenSQSegment (:2296) и hnswSegment (:2310) запечатанного пути нет ни на
-// записи, ни на чтении — оба пишут атрибуты и термы целиком, а hnswSegment
-// вдобавок сырой float32-вектор прямо из арены.
+// Умеют все три известных типа — но каждый научился этому отдельной правкой, и
+// именно поэтому список белый: frozenSegment получил документную секцию в v8,
+// frozenSQSegment и hnswSegment — только в v9, а между этими версиями отчёт
+// показывал по ним 1.0000. Четвёртый тип, добавленный так же незаметно, обязан
+// провалиться в default и опустить долю, а не унаследовать чужое доверие.
 func segmentSealsScopes(seg segment) bool {
-	_, ok := seg.(*frozenSegment)
-	return ok
+	switch seg.(type) {
+	case *frozenSegment, *frozenSQSegment, *hnswSegment:
+		return true
+	default:
+		return false
+	}
 }
 
 // KeyCoverage — покрытие ключом по каждому scope. scopeEq != "" сужает до

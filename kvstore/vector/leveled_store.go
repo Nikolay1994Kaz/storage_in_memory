@@ -84,8 +84,12 @@ const (
 // текстовый BM25-слой: frozen/SQ-сегменты сериализуют segmentText (writeSegText)
 // после segMeta, hnswSegment персистит термы по вектору (writeTerms) после
 // attrs — слой регенерируется buildSegment на load. Снапшоты v<7 читаются как
-// прежде (текста в них нет → слой nil).
-var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 8, 0, 0}
+// прежде (текста в них нет → слой nil). v8 — документная секция под конвертом
+// скоупа у frozen-сегмента. v9 — та же секция у SQ8- и hnsw-сегментов: до неё
+// запечатанный путь существовал ровно для одного типа из трёх, и факт,
+// записанный под шифрованием, но осевший в двух других, уезжал в снапшот
+// открытым. Снапшоты v8 читаются как прежде — секции у этих типов в них нет.
+var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 9, 0, 0}
 
 // leveledMagicPrefix — общая часть ('LVLV') для проверки формата без версии.
 var leveledMagicPrefix = [4]byte{'L', 'V', 'L', 'V'}
@@ -2297,14 +2301,29 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 				if _, err := w.Write([]byte{segTypeFrozenSQ8}); err != nil {
 					return fmt.Errorf("leveled: write segType[%d][%d]: %w", lyr, si, err)
 				}
-				if err := s.fg.WriteGraphToSQ(w); err != nil {
+				// v9: то же изъятие содержания, что у frozenSegment выше.
+				// Делители набора общие, типозависимы только разворот сегмента
+				// в документы и возврат векторов (snapshot_sealed_sq.go).
+				sqEntries := frozenSQEntries(s)
+				sqMask, sqPublic, sqAnySealed := splitBySealed(sqEntries, vmemScopeOf)
+				sqAttrs, sqText := s.attrs, s.text
+				if sqAnySealed {
+					sqAttrs = buildSegmentAttrs(sqPublic, nil)
+					sqText = buildSegmentText(sqPublic)
+				} else {
+					sqMask = nil // ни одного факта — прежний zero-alloc путь записи
+				}
+				if err := s.fg.WriteGraphToSQMasked(w, sqMask); err != nil {
 					return fmt.Errorf("leveled: write frozenSQ[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSegMeta(w, s.cat, s.attrs); err != nil {
+				if err := writeSegMeta(w, s.cat, sqAttrs); err != nil {
 					return fmt.Errorf("leveled: write frozenSQMeta[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSegText(w, s.text); err != nil {
+				if err := writeSegText(w, sqText); err != nil {
 					return fmt.Errorf("leveled: write frozenSQText[%d][%d]: %w", lyr, si, err)
+				}
+				if err := writeSealedDocs(w, sealedOnly(sqEntries, sqMask), vmemScopeOf, lvs.snapshotCrypto); err != nil {
+					return fmt.Errorf("leveled: write frozenSQSealed[%d][%d]: %w", lyr, si, err)
 				}
 
 			case *hnswSegment:
@@ -2312,61 +2331,83 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 					return fmt.Errorf("leveled: write segType[%d][%d]: %w", lyr, si, err)
 				}
 				s.mu.RLock()
-				// Считаем живые векторы
-				nVecs := 0
-				for id, key := range s.keys {
-					if key != "" && s.g.nodes[id].Alive {
-						nVecs++
-					}
-				}
-				binary.LittleEndian.PutUint32(u4[:], uint32(nVecs))
-				if _, err := w.Write(u4[:]); err != nil {
-					s.mu.RUnlock()
-					return fmt.Errorf("leveled: write nVecs[%d][%d]: %w", lyr, si, err)
-				}
 				// Термы по вектору (v7): node id = frozen id текстового слоя →
 				// декодим постинги в пер-доковые списки один раз на сегмент.
 				// На load buildSegment регенерирует segmentText из entries[].Terms
 				// (как колонки из Attrs). decTerms==nil (текстов нет) → nTerms=0.
 				decTerms := s.text.decodeTerms()
-				var klen [2]byte
-				var writeErr error
+				// v9: живые документы собираются СПИСКОМ до записи — иначе не
+				// узнать скоуп, не прочитав атрибуты, а без скоупа нечего
+				// изымать. Позиция в этом списке и есть позиция запечатанной
+				// секции: читатель складывает entries в том же порядке.
+				live := make([]DeltaEntry, 0, len(s.keys))
 				for id, key := range s.keys {
 					if key == "" || !s.g.nodes[id].Alive {
 						continue
-					}
-					binary.LittleEndian.PutUint16(klen[:], uint16(len(key)))
-					if _, err := w.Write(klen[:]); err != nil {
-						writeErr = err
-						break
-					}
-					if _, err := io.WriteString(w, key); err != nil {
-						writeErr = err
-						break
-					}
-					vec := s.g.arena.Get(s.g.nodes[id].VectorOffset)
-					if len(vec) > 0 {
-						b := unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), len(vec)*4)
-						if _, err := w.Write(b); err != nil {
-							writeErr = err
-							break
-						}
-					}
-					// Атрибуты вектора (v3): node id = индекс колонки → decodeAt(id).
-					// hnsw-сегмент на load перестраивается buildSegment(entries), который
-					// регенерирует колонки+каталог из entries[].Attrs (см. readAttrs ниже).
-					if err := writeAttrs(w, s.attrs.decodeAt(int(id))); err != nil {
-						writeErr = err
-						break
 					}
 					var entryTerms []TermTF
 					if int(id) < len(decTerms) {
 						entryTerms = decTerms[id]
 					}
-					if err := writeTerms(w, entryTerms); err != nil {
+					live = append(live, DeltaEntry{
+						Key: key,
+						Vec: s.g.arena.Get(s.g.nodes[id].VectorOffset),
+						// Атрибуты вектора (v3): node id = индекс колонки.
+						Attrs: s.attrs.decodeAt(int(id)),
+						Terms: entryTerms,
+					})
+				}
+				hMask, hPublic, hAnySealed := splitBySealed(live, vmemScopeOf)
+				if !hAnySealed {
+					hMask = nil
+				}
+
+				binary.LittleEndian.PutUint32(u4[:], uint32(len(live)))
+				if _, err := w.Write(u4[:]); err != nil {
+					s.mu.RUnlock()
+					return fmt.Errorf("leveled: write nVecs[%d][%d]: %w", lyr, si, err)
+				}
+				var klen [2]byte
+				zeroVec := make([]byte, dim*4)
+				var writeErr error
+				for _, e := range hPublic {
+					binary.LittleEndian.PutUint16(klen[:], uint16(len(e.Key)))
+					if _, err := w.Write(klen[:]); err != nil {
 						writeErr = err
 						break
 					}
+					if _, err := io.WriteString(w, e.Key); err != nil {
+						writeErr = err
+						break
+					}
+					// Вектор запечатанного документа уходит нулями: читатель
+					// всегда берёт ровно dim*4 байта, поэтому подменяется
+					// содержимое, а не длина — позиции не должны разъехаться.
+					if len(e.Vec) == dim && dim > 0 {
+						b := unsafe.Slice((*byte)(unsafe.Pointer(&e.Vec[0])), dim*4)
+						if _, err := w.Write(b); err != nil {
+							writeErr = err
+							break
+						}
+					} else if dim > 0 {
+						if _, err := w.Write(zeroVec); err != nil {
+							writeErr = err
+							break
+						}
+					}
+					// hnsw-сегмент на load перестраивается buildSegment(entries), который
+					// регенерирует колонки+каталог из entries[].Attrs (см. readAttrs ниже).
+					if err := writeAttrs(w, e.Attrs); err != nil {
+						writeErr = err
+						break
+					}
+					if err := writeTerms(w, e.Terms); err != nil {
+						writeErr = err
+						break
+					}
+				}
+				if writeErr == nil {
+					writeErr = writeSealedDocs(w, sealedOnly(live, hMask), vmemScopeOf, lvs.snapshotCrypto)
 				}
 				s.mu.RUnlock()
 				if writeErr != nil {
@@ -2442,7 +2483,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		return fmt.Errorf("leveled: invalid magic header (not a graph_leveled.bin?)")
 	}
 	version := magic[5]
-	if version < 1 || version > 8 {
+	if version < 1 || version > 9 {
 		return fmt.Errorf("leveled: unsupported snapshot version %d", version)
 	}
 
@@ -2560,6 +2601,22 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 						return fmt.Errorf("leveled: read frozenSQText[%d][%d]: %w", lyr, si, err)
 					}
 				}
+				// v9: документная секция появилась у SQ8 позже, чем у frozen
+				// (v8). Снапшоты v8 её не содержат — читать нечего, и это не
+				// ошибка, а честное «тогда мы этого не умели».
+				if version >= 9 {
+					sealedDocs, dead, err := readSealedDocs(r, fg.n, lvs.snapshotCrypto)
+					if err != nil {
+						return fmt.Errorf("leveled: read frozenSQSealed[%d][%d]: %w", lyr, si, err)
+					}
+					deadKeys = append(deadKeys, dead...)
+					if hasAnyDoc(sealedDocs) {
+						all := mergeSealedIntoEntries(frozenSQEntries(seg), sealedDocs)
+						restoreSealedVectorsSQ(fg, sealedDocs)
+						seg.attrs = buildSegmentAttrs(all, nil)
+						seg.text = buildSegmentText(all)
+					}
+				}
 				staged[lyr] = append(staged[lyr], stagedSeg{seg: seg})
 
 			case segTypeHNSWFlat:
@@ -2607,6 +2664,23 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 						terms = t
 					}
 					entries = append(entries, DeltaEntry{Key: key, Vec: vec, Attrs: attrs, Terms: terms})
+				}
+
+				// v9: содержание фактов лежит в документной секции, а в цикле
+				// выше вместо них прочитаны нули и пустые атрибуты. Позиция —
+				// индекс в entries: писатель шёл по тому же порядку.
+				if version >= 9 {
+					sealedDocs, dead, err := readSealedDocs(r, len(entries), lvs.snapshotCrypto)
+					if err != nil {
+						return fmt.Errorf("leveled: read hnswSealed[%d][%d]: %w", lyr, si, err)
+					}
+					// Стёртый скоуп: позиция остаётся пустышкой из нулей, а ключ
+					// уезжает в tombstones — как у frozen. Выбросить запись
+					// нельзя, иначе сегмент пересобрался бы со сдвигом.
+					deadKeys = append(deadKeys, dead...)
+					if hasAnyDoc(sealedDocs) {
+						entries = mergeSealedIntoEntries(entries, sealedDocs)
+					}
 				}
 
 				if len(entries) > 0 {
