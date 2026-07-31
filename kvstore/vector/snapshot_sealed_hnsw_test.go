@@ -60,8 +60,12 @@ func sealedHnswStore(t *testing.T, crypto *SnapshotCrypto) *LeveledVectorStore {
 		if d.scope != "" {
 			attrs.Cat[vmemAttrScope] = d.scope
 			attrs.Cat[vmemAttrSealed] = "1"
+			// Значение атрибута — тоже содержание. Строка не встречается в
+			// ключе намеренно: ключ лежит открыто ПО ЗАМЫСЛУ, и проверка,
+			// поймавшая его, ничего бы не доказала.
+			attrs.Cat[vmemAttrSource] = "chan-zephyr-" + d.scope
 		} else {
-			attrs.Cat["lang"] = "en"
+			attrs.Cat["lang"] = "lang-quokka" // парный контроль
 		}
 		if err := lvs.AddDocTerms(d.key, hnswVecOfDoc(i), attrs, []TermTF{{Term: d.term, TF: 1}}); err != nil {
 			t.Fatalf("AddDocTerms(%s): %v", d.key, err)
@@ -110,10 +114,20 @@ func TestSealedHnswSegmentHidesContent(t *testing.T) {
 	if !bytes.Contains(buf.Bytes(), vecBytes(hnswVecOfDoc(3))) {
 		t.Fatal("вектор постороннего документа не найден — проверка байтов ниже прошла бы по неверной причине")
 	}
+	if !strings.Contains(raw, "lang-quokka") {
+		t.Fatal("атрибут постороннего документа не найден — проверка атрибутов ниже прошла бы по неверной причине")
+	}
 
 	for _, secret := range []string{"aurora", "steering", "standup"} {
 		if strings.Contains(raw, secret) {
 			t.Errorf("терм %q факта лежит в hnsw-снапшоте открытым текстом", secret)
+		}
+	}
+	// Атрибуты — отдельная ось от термов и вектора: изъять одно и оставить
+	// другое легко и незаметно.
+	for _, secret := range []string{"chan-zephyr-alice", "chan-zephyr-bob"} {
+		if strings.Contains(raw, secret) {
+			t.Errorf("атрибут %q факта лежит в hnsw-снапшоте открытым текстом", secret)
 		}
 	}
 	for i, key := range []string{"f-alice-1", "f-alice-2", "f-bob-1"} {

@@ -72,8 +72,14 @@ func sealedStoreWithCfg(t *testing.T, cfg LeveledConfig, crypto *SnapshotCrypto)
 		if d.scope != "" {
 			attrs.Cat[vmemAttrScope] = d.scope
 			attrs.Cat[vmemAttrSealed] = "1" // как ставит путь записи, vmem.go:220
+			// Значение атрибута — тоже содержание, и проверяется отдельно от
+			// термов: изъять термы, но оставить колонки — ровно та половинчатая
+			// правка, которую легко сделать и не заметить. Строка нарочно не
+			// встречается в ключе, иначе проверка ловила бы ключ (а он лежит
+			// открыто ПО ЗАМЫСЛУ) вместо атрибута.
+			attrs.Cat[vmemAttrSource] = "chan-zephyr-" + d.scope
 		} else {
-			attrs.Cat["lang"] = "en"
+			attrs.Cat["lang"] = "lang-quokka" // парный контроль: обязан лежать открыто
 		}
 		if err := lvs.AddDocTerms(d.key, vecOfDoc(i), attrs, []TermTF{{Term: d.term, TF: 1}}); err != nil {
 			t.Fatalf("AddDocTerms(%s): %v", d.key, err)
@@ -121,9 +127,18 @@ func TestSealedSQSegmentHidesContent(t *testing.T) {
 	if !strings.Contains(raw, "weather") {
 		t.Fatal("терм постороннего документа не найден — снапшот пуст, проверки ниже бессмысленны")
 	}
+	if !strings.Contains(raw, "lang-quokka") {
+		t.Fatal("атрибут постороннего документа не найден — проверка атрибутов ниже прошла бы по неверной причине")
+	}
 	for _, secret := range []string{"aurora", "steering", "standup"} {
 		if strings.Contains(raw, secret) {
 			t.Errorf("терм %q факта лежит в SQ8-снапшоте открытым текстом", secret)
+		}
+	}
+	// Атрибуты — отдельная ось: термы можно изъять, а колонки оставить.
+	for _, secret := range []string{"chan-zephyr-alice", "chan-zephyr-bob"} {
+		if strings.Contains(raw, secret) {
+			t.Errorf("атрибут %q факта лежит в SQ8-снапшоте открытым текстом", secret)
 		}
 	}
 }
