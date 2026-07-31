@@ -2365,13 +2365,19 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			kr = reps[0]
 		}
 		auditReseal(rreq.Scope, len(rres.Docs))
-		buf.WriteArrayHeader(8)
+		buf.WriteArrayHeader(10)
 		buf.WriteBulkString("scope")
 		buf.WriteBulkString(rreq.Scope)
 		buf.WriteBulkString("resealed")
 		buf.WriteBulkString(strconv.Itoa(len(rres.Docs)))
 		buf.WriteBulkString("sealed_share")
 		buf.WriteBulkString(fmt.Sprintf("%.4f", kr.SealedShare()))
+		// exposed рядом с resealed намеренно: перезапись НЕ поднимает долю,
+		// если факт осел в типе сегмента без запечатанного пути. Без этого
+		// поля оператор прочитал бы «resealed=N» как «сделано», а доля
+		// осталась бы низкой без объяснения.
+		buf.WriteBulkString("exposed")
+		buf.WriteBulkString(strconv.Itoa(kr.Exposed))
 		buf.WriteBulkString("earlier_copies")
 		buf.WriteBulkString("not_covered")
 
@@ -2543,6 +2549,12 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 				{"total", strconv.Itoa(rep.Total)},
 				{"sealed", strconv.Itoa(kr.Sealed)},
 				{"unsealed", strconv.Itoa(kr.Unsealed)},
+				// exposed отделён от unsealed, потому что лечение разное:
+				// unsealed перезаписывается VMEM.RESEAL, exposed не чинится
+				// командой вовсе — факт лежит в типе сегмента, у которого нет
+				// запечатанного пути. Слитые в одно число, они бы означали
+				// «перезапиши и всё», что для второй половины неправда.
+				{"exposed", strconv.Itoa(kr.Exposed)},
 				{"sealed_share", fmt.Sprintf("%.4f", kr.SealedShare())},
 				{"has_key", hasKey},
 				{"declared", strconv.Itoa(rep.Total - rep.BySource["unknown"] - rep.BySource[""])},
