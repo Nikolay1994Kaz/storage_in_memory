@@ -127,6 +127,11 @@ func writeSealedDocs(w io.Writer, entries []DeltaEntry, scopeOf func(DeltaEntry)
 	if err := putU32(w, uint32(len(order))); err != nil {
 		return fmt.Errorf("sealed docs: write nGroups: %w", err)
 	}
+	// Буфер группы переиспользуется между группами и сегментами: он живёт ровно
+	// до записи своей группы, наружу не утекает (Seal копирует в конверт).
+	// Аллокация с нуля на каждую группу давала удвоение append по 80 раз за
+	// снапшот — 100 МБ мусора на корпус, чей снапшот весит 17 МБ.
+	var buf []byte
 	for _, scope := range order {
 		positions := byScope[scope]
 		sealed := scope != "" && crypto != nil && crypto.Seal != nil
@@ -144,7 +149,7 @@ func writeSealedDocs(w io.Writer, entries []DeltaEntry, scopeOf func(DeltaEntry)
 			return fmt.Errorf("sealed docs: write nDocs: %w", err)
 		}
 
-		var payload []byte
+		buf = buf[:0]
 		for _, pos := range positions {
 			e := entries[pos]
 			if err := putU32(w, uint32(pos)); err != nil {
@@ -153,12 +158,15 @@ func writeSealedDocs(w io.Writer, entries []DeltaEntry, scopeOf func(DeltaEntry)
 			if err := writeStr(w, e.Key); err != nil {
 				return fmt.Errorf("sealed docs: write key: %w", err)
 			}
-			blob := SerializeVectorWithDoc(e.Vec, e.Attrs, e.Terms)
-			var lenBuf [4]byte
-			binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(blob)))
-			payload = append(payload, lenBuf[:]...)
-			payload = append(payload, blob...)
+			// Длина блоба идёт ПЕРЕД ним, а известна только после — поэтому
+			// резервируем 4 байта и засыпаем их обратно. Промежуточный блоб не
+			// материализуется: документ кодируется сразу в буфер группы.
+			lenAt := len(buf)
+			buf = append(buf, 0, 0, 0, 0)
+			buf = appendVectorWithDoc(buf, e.Vec, e.Attrs, e.Terms)
+			binary.LittleEndian.PutUint32(buf[lenAt:lenAt+4], uint32(len(buf)-lenAt-4))
 		}
+		payload := buf
 
 		if sealed {
 			envelope, err := crypto.Seal(scope, payload)

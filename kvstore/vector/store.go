@@ -361,10 +361,57 @@ func SerializeVectorWithAttrs(vec []float32, attrs Attributes) []byte {
 // OpVSimAddAttrs + секция terms (writeTerms) в хвосте: [uint32 nFloats]
 // [vec float32 LE...][attrs][terms]. Термы, не сырой текст — см. wal.go.
 func SerializeVectorWithDoc(vec []float32, attrs Attributes, terms []TermTF) []byte {
-	buf := bytes.NewBuffer(SerializeVectorWithAttrs(vec, attrs))
-	// writeTerms пишет в io.Writer; на bytes.Buffer ошибки не бывает.
-	_ = writeTerms(buf, terms)
-	return buf.Bytes()
+	return appendVectorWithDoc(nil, vec, attrs, terms)
+}
+
+// sliceWriter — io.Writer поверх растущего среза.
+//
+// Существует ровно затем, чтобы КОДИРОВЩИК ОСТАЛСЯ ОДИН. Соблазн написать
+// append-версию writeAttrs/writeTerms руками велик, но два независимых
+// кодировщика одного формата расходятся молча: правку внесут в один, читатель
+// продолжит понимать оба до первого нового поля. Здесь append-путь и
+// io.Writer-путь — физически один и тот же код, разное только назначение.
+//
+// WriteString не для красоты: writeStr зовёт io.WriteString, который проверяет
+// io.StringWriter; без метода каждая строка конвертировалась бы в []byte
+// отдельной аллокацией.
+type sliceWriter struct{ b []byte }
+
+func (w *sliceWriter) Write(p []byte) (int, error) {
+	w.b = append(w.b, p...)
+	return len(p), nil
+}
+
+func (w *sliceWriter) WriteString(s string) (int, error) {
+	w.b = append(w.b, s...)
+	return len(s), nil
+}
+
+// appendVectorWithDoc — та же кодировка, что SerializeVectorWithDoc, но в
+// переданный буфер (dst может быть nil).
+//
+// Зачем: путь снапшота сериализует документы пачкой по 10k подряд, и свежий
+// bytes.Buffer на каждый стоил 36 МБ мусора на корпус, чей снапшот весит 17 МБ
+// (профиль 01.08) — вектор писался по 4 байта в буфер, растущий удвоением с
+// нуля, а потом результат ещё раз копировался во второй буфер под термы.
+// ⚠Сверять с SerializeVectorWithDoc бессмысленно — та теперь сама зовёт эту.
+// Эталон в serialize_append_test.go собран из ПРЕЖНЕЙ композиции
+// (SerializeVectorWithAttrs + writeTerms, обе нетронуты): расхождение
+// кодировщиков — это порча снапшота, которую содержательные проверки не видят,
+// и ловить её обязана байтовая сверка со старым способом, а не с самой собой.
+func appendVectorWithDoc(dst []byte, vec []float32, attrs Attributes, terms []TermTF) []byte {
+	w := &sliceWriter{b: dst}
+	var u4 [4]byte
+	binary.LittleEndian.PutUint32(u4[:], uint32(len(vec)))
+	_, _ = w.Write(u4[:])
+	for _, v := range vec {
+		binary.LittleEndian.PutUint32(u4[:], math.Float32bits(v))
+		_, _ = w.Write(u4[:])
+	}
+	// writeAttrs/writeTerms пишут в io.Writer; на sliceWriter ошибки не бывает.
+	_ = writeAttrs(w, attrs)
+	_ = writeTerms(w, terms)
+	return w.b
 }
 
 // DeserializeVectorWithDoc — обратная операция для replay OpVSimAddDoc.
