@@ -405,10 +405,22 @@ tinygo build -o fraud_scorer_reactor.wasm -target=wasi -buildmode=c-shared \
 
 ```bash
 go test -short ./...   # Fast run — heavy benchmarks/soak tests are gated off (~30s)
-make test              # Run all tests
+make test              # The gate: exactly what CI runs (-short, ~1 min)
+make test-race         # Race detector over the subsystems, as in ci.yml
+make test-full         # Everything, no -short: search-quality validation + 500k stress
 make bench             # Run benchmarks
 make vet               # Static analysis
 ```
+
+`make test-full` is **not** a gate and CI never runs it: it takes tens of minutes and
+exists to exercise scale (500k vectors) and search quality on real datasets. Read a
+failure there as a *measurement* first — re-check it on an idle machine before
+concluding the code broke.
+
+Insert throughput is guarded by `TestShardedInsertScaling`, which runs in CI. It
+asserts a *ratio* (sharded delta vs a single shard) rather than an absolute vec/s
+figure, because an absolute floor measures the hardware as much as the code — and a
+ratio compares two arms recorded on the same machine in the same run.
 
 ## Project Structure
 

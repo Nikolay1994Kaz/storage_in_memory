@@ -1,11 +1,34 @@
 package vector
 
 // =============================================================================
-// Stress-тест на 500k векторов
+// Тест МАСШТАБА И ЦЕЛОСТНОСТИ на 500k векторов.
 //
-// Запуск:
-//   go test ./kvstore/vector/ -run TestLeveledStore_500k -v -timeout 600s
+// Запуск (в -short скипается, CI его не гоняет — см. `make test-full`):
+//   go test ./kvstore/vector/ -run TestLeveledStore_500k_ScaleIntegrity -v -timeout 1800s
 //   go test ./kvstore/vector/ -run TestLeveledStore_500k_NoDeadlock -v -timeout 120s
+//
+// ⚠ЗДЕСЬ НЕТ ПОРОГА СКОРОСТИ ВСТАВКИ, И ЭТО РЕШЕНИЕ, А НЕ УПУЩЕНИЕ (01.08).
+//
+// Порог «≥1000 вект/с» стоял тут с 25 июня и упал при первом же запуске за
+// шесть недель: 435 вект/с на СВОБОДНОЙ машине. Разбор показал, что виноват не
+// движок и не среда, а противоречие внутри самого теста:
+//
+//	конфигурация выбрана ради МАЛОГО ЧИСЛА СЕГМЕНТОВ (DeltaMax=0 → авто 50k,
+//	«500k/50k = 10 L0 сегментов, меньше сегментов → быстрее search»),
+//	а порогом мерилась ВСТАВКА, для которой этот конфиг худший из возможных:
+//	DeltaShards не задан ⇒ один шард ⇒ 12 писателей строят ОДИН hnsw-граф по
+//	очереди. Измерено 01.08 на dim=128: 465 вект/с против 9105 на 12 шардах,
+//	разница 19.6×. Процесс при этом брал ровно 2 ядра из 12.
+//
+// Две цели в одном прогоне не берутся, и понижать порог под неудобное число
+// было бы подгонкой. Поэтому скорость вставки здесь ЛОГИРУЕТСЯ (число полезно),
+// но ничего не утверждает, а сторож пропускной способности живёт отдельно и на
+// шардированном пути — TestShardedInsertScaling.
+//
+// Что этот тест стережёт на самом деле и что у него ПРОХОДИТ (01.08):
+//	потери данных нет (500000/500000) · дельта дренируется (0.1 c) · дедлока
+//	нет · self-recall@10 = 99.5% · каскад L0→L1→L2 отрабатывает.
+// Ничто другое в пакете масштаб 500k не трогает.
 // =============================================================================
 
 import (
@@ -17,19 +40,18 @@ import (
 	"time"
 )
 
-// TestLeveledStore_500k — основной stress-тест.
-// Вставляет 500k векторов из 12 горутин, затем синхронизирует через
-// FlushDeltaSync и проверяет self-recall и QPS.
-func TestLeveledStore_500k(t *testing.T) {
+// TestLeveledStore_500k_ScaleIntegrity — целостность на масштабе: 500k векторов
+// из 12 горутин, затем FlushDeltaSync, проверка отсутствия потерь, дренажа
+// дельты, self-recall и завершения каскадных merge.
+func TestLeveledStore_500k_ScaleIntegrity(t *testing.T) {
 	if testing.Short() {
-		t.Skip("Skipping 500k stress test in short mode (run without -short for full test)")
+		t.Skip("Skipping 500k scale test in short mode (run without -short for full test)")
 	}
 	const (
-		N        = 500_000
-		dim      = 128
-		K        = 10
-		workers  = 12
-		deltaMax = 10_000
+		N       = 500_000
+		dim     = 128
+		K       = 10
+		workers = 12
 	)
 
 	lvs := NewLeveledVectorStore(LeveledConfig{
@@ -40,7 +62,11 @@ func TestLeveledStore_500k(t *testing.T) {
 		M:              32,
 		EfSearch:       100,
 		Distance:       EuclideanDistance,
-		// 12 билдеров = NumCPU на этом железе; полностью загружает 12 ядер.
+		// 12 билдеров, но ⚠12 ЯДЕР ЭТО НЕ ЗАГРУЖАЕТ — измерено 01.08: процесс
+		// стабильно берёт 2 ядра из 12. DeltaShards намеренно не задан (см.
+		// шапку файла), поэтому все 12 писателей строят один hnsw-граф под
+		// одним локом, и билдерам почти нечего делать до первого флаша.
+		// Прежний комментарий утверждал обратное и вводил в заблуждение.
 		NumBuilders: 12,
 		Fanout:      4,
 		UseSQ:       true,
@@ -50,7 +76,13 @@ func TestLeveledStore_500k(t *testing.T) {
 	// ── 1. Параллельная вставка ───────────────────────────────────────────────
 	vecs := makeRandVecs(N, dim, 42)
 
-	t.Logf("Inserting %dk vectors with %d workers (deltaMax=%d)...", N/1000, workers, deltaMax)
+	// ⚠Печатаем ФАКТИЧЕСКИЙ deltaMax из стора, а не константу теста. Раньше тут
+	// стояла своя `deltaMax = 10_000`, не использовавшаяся больше нигде, тогда
+	// как стор считал 50_000 — и в отчёт о падении ехало неверное число. Оно
+	// стоило разбирающему ложного следа: «дельта выросла вчетверо выше порога и
+	// не сбрасывается» вместо «ещё не доросла».
+	t.Logf("Inserting %dk vectors with %d workers (deltaMax=%d, deltaShards=%d)...",
+		N/1000, workers, lvs.Stats().DeltaMax, lvs.deltaShardCount())
 	start := time.Now()
 
 	var inserted atomic.Int64
@@ -101,11 +133,12 @@ func TestLeveledStore_500k(t *testing.T) {
 
 	insertDuration := time.Since(start)
 	insertRate := float64(N) / insertDuration.Seconds()
-	t.Logf("Insert done: %d vectors in %.1fs → %.0f vec/s", N, insertDuration.Seconds(), insertRate)
-
-	if insertRate < 1_000 {
-		t.Errorf("Insert rate too low: %.0f vec/s (expect ≥ 1000)", insertRate)
-	}
+	// Число ЛОГИРУЕТСЯ, но ничего не утверждает: см. шапку файла. Здесь оно
+	// характеризует односегментный путь под 12 писателями (порядок 400–500
+	// вект/с на dim=128), а сторож пропускной способности — в
+	// TestShardedInsertScaling, на конфигурации, которую реально разворачивают.
+	t.Logf("Insert done: %d vectors in %.1fs → %.0f vec/s (без порога, DeltaShards=%d)",
+		N, insertDuration.Seconds(), insertRate, lvs.deltaShardCount())
 
 	// ── 2. FlushDeltaSync — должен вернуться без deadlock ────────────────────
 	t.Log("Waiting for FlushDeltaSync...")
