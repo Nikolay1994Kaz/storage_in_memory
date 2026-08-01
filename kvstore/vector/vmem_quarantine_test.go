@@ -218,7 +218,8 @@ func TestVMEMQuarantineSkipsRacedUpsert(t *testing.T) {
 	}
 
 	// Фаза скана: кандидат отобран, источник у него ещё отравленный.
-	cands := lvs.collectBySource("web-scraper", 100)
+	qreq := QuarantineRequest{Scope: "user:a", Source: "web-scraper"}
+	cands := lvs.collectBySource(qreq, 2000, 100)
 	if len(cands) != 1 || cands[0] != "raced" {
 		t.Fatalf("скан отобрал %v, ожидался ровно [raced]", cands)
 	}
@@ -253,7 +254,7 @@ func TestVMEMQuarantineSkipsRacedUpsert(t *testing.T) {
 	}, 1000); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := lvs.quarantineKeys(lvs.collectBySource("web-scraper", 100), QuarantineRequest{
+	ok, err := lvs.quarantineKeys(lvs.collectBySource(qreq, 2000, 100), QuarantineRequest{
 		Scope: "user:a", Source: "web-scraper",
 	}, 2000)
 	if err != nil {

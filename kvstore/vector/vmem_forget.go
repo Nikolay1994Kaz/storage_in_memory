@@ -263,6 +263,59 @@ func (lvs *LeveledVectorStore) factCatAttrLocked(key, name string) (string, bool
 	return "", false
 }
 
+// factAttrsLocked — ВСЕ атрибуты свежайшей версии ключа, тем же провенансом,
+// что factCatAttrLocked/factNumAttrLocked (активная дельта → tombstone-маска →
+// flushing новее-первым → сегменты свежее-первым). Вызывать под lvs.mu (любой
+// стороны: чтение провенанса не мутирует).
+//
+// Зачем отдельно от них: предикату карантина нужны сразу scope, source,
+// valid_from, expires_at и quarantined_at, а пять вызовов пер-атрибутных
+// резолверов — это пять полных обходов LSM на один ключ. От getFactDocLocked
+// отличается тем, что не копирует вектор и не собирает термы: приговору по
+// происхождению они не нужны.
+func (lvs *LeveledVectorStore) factAttrsLocked(key string) (Attributes, bool) {
+	if lvs.delta != nil {
+		if a, ok := lvs.delta.GetAttrs(key); ok {
+			return a, true
+		}
+	}
+	if t := lvs.tombstones.Load(); t != nil {
+		if _, deleted := (*t)[key]; deleted {
+			return Attributes{}, false
+		}
+	}
+	for i := len(lvs.flushing) - 1; i >= 0; i-- {
+		if a, ok := lvs.flushing[i].GetAttrs(key); ok {
+			return a, true
+		}
+	}
+	for _, level := range lvs.levels {
+		for pos := len(level) - 1; pos >= 0; pos-- {
+			switch s := level[pos].(type) {
+			case *frozenSegment:
+				if i, ok := s.fg.keys.find(key); ok {
+					return s.attrs.decodeAt(i), true
+				}
+			case *frozenSQSegment:
+				if i, ok := s.fg.keys.find(key); ok {
+					return s.attrs.decodeAt(i), true
+				}
+			case *hnswSegment:
+				s.mu.RLock()
+				for id, k := range s.keys {
+					if k == key && s.g.nodes[id].Alive {
+						a := s.attrs.decodeAt(int(id))
+						s.mu.RUnlock()
+						return a, true
+					}
+				}
+				s.mu.RUnlock()
+			}
+		}
+	}
+	return Attributes{}, false
+}
+
 // factNumAttrLocked — NUM-атрибут СВЕЖАЙШЕЙ версии ключа (провенанс Get:
 // активная дельта → tombstone-маска → flushing новее-первым → сегменты
 // свежее-первым). Атрибуты-only зеркало getFactDocLocked: приговору жнеца не

@@ -101,18 +101,58 @@ func (lvs *LeveledVectorStore) Quarantine(req QuarantineRequest, now int64) (Qua
 	if limit <= 0 || limit > vmemQuarantineLimit {
 		limit = vmemQuarantineLimit
 	}
-	cands := lvs.collectBySource(req.Source, limit)
+	cands := lvs.collectBySource(req, now, limit)
 	if len(cands) == 0 {
 		return QuarantineResult{}, nil
 	}
 	return lvs.quarantineKeys(cands, req, now)
 }
 
-// collectBySource — фаза скана: ключи с CAT source == want по активной дельте,
-// flushing-дельтам и колонкам сегментов. Черновик: scope, нижняя граница и
-// «уже отозван» проверяются приговором по СВЕЖАЙШЕЙ версии — здесь дешёвый
-// отбор по самому селективному предикату.
-func (lvs *LeveledVectorStore) collectBySource(source string, limit int) []string {
+// quarantineEligibleLocked — ТОТ ЖЕ предикат, что у приговора, но по атрибутам
+// свежайшей версии и под RLock.
+//
+// ⚠НЕ АВТОРИТЕТЕН И НЕ ПЫТАЕТСЯ БЫТЬ. Между сканом и приговором факт может
+// измениться (гонка, закрытая a5d43ed), поэтому последнее слово остаётся за
+// quarantineKeys, который перепроверяет всё то же самое под эксклюзивным
+// замком. Здесь предикат нужен для ДРУГОГО: чтобы ЛИМИТ ПАРТИИ тратился на
+// факты, которые действительно будут отозваны.
+//
+// ⭐Почему без этого было сломано. Лимит применялся к ЧЕРНОВИКУ: скан набирал
+// первые limit ключей источника, а приговор потом отбрасывал уже отозванные.
+// Повторный вызов набирал ТЕХ ЖЕ и возвращал 0 при неотозванном остатке —
+// 20 фактов, отозвано 5, в памяти 15, и «возьмите хвост следующим вызовом»
+// (docs/COMMANDS.md) не работало никогда. Ноль означал две разные вещи:
+// «всё чисто» и «первая партия уже отозвана, остальное не тронуто».
+//
+// Отсеивать надо ВСЕ постоянные причины отказа, а не только «уже отозван»:
+// чужой scope, факт раньше SINCE и истёкший по TTL точно так же навсегда
+// съедали бы бюджет партии, и повторный вызов снова упирался бы в них.
+func (lvs *LeveledVectorStore) quarantineEligibleLocked(key string, req QuarantineRequest, now int64) bool {
+	attrs, ok := lvs.factAttrsLocked(key)
+	if !ok {
+		return false
+	}
+	if attrs.Cat[vmemAttrScope] != req.Scope || attrs.Cat[vmemAttrSource] != req.Source {
+		return false
+	}
+	if vf, ok := attrs.Num[vmemAttrValidFrom]; !ok || vf < float64(req.Since) {
+		return false
+	}
+	if exp, ok := attrs.Num[vmemAttrExpiresAt]; ok && exp <= float64(now) {
+		return false
+	}
+	if _, already := attrs.Num[vmemAttrQuarantinedAt]; already {
+		return false
+	}
+	return true
+}
+
+// collectBySource — фаза скана: ключи с CAT source == req.Source по активной
+// дельте, flushing-дельтам и колонкам сегментов. Дешёвый отбор по самому
+// селективному предикату идёт по колонке, а остальные условия карантина
+// проверяет quarantineEligibleLocked — НЕ ради авторитетности (она у
+// приговора), а чтобы limit считал ОТЗЫВЫ, а не кандидатов.
+func (lvs *LeveledVectorStore) collectBySource(req QuarantineRequest, now int64, limit int) []string {
 	seen := make(map[string]struct{})
 	out := make([]string, 0)
 	var tombs map[string]struct{}
@@ -123,13 +163,20 @@ func (lvs *LeveledVectorStore) collectBySource(source string, limit int) []strin
 		if _, gone := tombs[key]; gone {
 			return len(out) < limit
 		}
-		if _, dup := seen[key]; !dup {
-			seen[key] = struct{}{}
-			if !safe {
-				key = strings.Clone(key)
-			}
-			out = append(out, key)
+		if _, dup := seen[key]; dup {
+			return len(out) < limit
 		}
+		// В seen кладём ДО проверки предиката: ключ встречается в нескольких
+		// сегментах (старые версии), и перепроверять его на каждой — это
+		// полный обход LSM на каждую версию.
+		seen[key] = struct{}{}
+		if !lvs.quarantineEligibleLocked(key, req, now) {
+			return len(out) < limit
+		}
+		if !safe {
+			key = strings.Clone(key)
+		}
+		out = append(out, key)
 		return len(out) < limit
 	}
 
@@ -141,7 +188,7 @@ func (lvs *LeveledVectorStore) collectBySource(source string, limit int) []strin
 	}
 	memtables = append(memtables, lvs.flushing...)
 	for _, mt := range memtables {
-		for _, key := range mt.KeysCatEq(vmemAttrSource, source) {
+		for _, key := range mt.KeysCatEq(vmemAttrSource, req.Source) {
 			if !add(key, true) {
 				return out
 			}
@@ -151,26 +198,35 @@ func (lvs *LeveledVectorStore) collectBySource(source string, limit int) []strin
 		for _, seg := range level {
 			switch s := seg.(type) {
 			case *frozenSegment:
-				if !scanCatEqColumn(s.attrs, s.fg.keys, vmemAttrSource, source, add) {
+				if !scanCatEqColumn(s.attrs, s.fg.keys, vmemAttrSource, req.Source, add) {
 					return out
 				}
 			case *frozenSQSegment:
-				if !scanCatEqColumn(s.attrs, s.fg.keys, vmemAttrSource, source, add) {
+				if !scanCatEqColumn(s.attrs, s.fg.keys, vmemAttrSource, req.Source, add) {
 					return out
 				}
 			case *hnswSegment:
+				// 🚨ДВЕ ФАЗЫ, И ЭТО НЕ СТИЛЬ. Совпадения снимаются под s.mu, а
+				// add вызывается ПОСЛЕ RUnlock, потому что add → предикат →
+				// factAttrsLocked берёт s.mu.RLock ТОГО ЖЕ сегмента (свежайшая
+				// версия часто лежит именно здесь). Рекурсивный RLock на
+				// sync.RWMutex — не безобидность: писатель, вставший между
+				// двумя захватами, вешает обе стороны насмерть.
+				var matched []string
 				s.mu.RLock()
-				if code, col, ok := catCodeOf(s.attrs, vmemAttrSource, source); ok {
+				if code, col, ok := catCodeOf(s.attrs, vmemAttrSource, req.Source); ok {
 					for id, key := range s.keys {
 						if s.g.nodes[id].Alive && col.codes[int(id)] == code {
-							if !add(key, true) {
-								s.mu.RUnlock()
-								return out
-							}
+							matched = append(matched, key)
 						}
 					}
 				}
 				s.mu.RUnlock()
+				for _, key := range matched {
+					if !add(key, true) {
+						return out
+					}
+				}
 			}
 		}
 	}
