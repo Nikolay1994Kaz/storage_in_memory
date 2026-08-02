@@ -1,3 +1,12 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
@@ -37,7 +46,7 @@ func TestTenant_CalibrateBruteThreshold(t *testing.T) {
 	}
 	train, test, err := loadSIFTRaw("/tmp/sift200k.bin")
 	if err != nil {
-		t.Skipf("no dataset: %v (regen: python3 convert_sift200k.py)", err)
+		t.Skipf("no dataset: %v (regen: scripts/convert_annbench.py sift-128-euclidean.hdf5 /tmp/sift200k.bin --train 200000 --test 500)", err)
 	}
 
 	const (

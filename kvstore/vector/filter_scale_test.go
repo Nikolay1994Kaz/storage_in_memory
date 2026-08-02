@@ -1,11 +1,18 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
 	"fmt"
 	"math/rand"
 	"strconv"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,7 +44,7 @@ import (
 //
 //   go test ./kvstore/vector -run TestFilter_AttrScaleQPSGain -v -timeout 3600s
 //
-// Требует /tmp/sift1m.bin (python3 /tmp/make_sift1m.py).
+// Требует /tmp/sift1m.bin (scripts/convert_annbench.py sift-128-euclidean.hdf5 /tmp/sift1m.bin --test 1000).
 // =============================================================================
 
 // attrTenantOf раскладывает глобальный id по тенант-блокам разного размера.
@@ -64,7 +71,7 @@ func TestFilter_AttrScaleQPSGain(t *testing.T) {
 	}
 	train, test, err := loadSIFTRaw("/tmp/sift1m.bin")
 	if err != nil {
-		t.Skipf("нет данных: %v (python3 /tmp/make_sift1m.py)", err)
+		t.Skipf("нет данных: %v (scripts/convert_annbench.py sift-128-euclidean.hdf5 /tmp/sift1m.bin --test 1000)", err)
 	}
 
 	const (
@@ -236,44 +243,4 @@ func TestFilter_AttrScaleQPSGain(t *testing.T) {
 	fmt.Println("---")
 	fmt.Println("Выигрыш = filt_QPS/base_QPS при filt_rec ≥ base_rec. brute-тенанты (B≤16384) —")
 	fmt.Println("кратный отрыв (#7); graph-тенанты — паритет/умеренно (#2 на остаточном предикате).")
-}
-
-// filterGTByPred — точный top-K по индексам среди векторов, где pred(i) (параллельно).
-func filterGTByPred(vecs, queries [][]float32, K int, pred func(int) bool) [][]int {
-	pass := make([]bool, len(vecs))
-	for i := range vecs {
-		pass[i] = pred(i)
-	}
-	gt := make([][]int, len(queries))
-	var next int64 = -1
-	var wg sync.WaitGroup
-	for w := 0; w < 12; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				qi := int(atomic.AddInt64(&next, 1))
-				if qi >= len(queries) {
-					return
-				}
-				gt[qi] = topKFilteredIdx(vecs, queries[qi], K, pass)
-			}
-		}()
-	}
-	wg.Wait()
-	return gt
-}
-
-// recallStorePred — recall@K результатов движка (ключи=строковые id) против GT (индексы).
-func recallStorePred(queries [][]float32, gt [][]int, K int, search func([]float32) []VSearchResult) float64 {
-	var sum float64
-	for qi, q := range queries {
-		res := search(q)
-		ids := make([]int, len(res))
-		for i, r := range res {
-			ids[i], _ = strconv.Atoi(r.Key)
-		}
-		sum += recallVsGT(ids, gt[qi], K)
-	}
-	return sum / float64(len(queries))
 }

@@ -1,3 +1,12 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
@@ -24,11 +33,11 @@ import (
 //
 //	go test ./kvstore/vector/ -run TestFilterProfit_SelectivityCrossover -v -timeout 1200s
 //
-// Требует /tmp/sift200k.bin (python3 convert_sift200k.py).
+// Требует /tmp/sift200k.bin (scripts/convert_annbench.py sift-128-euclidean.hdf5 /tmp/sift200k.bin --train 200000 --test 500).
 func TestFilterProfit_SelectivityCrossover(t *testing.T) {
 	train, test, err := loadSIFTRaw("/tmp/sift200k.bin")
 	if err != nil {
-		t.Skipf("нет данных: %v (python3 convert_sift200k.py)", err)
+		t.Skipf("нет данных: %v (scripts/convert_annbench.py sift-128-euclidean.hdf5 /tmp/sift200k.bin --train 200000 --test 500)", err)
 	}
 	const N = 200_000
 	train = train[:N]
@@ -440,65 +449,6 @@ func filteredBruteGT(vecs, queries [][]float32, K int, pass []bool) [][]int {
 	}
 	wg.Wait()
 	return gt
-}
-
-// topKFilteredIdx — линейный скан с top-K по индексам, где pass[i].
-func topKFilteredIdx(vecs [][]float32, q []float32, K int, pass []bool) []int {
-	type cand struct {
-		id int
-		d  float32
-	}
-	top := make([]cand, 0, K+1)
-	for id, v := range vecs {
-		if pass != nil && !pass[id] {
-			continue
-		}
-		d := EuclideanDistance(q, v)
-		if len(top) < K {
-			top = append(top, cand{id, d})
-			if len(top) == K {
-				for i := 1; i < len(top); i++ {
-					for j := i; j > 0 && top[j].d < top[j-1].d; j-- {
-						top[j], top[j-1] = top[j-1], top[j]
-					}
-				}
-			}
-			continue
-		}
-		if d < top[K-1].d {
-			pos := K - 1
-			for pos > 0 && top[pos-1].d > d {
-				top[pos] = top[pos-1]
-				pos--
-			}
-			top[pos] = cand{id, d}
-		}
-	}
-	// финальная сортировка (если top<K)
-	for i := 1; i < len(top); i++ {
-		for j := i; j > 0 && top[j].d < top[j-1].d; j-- {
-			top[j], top[j-1] = top[j-1], top[j]
-		}
-	}
-	ids := make([]int, len(top))
-	for i := range top {
-		ids[i] = top[i].id
-	}
-	return ids
-}
-
-func recallVsGT(foundIDs []int, gt []int, K int) float64 {
-	gtset := make(map[int]struct{}, K)
-	for _, id := range gt {
-		gtset[id] = struct{}{}
-	}
-	hit := 0
-	for _, id := range foundIDs {
-		if _, ok := gtset[id]; ok {
-			hit++
-		}
-	}
-	return float64(hit) / float64(K)
 }
 
 // recallFiltered — recall@K фильтрованного HNSW-поиска движка против фильтрованного GT.

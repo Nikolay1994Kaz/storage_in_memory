@@ -146,7 +146,7 @@ placeholder vector or a cheap server-side embedder.
    self-contained instead: `scripts/convert_dbpedia_hf.py` takes the first
    100k HF rows as corpus, the next 1000 as held-out queries, computes exact
    brute-force top-100 cosine GT, and emits `/tmp/dbpedia100k_text.bin`
-   (same layout as `convert_dbpedia.py` → `loadDBpediaRaw` works unchanged)
+   (same layout as `scripts/convert_dbpedia.py` → `loadDBpediaRaw` works unchanged)
    plus `/tmp/dbpedia100k_text.jsonl` / `/tmp/dbpedia100k_queries.jsonl`
    sidecars aligned by row index. Corpus sanity: all 100k titles unique
    (known-item queries), median text 52 words, none empty. Parquet shards

@@ -1,3 +1,12 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
@@ -261,11 +270,6 @@ func TestIVF_Real_QPS(t *testing.T) {
 				nlist, nprobe, ivfRecall, ivfQPS, ivfQPS/baselineQPS)
 		}
 	}
-}
-
-// roundDist округляет дистанцию для сравнения (избегает float32 precision issues).
-func roundDist(d float32) float32 {
-	return float32(int(d*1000)) / 1000
 }
 
 // measureQPS запускает search в N воркерах T секунд, возвращает QPS.

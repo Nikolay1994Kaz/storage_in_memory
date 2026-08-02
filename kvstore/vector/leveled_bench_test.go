@@ -660,19 +660,6 @@ func benchmarkLCSegmentedSearch(b *testing.B, numSegments, segSize, dim int) {
 	}
 }
 
-func benchmarkLCMonolithSearch(b *testing.B, n, dim int) {
-	b.Helper()
-	g := lcBuildGraph(n, dim, 64, 42)
-	query := lcRandomQuery(dim, 999)
-	K := 10
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_ = g.Search(query, K, 100)
-	}
-}
-
 // lcMergeResults сливает K результатов из нескольких сегментов через minHeap
 func lcMergeResults(results [][]lcResult, K int) []lcResult {
 	type heapItem struct {

@@ -1,3 +1,12 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
@@ -46,7 +55,7 @@ func TestLargeTenant_FilterCeiling(t *testing.T) {
 	}
 	train, test, _, err := loadDBpediaRaw("/tmp/dbpedia100k.bin")
 	if err != nil {
-		t.Skipf("нет данных: %v (python3 convert_dbpedia.py)", err)
+		t.Skipf("нет данных: %v (scripts/convert_dbpedia.py)", err)
 	}
 	dim := len(train[0])
 

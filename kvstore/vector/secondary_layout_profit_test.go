@@ -1,3 +1,12 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
@@ -40,7 +49,7 @@ import (
 //
 //	go test ./kvstore/vector -run TestSecondaryLayout_Profit -v -timeout 3600s
 //
-// Требует /tmp/dbpedia100k.bin (python3 convert_dbpedia.py).
+// Требует /tmp/dbpedia100k.bin (scripts/convert_dbpedia.py).
 // =============================================================================
 
 func TestSecondaryLayout_Profit(t *testing.T) {
@@ -49,7 +58,7 @@ func TestSecondaryLayout_Profit(t *testing.T) {
 	}
 	train, test, gtGlobal, err := loadDBpediaRaw("/tmp/dbpedia100k.bin")
 	if err != nil {
-		t.Skipf("нет данных: %v (python3 convert_dbpedia.py)", err)
+		t.Skipf("нет данных: %v (scripts/convert_dbpedia.py)", err)
 	}
 	dim := len(train[0])
 

@@ -365,8 +365,15 @@ Tests: `TestVMEMCorpusBench` (`kvstore/vector/vmem_corpus_bench_test.go`),
 
 ## Reproducing
 
-The heavy benchmarks are committed but gated: they skip under `-short` and
-skip silently if the dataset file is missing.
+The heavy benchmarks are committed but gated behind the `datasets` build tag:
+they are excluded from a normal `go test` run entirely, and inside they still
+skip if the dataset file is missing.
+
+> The tag was added on 2026-08-02. Before it, these tests were merely
+> `-short`-gated and skipped **silently** when the data was absent — so a green
+> `make test-full` on a machine with an empty `/tmp` meant "30 functions never
+> ran", indistinguishable from "30 functions passed". Run them with
+> `make test-datasets` (or `go test -tags datasets ./kvstore/vector/`).
 
 ```bash
 # 1. Datasets (ann-benchmarks HDF5 → raw bin)
@@ -377,15 +384,15 @@ wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
 ./scripts/convert_annbench.py mnist-784-euclidean.hdf5 /tmp/mnist784.bin
 # dbpedia (includes angular ground truth, separate format):
 # https://storage.googleapis.com/ann-datasets/ann-benchmarks/dbpedia-openai-100k-angular.hdf5
-./convert_dbpedia.py dbpedia-openai-100k-angular.hdf5 /tmp/dbpedia100k.bin
+./scripts/convert_dbpedia.py dbpedia-openai-100k-angular.hdf5 /tmp/dbpedia100k.bin
 # dbpedia with texts for BM25/hybrid (downloads HF parquet shards on first run):
 python3 scripts/convert_dbpedia_hf.py   # → /tmp/dbpedia100k_text.* + queries jsonl
 
-# 2. Run (no -short → heavy tests enabled; -v prints the tables)
-go test -run 'TestSIFT1M_Validation|TestGIST1M_Validation' -v -timeout 60m ./kvstore/vector/
-go test -run 'TestDBpedia_RealEmbeddingValidation' -v -timeout 30m ./kvstore/vector/
-go test -run 'TestTenant_SearchTenantQPSGain|TestFilter_AttrScaleQPSGain' -v -timeout 60m ./kvstore/vector/
-go test -run 'TestBM25HybridProfit' -v -timeout 60m ./kvstore/vector/
+# 2. Run (-tags datasets → these tests exist at all; -v prints the tables)
+go test -tags datasets -run 'TestSIFT1M_Validation|TestGIST1M_Validation' -v -timeout 60m ./kvstore/vector/
+go test -tags datasets -run 'TestDBpedia_RealEmbeddingValidation' -v -timeout 30m ./kvstore/vector/
+go test -tags datasets -run 'TestTenant_SearchTenantQPSGain|TestFilter_AttrScaleQPSGain' -v -timeout 60m ./kvstore/vector/
+go test -tags datasets -run 'TestBM25HybridProfit' -v -timeout 60m ./kvstore/vector/
 
 # 3. VMEM (section 7)
 # quality — self-contained synthetic corpus, no external data needed:

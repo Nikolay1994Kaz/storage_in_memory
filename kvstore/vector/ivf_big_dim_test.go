@@ -1,12 +1,17 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
-	"fmt"
 	"math"
-	"math/rand"
 	"sort"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -111,55 +116,4 @@ func testQPSAtScale(t *testing.T, alloc *tcmalloc.TCMallocStore, vecs, queries [
 
 	_ = n
 	_ = dim
-}
-
-func l3StatusStr(mb float64) string {
-	if mb <= 12 {
-		return "✓ fits"
-	}
-	return fmt.Sprintf("❌ %.1f× over", mb/12)
-}
-
-// measureQPSBatch — вспомогательный для testQPSAtScale
-func measureQPSBatch(searchFn func(q []float32), queries [][]float32, workers int, duration time.Duration) float64 {
-	var count atomic.Int64
-	done := make(chan struct{})
-
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			i := id
-			for {
-				select {
-				case <-done:
-					return
-				default:
-					searchFn(queries[i%len(queries)])
-					count.Add(1)
-					i++
-				}
-			}
-		}(w)
-	}
-
-	time.Sleep(duration)
-	close(done)
-	wg.Wait()
-
-	return float64(count.Load()) / duration.Seconds()
-}
-
-// randFloatVecs генерирует случайные векторы (для тестов где нет SIFT).
-func randFloatVecs(n, dim int, seed int64) [][]float32 {
-	rng := rand.New(rand.NewSource(seed))
-	vecs := make([][]float32, n)
-	for i := range vecs {
-		vecs[i] = make([]float32, dim)
-		for d := range vecs[i] {
-			vecs[i][d] = rng.Float32() * 100
-		}
-	}
-	return vecs
 }

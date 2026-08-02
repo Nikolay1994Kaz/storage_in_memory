@@ -1,11 +1,18 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
 	"fmt"
 	"math/rand"
 	"strconv"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,7 +45,7 @@ func TestTenant_SearchTenantQPSGain(t *testing.T) {
 	}
 	train, test, err := loadSIFTRaw("/tmp/sift200k.bin")
 	if err != nil {
-		t.Skipf("нет данных: %v (python3 convert_sift200k.py)", err)
+		t.Skipf("нет данных: %v (scripts/convert_annbench.py sift-128-euclidean.hdf5 /tmp/sift200k.bin --train 200000 --test 500)", err)
 	}
 
 	const (
@@ -196,27 +203,4 @@ func keysOf(res []VSearchResult) []string {
 		ks[i] = r.Key
 	}
 	return ks
-}
-
-// runQPS гоняет fn по запросам в W потоков в течение dur, возвращает запросов/с.
-func runQPS(W int, dur time.Duration, queries [][]float32, fn func([]float32)) float64 {
-	var idx int64 = -1
-	var ops int64
-	deadline := time.Now().Add(dur)
-	var wg sync.WaitGroup
-	for w := 0; w < W; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			local := 0
-			for time.Now().Before(deadline) {
-				q := queries[int(atomic.AddInt64(&idx, 1))%len(queries)]
-				fn(q)
-				local++
-			}
-			atomic.AddInt64(&ops, int64(local))
-		}()
-	}
-	wg.Wait()
-	return float64(ops) / dur.Seconds()
 }

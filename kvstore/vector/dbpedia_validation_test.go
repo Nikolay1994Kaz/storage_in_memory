@@ -1,3 +1,12 @@
+//go:build datasets
+
+// Замер на внешнем датасете. Тег `datasets` намеренно держит его ВНЕ обычной
+// сборки тестов: без файла в /tmp такой тест скипался молча, и «ok» пакета
+// означал в том числе «тридцать функций даже не пытались запуститься».
+// Запуск и получение данных — docs/BENCHMARKS.md, раздел Reproducing:
+//
+//	make test-datasets
+
 package vector
 
 import (
@@ -27,7 +36,7 @@ import (
 //
 //   go test ./kvstore/vector -run TestDBpedia_RealEmbeddingValidation -v -timeout 1800s
 //
-// Требует /tmp/dbpedia100k.bin (python3 convert_dbpedia.py).
+// Требует /tmp/dbpedia100k.bin (scripts/convert_dbpedia.py).
 // =============================================================================
 
 // loadDBpediaRaw читает формат convert_dbpedia.py: train/test (как SIFT) + GT.
@@ -43,6 +52,15 @@ func loadDBpediaRaw(path string) (train, test [][]float32, gt [][]int32, err err
 	dim := int(binary.LittleEndian.Uint32(data[4:8]))
 	off := 8
 
+	// ⚠Границы проверяются ДО unsafe.Slice: без этого файл, собранный не тем
+	// скриптом (convert_annbench.py пишет тот же формат, но БЕЗ хвоста ground
+	// truth), давал чтение за пределами буфера — не ошибку, а UB. Формат
+	// собирает scripts/convert_dbpedia.py.
+	need := 8 + n*dim*4 + 4
+	if n <= 0 || dim <= 0 || len(data) < need {
+		return nil, nil, nil, fmt.Errorf("файл оборван: n=%d dim=%d, нужно ≥%d байт, есть %d", n, dim, need, len(data))
+	}
+
 	trainFlat := unsafe.Slice((*float32)(unsafe.Pointer(&data[off])), n*dim)
 	train = make([][]float32, n)
 	for i := 0; i < n; i++ {
@@ -52,6 +70,10 @@ func loadDBpediaRaw(path string) (train, test [][]float32, gt [][]int32, err err
 
 	nTest := int(binary.LittleEndian.Uint32(data[off : off+4]))
 	off += 4
+	if nTest <= 0 || len(data) < off+nTest*dim*4 {
+		return nil, nil, nil, fmt.Errorf("тестовая секция оборвана: nTest=%d, нужно ещё %d байт, есть %d",
+			nTest, nTest*dim*4, len(data)-off)
+	}
 	testFlat := unsafe.Slice((*float32)(unsafe.Pointer(&data[off])), nTest*dim)
 	test = make([][]float32, nTest)
 	for i := 0; i < nTest; i++ {
@@ -59,8 +81,14 @@ func loadDBpediaRaw(path string) (train, test [][]float32, gt [][]int32, err err
 	}
 	off += nTest * dim * 4
 
+	if len(data) < off+4 {
+		return nil, nil, nil, fmt.Errorf("нет секции ground truth: файл собран не scripts/convert_dbpedia.py?")
+	}
 	kgt := int(binary.LittleEndian.Uint32(data[off : off+4]))
 	off += 4
+	if kgt <= 0 || len(data) < off+nTest*kgt*4 {
+		return nil, nil, nil, fmt.Errorf("ground truth оборван: K=%d, нужно ещё %d байт, есть %d", kgt, nTest*kgt*4, len(data)-off)
+	}
 	gtFlat := unsafe.Slice((*int32)(unsafe.Pointer(&data[off])), nTest*kgt)
 	gt = make([][]int32, nTest)
 	for i := 0; i < nTest; i++ {
@@ -75,7 +103,7 @@ func TestDBpedia_RealEmbeddingValidation(t *testing.T) {
 	}
 	train, test, gt, err := loadDBpediaRaw("/tmp/dbpedia100k.bin")
 	if err != nil {
-		t.Skipf("нет данных: %v (python3 convert_dbpedia.py)", err)
+		t.Skipf("нет данных: %v (scripts/convert_dbpedia.py)", err)
 	}
 	dim := len(train[0])
 	const (
