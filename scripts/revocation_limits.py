@@ -212,27 +212,38 @@ def main() -> int:
     now = int(time.time())
     cases = []
 
+    # ⭐still_trusted закреплён наравне с прочими границами: это ЕДИНСТВЕННОЕ
+    # из этих чисел, которое движок называет сам, без знания плана. Его нули в
+    # L1/L4/L5 закрепляют не удачу, а ГРАНИЦУ ЧЕСТНОСТИ — по спрошенному
+    # источнику там действительно чисто, и поле не вправе намекать на большее,
+    # хотя ложь в памяти живёт (другим каналом, в пересказе). Рост этого числа
+    # без роста lost означал бы, что движок начал приписывать себе покрытие.
     p = fresh_plan(now)
     cases.append(run_case("L0 контроль: один канал, без окна", "как в основном прогоне",
                           p, {f.fid: f.text for f in p}, False, POISONS,
-                          {"revoked": 15, "left": 0, "lost": 12, "symptom": 0}))
+                          {"revoked": 15, "left": 0, "lost": 12, "symptom": 0,
+                           "still_trusted": 0}))
 
     p = fresh_plan(now)
     note = variant_two_channels(p)
     cases.append(run_case("L1 два канала", note, p, {f.fid: f.text for f in p},
                           False, POISONS,
-                          {"revoked": 13, "left": 2, "lost": 12, "hint": 0}))
+                          {"revoked": 13, "left": 2, "lost": 12, "hint": 0,
+                           "still_trusted": 0}))
 
     p = fresh_plan(now)
     cases.append(run_case("L2 окно SINCE", "то же, что L0, но отзыв ограничен окном",
                           p, {f.fid: f.text for f in p}, True, POISONS,
-                          {"revoked": 3, "left": 0, "lost": 0}))
+                          {"revoked": 3, "left": 0, "lost": 0, "still_trusted": 12}))
 
+    # ⭐L3 — случай, ради которого поле и заведено: отозвана ОДНА подсадка из
+    # пятнадцати фактов канала, и движок говорит об этом прямо (14 не тронуто),
+    # тогда как раньше отвечал бодрым «отозвано 1» и молчал.
     p = fresh_plan(now)
     note = variant_spread_dates(p, now)
     cases.append(run_case("L3 окно + разные даты действия", note, p,
                           {f.fid: f.text for f in p}, True, POISONS,
-                          {"revoked": 1, "left": 2, "lost": 0}))
+                          {"revoked": 1, "left": 2, "lost": 0, "still_trusted": 14}))
 
     p = fresh_plan(now)
     note = variant_backdated(p, now)
@@ -243,13 +254,14 @@ def main() -> int:
     note = variant_derived(p, now)
     cases.append(run_case("L4 производный вывод", note, p, {f.fid: f.text for f in p},
                           False, (*POISONS, DERIVED),
-                          {"revoked": 15, "left": 1, "hint": 1}))
+                          {"revoked": 15, "left": 1, "hint": 1, "still_trusted": 0}))
 
     p = fresh_plan(now)
     note = variant_two_channels_same_claim(p)
     cases.append(run_case("L5 два канала, одно утверждение", note, p,
                           {f.fid: f.text for f in p}, False, POISONS,
-                          {"revoked": 14, "left": 1, "symptom": 1, "hint": 1}))
+                          {"revoked": 14, "left": 1, "symptom": 1, "hint": 1,
+                           "still_trusted": 0}))
 
     print(f"порт {PORT}, зерно {ms.SEED}, корпус тот же, что в основном прогоне")
     print(f"замеченная подсадка везде одна: {OBSERVED}; канал вычисляется через EXPLAIN\n")
@@ -287,6 +299,15 @@ def main() -> int:
         print(f"⚠поведение изменилось с момента замера: {', '.join(moved)}")
         return 1
     print("границы те же, что были измерены 31.07")
+    # ⭐Что даёт остаток и чего он не даёт — читается прямо из колонок выше.
+    # В L3 он единственный сигнал, что лечение коснулось одного факта из
+    # пятнадцати: цена нулевая, симптом снят, и без него всё выглядит успехом.
+    # А в L1, L4 и L5 он равен нулю при живой лжи — и это не изъян поля, а его
+    # граница: спрошено было про ОДИН источник, по нему действительно чисто.
+    # Ложь другим каналом и ложь в пересказе лежат вне предиката, поэтому в
+    # квитанции рядом стоит other_origins=not_covered.
+    print("остаток называет размер НЕПРОВЕРЕННОГО в пределах спрошенного "
+          "источника; ложь вне его (L1/L4/L5) он не видит и не обещает")
     return 0
 
 
