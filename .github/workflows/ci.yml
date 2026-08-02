@@ -72,3 +72,12 @@ jobs:
       # корректностные тесты остаются). Без -race — гоним однопоточно для скорости.
       - name: Test (vector)
         run: go test -short -timeout 5m ./kvstore/vector/
+
+      # 🚨Конкурентные тесты vector — ОБЯЗАТЕЛЬНО под -race. Без этого шага
+      # TestLSH_ConcurrentSearchNoRace и TestVMEMReapWritersRace исполнялись с
+      # выключенным оракулом: их единственная проверка — сам детектор гонок,
+      # а он тут не включался ни в CI, ни в `make test-race` (тот берёт только
+      # ./kvstore/internal/...). Весь пакет под -race идёт >5.5 мин, поэтому
+      # берём выборку по именам — 5 секунд.
+      - name: Test (vector, race — конкурентные)
+        run: go test -short -race -timeout 10m -run 'Race|Concurrent|Parallel|Storm|Churn' ./kvstore/vector/
