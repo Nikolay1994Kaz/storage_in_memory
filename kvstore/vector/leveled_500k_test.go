@@ -150,9 +150,15 @@ func TestLeveledStore_500k_ScaleIntegrity(t *testing.T) {
 		close(flushDone)
 	}()
 
+	// ⚠Длительность фиксируется ЗДЕСЬ, а не пересчитывается в сводке из
+	// syncStart: между этим местом и печатью SUMMARY идут замер recall,
+	// ожидание фоновых merge и 5 с замера QPS. Сводка показывала 185.6 с при
+	// настоящем флаше 0.1 с — в 1800 раз, и именно сводку переносят в отчёт.
+	var syncDuration time.Duration
 	select {
 	case <-flushDone:
-		t.Logf("FlushDeltaSync completed in %.1fs", time.Since(syncStart).Seconds())
+		syncDuration = time.Since(syncStart)
+		t.Logf("FlushDeltaSync completed in %.1fs", syncDuration.Seconds())
 	case <-time.After(300 * time.Second):
 		stats := lvs.Stats()
 		t.Fatalf("DEADLOCK: FlushDeltaSync did not return in 300s | delta=%d segments=%v",
@@ -256,7 +262,7 @@ func TestLeveledStore_500k_ScaleIntegrity(t *testing.T) {
 	// ── Summary ───────────────────────────────────────────────────────────────
 	t.Logf("=== SUMMARY 500k vectors dim=%d ===", dim)
 	t.Logf("  Insert:        %.0f vec/s (%.1fs total)", insertRate, insertDuration.Seconds())
-	t.Logf("  FlushDeltaSync: %.1fs", time.Since(syncStart).Seconds())
+	t.Logf("  FlushDeltaSync: %.1fs", syncDuration.Seconds())
 	t.Logf("  Self-Recall@10: %.1f%%", selfRecall)
 	t.Logf("  QPS (%d workers): %.0f", workers, qps)
 }
