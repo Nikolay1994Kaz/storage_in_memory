@@ -353,10 +353,11 @@ func TestAuditChain_QuarantineRecordsEveryFactByName(t *testing.T) {
 	}
 	e.do("VMEM.REMEMBER", "hank", "TEXT", "чистый факт", "SOURCE", "good-agent")
 
-	v := e.do("VMEM.QUARANTINE", "hank", "SOURCE", "bad-agent")
-	if v.Typ != ':' || v.Num != 3 {
-		t.Fatalf("QUARANTINE вернула %v/%d, ожидалось :3", string(v.Typ), v.Num)
-	}
+	// Квитанция и журнал — два независимых счёта одного события; сверяет их
+	// проверка ниже, поэтому здесь фиксируется именно то, что обещано клиенту.
+	wantReceipt(t, e.do("VMEM.QUARANTINE", "hank", "SOURCE", "bad-agent"), map[string]string{
+		"revoked": "3", "still_trusted": "0",
+	})
 
 	named := map[string]bool{}
 	var summary *quarantinePayload

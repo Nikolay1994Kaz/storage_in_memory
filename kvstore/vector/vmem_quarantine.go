@@ -75,15 +75,43 @@ type QuarantineRequest struct {
 	Limit  int    // потолок батча; 0 → vmemQuarantineLimit
 }
 
+// QuarantineRemainder — сколько фактов ЭТОГО ЖЕ источника память всё ещё
+// считает истиной ПОСЛЕ отзыва, и по какой причине предикат их не взял.
+//
+// ⭐ЗАЧЕМ. Число отозванных ≠ полнота лечения. Команда, отвечающая «отозвано
+// 3», одинаково звучит и когда лжи больше нет, и когда двенадцать фактов того
+// же канала остались нетронутыми за границей окна. Разницу знал только тот,
+// кто считал её снаружи (scripts/revocation_limits.py), — то есть измерение
+// жило в харнессе, а продукт молчал. Это единственное, чем ответ отличался от
+// вопроса, который задаёт закупочный опросник: «как вы знаете, что устранение
+// было полным».
+//
+// Разбивка — ТОЧНОЕ ЗЕРКАЛО условий приговора quarantineKeys, а не удобная
+// категоризация рядом с ним: OutsideWindow считает ровно то, что приговор
+// отвергает предикатом valid_from (включая факт БЕЗ valid_from — такой не
+// отзывается ни при каком окне, легаси-аналог absent в VMEM.COVERAGE), а
+// OverLimit — всё прочее, то есть подходящее под предикат и не влезшее в батч.
+// Сумма причин равна StillTrusted по построению; ценность не в их сходимости,
+// а в том, что StillTrusted ИЗМЕРЕН по состоянию, а не выведен из счётчиков.
+type QuarantineRemainder struct {
+	StillTrusted  int // живых, не отозванных фактов scope+source
+	OutsideWindow int // из них: предикат valid_from их не берёт
+	OverLimit     int // из них: под предикат подходят, ждут следующего вызова
+}
+
 // QuarantineResult — новые (отозванные) версии фактов: ровно то, что обязано
-// уйти в WAL одной записью OpVSimAddDocBatch.
+// уйти в WAL одной записью OpVSimAddDocBatch, плюс остаток по тому же
+// источнику.
 type QuarantineResult struct {
-	Docs []RememberedDoc
+	Docs      []RememberedDoc
+	Remainder QuarantineRemainder
 }
 
 // Quarantine — массовый отзыв по происхождению. Возвращает отозванные версии;
 // пустой результат означает «под предикат никто не попал» и не является
-// ошибкой (повторный карантин того же источника идемпотентен).
+// ошибкой (повторный карантин того же источника идемпотентен). Остаток
+// считается ВСЕГДА, в том числе при пустом результате: именно там ответ «0»
+// и нуждается в расшифровке больше всего.
 func (lvs *LeveledVectorStore) Quarantine(req QuarantineRequest, now int64) (QuarantineResult, error) {
 	if now <= 0 || now >= vmemOpenValidTo {
 		return QuarantineResult{}, ErrVMEMNow
@@ -101,11 +129,65 @@ func (lvs *LeveledVectorStore) Quarantine(req QuarantineRequest, now int64) (Qua
 	if limit <= 0 || limit > vmemQuarantineLimit {
 		limit = vmemQuarantineLimit
 	}
-	cands := lvs.collectBySource(req, now, limit)
-	if len(cands) == 0 {
-		return QuarantineResult{}, nil
+	var res QuarantineResult
+	if cands := lvs.collectBySource(req, now, limit); len(cands) > 0 {
+		var err error
+		if res, err = lvs.quarantineKeys(cands, req, now); err != nil {
+			return QuarantineResult{}, err
+		}
 	}
-	return lvs.quarantineKeys(cands, req, now)
+	res.Remainder = lvs.sourceRemainder(req, now)
+	return res, nil
+}
+
+// sourceRemainder — остаток по предикату происхождения, измеренный ПОЛНЫМ
+// проходом по состоянию ПОСЛЕ приговора.
+//
+// 🚨ПОЧЕМУ НЕ АРИФМЕТИКА ПО ЧЕРНОВИКУ СКАНА, ХОТЯ ОНА БЕСПЛАТНА. collectBySource
+// обрывается, как только батч набран: при сработавшем LIMIT он не досматривает
+// стор до конца и попросту НЕ ВИДИТ хвост. Счётчик, снятый по дороге, назвал бы
+// остаток нулём ровно в том случае, ради которого поле и заводится, — а поле
+// это ответ на вопрос о полноте. Ошибка была бы в нашу пользу и незаметна
+// снаружи: тот же класс, что «прибор считал не то, что показывал».
+//
+// Отсюда же — «после», а не «до»: остаток есть свойство ИСХОДА, и меряться он
+// обязан по памяти, а не по намерению. Цена — полный скан на вызов, как у
+// VMEM.COVERAGE; карантин это операция дня после инцидента, а не горячий путь.
+func (lvs *LeveledVectorStore) sourceRemainder(req QuarantineRequest, now int64) QuarantineRemainder {
+	// Ключи отдельным проходом по той же причине, что в QuarantinedFacts и
+	// ProvenanceCoverage: ForEach держит lvs.mu.RLock, а чтение атрибутов
+	// берёт его же — рекурсивный RLock с ждущим писателем даёт дедлок.
+	var keys []string
+	lvs.ForEach(func(key string, _ []float32) { keys = append(keys, key) })
+	if len(keys) == 0 {
+		return QuarantineRemainder{}
+	}
+	scopes := lvs.catForKeys(keys, vmemAttrScope)
+	sources := lvs.catForKeys(keys, vmemAttrSource)
+	nums := lvs.numsForKeys(keys, vmemAttrValidFrom, vmemAttrExpiresAt, vmemAttrQuarantinedAt)
+
+	var r QuarantineRemainder
+	for i := range keys {
+		if scopes[i] != req.Scope || sources[i] != req.Source {
+			continue
+		}
+		validFrom, expiresAt, quarantinedAt := nums[i][0], nums[i][1], nums[i][2]
+		if !math.IsNaN(quarantinedAt) {
+			continue // отозван — этот и есть результат лечения
+		}
+		// Истёкший по TTL невидим на чтении, значит истиной уже не считается;
+		// приговор пропускает его по тому же основанию.
+		if !math.IsNaN(expiresAt) && expiresAt <= float64(now) {
+			continue
+		}
+		r.StillTrusted++
+		if math.IsNaN(validFrom) || validFrom < float64(req.Since) {
+			r.OutsideWindow++
+		} else {
+			r.OverLimit++
+		}
+	}
+	return r
 }
 
 // quarantineEligibleLocked — ТОТ ЖЕ предикат, что у приговора, но по атрибутам

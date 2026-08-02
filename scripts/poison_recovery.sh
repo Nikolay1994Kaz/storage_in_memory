@@ -47,6 +47,10 @@ command -v redis-cli >/dev/null || { echo "нужен redis-cli"; exit 1; }
 
 r() { redis-cli -p "$PORT" "$@"; }
 
+# qfield <квитанция> <имя поля> — ответ VMEM.QUARANTINE приходит плоским
+# списком «имя, значение, …»; поле достаётся по имени, а не по позиции.
+qfield() { awk -v k="$2" '$0==k{getline; print; exit}' <<<"$1"; }
+
 start() { # start [доп-флаги...]
   "$BIN" -port "$PORT" -data-dir "$DATA" -metrics-port 0 -log-level error "$@" \
     > "$WORK/server.log" 2>&1 &
@@ -114,8 +118,10 @@ stop
 echo
 echo "═══ 6. СТРАТЕГИЯ B: выборочный отзыв по происхождению"
 start
-REVOKED=$(r VMEM.QUARANTINE "$SCOPE" SOURCE email-agent)
-echo "   VMEM.QUARANTINE … SOURCE email-agent → отозвано: $REVOKED"
+RECEIPT=$(r VMEM.QUARANTINE "$SCOPE" SOURCE email-agent)
+REVOKED=$(qfield "$RECEIPT" revoked)
+echo "   VMEM.QUARANTINE … SOURCE email-agent → отозвано: $REVOKED, "\
+"остаток по источнику: $(qfield "$RECEIPT" still_trusted)"
 B_BEFORE=$(count_of before); B_AFTER=$(count_of after); B_POISON=$(count_of poison)
 echo "   законных ДО подсадки:    $B_BEFORE / 5"
 echo "   законных ПОСЛЕ подсадки: $B_AFTER / 4"

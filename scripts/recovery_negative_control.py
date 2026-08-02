@@ -413,8 +413,10 @@ def main() -> int:
         observed = ms.phase_symptom(c)
         channel = ms.phase_localize(c, observed)
         at = int(time.time())
-        n = ms.phase_revoke(c, channel)
-        print(f"VMEM: EXPLAIN назвал канал → {channel} (имя не подсказано), отозвано {n}")
+        rec = ms.phase_revoke(c, channel)
+        n = rec["revoked"]
+        print(f"VMEM: EXPLAIN назвал канал → {channel} (имя не подсказано), "
+              f"отозвано {n}, движок называет остаток по каналу: {rec['still_trusted']}")
         C = measure_vmem(c, texts)
         C.update(probe_evidence(c, texts, at))
         C["signature"] = probe_signature(c, srv)
@@ -438,9 +440,11 @@ def main() -> int:
         time.sleep(1.2)
         channel2 = ms.phase_localize(c, ms.phase_symptom(c))
         at2 = int(time.time())
-        n2 = int(c.call("VMEM.QUARANTINE", SCOPE, "SOURCE", channel2, "SINCE", since))
+        rec2 = ms.phase_revoke(c, channel2, since=since)
+        n2 = rec2["revoked"]
         print(f"VMEM: тот же отзыв с окном SINCE → отозвано {n2} "
-              f"(без окна было {n})")
+              f"(без окна было {n}), движок называет остаток по каналу: "
+              f"{rec2['still_trusted']} (вне окна {rec2['outside_window']})")
         D = measure_vmem(c, texts)
         D.update(probe_evidence(c, texts, at2))
         D["signature"] = probe_signature(c, srv2)

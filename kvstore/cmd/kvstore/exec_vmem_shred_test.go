@@ -288,7 +288,9 @@ func TestVMEMShred_EveryVMEMWriteIsSealed(t *testing.T) {
 	const plain = "Aurora design review approved"
 	e.wantBulk(e.do("VMEM.REMEMBER", "user:dana", "TEXT", plain, "ID", "d1", "SOURCE", "human"), "d1")
 	e.wantBulk(e.do("VMEM.REMEMBER", "user:dana", "TEXT", poison, "ID", "d2", "SOURCE", "email-agent"), "d2")
-	e.wantInt(e.do("VMEM.QUARANTINE", "user:dana", "SOURCE", "email-agent"), 1)
+	wantReceipt(t, e.do("VMEM.QUARANTINE", "user:dana", "SOURCE", "email-agent"), map[string]string{
+		"revoked": "1", "still_trusted": "0",
+	})
 	e.wantInt(e.do("VMEM.BACKFILL", "user:dana", "SOURCE", "imported"), 0)
 
 	archivePath := archiveWAL(t, e)

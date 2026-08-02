@@ -486,6 +486,25 @@ func TestExecVMEM_Provenance(t *testing.T) {
 	}
 }
 
+// wantReceipt — сверка КВИТАНЦИИ по названным полям. Отсутствующее поле —
+// провал, а не пропуск: молча не найденный ключ превратил бы проверку в
+// «ответ вообще есть», что и так видно.
+func wantReceipt(t *testing.T, v protocol.Value, want map[string]string) {
+	t.Helper()
+	if v.Typ != '*' {
+		t.Fatalf("квитанция не массив: typ=%q str=%q", v.Typ, v.Str)
+	}
+	got := fieldsOf(t, v)
+	for k, exp := range want {
+		switch actual, ok := got[k]; {
+		case !ok:
+			t.Errorf("в квитанции нет поля %q (есть: %v)", k, got)
+		case actual != exp:
+			t.Errorf("квитанция.%s = %q, ожидалось %q", k, actual, exp)
+		}
+	}
+}
+
 // TestExecVMEM_Quarantine — карантин через RESP: выборочный отзыв по
 // происхождению, законные факты целы, история веры доступна через ASOF, и всё
 // это переживает рестарт-реплей (батч едет одной записью — краш не может
@@ -514,8 +533,20 @@ func TestExecVMEM_Quarantine(t *testing.T) {
 	e1.wantErrPrefix(e1.do("VMEM.QUARANTINE", "s", "SOURCE"), "ERR usage: VMEM.QUARANTINE")
 	e1.wantErrPrefix(e1.do("VMEM.QUARANTINE", "s", "SINCE", "1000", "SOURCE"), "ERR SOURCE requires")
 	e1.wantErrPrefix(e1.do("VMEM.QUARANTINE", "s", "SINCE", "1000", "LIMIT", "5"), "ERR vmem: quarantine requires a source")
-	e1.wantInt(e1.do("VMEM.QUARANTINE", "s", "SOURCE", "web-scraper"), 2)
-	e1.wantInt(e1.do("VMEM.QUARANTINE", "s", "SOURCE", "web-scraper"), 0) // идемпотентно
+	wantReceipt(t, e1.do("VMEM.QUARANTINE", "s", "SOURCE", "web-scraper"), map[string]string{
+		"scope": "s", "source": "web-scraper", "since": "none",
+		"revoked": "2", "still_trusted": "0", "outside_window": "0", "over_limit": "0",
+		// Оговорка обязана быть в КАЖДОЙ квитанции, а не только в тревожной:
+		// ноль в still_trusted иначе читается как «инцидент закрыт», хотя
+		// он про один источник (ложь другим каналом — L1/L4/L5, измерены).
+		"other_origins": "not_covered",
+	})
+	// Идемпотентно — и теперь ноль означает ОДНО: отзывать нечего и не
+	// осталось ничего. До квитанции этот же `:0` не отличался от «первая
+	// партия снята, остальное не тронуто».
+	wantReceipt(t, e1.do("VMEM.QUARANTINE", "s", "SOURCE", "web-scraper"), map[string]string{
+		"revoked": "0", "still_trusted": "0", "outside_window": "0", "over_limit": "0",
+	})
 
 	if got := recallIDs(e1, "s", "10", "дедлайн"); !slices.Equal(got, []string{"ok1"}) {
 		t.Fatalf("после карантина: %v, ожидался [ok1]", got)
@@ -538,4 +569,64 @@ func TestExecVMEM_Quarantine(t *testing.T) {
 	if got := recallIDs(e2, "s", "10", "дедлайн", "ASOF", "1500"); len(got) != 3 {
 		t.Fatalf("после реплея ASOF: %v, ожидались все три — улика потеряна при рестарте", got)
 	}
+}
+
+// TestExecVMEM_QuarantineRemainderOutsideWindow — то, ради чего ответ перестал
+// быть числом.
+//
+// 🚨СЦЕНАРИЙ ВОСПРОИЗВОДИТ ИЗМЕРЕННУЮ ДЫРУ (L3, scripts/revocation_limits.py):
+// окно вычисляется из valid_from ЗАМЕЧЕННОЙ подсадки — оператор знает ровно
+// это, — а подсаженное раньше уходит из-под окна, и злого умысла для этого не
+// нужно: «бюджет заморожен с начала месяца» датируется началом месяца. Отзыв
+// отрабатывает честно и снимает ровно одно. Раньше он отвечал бодрым `:1`, и
+// ДВЕ пережившие лечение лжи не были названы ничем. Теперь их называет сам
+// движок, а не скрипт рядом с ним.
+func TestExecVMEM_QuarantineRemainderOutsideWindow(t *testing.T) {
+	e := newExecEnv(t)
+	e.wantBulk(e.do("VMEM.REMEMBER", "s", "TEXT", "бюджет заморожен", "ID", "old1", "SOURCE", "email-channel", "VALIDFROM", "1000"), "old1")
+	e.wantBulk(e.do("VMEM.REMEMBER", "s", "TEXT", "закупки остановлены", "ID", "old2", "SOURCE", "email-channel", "VALIDFROM", "1000"), "old2")
+	e.wantBulk(e.do("VMEM.REMEMBER", "s", "TEXT", "подрядчик сменился", "ID", "seen", "SOURCE", "email-channel", "VALIDFROM", "3000"), "seen")
+	// Сосед: другой источник в счёт остатка попадать не имеет права, иначе
+	// still_trusted мерил бы размер памяти, а не полноту лечения.
+	e.wantBulk(e.do("VMEM.REMEMBER", "s", "TEXT", "встреча в четверг", "ID", "human1", "SOURCE", "human", "VALIDFROM", "1000"), "human1")
+
+	wantReceipt(t, e.do("VMEM.QUARANTINE", "s", "SOURCE", "email-channel", "SINCE", "3000"), map[string]string{
+		"since": "3000", "revoked": "1",
+		"still_trusted": "2", "outside_window": "2", "over_limit": "0",
+	})
+	// Тот же отзыв без окна: остаток снимается, и цена этого выбора видна
+	// рядом — обе точки компромисса теперь предъявлены числом.
+	wantReceipt(t, e.do("VMEM.QUARANTINE", "s", "SOURCE", "email-channel"), map[string]string{
+		"since": "none", "revoked": "2",
+		"still_trusted": "0", "outside_window": "0", "over_limit": "0",
+	})
+}
+
+// TestExecVMEM_QuarantineRemainderOverLimit — вторая причина остатка: партия
+// ограничена сверху, и хвост до сих пор был неотличим снаружи. Число
+// отозванных совпадает с LIMIT и в случае «набрали ровно партию, есть ещё», и
+// в случае «столько и было» — а разница между ними это разница между
+// «повторите вызов» и «работа закончена».
+func TestExecVMEM_QuarantineRemainderOverLimit(t *testing.T) {
+	e := newExecEnv(t)
+	for i := 0; i < 5; i++ {
+		id := "f" + strconv.Itoa(i)
+		e.wantBulk(e.do("VMEM.REMEMBER", "s", "TEXT", "подсадка "+id, "ID", id, "SOURCE", "bad", "VALIDFROM", "1000"), id)
+	}
+	// Партия по 2: остаток обязан таять ровно на снятое, а не «пересчитаться»
+	// заново, — поэтому ожидания записаны последовательностью, а не одним
+	// финальным нулём.
+	for _, want := range []map[string]string{
+		{"revoked": "2", "still_trusted": "3", "over_limit": "3", "outside_window": "0"},
+		{"revoked": "2", "still_trusted": "1", "over_limit": "1", "outside_window": "0"},
+		{"revoked": "1", "still_trusted": "0", "over_limit": "0", "outside_window": "0"},
+	} {
+		wantReceipt(t, e.do("VMEM.QUARANTINE", "s", "SOURCE", "bad", "LIMIT", "2"), want)
+	}
+	// Контроль диагноза: последний вызов уже вернул ноль по обоим счётчикам —
+	// если бы остаток считался по ЧЕРНОВИКУ скана (он обрывается на LIMIT),
+	// первый же вызов показал бы over_limit=0 и проверки выше прошли бы мимо.
+	wantReceipt(t, e.do("VMEM.QUARANTINE", "s", "SOURCE", "bad", "LIMIT", "2"), map[string]string{
+		"revoked": "0", "still_trusted": "0", "over_limit": "0",
+	})
 }

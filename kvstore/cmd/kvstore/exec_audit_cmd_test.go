@@ -343,9 +343,9 @@ func TestAudit_ReconcileCountsQuarantineAsRevoked(t *testing.T) {
 		t.Fatalf("на согласованном состоянии сверка нашла расхождения: %+v", rep)
 	}
 
-	if n := e.do("VMEM.QUARANTINE", "alice", "SOURCE", "web").Num; n != 1 {
-		t.Fatalf("отозвано %d, ожидался 1", n)
-	}
+	wantReceipt(t, e.do("VMEM.QUARANTINE", "alice", "SOURCE", "web"), map[string]string{
+		"revoked": "1", "still_trusted": "0",
+	})
 	if _, err := auditChain.Flush(); err != nil {
 		t.Fatal(err)
 	}

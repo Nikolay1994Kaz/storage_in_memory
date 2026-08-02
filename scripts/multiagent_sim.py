@@ -334,8 +334,25 @@ def phase_localize(c: Resp, observed_id: str) -> str:
     raise SystemExit("ЛОКАЛИЗАЦИЯ ПРОВАЛЕНА: EXPLAIN не дал source замеченного факта")
 
 
-def phase_revoke(c: Resp, channel: str) -> int:
-    return int(c.call("VMEM.QUARANTINE", SCOPE, "SOURCE", channel))
+QUARANTINE_COUNTS = ("revoked", "still_trusted", "outside_window", "over_limit")
+
+
+def phase_revoke(c: Resp, channel: str, since=None) -> dict:
+    """Отзыв по происхождению. Возвращает КВИТАНЦИЮ, а не число отозванных:
+    still_trusted говорит, сколько фактов того же канала память всё ещё считает
+    истиной, — то есть отвечает на «а всё ли снято», на что голое число
+    ответить не может."""
+    args = ["VMEM.QUARANTINE", SCOPE, "SOURCE", channel]
+    if since is not None:
+        args += ["SINCE", since]
+    rec = _fields(c.call(*args))
+    missing = [k for k in QUARANTINE_COUNTS if k not in rec]
+    if missing:
+        # Не «продолжим с нулями»: молча подставленный ноль в поле про полноту
+        # лечения — ровно та ложь в нашу пользу, ради устранения которой поле
+        # и заведено.
+        raise SystemExit(f"VMEM.QUARANTINE вернула не квитанцию, нет полей {missing}: {rec}")
+    return {k: (int(v) if k in QUARANTINE_COUNTS else v) for k, v in rec.items()}
 
 
 # ─────────────────── слой доказательства (шаг 3) ────────────────────────────
@@ -574,8 +591,10 @@ def main() -> int:
             # зелёным — оно не меряет ничего, и все цифры выше декоративны.
             print("3. ОТЗЫВ ПРОПУЩЕН (--no-revoke): проверяем, что табло краснеет")
         else:
-            n = phase_revoke(c, channel)
-            print(f"3. ОТЗЫВ: VMEM.QUARANTINE {SCOPE} SOURCE {channel} → отозвано {n}")
+            rec = phase_revoke(c, channel)
+            print(f"3. ОТЗЫВ: VMEM.QUARANTINE {SCOPE} SOURCE {channel} → "
+                  f"отозвано {rec['revoked']}, осталось истиной по каналу "
+                  f"{rec['still_trusted']}")
         print()
 
         rows = scorecard(c, texts, before, revoked_at)

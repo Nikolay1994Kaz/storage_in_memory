@@ -2623,7 +2623,8 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// целиком (текст, вектор, прикладное время), но получают ось
 		// quarantined_at — RECALL их больше не выдаёт, AS_OF до момента
 		// отзыва выдаёт по-прежнему (история веры не переписывается), ALL
-		// показывает всегда. Ответ: число отозванных.
+		// показывает всегда. Ответ — квитанция: что сделано и ЧТО ОСТАЛОСЬ
+		// (см. still_trusted ниже).
 		//
 		// Весь батч едет ОДНОЙ записью OpVSimAddDocBatch — один CRC: краш не
 		// может оставить «часть лжи отозвана, часть жива». Отсюда потолок
@@ -2688,27 +2689,60 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
-		if len(res.Docs) == 0 {
-			buf.WriteInt(0)
-			return
+		if len(res.Docs) > 0 {
+			batch := make([]vector.BatchDoc, len(res.Docs))
+			for i, d := range res.Docs {
+				batch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
+			}
+			bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Docs[0].ID, Value: sealValue(qreq.Scope, vector.SerializeDocBatch(batch))})
+			// Карантин — доказываемый момент: поимённо в цепь и синхронно.
+			// Отказ записи в цепь не отменяет самого отзыва (он уже в WAL),
+			// поэтому команда не падает, но пробел в журнале называется вслух.
+			qids := make([]string, len(res.Docs))
+			for i, d := range res.Docs {
+				qids[i] = d.ID
+			}
+			if _, err := auditQuarantine(qreq.Scope, qreq.Source, qreq.Since, qids); err != nil {
+				slog.Error("audit chain: quarantine not recorded, retirement itself succeeded",
+					"scope", qreq.Scope, "source", qreq.Source, "facts", len(qids), "err", err)
+			}
 		}
-		batch := make([]vector.BatchDoc, len(res.Docs))
-		for i, d := range res.Docs {
-			batch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
+		// ⭐Ответ — квитанция, а не число отозванных, и разница ровно в том
+		// поле, которое отвечает на «а всё ли снято». Голое `:3` одинаково
+		// звучит и когда лжи больше нет, и когда двенадцать фактов того же
+		// канала остались за границей окна: полноту лечения по нему не
+		// восстановить, а окно вводит компромисс цена↔полнота, который до сих
+		// пор был МОЛЧАЛИВЫМ — считался снаружи и оператору не предъявлялся.
+		//
+		// still_trusted — единственное число, которое здесь измерено по
+		// памяти, а не выведено; остальные два раскладывают его по причинам.
+		// Ноль означает «в пределах этого предиката не осталось ничего», и
+		// граница названа соседним полем: other_origins всегда not_covered —
+		// ложь, пришедшая ДРУГИМ каналом или выведенная агентом из отозванного
+		// (её происхождение уже чистое), этим счётом не покрыта и покрыта быть
+		// не может. Обе дыры измерены (scripts/revocation_limits.py, L1/L4/L5),
+		// и умолчать о них в квитанции значило бы выдать «0» за конец истории.
+		buf.WriteArrayHeader(16)
+		buf.WriteBulkString("scope")
+		buf.WriteBulkString(qreq.Scope)
+		buf.WriteBulkString("source")
+		buf.WriteBulkString(qreq.Source)
+		buf.WriteBulkString("since")
+		if qreq.Since > 0 {
+			buf.WriteBulkString(strconv.FormatInt(qreq.Since, 10))
+		} else {
+			buf.WriteBulkString("none")
 		}
-		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Docs[0].ID, Value: sealValue(qreq.Scope, vector.SerializeDocBatch(batch))})
-		// Карантин — доказываемый момент: поимённо в цепь и синхронно. Отказ
-		// записи в цепь не отменяет самого отзыва (он уже в WAL), поэтому
-		// команда не падает, но пробел в журнале называется вслух.
-		qids := make([]string, len(res.Docs))
-		for i, d := range res.Docs {
-			qids[i] = d.ID
-		}
-		if _, err := auditQuarantine(qreq.Scope, qreq.Source, qreq.Since, qids); err != nil {
-			slog.Error("audit chain: quarantine not recorded, retirement itself succeeded",
-				"scope", qreq.Scope, "source", qreq.Source, "facts", len(qids), "err", err)
-		}
-		buf.WriteInt(len(res.Docs))
+		buf.WriteBulkString("revoked")
+		buf.WriteBulkString(strconv.Itoa(len(res.Docs)))
+		buf.WriteBulkString("still_trusted")
+		buf.WriteBulkString(strconv.Itoa(res.Remainder.StillTrusted))
+		buf.WriteBulkString("outside_window")
+		buf.WriteBulkString(strconv.Itoa(res.Remainder.OutsideWindow))
+		buf.WriteBulkString("over_limit")
+		buf.WriteBulkString(strconv.Itoa(res.Remainder.OverLimit))
+		buf.WriteBulkString("other_origins")
+		buf.WriteBulkString("not_covered")
 
 	case "VMEM.FORGET":
 		// VMEM.FORGET <scope> <id> — erasure: физически, из истории тоже

@@ -215,8 +215,14 @@ def run_vmem(work: str) -> tuple[dict, dict, list[str]]:
     # B2 — выборочный отзыв по происхождению.
     time.sleep(2)  # отзыв обязан лечь ПОЗЖЕ записей, иначе AS_OF нечего показывать
     srv.start()
-    revoked = cli("VMEM.QUARANTINE", SCOPE, "SOURCE", SRC_EMAIL).strip()
-    notes.append(f"VMEM.QUARANTINE … SOURCE {SRC_EMAIL} → отозвано: {revoked}")
+    # Квитанция приходит плоским списком «имя, значение, …» построчно; поле
+    # берётся по имени — позиция это деталь протокола.
+    receipt = cli("VMEM.QUARANTINE", SCOPE, "SOURCE", SRC_EMAIL).split("\n")
+    fields = {receipt[i].strip(): receipt[i + 1].strip()
+              for i in range(0, len(receipt) - 1, 2)}
+    revoked = fields.get("revoked", "?")
+    notes.append(f"VMEM.QUARANTINE … SOURCE {SRC_EMAIL} → отозвано: {revoked}, "
+                 f"остаток по источнику: {fields.get('still_trusted', '?')}")
     b2 = counts(recall_ids())
     b2["evidence_query"] = counts(recall_ids("ALL"))["poison"] > 0
     b2["evidence_snapshot"] = True

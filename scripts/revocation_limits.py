@@ -164,16 +164,16 @@ def run_case(name: str, note: str, plan: list[ms.Fact], texts: dict[str, str],
             return {"name": name, "note": note, "undetected": True, "aimed": aimed}
 
         channel = ms.phase_localize(c, OBSERVED)  # имя вычисляется, не подсказано
-        args = ["VMEM.QUARANTINE", SCOPE, "SOURCE", channel]
+        since = None
         window = ""
         if use_since:
             # ⭐Окно вычисляется из ЗАМЕЧЕННОГО факта — «с того момента, каким
             # датирована найденная ложь». Оператор знает ровно это и ничего
             # больше; подставить сюда знание о корпусе было бы подгонкой.
             since = next(f.valid_from for f in plan if f.fid == OBSERVED)
-            args += ["SINCE", since]
             window = f" SINCE {since} (valid_from замеченной подсадки)"
-        revoked = int(c.call(*args))
+        receipt = ms.phase_revoke(c, channel, since=since)
+        revoked = receipt["revoked"]
 
         # Что именно отозвано — нужно и для подсказки второго круга.
         revoked_ids = [f.fid for f in plan if f.source == channel
@@ -187,7 +187,11 @@ def run_case(name: str, note: str, plan: list[ms.Fact], texts: dict[str, str],
 
         got = {"name": name, "note": note, "channel": channel + window,
                "revoked": revoked, "left": left, "lost": len(lost),
-               "outside": outside, "symptom": still, "hint": hint}
+               "outside": outside, "symptom": still, "hint": hint,
+               # ⭐Что о своей неполноте говорит САМ движок. Все прочие числа
+               # в этой таблице добыты харнессом, который знает план; это —
+               # единственное, доступное оператору в проде.
+               "still_trusted": receipt["still_trusted"]}
         drift = {}
         for k, want in (expect or {}).items():
             cur = got[k]
@@ -260,6 +264,11 @@ def main() -> int:
                   f"({', '.join(c['aimed']) if c['aimed'] else 'ни одной'})")
             continue
         print(f"  локализация → {c['channel']}, отозвано {c['revoked']}")
+        # ⭐Что движок говорит о собственной неполноте, БЕЗ знания плана. Ниже
+        # харнесс назовёт, сколько лжи уцелело, — но это знание оператору
+        # недоступно; доступно ему ровно это число, и раньше не было и его.
+        print(f"  движок называет остаток по каналу: {c['still_trusted']} "
+              f"(не тронуто лечением; ложь это или правда, он не судит)")
         print(f"  ⭐ложь осталась в памяти (прицельный запрос): {len(c['left'])} "
               f"({', '.join(c['left']) if c['left'] else 'ничего'})")
         print(f"  память лжёт на ТОТ ЖЕ вопрос (топ-10 симптома): "
