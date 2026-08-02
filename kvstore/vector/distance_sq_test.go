@@ -1,26 +1,39 @@
+//go:build amd64
+
+// 🚨Тег обязателен: euclideanSQ8AVX2/dotProductSQ8AVX2 объявлены в
+// distance_sq_amd64.go, то есть существуют ТОЛЬКО на amd64. Без тега файл
+// ломал сборку тестов всего пакета на arm64 — `go vet ./kvstore/vector/` под
+// GOARCH=arm64 падал с `undefined: euclideanSQ8AVX2`, а значит на Apple
+// Silicon и ARM-серверах тесты vector нельзя было запустить вовсе. CI этого
+// не показывал: ubuntu-latest — amd64. Прод-код при этом собирался нормально,
+// поэтому дефект жил только в тестах.
+
 package vector
 
 import (
-	"math"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/cpu"
 )
 
-// TestSQ8_AVX2_vs_PureGo проверяет корректность AVX2 asm vs Pure-Go fallback.
-// Если AVX2 недоступен (не-amd64 или старый CPU), тест пропускается.
+// requireAVX2 — AVX2-функции зовутся здесь НАПРЯМУЮ, минуя диспетчер
+// sq8EuclidImpl. На amd64 без AVX2 это не медленный путь, а SIGILL, поэтому
+// пропуск обязан быть явным и с причиной: молчаливый скип уже однажды скрыл
+// три неисполнявшихся теста вокруг вставки.
+func requireAVX2(t *testing.T) {
+	t.Helper()
+	if !cpu.X86.HasAVX2 {
+		t.Skip("CPU без AVX2: asm-функции вызываются напрямую и дали бы SIGILL")
+	}
+}
+
+// TestSQ8_AVX2_vs_PureGo проверяет корректность AVX2 asm против Pure-Go.
 //
 // Устраняет риск subtle-багов в asm: VPMOVZXBD, VCVTDQ2PS, VFMADD, horizontal sum.
 // Допуск — небольшая численная разница из-за порядка операций (FMA reassociation).
 func TestSQ8_AVX2_vs_PureGo(t *testing.T) {
-	// Проверяем, что AVX2 включён (init() перезаписал globals).
-	sq8EuclidAVX2Active := false
-	if sq8EuclidImpl != nil {
-		// Сравниваем указатели: если != euclideanSQ8PureGo → AVX2 активен.
-		// Тривиальный способ: проверить изменилось ли поведение.
-		// Просто вызываем обе функции напрямую.
-		sq8EuclidAVX2Active = true
-	}
-	_ = sq8EuclidAVX2Active
+	requireAVX2(t)
 
 	cases := []struct {
 		name string
@@ -65,6 +78,7 @@ func TestSQ8_AVX2_Benchmark(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping benchmark in short mode")
 	}
+	requireAVX2(t)
 	const dim = 128
 	const n = 100000
 
@@ -105,10 +119,14 @@ func TestSQ8_AVX2_Benchmark(t *testing.T) {
 	t.Logf("AVX2:    %v for %d ops (%.1f ns/op)", avx2Dur, n, float64(avx2Dur)/float64(n))
 	t.Logf("Speedup: %.2f×", speedup)
 
-	// AVX2 должен быть быстрее. Если нет — asm некорректен или CPU не поддерживает.
-	// Допуск: AVX2 не должен быть медленнее (speedup >= 1.0).
+	// 🚨Было t.Logf("WARNING: …") — то есть единственная причина, по которой этот
+	// asm вообще существует, не проверялась ничем. Порог на ОТНОШЕНИИ, а не на
+	// абсолютном времени: посторонняя нагрузка тормозит обе руки разом и
+	// отношение переживает, тогда как абсолютный порог падал бы от чужого
+	// процесса. Запас велик — AVX2 обрабатывает 8 размерностей за итерацию,
+	// ожидание кратное, порог всего 1.0.
 	if speedup < 1.0 {
-		t.Logf("WARNING: AVX2 not faster than Pure-Go (speedup=%.2f). Check asm correctness.", speedup)
+		t.Errorf("AVX2 не быстрее Pure-Go (speedup=%.2f) — asm не окупает своего существования", speedup)
 	}
 }
 
@@ -178,17 +196,5 @@ func makeRandTestCodes(dim int, seed uint64) []uint8 {
 	return c
 }
 
-func approxEqual(a, b, tol float32) bool {
-	return math.Abs(float64(a-b)) < float64(tol)
-}
-
-func approxEqualRel(a, b, tol float32) bool {
-	if a == 0 && b == 0 {
-		return true
-	}
-	denom := math.Abs(float64(a)) + math.Abs(float64(b))
-	if denom == 0 {
-		return true
-	}
-	return math.Abs(float64(a-b))/denom < float64(tol)
-}
+// approxEqual / approxEqualRel живут в approx_test.go — вне тега amd64,
+// потому что нужны и файлам, не связанным с asm.
