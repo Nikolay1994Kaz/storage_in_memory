@@ -126,26 +126,27 @@ func TestTriggerManager_Fire_PatternMatching(t *testing.T) {
 	defer engine.Close()
 
 	tm := NewTriggerManager(engine)
+	fires := countFires(t)
 
 	// Добавляем триггеры с разными паттернами
 	tm.AddTrigger(OnSet, "tx:*", "mod", "fn")   // tx:123 ✓, user:1 ✗
 	tm.AddTrigger(OnSet, "user:*", "mod", "fn") // user:1 ✓, tx:123 ✗
 	tm.AddTrigger(OnDel, "*", "mod", "fn")      // любой ключ, но только DEL
 
-	// Fire(SET, "tx:123") — должен сматчить первый триггер
-	// (ошибка "module not found" ожидаема — модуль не загружен)
+	// Каждое совпадение считается отдельно: раньше здесь стояло «Если дошли сюда
+	// без паники — паттерны работают корректно», и тест был зелёным даже если бы
+	// Fire не матчил вообще ничего.
 	tm.Fire(OnSet, "tx:123", 0)
+	wantFires(t, fires, 1, "tx:123 обязан сматчить tx:*")
 
-	// Fire(SET, "user:1") — должен сматчить второй триггер
 	tm.Fire(OnSet, "user:1", 0)
+	wantFires(t, fires, 2, "user:1 обязан сматчить user:*")
 
-	// Fire(SET, "random") — не матчит ни один SET-триггер
 	tm.Fire(OnSet, "random", 0)
+	wantFires(t, fires, 2, "random не подходит ни под один SET-триггер")
 
-	// Fire(DEL, "anything") — матчит третий триггер (паттерн "*")
 	tm.Fire(OnDel, "anything", 0)
-
-	// Если дошли сюда без паники — паттерны работают корректно
+	wantFires(t, fires, 3, "DEL-триггер с паттерном * обязан сработать")
 }
 
 // ─── Fire: несовпадающее событие не вызывает триггер ─────
@@ -155,15 +156,16 @@ func TestTriggerManager_Fire_EventMismatch(t *testing.T) {
 	defer engine.Close()
 
 	tm := NewTriggerManager(engine)
+	fires := countFires(t)
 
 	// Триггер только на SET
 	tm.AddTrigger(OnSet, "*", "mod", "fn")
 
-	// DEL не должен вызвать SET-триггер
-	// (если бы вызвал — была бы ошибка "module not found" в логах,
-	// но паники не будет в любом случае)
+	// DEL и EXPIRE не должны его вызвать. Комментарий здесь раньше сам называл
+	// наблюдаемый признак («была бы ошибка в логах»), но проверки не было.
 	tm.Fire(OnDel, "any-key", 0)
 	tm.Fire(OnExpire, "any-key", 0)
+	wantFires(t, fires, 0, "SET-триггер не должен срабатывать на DEL/EXPIRE")
 }
 
 // ─── Fire: пустой менеджер — нет паники ──────────────────
@@ -173,10 +175,14 @@ func TestTriggerManager_Fire_Empty(t *testing.T) {
 	defer engine.Close()
 
 	tm := NewTriggerManager(engine)
+	fires := countFires(t)
 
-	// Не паникует при вызове без триггеров
+	// Не паникует при вызове без триггеров — и ничего не вызывает: это ещё и
+	// проверка быстрого пути `len(tm.triggers) == 0`, ради которого Fire висит
+	// на каждом SET/DEL.
 	tm.Fire(OnSet, "key", 0)
 	tm.Fire(OnDel, "key", 0)
+	wantFires(t, fires, 0, "пустой менеджер не имеет что вызывать")
 }
 
 // ─── Конкурентный доступ: Add + Fire + Remove ────────────
@@ -231,16 +237,17 @@ func TestTriggerManager_Fire_MultipleMatch(t *testing.T) {
 	defer engine.Close()
 
 	tm := NewTriggerManager(engine)
+	fires := countFires(t)
 
 	// Два триггера на SET, оба матчат "tx:123"
 	tm.AddTrigger(OnSet, "tx:*", "mod_a", "fn_a")
 	tm.AddTrigger(OnSet, "*", "mod_b", "fn_b") // wildcard — тоже матчит
 
-	// Fire не должен остановиться после первого совпадения.
-	// Оба триггера вызовут ExecFunctionWithKey → ошибка "module not found"
-	// (это нормально — модули не загружены).
-	// Главное: нет паники, оба отработали.
+	// Fire не должен остановиться после первого совпадения. Раньше «оба
+	// отработали» было только в комментарии: тест не отличил бы двойное
+	// срабатывание от одинарного, а именно это он и проверяет.
 	tm.Fire(OnSet, "tx:123", 0)
+	wantFires(t, fires, 2, "оба совпавших триггера обязаны сработать, а не первый")
 }
 
 // ─── Fire: невалидный glob-паттерн → не паникует ─────────
@@ -253,12 +260,16 @@ func TestTriggerManager_Fire_BadPattern(t *testing.T) {
 	defer engine.Close()
 
 	tm := NewTriggerManager(engine)
+	fires := countFires(t)
 
 	// "[" — невалидный glob
 	tm.AddTrigger(OnSet, "[", "mod", "fn")
 	// Нормальный триггер после битого
 	tm.AddTrigger(OnSet, "*", "mod", "fn")
 
-	// Не паникует, пропускает битый паттерн
+	// Ровно одно срабатывание: битый паттерн пропущен, а следующий за ним —
+	// отработал. Число важнее отсутствия паники: 0 означал бы, что ErrBadPattern
+	// прерывает весь обход и глушит исправные триггеры.
 	tm.Fire(OnSet, "any-key", 0)
+	wantFires(t, fires, 1, "битый паттерн пропускается, но не отменяет остальные")
 }
