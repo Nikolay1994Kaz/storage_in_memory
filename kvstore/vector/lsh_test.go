@@ -326,15 +326,93 @@ func TestLSH_HashQuality(t *testing.T) {
 	hammingSimilar := HammingDistance(baseHash, similarHash)
 	hammingDistant := HammingDistance(baseHash, distantHash)
 
-	t.Logf("Hamming(base, similar) = %d bits (expected low)", hammingSimilar)
-	t.Logf("Hamming(base, distant) = %d bits (expected ~32)", hammingDistant)
+	t.Logf("Hamming(base, similar) = %d bits (замерено 4)", hammingSimilar)
+	t.Logf("Hamming(base, distant) = %d bits (замерено 29, теория ~32)", hammingDistant)
 
+	// 🚨Раньше все три проверки ниже были t.Logf("WARNING: …"), то есть тест не мог
+	// упасть НИКОГДА. Проверено мутацией: с `ComputeHash → 0` (хеш выродился в
+	// константу, LSH сломан полностью) этот тест оставался зелёным, и TestLSH_Recall
+	// тоже — 100% recall во всех 12 конфигурациях, потому что SearchWithLSH
+	// расширяет threshold до 32 и уходит в полный перебор. LSH при этом живёт в
+	// проде (store.go, leveled_store.go, snapshot_binary.go, main.go).
+	// Пороги взяты с кратным запасом от замера, а не подогнаны под него.
+
+	// Фундаментальный инвариант SimHash: близкое ближе далёкого. Ловит вырождение
+	// хеша в константу (тогда обе дистанции 0 и условие срабатывает).
 	if hammingSimilar >= hammingDistant {
-		t.Logf("WARNING: similar vector has higher Hamming than distant! LSH quality may be suboptimal")
+		t.Errorf("похожий вектор дальше далёкого: similar=%d >= distant=%d — хеш не разделяет направления",
+			hammingSimilar, hammingDistant)
+	}
+	// Замерено 4 из 64 при отклонении ~0.05 на координату. Порог 20 — пятикратный запас.
+	if hammingSimilar > 20 {
+		t.Errorf("похожий вектор отличается на %d бит из 64 (порог 20) — хеш слишком чувствителен",
+			hammingSimilar)
+	}
+	// Случайные векторы обязаны расходиться примерно на половину бит. Замерено 29,
+	// теория 32. Окно 12..52 ловит и вырождение (0), и «инвертированный» хеш (64).
+	if hammingDistant < 12 || hammingDistant > 52 {
+		t.Errorf("случайные векторы разошлись на %d бит из 64 (ожидалось 12..52) — хеш вырожден",
+			hammingDistant)
+	}
+}
+
+// TestLSH_CandidatePruning — LSH обязан ОТСЕИВАТЬ, и это единственное, ради чего
+// он существует: сузить перебор, не потеряв соседа.
+//
+// ⭐Почему отдельным тестом, а не порогом внутри TestLSH_Recall: тот меряет
+// recall через SearchWithLSH, а там адаптивный цикл поднимает threshold до 32 и
+// при нехватке кандидатов уходит в searchNoLSH. То есть полный перебор
+// возвращает верный ответ и с мёртвым хешем — recall слеп к качеству LSH по
+// построению. Здесь проверяется сам индекс, где подмены нет.
+func TestLSH_CandidatePruning(t *testing.T) {
+	const (
+		n         = 2000
+		dim       = 128
+		threshold = 8
+	)
+	idx := NewLSHIndex(dim, 42)
+	rng := rand.New(rand.NewSource(20260802))
+
+	vecs := make([][]float32, n)
+	for i := range vecs {
+		v := make([]float32, dim)
+		for j := range v {
+			v[j] = rng.Float32()*2 - 1
+		}
+		vecs[i] = v
+		idx.Insert(uint32(i), v)
 	}
 
-	// Близкий вектор должен отличаться меньше чем на 20 бит из 64
-	if hammingSimilar > 20 {
-		t.Logf("WARNING: similar vector Hamming=%d (expected <20)", hammingSimilar)
+	// Запрос — сосед вектора 0 со сдвигом много меньше разброса самих координат.
+	query := make([]float32, dim)
+	copy(query, vecs[0])
+	for j := range query {
+		query[j] += (rng.Float32()*2 - 1) * 0.02
+	}
+	qHash := idx.ComputeHash(query)
+
+	got := idx.FindCandidates(qHash, threshold, nil)
+	t.Logf("кандидатов при threshold=%d: %d из %d", threshold, len(got), n)
+
+	// 1. Сосед обязан остаться. Отсев, теряющий цель, — не отсев, а потеря данных.
+	found := false
+	for _, id := range got {
+		if id == 0 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("истинный сосед отсеян при threshold=%d — LSH теряет цель", threshold)
+	}
+	// 2. И обязан отсеять большинство. При хеше-константе сюда попадут ВСЕ n.
+	if len(got) > n/2 {
+		t.Errorf("кандидатов %d из %d — LSH не сужает перебор (мёртвый хеш даёт все %d)",
+			len(got), n, n)
+	}
+	// 3. ПАРНЫЙ КОНТРОЛЬ: при максимальном пороге обязаны вернуться все. Без него
+	// проверка выше прошла бы и на индексе, который просто ничего не находит.
+	if all := idx.FindCandidates(qHash, 64, nil); len(all) != n {
+		t.Errorf("при threshold=64 кандидатов %d, ожидались все %d — индекс неполон", len(all), n)
 	}
 }
