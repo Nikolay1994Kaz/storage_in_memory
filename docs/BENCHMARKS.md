@@ -333,6 +333,11 @@ governor — conservative):
 
 Accepted latency floors, all met: clean RECALL p99 ≤ 1 ms (measured 0.29 ms);
 RECALL p99 under mix ≤ 25 ms (13.3 ms); scope-isolation violations = 0
+(⚠ a *correctness* property — the engine never returns another scope's fact by
+mistake — and **not** an access-control boundary: `AUTH` is one shared secret
+with no per-principal authorization, so any authenticated connection may
+address any scope by name. Trust boundary = process. See `MEMORY_GOVERNANCE.md`
+primitive 6)
 (checked E2E on every returned id, 0 of 9 219); errors = 0 (across 77 777 mix
 operations and all recalls). REMEMBER latency is fsync-bound (durable WAL per
 batch), not CPU-bound.

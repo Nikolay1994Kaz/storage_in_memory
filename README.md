@@ -159,6 +159,17 @@ temporal accuracy (`ASOF`, supersession chains) **1.000**; scope isolation
 **0 violations**; end-to-end `RECALL` p99 **0.29 ms** at **64 426 QPS** over
 RESP on a 2019 laptop.
 
+> **What "scope isolation" does and does not mean.** It is a correctness
+> property: the engine never returns another scope's fact *by mistake* — the
+> failure mode being guarded is a filter applied after fusion, an unmerged
+> delta filtered differently from frozen segments, a graph traversal crossing a
+> tenant block. It is **not** an access-control boundary. `AUTH` is a single
+> shared secret with no per-principal authorization, so any authenticated
+> connection may address any scope by name, including `VMEM.SHRED`. The trust
+> boundary is the **process**: run one per trust domain. See
+> [SECURITY.md](SECURITY.md) and
+> [docs/MEMORY_GOVERNANCE.md](docs/MEMORY_GOVERNANCE.md) (primitive 6).
+
 ## Features
 
 - **VMEM agent memory** — `VMEM.REMEMBER` / `VMEM.RECALL` / `VMEM.FORGET`: validity intervals + supersession history (`ASOF` time travel), TTL + erasure (immediate unreachability, physical horizon stated in `docs/VMEM_DESIGN.md`), recency×importance recall over BM25 or hybrid; verbatim KV anchors; MCP adapter `vmem-mcp` (Linux/macOS/Windows) for Claude Code/Desktop and any MCP host

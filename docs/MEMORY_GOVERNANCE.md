@@ -91,13 +91,37 @@ crosses one; checked end-to-end on every returned id — **0 violations in
 
 ### 6. Access-control policy — *who may read*
 
-⚠ **Partial, and this is the weakest primitive here.** AUTH
-(`-requirepass-file` or env; the flag form is documented as unsafe) and TLS
-exist, and the server binds to loopback by default. But authentication is a
-**single shared secret**: there is no principal→scope mapping, so "who may
-read" is enforced at the connection, not per principal. Scope isolation
-protects agents from each other's data; it does not express that principal A
-may read scope X and not scope Y.
+⚠ **Closed by deployment, not by the engine — the weakest primitive here.**
+AUTH (`-requirepass-file` or env; the flag form is documented as unsafe) and
+TLS exist, and the server binds to loopback by default. But authentication is a
+**single shared secret**: after a successful `AUTH` the connection carries a
+boolean, not an identity. There is no principal→scope mapping, so every
+authenticated connection has full authority over **every** scope — including
+`VMEM.SHRED`, which is irreversible and reaches shipped archives.
+
+The architecture is not wrong, it is a different shape: **the trust boundary is
+the process**, one per trust domain, as with most embedded and self-hosted
+stores. What matters is that it is written down, because the measured number
+next door invites the opposite reading:
+
+⚠ **"Scope isolation — 0 violations in 9 219" is a correctness property, not a
+security guarantee.** It proves the retrieval path never returns another
+scope's fact *by mistake* — the guarded failure modes are a filter applied
+after fusion, an unmerged delta filtered differently from frozen segments, a
+graph traversal crossing a tenant block, all of which this project has shipped
+and fixed before. It proves nothing about whether the caller was entitled to
+ask. Asking for another scope by name is permitted.
+
+This is the same trap the engine already solves one layer down: a bare
+`still_trusted: 0` would read as "incident closed", so every quarantine receipt
+carries `other_origins: not_covered` whose only job is to block a wrong
+inference. A precise denominator lends credibility to claims it never made.
+
+**Trigger for building real ACLs**: one server serving several mutually
+distrusting principals. Until then this is a deployment pattern, and building
+per-principal authorization would mean an authorization check on every command
+that names a scope or key, across a command surface that is deliberately small
+and frozen.
 
 ### 7. Post-deletion verification — *verified forgetting across substrates, not claimed deletion*
 

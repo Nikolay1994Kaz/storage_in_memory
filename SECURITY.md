@@ -51,6 +51,18 @@ Out of scope:
 These are deliberate decisions, already documented, and reporting them as
 findings will only cost you time:
 
+- **`AUTH` is one shared secret, and the trust boundary is the process.** There
+  is no per-principal authorization: after a successful `AUTH` the connection
+  carries a boolean, not an identity. Every authenticated connection therefore
+  has full authority over **every** scope — read it, quarantine it, and
+  `VMEM.SHRED` it, which is irreversible and reaches shipped archives. Everyone
+  who holds the password shares one trust domain; run one process per trust
+  domain. Scope isolation is a **correctness** property of retrieval (the
+  engine never returns another scope's fact *by mistake*, measured at 0
+  violations in 9 219) and **not an access-control boundary** — asking for
+  another scope by name is permitted. Reporting the absence of ACLs is not a
+  finding; reporting a place where the docs imply scopes are a security
+  boundary is.
 - **`MULTI`/`EXEC` is grouping, not isolation.** Commands from other
   connections can interleave between queued commands. The reasoning is in
   README ("Isolation contract") and `docs/COMMANDS.md`.
@@ -75,9 +87,14 @@ findings will only cost you time:
   server contains facts); facts written before the keyring existed are under no
   key at all and cannot be shredded (`VMEM.RESEAL` moves them forward,
   `VMEM.COVERAGE` shows the gap, and neither can reach copies that already
-  left); `frozenSQ` and flat-HNSW segments are not yet covered in the binary
-  snapshot, so with `-hnsw-use-sq` or fp32 dimensions above 256 facts stay
-  readable in a snapshot taken *before* the shred. The receipt asserts only
+  left); and a snapshot written by an **older build** can still hold the facts
+  in the clear — snapshot format v8 sealed only `frozenSegment`, so with
+  `-hnsw-use-sq` or fp32 dimensions above 256 the payload was exposed. Format
+  **v9 seals all three segment types** (`frozenSegment`, `frozenSQSegment`,
+  `hnswSegment`); re-saving a snapshot migrates an old file forward, and the
+  coverage report answers by a **whitelist** — an unknown segment type counts
+  as uncovered and drops the ratio on its own rather than inheriting trust.
+  The receipt asserts only
   *this key id was destroyed*, never "the data is gone". All of this is in
   `docs/VMEM_DESIGN.md`; a finding is a way to recover sealed payload without
   the KEK, or a claim the engine makes beyond these.
