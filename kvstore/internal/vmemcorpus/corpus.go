@@ -45,7 +45,28 @@ type Params struct {
 	HorizonDays int // длина виртуальной ленты
 
 	KnownQ, ParaQ, AsOfQ, NowChainQ, ErasureQ int
+
+	// NoiseShare — доля «грязи» к PlainFacts (0.8 = ещё 80% сверху). 0 =
+	// выключено, и тогда лента обязана быть БИТ-В-БИТ прежней: чистый корпус
+	// служит контролем, и правка, которая его шевельнёт, обесценит канон
+	// (см. TestCorpusNoiseZeroIsIdentity).
+	//
+	// ЗАЧЕМ. Чистый корпус производит только осмысленные факты: каждый либо
+	// нужен, либо перекрыт supersession, либо явно забыт. Реальная память
+	// пачкается иначе, и обзоры называют это главным практическим отказом —
+	// «через месяц тонут в шуме, потому что ничто не решает, чего не помнить».
+	// Четыре формы грязи ниже — то, чего генератор не делал.
+	NoiseShare float64
 }
+
+// Формы шума. Все садятся В ТОТ ЖЕ SCOPE, что источник: шум в чужом скоупе
+// отсекается фильтром бесплатно, и замер вышел бы про фильтр, а не про поиск.
+const (
+	NoiseJunk    = "junk"    // случайные слова, ent-токена нет: чистый объём
+	NoiseDup     = "dup"     // почти-дубликат источника без ent-токена
+	NoiseStale   = "stale"   // тот же ent-токен, СТАРШЕ источника, без supersedes
+	NoiseRestate = "restate" // пересказ подмножеством слов, позже источника
+)
 
 // Default — базовые размеры бенча (канон шага 8).
 func Default() Params {
@@ -300,6 +321,14 @@ func Generate(p Params) *Corpus {
 		}
 	}
 
+	// --- шум (по умолчанию выключен) -----------------------------------------
+	// ⭐Собственный RNG — не украшение. Основной rng ниже строит ЗАПРОСЫ; если
+	// шум съест хоть один розыгрыш, набор запросов поедет, и деградацию будет
+	// не на что списать: сравнивались бы разные вопросы, а не разные корпуса.
+	if p.NoiseShare > 0 {
+		plain = append(plain, genNoise(p, plain[:p.PlainFacts], plainWords, nowV)...)
+	}
+
 	// --- лента событий -------------------------------------------------------
 	events := make([]Event, 0, len(plain)+len(forgets))
 	for _, f := range plain {
@@ -401,6 +430,73 @@ func Generate(p Params) *Corpus {
 
 // bowVec — hashed bag-of-words: детерминированный юнит-вектор текста, плечо
 // похожести коррелирует с пересечением слов.
+// noiseSeedSalt — сдвиг seed'а для шумового RNG. Отдельный поток розыгрышей,
+// чтобы включение шума не двигало ни ленту чистых фактов, ни набор запросов.
+const noiseSeedSalt = 0x5EED4E01
+
+// genNoise строит «грязь» из УЖЕ построенных обычных фактов. Шум не порождает
+// ни одного запроса: вопросы остаются те же, что на чистом корпусе, и потому
+// падение метрики можно списать на корпус, а не на смену вопросов.
+//
+// Формы намеренно РАЗНЫЕ по механизму вреда:
+//   - junk давит объёмом (растёт df, падает idf редких слов);
+//   - dup конкурирует лексически, не будучи целью;
+//   - stale делит с целью опознавательный ent-токен и не перекрыт supersession —
+//     развязать ничью обязано затухание, потому он и СТАРШЕ цели;
+//   - restate — пересказ от имени агента: слова цели без её токена, позже цели.
+func genNoise(p Params, src []*Fact, srcWords [][]string, nowV int64) []*Fact {
+	rng := rand.New(rand.NewSource(p.Seed ^ noiseSeedSalt))
+	n := int(float64(p.PlainFacts) * p.NoiseShare)
+	out := make([]*Fact, 0, n)
+	kinds := []string{NoiseJunk, NoiseDup, NoiseStale, NoiseRestate}
+	for i := 0; i < n; i++ {
+		kind := kinds[i%len(kinds)]
+		si := rng.Intn(len(src))
+		s, sw := src[si], srcWords[si]
+		f := &Fact{
+			ID:    fmt.Sprintf("noise:%s:%06d", kind, i),
+			Scope: s.Scope, // тот же скоуп: иначе фильтр уберёт шум бесплатно
+			Type:  "note",
+			Imp:   -1,
+			At:    s.At,
+		}
+		switch kind {
+		case NoiseJunk:
+			w := make([]string, 8+rng.Intn(17))
+			for j := range w {
+				u := rng.Float64() * rng.Float64()
+				w[j] = fmt.Sprintf("word%05d", int(float64(p.Vocab)*u))
+			}
+			f.Text = strings.Join(w, " ")
+			f.At = nowV - rng.Int63n(int64(p.HorizonDays)*day)
+		case NoiseDup:
+			w := append([]string{}, sw...)
+			if len(w) > 3 {
+				w = w[:len(w)-2] // «почти» тот же текст, но без ent-токена
+			}
+			f.Text = strings.Join(w, " ")
+		case NoiseStale:
+			// ent-токен цели + её слова, но СТАРШЕ на 60–180 дней и без
+			// supersedes: два живых факта на один опознавательный токен.
+			w := append(append([]string{}, sw...), fmt.Sprintf("ent%05d", si))
+			f.Text = strings.Join(w, " ")
+			f.At = s.At - (60+rng.Int63n(121))*day
+		case NoiseRestate:
+			k := 3 + rng.Intn(4)
+			w := make([]string, 0, k+1)
+			for j := 0; j < k && j < len(sw); j++ {
+				w = append(w, sw[rng.Intn(len(sw))])
+			}
+			f.Text = strings.Join(append(w, "recalled"), " ")
+			if s.At+day < nowV {
+				f.At = s.At + rng.Int63n(nowV-s.At-day)
+			}
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 func bowVec(text string) []float32 {
 	v := make([]float32, bowDim)
 	for _, w := range strings.Fields(text) {
