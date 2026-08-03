@@ -14,6 +14,14 @@ when you bring embeddings. Agents plug in over **MCP** in two minutes
 ([docs/QUICKSTART_MCP.md](docs/QUICKSTART_MCP.md)); everything is also
 scriptable over **RESP** from any Redis client library.
 
+Retrieval quality is measured against a public benchmark rather than asserted:
+**97.4% R@5 on LongMemEval_S** (500 questions, retrieval-only, no LLM in the
+loop) — in a run that also reproduces the published 96.6% baseline, so the
+comparison is checkable rather than claimed. Read it as parity with a good
+vector store, and see [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the per-type
+breakdown, the one type where our hybrid ranking *loses*, and the stated limits
+of that evidence.
+
 Under the memory surface sits a single-node in-memory engine built for the
 job: HNSW vector search with SQ8 quantization, BM25 full-text with RRF hybrid
 fusion, tenant/attribute filtering, a small frozen KV/TTL/Pub-Sub layer, and
@@ -338,6 +346,15 @@ Measured on standard ANN datasets and real OpenAI embeddings, including
 same-machine head-to-head runs against hnswlib — full tables, methodology and
 honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
 
+- **Retrieval quality on a public benchmark (LongMemEval_S, 500 questions):**
+  **97.4% R@5** through `VMEM.RECALL`, **96.6%** on the pure vector path. The
+  same run reproduces the published **96.6%** ChromaDB/MiniLM baseline exactly —
+  that reproduction, not the headline, is what makes the comparison mean
+  anything. Retrieval-only metric, no LLM anywhere. Treat it as **parity, not a
+  lead**: 487 versus 483 questions of 500. The per-type breakdown shows the
+  hybrid arm is a trade (−16.7 points on indirectly-stated preferences), and
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md) states exactly how far this evidence
+  reaches.
 - **Agent memory (VMEM):** on a 27.5k-event synthetic "agent life" —
   known-item hit@1 **0.982** / MRR **0.991**, paraphrase hit@10 1.000,
   temporal accuracy (`ASOF` + supersession chains) **1.000**, scope isolation

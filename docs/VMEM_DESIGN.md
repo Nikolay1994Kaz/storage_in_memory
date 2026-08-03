@@ -512,7 +512,13 @@ that exists this section is the guarantee.
   reversible if ever).
 - Scope hierarchies; multi-text/chunking (a fact is one short text; long
   documents are RAG's job, not memory's).
-- Chasing LoCoMo/LongMemEval leaderboards.
+- Chasing LoCoMo/LongMemEval leaderboards. Still a non-goal, and the
+  distinction now matters, because LongMemEval **was** run once on 2026-08-03
+  (`BENCHMARKS.md` §8): a benchmark run to obtain a comparable number and a
+  benchmark run to climb are different activities. Nothing in the engine was
+  changed for it, no parameter was tuned against it, and the one question type
+  where our ranking scores *below* the pure vector path is written down in
+  "Known risks" instead of being optimised away.
 
 ## Plan of work
 
@@ -692,6 +698,20 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
 
 ## Known risks / recorded traps
 
+- **Fusion is a trade, and the price is now measured on outside data.** On
+  LongMemEval_S (`BENCHMARKS.md` §8, 500 questions, public ground truth) the
+  hybrid path beats the pure vector path overall — 97.4% vs 96.6% R@5 — but the
+  average hides the shape: +7.2 points on `single-session-user`, +3.0 on
+  `temporal-reasoning`, and **−16.7 on `single-session-preference`** (96.7 →
+  80.0). Preferences are stated indirectly, so the question shares no
+  distinctive terms with the session; the BM25 arm scores near-noise there
+  (73.3% alone) and RRF still lets it displace the correct vector hit. RRF is
+  rank-blind by construction — it cannot tell a confident arm from a guessing
+  one — so this is a property of the fusion rule, not a bug in an arm.
+  Unfixed by choice: the obvious remedy (weight an arm by its own confidence)
+  needs an independent oracle for the fused path before anything is tuned, and
+  we do not have one — tuning against the harness that would grade the tuning
+  is fitting to your own instrument.
 - **Idempotency**: agent retries of REMEMBER without client `ID=` create
   duplicate facts; documented, client `ID=` is the remedy.
 - **Clock skew** on client-supplied `valid_from` is accepted (import

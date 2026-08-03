@@ -343,6 +343,106 @@ Tests: `TestVMEMCorpusBench` (`kvstore/vector/vmem_corpus_bench_test.go`),
 
 ---
 
+## 8. Retrieval quality on a public agent-memory benchmark — LongMemEval
+
+Sections 1–7 measure our index against our own ground truth. This one answers
+the question a buyer asks first — *how well does the memory find the right
+thing?* — on a public benchmark, against a published number.
+
+**Setup.** LongMemEval_S (`xiaowu0162/longmemeval-cleaned`): 500 questions,
+each with its own haystack of ~48 chat sessions (23 796 session-documents,
+18 362 unique). The protocol is copied line-for-line from the MemPalace harness
+that published 96.6% R@5: a session's document is **user turns only** joined
+with `\n`; sessions with no user turn are dropped; the metric is
+`recall_any@5` — *is at least one labelled session in the top 5?*; the embedder
+is `all-MiniLM-L6-v2` (`max_seq_length=256`, so a ~9.6k-character session is
+truncated to roughly its first tenth — theirs is too). **No LLM is invoked
+anywhere**: ground truth ships in the data as `answer_session_ids`.
+
+**Calibration first.** Our `exact` arm — a plain NumPy cosine scan, which is
+also what ChromaDB does at a 48-document pool — reproduces **96.6%**, the
+published figure. That is what makes the rest of the table comparable: same
+corpus, same truncation, same metric, same embedder. A benchmark that first
+reproduces someone else's number and then prints its own is a different object
+from one that only prints its own.
+
+| arm | R@5 | what it is |
+|---|---|---|
+| `exact` | 96.6% | embedder ceiling = the published baseline, reproduced |
+| `vsim` | **96.6%** | our vector path (`VSIM.FILTER`, columnar tenant filter) |
+| `bm25` | 96.2% | `VMEM.RECALL` without `VEC` — the lexical arm alone |
+| `vmem` | **97.4%** | `VMEM.RECALL` — hybrid + decay + importance |
+| control — foreign question | 18.6–22.2% | same pool, another question's text/vector |
+| control — analytic random | 10.5% | 5/N |
+
+**97.4% against 96.6% is 487 versus 483 questions out of 500 — parity, not a
+lead.** The value is that the number exists and lines up, not that it is bigger.
+
+**What the average hides.** Per question type the lexical arm is a trade, not a
+free win:
+
+| type | n | `exact`/`vsim` | `bm25` | `vmem` |
+|---|---|---|---|---|
+| knowledge-update | 78 | 100.0 | 100.0 | 100.0 |
+| multi-session | 133 | 99.2 | 98.5 | 99.2 |
+| single-session-assistant | 56 | 96.4 | 96.4 | 96.4 |
+| **single-session-preference** | 30 | **96.7** | **73.3** | **80.0** |
+| single-session-user | 70 | 91.4 | 98.6 | **98.6** |
+| temporal-reasoning | 133 | 94.7 | 95.5 | **97.7** |
+
+Fusion buys +7.2 points on `single-session-user` and +3.0 on
+`temporal-reasoning`, and pays **−16.7 on preferences**: preferences are stated
+indirectly, the question shares no distinctive terms with the session, BM25
+alone scores near-noise there (73.3%), and RRF lets it displace the correct
+vector hit. Known, unfixed, and invisible in the aggregate.
+
+**Recency decay costs 0.2 points here — and this benchmark cannot test it.**
+Inserting every session with its real date (`VALIDFROM`) changes all 500 top-1
+scores, so the setting demonstrably took effect, yet R@5 does not move. The
+reason is measured, not assumed: the **median date spread inside one haystack
+is 11 days** against a 30-day half-life, so all candidates age together and the
+rank penalty does not reorder them. Nothing about freshness should be claimed
+from this dataset.
+
+**One dataset artifact, named and subtracted.** Querying with `ASOF` = the
+question's own date drops the temporal row to 82.7%. That is the data, not the
+engine: 1 471 haystack sessions are dated **after** the question that asks
+about them, and for 20 questions *every* labelled session is. All 20 are
+`temporal-reasoning`, and 20 of 133 accounts for the drop exactly. Over the 480
+questions where `ASOF` still leaves an answer reachable: 97.1%, against 97.3%
+without it.
+
+**How far this evidence reaches** — the harness prints this block on every run,
+so the limits travel with the numbers instead of living in someone's notes:
+
+- **Safe to quote — `exact` / `vsim`.** An independent oracle checks `vsim`
+  against the exact scan **per question**, not on the mean (two different
+  distributions can share a mean). Vectors are rounded to 6 decimals *before*
+  both arms, so a rounding difference cannot masquerade as an engine defect.
+- **Quote with a caveat — `vmem`.** Negative controls run through the engine,
+  output completeness and id resolution are asserted, but there is **no
+  independent oracle**: verifying RRF fusion needs a second implementation.
+- **Do not quote `bm25` against the academic BM25 baseline (~70%).** Leakage is
+  refuted by the control, but the gap itself is unexplained.
+- **Do not quote the per-type table as agreeing with theirs.** Only the
+  aggregate reproduces exactly; per bucket we differ by 1–3 questions in both
+  directions — most likely ONNX (theirs) versus PyTorch (ours) MiniLM — and
+  that was not separately verified.
+
+Instrumentation catches what would otherwise be silent: 3 `bm25` and 6 `ASOF`
+queries return fewer than 5 candidates, which *understates* those arms, and
+every returned id resolved to a session (0 lost). The first run of `vsim`
+returned a flat 0% and the oracle caught it — the cause was ours, not the
+engine's: `VSIM.SEARCHFILTER` in KV mode looks up `<field>:<key>` in the KV
+store and does not see columnar `CAT` attributes at all. The columnar filter is
+`VSIM.FILTER`.
+
+Harness: `scripts/longmemeval_bench.py` (self-contained; oracle, two negative
+controls and a no-op check are part of the run, and any of them failing exits
+non-zero).
+
+---
+
 ## Caveats, all in one place
 
 - **Laptop hardware, thermal throttling** — absolute QPS conservative, ratios reliable.
@@ -362,6 +462,11 @@ Tests: `TestVMEMCorpusBench` (`kvstore/vector/vmem_corpus_bench_test.go`),
 - **ANN is approximate**: under churn a small fraction of stored vectors can
   temporarily miss from top-K (measured ~2% on soak); `VSIM.EXISTS` is the
   exact membership check.
+- **LongMemEval (section 8) does not exercise ANN at all.** Each question
+  retrieves from its own ~48-document pool, so neither we nor the published
+  baseline approximate anything — the number measures the embedder and our
+  fusion, not the index. It is the right answer to "does retrieval work", and
+  the wrong instrument for "does the index scale".
 
 ## Reproducing
 
@@ -406,6 +511,19 @@ go build -o /tmp/kv ./kvstore/cmd/kvstore
 (cd "$(mktemp -d)" && /tmp/kv -port 6390 -metrics-port 0 &)
 go run ./kvstore/cmd/vmemload -addr 127.0.0.1:6390 -mix 30s
 # stop the server with `kill $(pidof kv)` (an exact-name kill, not a substring pkill)
+
+# 4. LongMemEval retrieval quality (section 8) — Python, no Go tags involved
+python3 -m venv .venv && ./.venv/bin/pip install sentence-transformers numpy
+mkdir -p scratch/longmemeval
+curl -L -o scratch/longmemeval/longmemeval_s_cleaned.json \
+  https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+go build -o kvstore-server ./kvstore/cmd/kvstore   # the harness starts its own servers
+./.venv/bin/python scripts/longmemeval_bench.py                              # all arms
+./.venv/bin/python scripts/longmemeval_bench.py --limit=20 --arms=exact,vsim # smoke
+# Pass flags as --name=value: the harness imports scripts/multiagent_sim.py,
+# which parses sys.argv at import time.
+# The first run embeds 18 362 documents (~7 min on 12 cores) and caches them to
+# scratch/longmemeval/emb_*.npz; later runs take ~4 min, all of it engine time.
 ```
 
 The hnswlib side of the head-to-heads: `pip install hnswlib`, same M/efC/ef
