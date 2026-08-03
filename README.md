@@ -83,6 +83,14 @@ semantics in [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md)):
 - **Verbatim anchor.** Recall returns the original stored text, never a lossy
   rewrite; every derived structure is recomputable from the anchors.
 
+These properties are described against a published framework rather than our
+own vocabulary. [docs/MEMORY_GOVERNANCE.md](docs/MEMORY_GOVERNANCE.md) walks the
+nine governance primitives from the *Mnemonic Sovereignty* survey
+([arXiv 2604.16548](https://arxiv.org/abs/2604.16548)) one at a time and marks
+each **implemented**, **partial**, **out of scope by design**, or a **gap** —
+including the two where this engine is weakest and the boundary it will not
+cross (it never decides which fact is true).
+
 ### Recovery after memory corruption
 
 Prevention has a ceiling: a plausible false statement arriving from a

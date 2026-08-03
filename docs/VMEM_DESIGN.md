@@ -505,6 +505,18 @@ that exists this section is the guarantee.
    limitation is stated here and in `docs/COMMANDS.md` rather than left for an
    auditor to discover.
 
+## External framing
+
+What this document specifies in our own terms has a name in the literature:
+the *Mnemonic Sovereignty* survey ([arXiv 2604.16548](https://arxiv.org/abs/2604.16548))
+organizes the same ground into six lifecycle phases, four security objectives
+and nine governance primitives. `MEMORY_GOVERNANCE.md` maps this engine onto
+that framework primitive by primitive, including the two where we are weakest
+(no principal→scope access policy; provenance breaks at agent-authored
+restatements) and the phases that are not ours at all (Execute, Share &
+Propagate). Use that document when explaining the engine to someone outside the
+project; use this one when changing it.
+
 ## Deliberately NOT built (v1)
 
 - LLM fact extraction from dialogue (upper floor — Mem0/Zep territory).
