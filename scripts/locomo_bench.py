@@ -488,7 +488,8 @@ def sweep_halflife(convs, qs, dvs, qv, port, days: list[int]):
 
 
 def arm_vmem(convs, qs, dvs, qv, port, dated: bool, novec: bool = False,
-             asof: bool = False, shuffle: bool = False, halflife: int = 0):
+             asof: bool = False, shuffle: bool = False, halflife: int = 0,
+             weights: tuple[float, float] | None = None):
     """Возвращает (any, cov, топ-1 скоры). ⭐Скоры — не для отчёта, а улика:
     если датированная и недатированная руки дают ПОБАЙТНО те же скоры, значит
     VALIDFROM не долетел, и равенство их recall означает «не измерили», а не
@@ -528,6 +529,12 @@ def arm_vmem(convs, qs, dvs, qv, port, dated: bool, novec: bool = False,
                 args += ["ASOF", str(q.date)]
             if halflife:
                 args += ["HALFLIFE", str(halflife * 24 * 3600)]
+            if weights and not novec:
+                # ⭐Рычаг весов плеч: замер нашёл, что слияние стоит −18.3
+                # пункта, когда одно плечо сильно слабее. Здесь проверяется,
+                # ВОЗВРАЩАЕТ ли рычаг потерянное — на тех же вопросах, где
+                # потеря и была измерена.
+                args += ["WEIGHTS", str(weights[0]), str(weights[1])]
             if not novec:
                 args += ["VEC", *fmt_vec(qv[order[i]])]
             r = c.call(*args)
@@ -574,7 +581,7 @@ CTRL = {"shuffled", "bm25s", "vmems"}
 
 
 def report(convs, qs, res, cov, unit, stat, embedder="minilm",
-           halflife=0) -> None:
+           halflife=0, weights=None) -> None:
     npool = sum(len(c.docs) for c in convs) / len(convs)
     print()
     print(f"единица извлечения: {unit} · вопросов: {len(qs)} · документов: "
@@ -583,7 +590,8 @@ def report(convs, qs, res, cov, unit, stat, embedder="minilm",
     # ⭐конфигурация печатается ВМЕСТЕ с числом: строка «LoCoMo 57%» без
     # эмбеддера и полураспада ничего не значит — оба меняют её на 18 пунктов
     print(f"эмбеддер: {MODEL_NAME if embedder == 'minilm' else NOMIC_MODEL} · "
-          f"полураспад: {str(halflife) + ' дн' if halflife else 'дефолт 30 дн'}")
+          f"полураспад: {str(halflife) + ' дн' if halflife else 'дефолт движка'}"
+          f" · веса плеч: {weights if weights else 'по умолчанию (1,1)'}")
     over = sum(1 for q in qs if q.over_k)
     print(f"целей на вопрос: медиана {int(np.median([len(q.targets) for q in qs]))}"
           f", у {over} вопросов целей больше K — полное покрытие им "
@@ -697,7 +705,10 @@ def main() -> int:
                     default="minilm")
     ap.add_argument("--halflife", type=int, default=0,
                     help="полураспад в днях для рук vmemd/vmema; 0 = дефолт "
-                         "движка (30 дней)")
+                         "движка (365 дней)")
+    ap.add_argument("--weights", default="",
+                    help="веса плеч RRF через запятую: <текст>,<вектор>. "
+                         "Например 1,0 — лексика без векторного голоса")
     a = ap.parse_args()
 
     arms = [x for x in a.arms.split(",") if x]
@@ -722,8 +733,16 @@ def main() -> int:
     cov: dict[str, list[float]] = {}
     sc: dict[str, list[str]] = {}
 
+    wts = None
+    if a.weights:
+        parts = [float(x) for x in a.weights.split(",")]
+        if len(parts) != 2:
+            sys.exit("--weights ждёт ровно два числа: <текст>,<вектор>")
+        wts = (parts[0], parts[1])
+
     def vmem(name, port_off, **kw):
         kw.setdefault("halflife", a.halflife)
+        kw.setdefault("weights", wts)
         res[name], cov[name], sc[name] = arm_vmem(convs, qs, dvs, qv,
                                                   a.port + port_off, **kw)
 
@@ -747,7 +766,7 @@ def main() -> int:
     if "vmems" in arms:
         vmem("vmems", 6, dated=False, shuffle=True)
 
-    report(convs, qs, res, cov, a.unit, stat, a.embedder, a.halflife)
+    report(convs, qs, res, cov, a.unit, stat, a.embedder, a.halflife, wts)
 
     rc = 0
     # ⭐ОРАКУЛ: движок обязан совпасть с точным перебором ВОПРОС-В-ВОПРОС.

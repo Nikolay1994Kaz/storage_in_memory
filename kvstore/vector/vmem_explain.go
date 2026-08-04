@@ -114,7 +114,14 @@ type ExplainResult struct {
 	Hybrid   bool  // шли оба плеча или только лексическое
 	TEff     int64 // момент, на который судились время и возраст (as_of|now)
 	HalfLife int64 // период полураспада, применённый к этому запросу
-	Facts    []ExplainedFact
+	// WeightText / WeightVec — веса плеч, ФАКТИЧЕСКИ применённые к этому
+	// запросу (1.0, если клиент их не задавал). Печатаются всегда, а не только
+	// при отклонении от единицы: разбор инцидента начинается с вопроса «почему
+	// этот факт наверху», и вес, о котором объяснение молчит, — первое место,
+	// где оно разойдётся с ранжированием. На BM25-only пути веса не действуют
+	// и обе величины равны 1.
+	WeightText, WeightVec float64
+	Facts                 []ExplainedFact
 }
 
 // recallTrace — сырьё разложения, заполняемое боевым путём Recall. Все методы
@@ -132,14 +139,19 @@ type recallTrace struct {
 	hybrid   bool
 	tEff     int64
 	halfLife int64
+	// Веса, применённые слиянием. Берутся из боевого пути, а не пересчитываются
+	// из запроса: пересчёт — это вторая реализация, которая разойдётся молча.
+	wText, wVec float64
 }
 
 func (tr *recallTrace) begin(keys []string, nums [][]float64, cands []VTextResult,
-	textArm []VTextResult, vecArm []VSearchResult, hybrid bool, tEff, halfLife int64) {
+	textArm []VTextResult, vecArm []VSearchResult, hybrid bool, tEff, halfLife int64,
+	wText, wVec float64) {
 	if tr == nil {
 		return
 	}
 	tr.keys, tr.nums, tr.hybrid, tr.tEff, tr.halfLife = keys, nums, hybrid, tEff, halfLife
+	tr.wText, tr.wVec = wText, wVec
 	tr.base = make([]float64, len(cands))
 	tr.final = make([]float64, len(cands))
 	tr.drops = make([]DropReason, len(cands))
@@ -200,7 +212,8 @@ func (lvs *LeveledVectorStore) Explain(req RecallRequest, now int64) (ExplainRes
 	if _, err := lvs.recall(req, now, tr); err != nil {
 		return ExplainResult{}, err
 	}
-	res := ExplainResult{Hybrid: tr.hybrid, TEff: tr.tEff, HalfLife: tr.halfLife}
+	res := ExplainResult{Hybrid: tr.hybrid, TEff: tr.tEff, HalfLife: tr.halfLife,
+		WeightText: tr.wText, WeightVec: tr.wVec}
 	if len(tr.keys) == 0 {
 		return res, nil // пре-фильтр не дал ни одного кандидата
 	}

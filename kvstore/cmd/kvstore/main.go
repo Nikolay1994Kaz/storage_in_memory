@@ -1275,6 +1275,22 @@ func parseRecallArgs(args [][]byte) (vector.RecallRequest, string) {
 			}
 			rreq.HalfLifeSec = v
 			i += 2
+		case "WEIGHTS":
+			// Веса плеч RRF: <текст> <вектор>. Рычаг, а не автоматика — движок
+			// не угадывает сам, какое плечо гасить (см. RecallRequest).
+			if i+2 >= len(args) {
+				return rreq, "WEIGHTS requires <text> <vector>"
+			}
+			wt, err := strconv.ParseFloat(unsafeString(args[i+1]), 64)
+			if err != nil {
+				return rreq, "WEIGHTS text weight not a number"
+			}
+			wv, err := strconv.ParseFloat(unsafeString(args[i+2]), 64)
+			if err != nil {
+				return rreq, "WEIGHTS vector weight not a number"
+			}
+			rreq.WeightText, rreq.WeightVec = &wt, &wv
+			i += 3
 		case "VEC":
 			rreq.Vector = make([]float32, 0, len(args)-i-1)
 			for j := i + 1; j < len(args); j++ {
@@ -1286,9 +1302,13 @@ func parseRecallArgs(args [][]byte) (vector.RecallRequest, string) {
 			}
 			return rreq, ""
 		default:
-			return rreq, fmt.Sprintf("unexpected token %q (want ASOF|ALL|TYPE|SOURCE|HALFLIFE|VEC)", unsafeString(args[i]))
+			return rreq, fmt.Sprintf("unexpected token %q (want ASOF|ALL|TYPE|SOURCE|HALFLIFE|WEIGHTS|VEC)", unsafeString(args[i]))
 		}
 	}
+	// ⚠«WEIGHTS без VEC» здесь НЕ проверяется намеренно: правило живёт в ядре
+	// (ErrVMEMWeightsNoVec), и вторая его копия на разборе аргументов разошлась
+	// бы с первой ровно тогда, когда одну из них поправят. Ошибка ядра
+	// доезжает до клиента тем же путём, что остальные.
 	return rreq, ""
 }
 
@@ -2104,7 +2124,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		buf.WriteBulkString(res.Doc.ID)
 
 	case "VMEM.RECALL":
-		// VMEM.RECALL <scope> <K> <query> [ASOF <unix> | ALL] [TYPE <t>] [SOURCE <s>] [HALFLIFE <sec>] [VEC <f1> ... <fN>]
+		// VMEM.RECALL <scope> <K> <query> [ASOF <unix> | ALL] [TYPE <t>] [SOURCE <s>] [HALFLIFE <sec>] [WEIGHTS <wtext> <wvec>] [VEC <f1> ... <fN>]
 		// Ответ: тройки [id, score, text]. Скор = fused × 2^(−age/halfLife) ×
 		// (0.5+imp) — сравним только внутри выдачи. text — дословный якорь из
 		// KV (пустая строка, если якоря нет: не-VMEM док, попавший в scope).
@@ -2118,7 +2138,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		rreq, parseErr := parseRecallArgs(args)
 		if parseErr == "usage" {
-			buf.WriteError("ERR usage: VMEM.RECALL <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [VEC v1 ... vN]")
+			buf.WriteError("ERR usage: VMEM.RECALL <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [WEIGHTS wtext wvec] [VEC v1 ... vN]")
 			return
 		}
 		if parseErr != "" {
@@ -2166,7 +2186,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		xreq, parseErr := parseRecallArgs(args)
 		if parseErr == "usage" {
-			buf.WriteError("ERR usage: VMEM.EXPLAIN <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [VEC v1 ... vN]")
+			buf.WriteError("ERR usage: VMEM.EXPLAIN <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [WEIGHTS wtext wvec] [VEC v1 ... vN]")
 			return
 		}
 		if parseErr != "" {

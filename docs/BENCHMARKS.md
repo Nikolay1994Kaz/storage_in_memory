@@ -503,8 +503,15 @@ aggregate:
 
 The rule the table states: **RRF fusion pays off when the two arms are
 comparable and costs when one is much weaker** — it lets the weak arm displace
-the strong arm's correct hit. There is currently no knob to down-weight a weak
-arm per query; that is a known gap, and this is the measurement that sizes it.
+the strong arm's correct hit.
+
+This measurement produced a change: `VMEM.RECALL` now takes
+`WEIGHTS wtext wvec`, scaling each arm's vote in the fusion (default `1 1`). It
+is a lever for a client who knows its data, **not autotuning** — the engine does
+not guess which arm to mute, because any such rule would be calibrated against
+the same benchmark that grades the calibration. ⏭Not yet re-measured on LoCoMo:
+the lever is covered by unit and protocol tests, but the run showing how much of
+the −18.3 it recovers has not been done.
 
 **Recency decay — the thing LongMemEval could not test.** There the median date
 spread inside a haystack was 11 days against a 30-day half-life, so candidates

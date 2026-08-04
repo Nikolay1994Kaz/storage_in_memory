@@ -119,6 +119,15 @@ var (
 	// ErrVMEMHalfLife — период полураспада должен быть неотрицательным
 	// (0 = дефолт движка).
 	ErrVMEMHalfLife = errors.New("vmem: half_life must be >= 0 seconds")
+	// ErrVMEMWeights — веса плеч неотрицательны и не могут быть нулевыми
+	// одновременно: слияние без единого голосующего плеча ранжирует пустотой,
+	// а вернуло бы правдоподобный список в произвольном порядке.
+	ErrVMEMWeights = errors.New("vmem: fusion weights must be >= 0 and not both zero")
+	// ErrVMEMWeightsNoVec — веса без вектора отклоняются, а не игнорируются.
+	// Применить их не к чему (BM25-only живёт в скоровой шкале, не в ранговой),
+	// и принять запрос значило бы выдать иллюзию управления: команда «сработала
+	// бы», не изменив ничего.
+	ErrVMEMWeightsNoVec = errors.New("vmem: fusion weights require a query vector (hybrid path only)")
 )
 
 // RememberRequest — вход VMEM.REMEMBER до кухни полей (см. таблицу контракта).
@@ -273,11 +282,31 @@ func vmemPlaceholderVector(id string, dim int) []float32 {
 	return vec
 }
 
-// vmemDefaultHalfLifeSec — дефолтный период полураспада свежести (30 дней).
+// vmemDefaultHalfLifeSec — дефолтный период полураспада свежести (365 дней).
 // Механизм наш, политика клиента: переопределяется per-request (HalfLifeSec).
 // Per-type полураспады — открытая дверь (нужен проброс type кандидатам),
 // добавляются спрос-driven, формат не трогают.
-const vmemDefaultHalfLifeSec = int64(30 * 24 * 3600)
+//
+// ⭐БЫЛО 30 ДНЕЙ, ИЗМЕНЕНО 04.08 ПО ЗАМЕРУ (BENCHMARKS.md §9, LoCoMo).
+// Прежний дефолт был выбран под короткую историю и на ней безвреден: на
+// LongMemEval разброс дат внутри стога — медиана 11 дней, возраст кандидатов
+// почти одинаков, порядок не меняется. Но память живёт дольше стога. На
+// разговорах длиной 184–293 дня штраф λ·age/halfLife = 5·238/30 доходит до
+// +39.7 в знаменателе 1/(60+rank+…) — верный факт восьмимесячной давности
+// проигрывает свежему, стоящему СОРОКОВЫМ по релевантности. Цена замерена:
+// −11.8 пункта recall@5 на репликах, −27.2 на сессиях.
+//
+// Свип показал, что механизм исправен, а неверен именно дефолт: 30 дн → 39.1%,
+// 90 → 48.6%, 365 → 51.0%, 1095 → 51.1% при базе без затухания 50.9%. С года и
+// выше recall возвращается к базе РОВНО, при этом свежесть продолжает работать
+// в нужную сторону: +2.5 пункта на целях моложе 30 дней, −1.8 на старше 180.
+// Год выбран как наименьшее значение, которое уже не стоит ничего: 1095 дней
+// добавляет 0.1 пункта и заодно почти выключает механизм.
+//
+// ⚠Кому нужно быстрое забывание (сессионный контекст, «что мы делали на этой
+// неделе») — ставит HALFLIFE явно. Дефолт обязан быть безопасным, а безопасный
+// здесь тот, который не топит старые факты молча.
+const vmemDefaultHalfLifeSec = int64(365 * 24 * 3600)
 
 // vmemRecallOverfetch — глубина кандидатов до скоринга (шаг 5): свежий важный
 // факт с рангом похожести > K обязан уметь всплыть в top-K; скоринг только
@@ -318,6 +347,31 @@ type RecallRequest struct {
 	// HalfLifeSec — период полураспада свежести в секундах (шаг 5);
 	// 0 → vmemDefaultHalfLifeSec. Политика затухания принадлежит клиенту.
 	HalfLifeSec int64
+	// WeightText / WeightVec — веса плеч в RRF-слиянии; nil → 1.0 (обычное
+	// равноправное слияние). Действуют ТОЛЬКО на гибридном пути.
+	//
+	// ⭐ЗАЧЕМ (BENCHMARKS.md §9). RRF ранг-слеп по построению: он не отличает
+	// уверенное плечо от гадающего, и слабое плечо голосует наравне с сильным.
+	// Замер на LoCoMo показал, что у этого есть ЗНАК: слияние стоит +6.2 пункта
+	// recall@5, когда плечи сопоставимы (57.0 против 54.9 поодиночке → 61.1
+	// слитно), и −18.3, когда одно сильно слабее (51.8 против 90.4 → 72.1).
+	// Один корпус, одно правило, противоположный исход — разница только в
+	// балансе плеч. Клиенту, который знает свои данные, нужен способ сказать
+	// это движку.
+	//
+	// 🚨ЭТО РЫЧАГ, А НЕ АВТОМАТИКА, и намеренно. Движок НЕ пытается сам угадать,
+	// какое плечо гасить: правило вида «плоские скоры → плечо гадает» пришлось
+	// бы калибровать по тому же бенчмарку, который потом эту калибровку и
+	// оценивает — подгонка под собственный прибор. Автоподбор ждёт независимого
+	// оракула фьюжна (его нет, см. Known risks в VMEM_DESIGN.md).
+	//
+	// ⚠Вес 0 выключает ГОЛОС плеча в ранговом слиянии, но не переключает запрос
+	// на одноплечий путь: BM25-only живёт в другой шкале (score × пол возраста
+	// × важность), а не в ранговой. `WEIGHTS 1 0` и «не передать VEC вовсе» —
+	// два разных запроса, и порядок выдачи у них может отличаться. Кандидаты
+	// выключенного плеча остаются в пуле с нулевым вкладом.
+	WeightText *float64
+	WeightVec  *float64
 }
 
 // recallFilter — чистая кухня фильтра RECALL: три режима валидности = один
@@ -350,6 +404,24 @@ func recallFilter(req RecallRequest, now int64) (Filter, error) {
 	}
 	if req.HalfLifeSec < 0 {
 		return Filter{}, ErrVMEMHalfLife
+	}
+	// Веса судятся ДО поиска, а не при слиянии: запрос с бессмысленными весами
+	// обязан упасть, а не тихо отранжировать нулями. NaN проходит любое
+	// сравнение — ловится явно.
+	if wt, wv := req.WeightText, req.WeightVec; wt != nil || wv != nil {
+		if req.Vector == nil {
+			return Filter{}, ErrVMEMWeightsNoVec
+		}
+		t, v := 1.0, 1.0
+		if wt != nil {
+			t = *wt
+		}
+		if wv != nil {
+			v = *wv
+		}
+		if math.IsNaN(t) || math.IsNaN(v) || t < 0 || v < 0 || (t == 0 && v == 0) {
+			return Filter{}, ErrVMEMWeights
+		}
 	}
 	f := Filter{
 		Eq: map[string]string{vmemAttrScope: req.Scope},
@@ -422,6 +494,15 @@ func (lvs *LeveledVectorStore) recall(req RecallRequest, now int64, tr *recallTr
 
 	depth := max(vmemRecallOverfetch, req.K)
 	hybrid := req.Vector != nil
+	// Веса объявлены здесь, а не внутри ветки слияния: их видит и трассировка
+	// EXPLAIN, которая обязана печатать ФАКТИЧЕСКИ применённые значения.
+	wText, wVec := 1.0, 1.0
+	if req.WeightText != nil {
+		wText = *req.WeightText
+	}
+	if req.WeightVec != nil {
+		wVec = *req.WeightVec
+	}
 	var cands []VTextResult // BM25-only: скоры плеча; hybrid: собирается ПОСЛЕ проекции
 	var keys []string
 	var textArm []VTextResult
@@ -494,10 +575,10 @@ func (lvs *LeveledVectorStore) recall(req RecallRequest, now int64, tr *recallTr
 		}
 		fused := make([]float64, len(keys))
 		for r := range textArm {
-			fused[pos[textArm[r].Key]] += 1.0 / (float64(rrfK+r+1) + agePen(textArm[r].Key))
+			fused[pos[textArm[r].Key]] += wText / (float64(rrfK+r+1) + agePen(textArm[r].Key))
 		}
 		for r := range vecArm {
-			fused[pos[vecArm[r].Key]] += 1.0 / (float64(rrfK+r+1) + agePen(vecArm[r].Key))
+			fused[pos[vecArm[r].Key]] += wVec / (float64(rrfK+r+1) + agePen(vecArm[r].Key))
 		}
 		cands = make([]VTextResult, len(keys))
 		for i, k := range keys {
@@ -508,7 +589,7 @@ func (lvs *LeveledVectorStore) recall(req RecallRequest, now int64, tr *recallTr
 	// Снимок ДО множителей памяти: дальше цикл домножает cands[i].Score на
 	// месте и переиспользует тот же массив под kept (cands[:0]), так что после
 	// него исходных скоров уже не существует.
-	tr.begin(keys, nums, cands, textArm, vecArm, hybrid, tEff, halfLife)
+	tr.begin(keys, nums, cands, textArm, vecArm, hybrid, tEff, halfLife, wText, wVec)
 
 	var typeOK []bool
 	if req.TypeEq != "" {

@@ -730,9 +730,14 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
   **−18.3** when one is far weaker (51.8 vs 90.4 alone → 72.1 fused). Same rule,
   same corpus, opposite outcome depending only on arm balance. This sharpens the
   entry above: the missing knob is not "weight by confidence" in the abstract,
-  it is "detect that one arm is out of its depth on *this* query". Still
-  unfixed, and still for the same reason — no independent oracle for the fused
-  path.
+  it is "detect that one arm is out of its depth on *this* query".
+  **Half-fixed on 2026-08-04**: `WEIGHTS wtext wvec` now scales each arm's vote
+  (default `1 1`, requires `VEC`, rejects negatives and both-zero). That is a
+  **lever for the client, not autotuning** — and the distinction is the whole
+  point. A rule of the form "flat scores mean the arm is guessing" would have to
+  be calibrated against the same benchmark that then grades the calibration,
+  which is fitting to your own instrument. Automatic arm weighting stays
+  unfixed, for the unchanged reason: no independent oracle for the fused path.
 - **The default half-life is a short-history default.** `BENCHMARKS.md` §9
   measures it: on conversations spanning 184–293 days, the 30-day default costs
   **11.8 points** of recall@5 (turn unit) and 27.2 (session unit), because the
