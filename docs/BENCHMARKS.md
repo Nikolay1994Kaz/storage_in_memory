@@ -448,6 +448,130 @@ non-zero).
 
 ---
 
+## 9. Retrieval quality on a second public benchmark — LoCoMo
+
+Section 8 answers "does retrieval work" against a published number. This one
+was run because LoCoMo is the other benchmark the niche quotes, and because its
+corpus can test something LongMemEval structurally cannot: **recency decay**.
+
+> **This is retrieval recall, not QA accuracy. No LLM is invoked anywhere.**
+> Published "LoCoMo N%" figures are sometimes retrieval recall and sometimes
+> LLM-judged answer accuracy, and the two differ by a wide margin. One author
+> publishing such a number says so directly — methodologies range over "pure
+> token-overlap F1, pure LLM-as-judge, or hybrid". Placing this row next to
+> someone's QA accuracy would be the same defect this repo fixed in
+> `SECURITY.md`: a measurement lending its credibility to a claim it never made.
+
+**Setup.** `snap-research/locomo`, `locomo10.json`: 10 conversations, 272
+sessions, 5 882 turns. Questions in categories 1–4 total **1 540** — category 5
+(adversarial, 446) is excluded, as everyone publishing figures does, because its
+task is "the model must refuse", not "find"; it ships no `answer`, only
+`adversarial_answer`. Four more questions have no resolvable evidence, leaving
+**1 536**. A document carries the speaker name and, when the turn has an image,
+its caption: 909 of 2 361 labelled turns are multimodal and the answer often
+lives in the caption ("take a look at this" + *a photo of a painting of a sunset
+over a lake*). Without captions those questions are unanswerable by
+construction; the same text is given to every arm.
+
+**Two units, because the strict one and the comparable one are not the same.**
+LoCoMo annotates evidence at turn level (`dia_id`), which is the only
+granularity where the oracle is exact — that is the primary number, with 588
+candidates per question, twelve times LongMemEval's pool. The session unit (27
+candidates) is softer and matches section 8's protocol, where a document was a
+whole session. Both are reported; neither is presented as the other.
+
+**Best measured configuration** (`nomic-embed-text`, half-life 365 d):
+
+| arm | turn | session | what it is |
+|---|---|---|---|
+| `exact` = `vsim` | 57.0% | 67.4% | embedder ceiling; our vector path matches it per question |
+| `bm25` | 54.9% | 90.4% | `VMEM.RECALL` without `VEC` — the lexical arm alone |
+| **`vmem`** | **61.2%** | 82.6% | `VMEM.RECALL` — hybrid + decay + importance |
+| control — foreign question | 1.2–1.5% | 23.4–25.9% | same pool, a question from another conversation |
+| control — analytic random | 0.9% | 18.4% | K/N |
+
+**Fusion is a trade, and here it was measured in both directions.** Section 8
+saw this only inside one bucket (−16.7 on preferences); on LoCoMo it moves the
+aggregate:
+
+| unit / embedder | vector | `bm25` | hybrid | fusion buys |
+|---|---|---|---|---|
+| turn, MiniLM | 39.1% | 54.9% | 50.9% | **−4.0** |
+| turn, nomic | 57.0% | 54.9% | 61.1% | **+6.2** |
+| session, MiniLM | 51.8% | 90.4% | 72.1% | **−18.3** |
+| session, nomic | 67.4% | 90.4% | 83.3% | **−7.1** |
+
+The rule the table states: **RRF fusion pays off when the two arms are
+comparable and costs when one is much weaker** — it lets the weak arm displace
+the strong arm's correct hit. There is currently no knob to down-weight a weak
+arm per query; that is a known gap, and this is the measurement that sizes it.
+
+**Recency decay — the thing LongMemEval could not test.** There the median date
+spread inside a haystack was 11 days against a 30-day half-life, so candidates
+aged together and nothing reordered. LoCoMo conversations span 184–293 days
+(median 238), so age differences are real. The default half-life is wrong for
+that shape, and the cost is large:
+
+| half-life | turn | session |
+|---|---|---|
+| **30 d (default)** | **39.1%** | **44.9%** |
+| 90 d | 48.6% | 61.7% |
+| 365 d | 51.0% | 70.6% |
+| 1095 d | 51.1% | 72.0% |
+| baseline — all facts fresh | 50.9% | 72.1% |
+
+The mechanism is sound, the default is not: from a year upward decay returns
+recall to baseline exactly. The arithmetic matches the code — the rank penalty
+is `λ·age/half-life` with `λ=5` inside `1/(60 + rank + …)`, so at a 238-day age
+a fact carries +39.7 and loses to a fresh one sitting fortieth by relevance. At
+a 365-day half-life the setting turns mild and useful: **+2.5 points on targets
+younger than 30 days, −1.8 on targets older than 180** (turn unit).
+
+**Where the remaining gap actually is — the write path, not the search.** Three
+instruments agree, and they point away from retrieval:
+
+- an **oracle of findability**: querying with the target's own text finds it
+  **100%** of the time, so indexing and protocol are sound;
+- the median rank of the correct turn is **11** out of 588, and 74.3% of targets
+  sit in the top 50 — near, but not top-5;
+- **66.9%** of queries land on the right *place* in the conversation (39.1%
+  exact turn, +18.0% a turn within ±2, +9.8% the same session).
+
+The failure is the distance between a question and a **raw conversational
+turn**: *"What is Joanna's project called?"* against *"Thanks, Nate! We've made
+some great progress. I'm working on one with my group called 'Finding Home.'"* —
+rank 117. Systems that store LLM-extracted, self-contained facts are matching
+the question against something close to a restatement of itself. That is a
+difference in what gets written, not in how it is found, and it is worth stating
+plainly rather than hiding inside an aggregate.
+
+**How far this evidence reaches** — printed by the harness on every run:
+
+- **Safe to quote — `exact` / `vsim`.** The oracle checks `vsim` against the
+  exact scan **per question** on both units; vectors are rounded to 6 decimals
+  before both arms.
+- **Quote with a caveat — `vmem`.** Controls run through the engine and output
+  completeness and id resolution are asserted, but there is no independent
+  oracle for RRF fusion.
+- **The session unit is the soft number.** 27 candidates, and blind choice
+  already scores 18.4% — the strict figure is the turn unit.
+- **Not a ranking against published figures.** Systems storing compressed facts
+  retrieve a different kind of object; their recall@5 is not computed over these
+  documents. Context, not a leaderboard position.
+- **Dataset repairs are counted, not silent.** Six evidence references are
+  malformed and repairable (`D8:6; D9:17`, `D:11:26`, `D30:05`); three point at
+  turns that do not exist (`D10:19` in a 16-turn session, `D4:36` in a 25-turn
+  one, a bare `D`). An unresolved reference silently *lowers* recall, so the
+  count is printed.
+- **One control is weaker than intended.** The shuffle requires the substituted
+  question to come from another conversation; for 132 questions the fallback
+  permutation could not honour that, and the harness says so on each run.
+
+Harness: `scripts/locomo_bench.py` (oracle, three negative controls and two
+no-op checks are part of the run; any failure exits non-zero).
+
+---
+
 ## Caveats, all in one place
 
 - **Laptop hardware, thermal throttling** — absolute QPS conservative, ratios reliable.
@@ -472,6 +596,15 @@ non-zero).
   baseline approximate anything — the number measures the embedder and our
   fusion, not the index. It is the right answer to "does retrieval work", and
   the wrong instrument for "does the index scale".
+- **LoCoMo (section 9) does not exercise ANN either** — 588 candidates per
+  question at the turn unit, far below the brute-force threshold. Same reading:
+  it measures retrieval quality, not index scaling. It *does* test recency
+  decay, which section 8 structurally cannot.
+- **The recency half-life default (30 days) is tuned for short histories.** On a
+  corpus spanning eight months it costs 11.8 points (turn) and 27.2 (session);
+  a half-life of a year or more removes the cost entirely. The policy is
+  per-request (`HALFLIFE`), so this is a default to set consciously, not a
+  defect — but leaving it unset on long-lived memory is a measured mistake.
 
 ## Reproducing
 
@@ -529,6 +662,19 @@ go build -o kvstore-server ./kvstore/cmd/kvstore   # the harness starts its own 
 # which parses sys.argv at import time.
 # The first run embeds 18 362 documents (~7 min on 12 cores) and caches them to
 # scratch/longmemeval/emb_*.npz; later runs take ~4 min, all of it engine time.
+
+# 5. LoCoMo retrieval quality (section 9) — same venv, same server binary
+mkdir -p scratch/locomo
+curl -L -o scratch/locomo/locomo10.json \
+  https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json
+./.venv/bin/python scripts/locomo_bench.py --unit turn        # strict, 588 candidates
+./.venv/bin/python scripts/locomo_bench.py --unit session     # soft, 27 candidates
+# best measured configuration (needs a local ollama serving nomic-embed-text):
+./.venv/bin/python scripts/locomo_bench.py --unit turn --embedder nomic --halflife 365
+# what the default half-life costs on an eight-month corpus:
+./.venv/bin/python scripts/locomo_bench.py --unit turn --sweep-halflife 30,90,365,1095
+# Check ollama by calling /api/embed, not `systemctl --user is-active ollama` —
+# the unit reports inactive while the server answers fine.
 ```
 
 The hnswlib side of the head-to-heads: `pip install hnswlib`, same M/efC/ef

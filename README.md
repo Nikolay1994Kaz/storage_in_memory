@@ -14,13 +14,22 @@ when you bring embeddings. Agents plug in over **MCP** in two minutes
 ([docs/QUICKSTART_MCP.md](docs/QUICKSTART_MCP.md)); everything is also
 scriptable over **RESP** from any Redis client library.
 
-Retrieval quality is measured against a public benchmark rather than asserted:
+Retrieval quality is measured against public benchmarks rather than asserted:
 **97.4% R@5 on LongMemEval_S** (500 questions, retrieval-only, no LLM in the
 loop) — in a run that also reproduces the published 96.6% baseline, so the
 comparison is checkable rather than claimed. Read it as parity with a good
 vector store, and see [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the per-type
 breakdown, the one type where our hybrid ranking *loses*, and the stated limits
 of that evidence.
+
+A second benchmark, **LoCoMo**, is reported the same way and is less flattering
+on purpose: **61.2% recall@5** against annotated evidence turns (1 536
+questions, retrieval-only). It is a stricter unit — the correct *turn* out of
+588 candidates, not the correct session — and it is the run that found two
+things worth knowing before you deploy: the default recency half-life is wrong
+for memories spanning months, and hybrid fusion *costs* recall when one arm is
+much weaker than the other. Both are quantified in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) §9.
 
 Under the memory surface sits a single-node in-memory engine built for the
 job: HNSW vector search with SQ8 quantization, BM25 full-text with RRF hybrid
@@ -374,6 +383,17 @@ honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
   hybrid arm is a trade (−16.7 points on indirectly-stated preferences), and
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md) states exactly how far this evidence
   reaches.
+- **Retrieval quality on a second public benchmark (LoCoMo, 1 536 questions):**
+  **61.2% recall@5** against annotated evidence *turns* — 588 candidates per
+  question, retrieval-only, no LLM. Two findings the aggregate would have
+  hidden: the **default 30-day half-life costs 11.8 points** on conversations
+  spanning eight months (a half-life of a year restores it exactly), and
+  **hybrid fusion is directional** — worth +6.2 points when the vector and
+  lexical arms are comparable, worth −18.3 when one is far weaker. The
+  remaining gap to systems that store LLM-extracted facts is in the *write
+  path*, not the search: querying by the target's own text finds it 100% of the
+  time, and 66.9% of queries already land within the right stretch of the
+  conversation.
 - **Agent memory (VMEM):** on a 27.5k-event synthetic "agent life" —
   known-item hit@1 **0.982** / MRR **0.991**, paraphrase hit@10 1.000,
   temporal accuracy (`ASOF` + supersession chains) **1.000**, scope isolation
