@@ -101,8 +101,19 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 # nomic-embed-text (768 dim, 2024) отвечает: 57.0%, то есть плечо. Держать
 # обе модели обязательно — MiniLM для сопоставимости с нашим же LongMemEval,
 # nomic для ответа на вопрос «а если эмбеддер не из позапрошлой эпохи».
+# ⭐Третий эмбеддер отвечает на другой вопрос, чем второй. nomic показал, что
+# дело в ПЛЕЧЕ, а не в слиянии. bge-m3 (567M против 137M, 1024 dim против 768)
+# проверяет, есть ли у этого запас: если прибавка от вчетверо большей модели
+# мала, плечо упёрлось не в модель. ⚠И он мультиязычный — свой корпус (272
+# транскрипта) русский, там английские модели мерили бы себя, а не наш поиск.
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434") + "/api/embed"
 NOMIC_MODEL = "nomic-embed-text"
+BGE_MODEL = "bge-m3"
+OLLAMA_MODELS = {"nomic": NOMIC_MODEL, "bge": BGE_MODEL}
+# ⭐(префикс документа, префикс запроса). Только у nomic: он обучен различать
+# роль текста, документы и запросы ложатся в разные области пространства.
+# У bge-m3 и MiniLM обязательных префиксов нет — приписка была бы шумом.
+EMBED_PREFIX = {"nomic": ("search_document: ", "search_query: ")}
 VENV_HINT = "нужен sentence-transformers: scratch/.venv/bin/python"
 K = 5
 ROUND = 6  # знаков после запятой в векторе, общих для numpy и движка
@@ -268,22 +279,39 @@ def load(unit: str, limit: int | None) -> tuple[list[Conversation],
 
 # ─────────────────────────── эмбеддинги ─────────────────────────────────────
 
-def _embed_ollama(texts: list[str], batch: int = 64) -> np.ndarray:
-    """nomic-embed-text через локальную ollama. ⚠Проверять доступность надо
+def _embed_ollama(texts: list[str], model: str = NOMIC_MODEL,
+                  batch: int = 64, cpu: bool = False) -> np.ndarray:
+    """Эмбеддер через локальную ollama. ⚠Проверять доступность надо
     ЗАПРОСОМ К API: `systemctl --user is-active ollama` отвечает inactive и
-    при живом сервере — юнит врёт в обе стороны."""
+    при живом сервере — юнит врёт в обе стороны.
+
+    🚨cpu=True считает на процессоре. Это не оптимизация, а обход дефекта
+    среды: bge-m3 (XLM-RoBERTa-large) в f16 на GTX 1650 (Turing) выдаёт NaN
+    примерно на 37% обычных английских реплик, ollama не может сериализовать
+    NaN в JSON и отвечает 500. На CPU те же тексты считаются чисто. Проверено
+    04.08: батч 4 проходит, батч 8 падает, один и тот же текст даёт 500 на GPU
+    и вектор из 1024 чисел с num_gpu=0. Цена — 7.2 док/с вместо GPU-скорости.
+    """
     import json as _json
     import urllib.request
     out = []
     t0 = time.time()
     for s in range(0, len(texts), batch):
+        body = {"model": model, "input": texts[s:s + batch]}
+        if cpu:
+            body["options"] = {"num_gpu": 0}
         req = urllib.request.Request(
-            OLLAMA_URL,
-            data=_json.dumps({"model": NOMIC_MODEL,
-                              "input": texts[s:s + batch]}).encode(),
+            OLLAMA_URL, data=_json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=600) as r:
-            out.extend(_json.load(r)["embeddings"])
+        try:
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                out.extend(_json.load(r)["embeddings"])
+        except urllib.error.HTTPError as e:
+            if e.code == 500 and not cpu:
+                sys.exit(f"ollama 500 на батче {s}..{s + batch} модели "
+                         f"{model}. Частая причина — NaN в векторе на GPU "
+                         f"(см. докстроку). Проверить: --embed-cpu")
+            raise
     el = max(time.time() - t0, 1e-9)
     print(f"  готово за {el:.1f} с ({len(texts) / el:.0f} док/с)")
     v = np.array(out, dtype=np.float32)
@@ -292,7 +320,8 @@ def _embed_ollama(texts: list[str], batch: int = 64) -> np.ndarray:
 
 
 def embed_all(convs: list[Conversation], qs: list[Question], tag: str,
-              embedder: str = "minilm") -> tuple[list[np.ndarray], np.ndarray]:
+              embedder: str = "minilm", cpu: bool = False,
+              prefix: bool = True) -> tuple[list[np.ndarray], np.ndarray]:
     """Возвращает (векторы документов по разговорам, векторы вопросов)."""
     texts: list[str] = []
     spans: list[tuple[int, int]] = []
@@ -301,21 +330,32 @@ def embed_all(convs: list[Conversation], qs: list[Question], tag: str,
         texts.extend(c.docs)
     qtexts = [q.text for q in qs]
 
-    model = MODEL_NAME if embedder == "minilm" else NOMIC_MODEL
+    model = OLLAMA_MODELS.get(embedder, MODEL_NAME)
+    # ⭐nomic обучен РАЗЛИЧАТЬ роль текста по префиксу: документ и запрос
+    # ложатся в разные области пространства. Без префикса модель работает не в
+    # своём режиме. ⚠Префикс уходит ТОЛЬКО в эмбеддер: в движок документ
+    # обязан лечь чистым, иначе лексический ствол проиндексирует само слово
+    # «search_document» и замер станет мерить нашу же приписку.
+    pre = EMBED_PREFIX.get(embedder) if prefix else None
+    if pre:
+        etexts = [pre[0] + t for t in texts]
+        eqtexts = [pre[1] + q for q in qtexts]
+    else:
+        etexts, eqtexts = texts, qtexts
     sig = hashlib.sha256(
         (tag + "|" + model + "|" + str(len(texts)) + "|" +
-         str(len(qtexts))).encode()).hexdigest()[:16]
+         str(len(qtexts)) + ("|pre" if pre else "")).encode()).hexdigest()[:16]
     cache = os.path.join(CACHE_DIR, f"emb_{embedder}_{sig}.npz")
     if os.path.exists(cache):
         z = np.load(cache)
         print(f"эмбеддинги из кэша: {cache}")
         dv, qv = z["docs"], z["qs"]
     else:
-        print(f"эмбеддинг ({model}): {len(texts)} документов + "
-              f"{len(qtexts)} вопросов")
-        if embedder == "nomic":
-            dv = _embed_ollama(texts)
-            qv = _embed_ollama(qtexts)
+        print(f"эмбеддинг ({model}{', с префиксами' if pre else ''}): "
+              f"{len(texts)} документов + {len(qtexts)} вопросов")
+        if embedder in OLLAMA_MODELS:
+            dv = _embed_ollama(etexts, model, cpu=cpu)
+            qv = _embed_ollama(eqtexts, model, cpu=cpu)
         else:
             try:
                 from sentence_transformers import SentenceTransformer
@@ -323,9 +363,9 @@ def embed_all(convs: list[Conversation], qs: list[Question], tag: str,
                 sys.exit(f"нет sentence_transformers. {VENV_HINT}")
             m = SentenceTransformer(MODEL_NAME)
             t0 = time.time()
-            dv = m.encode(texts, batch_size=64, normalize_embeddings=True,
+            dv = m.encode(etexts, batch_size=64, normalize_embeddings=True,
                           show_progress_bar=False).astype(np.float32)
-            qv = m.encode(qtexts, batch_size=64, normalize_embeddings=True,
+            qv = m.encode(eqtexts, batch_size=64, normalize_embeddings=True,
                           show_progress_bar=False).astype(np.float32)
             el = max(time.time() - t0, 1e-9)
             print(f"  готово за {el:.1f} с ({len(texts) / el:.0f} док/с)")
@@ -580,7 +620,7 @@ NAMES = {
 CTRL = {"shuffled", "bm25s", "vmems"}
 
 
-def report(convs, qs, res, cov, unit, stat, embedder="minilm",
+def report(convs, qs, res, cov, unit, stat, embedder="minilm", prefix=True,
            halflife=0, weights=None) -> None:
     npool = sum(len(c.docs) for c in convs) / len(convs)
     print()
@@ -589,7 +629,12 @@ def report(convs, qs, res, cov, unit, stat, embedder="minilm",
           f"{npool:.0f} · K={K}")
     # ⭐конфигурация печатается ВМЕСТЕ с числом: строка «LoCoMo 57%» без
     # эмбеддера и полураспада ничего не значит — оба меняют её на 18 пунктов
-    print(f"эмбеддер: {MODEL_NAME if embedder == 'minilm' else NOMIC_MODEL} · "
+    # ⭐имя берётся из ТОЙ ЖЕ карты, что и вызов эмбеддера: вторая копия
+    # правила разошлась бы с первой ровно тогда, когда одну поправят — и
+    # 04.08 разошлась, отчёт печатал nomic для прогона на bge-m3
+    pre_on = prefix and embedder in EMBED_PREFIX
+    print(f"эмбеддер: {OLLAMA_MODELS.get(embedder, MODEL_NAME)}"
+          f"{' + префиксы роли' if pre_on else ''} · "
           f"полураспад: {str(halflife) + ' дн' if halflife else 'дефолт движка'}"
           f" · веса плеч: {weights if weights else 'по умолчанию (1,1)'}")
     over = sum(1 for q in qs if q.over_k)
@@ -701,8 +746,14 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=6499)
     ap.add_argument("--sweep-halflife", default="",
                     help="через запятую, в днях: 30,90,365,3650")
-    ap.add_argument("--embedder", choices=("minilm", "nomic"),
+    ap.add_argument("--embedder", choices=("minilm", "nomic", "bge"),
                     default="minilm")
+    ap.add_argument("--no-prefix", action="store_true",
+                    help="не ставить префиксы роли (nomic). Нужен, чтобы "
+                         "измерить их цену на одном и том же прогоне")
+    ap.add_argument("--embed-cpu", action="store_true",
+                    help="считать эмбеддинги на CPU: обход NaN у bge-m3 в f16 "
+                         "на Turing (см. докстроку _embed_ollama)")
     ap.add_argument("--halflife", type=int, default=0,
                     help="полураспад в днях для рук vmemd/vmema; 0 = дефолт "
                          "движка (365 дней)")
@@ -720,7 +771,8 @@ def main() -> int:
     print(f"разговоров: {len(convs)}, документов: "
           f"{sum(len(c.docs) for c in convs)}, вопросов: {len(qs)}")
     dvs, qv = embed_all(convs, qs, tag=f"{a.unit}|limit{a.limit}",
-                        embedder=a.embedder)
+                        embedder=a.embedder, cpu=a.embed_cpu,
+                        prefix=not a.no_prefix)
 
     if a.sweep_halflife:
         days = [int(x) for x in a.sweep_halflife.split(",") if x]
@@ -766,7 +818,8 @@ def main() -> int:
     if "vmems" in arms:
         vmem("vmems", 6, dated=False, shuffle=True)
 
-    report(convs, qs, res, cov, a.unit, stat, a.embedder, a.halflife, wts)
+    report(convs, qs, res, cov, a.unit, stat, a.embedder, not a.no_prefix,
+           a.halflife, wts)
 
     rc = 0
     # ⭐ОРАКУЛ: движок обязан совпасть с точным перебором ВОПРОС-В-ВОПРОС.

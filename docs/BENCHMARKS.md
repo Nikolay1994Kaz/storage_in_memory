@@ -480,15 +480,21 @@ candidates per question, twelve times LongMemEval's pool. The session unit (27
 candidates) is softer and matches section 8's protocol, where a document was a
 whole session. Both are reported; neither is presented as the other.
 
-**Best measured configuration** (`nomic-embed-text`, half-life 365 d):
+**Best measured configuration** (`nomic-embed-text` **with role prefixes**,
+half-life 365 d):
 
 | arm | turn | session | what it is |
 |---|---|---|---|
-| `exact` = `vsim` | 57.0% | 67.4% | embedder ceiling; our vector path matches it per question |
-| `bm25` | 54.9% | 90.4% | `VMEM.RECALL` without `VEC` — the lexical arm alone |
-| **`vmem`** | **61.2%** | 82.6% | `VMEM.RECALL` — hybrid + decay + importance |
-| control — foreign question | 1.2–1.5% | 23.4–25.9% | same pool, a question from another conversation |
+| `exact` = `vsim` | 63.3% | 67.0% | embedder ceiling; our vector path matches it per question |
+| `bm25` | 54.8% | 90.4% | `VMEM.RECALL` without `VEC` — the lexical arm alone |
+| **`vmem`** | **64.6%** | 82.9% | `VMEM.RECALL` — hybrid + decay + importance |
+| control — foreign question | 1.5–2.3% | 22.8–25.9% | same pool, a question from another conversation |
 | control — analytic random | 0.9% | 18.4% | K/N |
+
+Every row here comes from the same configuration, controls included. That is not
+a formality: two of this section's defects were a figure carrying a label from a
+different run, so controls measured under an older embedder are not reused under
+a newer one.
 
 **Fusion is a trade, and here it was measured in both directions.** Section 8
 saw this only inside one bucket (−16.7 on preferences); on LoCoMo it moves the
@@ -497,31 +503,99 @@ aggregate:
 | unit / embedder | vector | `bm25` | hybrid | fusion buys |
 |---|---|---|---|---|
 | turn, MiniLM | 39.1% | 54.9% | 50.9% | **−4.0** |
-| turn, nomic | 57.0% | 54.9% | 61.1% | **+6.2** |
+| turn, bge-m3 | 52.0% | 54.8% | 60.5% | **+5.7** |
+| turn, nomic | 57.0% | 54.9% | 61.1% | **+4.1** |
+| **turn, nomic + prefixes** | 63.3% | 54.8% | **64.6%** | **+1.3** |
 | session, MiniLM | 51.8% | 90.4% | 72.1% | **−18.3** |
 | session, nomic | 67.4% | 90.4% | 83.3% | **−7.1** |
+| session, nomic + prefixes | 67.0% | 90.4% | 82.9% | **−7.5** |
+
+"Fusion buys" is the hybrid minus **the better of the two arms**, which is the
+only comparison a client can act on — it answers "should I have just used the
+stronger arm alone". An earlier version of this table subtracted `bm25`
+unconditionally; that agrees with the honest figure while the lexical arm leads,
+and inflates it once the vector arm does. Under prefixes the vector arm leads on
+turns, and the two definitions differ by 8.5 points.
 
 The rule the table states: **RRF fusion pays off when the two arms are
 comparable and costs when one is much weaker** — it lets the weak arm displace
-the strong arm's correct hit.
+the strong arm's correct hit. Six configurations now agree, and the sign has
+flipped in both directions: with MiniLM the vector arm was the weak one, with
+prefixed nomic on turns the *lexical* arm is, and fusion's payoff drops to
++1.3.
+
+**Using the embedder correctly beat replacing it.** `nomic-embed-text` is
+trained to be told a text's *role* — `search_document: ` on stored text,
+`search_query: ` on the question — and the harness was not doing it. Adding the
+prefixes moved the vector arm **57.0% → 63.3%** on turns. For comparison,
+swapping in a model four times its size went the other way:
+
+| embedder | params | dim | vector, turn |
+|---|---|---|---|
+| `all-MiniLM-L6-v2` (2021) | 22M | 384 | 39.1% |
+| `bge-m3` | 567M | 1024 | 52.0% |
+| `nomic-embed-text` | 137M | 768 | 57.0% |
+| **`nomic-embed-text` + prefixes** | 137M | 768 | **63.3%** |
+
+Two lines of prefixing bought **+6.3**; a 1.2 GB multilingual model **cost 5.0**
+against the smaller one. `bge-m3` spends its capacity across a hundred
+languages, and LoCoMo is English — a real trade, not a defect of the model.
+Dimensionality bought nothing on its own: 1024 lost to 768.
+
+⚠️**The prefix gain depends on the retrieval unit.** On sessions the same change
+is worth nothing (67.4% → 67.0%, inside run-to-run noise): the prefix is a sixth
+of a 109-character turn and half a percent of a 2 878-character session, and a
+session vector averages dozens of turns into one point regardless. Quote the
++6.3 for short documents only.
 
 This measurement produced a change: `VMEM.RECALL` now takes
 `WEIGHTS wtext wvec`, scaling each arm's vote in the fusion (default `1 1`). It
 is a lever for a client who knows its data, **not autotuning** — the engine does
 not guess which arm to mute, because any such rule would be calibrated against
-the same benchmark that grades the calibration. ⏭Not yet re-measured on LoCoMo:
-the lever is covered by unit and protocol tests, but the run showing how much of
-the −18.3 it recovers has not been done.
+the same benchmark that grades the calibration.
+
+**The lever was then measured on the same questions that showed the loss**
+(MiniLM, where the vector arm is the weak one):
+
+| unit | hybrid `1 1` | `WEIGHTS 1 0` | `bm25` alone | recovered |
+|---|---|---|---|---|
+| session | 72.1% | **90.4%** | 90.4% | all of the −18.3 |
+| turn | 51.0% | **54.8%** | 54.9% | all of the −3.9 |
+
+It is a dial, not a switch: `WEIGHTS 1 0.3` lands at 53.5%, between the two
+ends. And the match with `bm25` is exact to the decimal in every category, which
+on its own is indistinguishable from the arm having silently collapsed into
+`bm25` — so a control run without weights was required, and it reproduced 72.1%
+and 51.0%. The exactness itself is expected once seen: with equal ages and
+importances, single-arm RRF is monotonic in rank, so the top-5 order is the
+lexical one.
+
+🚨**Muting an arm is a trade, not a free win.** The same run, by question
+category, shows the vector arm was never uniformly weak:
+
+| category (turn, MiniLM) | `bm25` | hybrid | vector adds |
+|---|---|---|---|
+| multi-hop | 41.1% | **46.1%** | **+5.0** |
+| temporal | 62.3% | 56.7% | −5.6 |
+| single-hop | 58.9% | 53.2% | −5.7 |
+| open-domain | 34.8% | 26.1% | −8.7 |
+
+Silencing it buys +3.9 on the aggregate and costs 5.0 on multi-hop, where the
+answer is spread across turns and there is no literal overlap to match. This is
+the actual argument for a lever over a constant: **the optimum depends on the
+question mix**, which the client knows and the engine does not. Under prefixes
+the picture inverts — fusion then hurts open-domain (32.6% against 41.3% for the
+vector arm alone) — and the same lever is what addresses it.
 
 **Recency decay — the thing LongMemEval could not test.** There the median date
 spread inside a haystack was 11 days against a 30-day half-life, so candidates
 aged together and nothing reordered. LoCoMo conversations span 184–293 days
-(median 238), so age differences are real. The default half-life is wrong for
-that shape, and the cost is large:
+(median 238), so age differences are real. The 30-day default was wrong for that
+shape, and the cost was large — this run is what changed the default to 365 d:
 
-| half-life | turn | session |
+| half-life (MiniLM, `ASOF` on the question's date) | turn | session |
 |---|---|---|
-| **30 d (default)** | **39.1%** | **44.9%** |
+| **30 d (old default)** | **39.1%** | **44.9%** |
 | 90 d | 48.6% | 61.7% |
 | 365 d | 51.0% | 70.6% |
 | 1095 d | 51.1% | 72.0% |
@@ -535,7 +609,11 @@ a 365-day half-life the setting turns mild and useful: **+2.5 points on targets
 younger than 30 days, −1.8 on targets older than 180** (turn unit).
 
 **Where the remaining gap actually is — the write path, not the search.** Three
-instruments agree, and they point away from retrieval:
+instruments agree, and they point away from retrieval. ⚠️They were run on the
+MiniLM configuration (its vector arm scores the 39.1% below); the prefixed
+configuration lands exactly on target 63.3% of the time, so the gap these
+numbers describe is **narrower than it was when they were taken** — the
+direction stands, the size is stale:
 
 - an **oracle of findability**: querying with the target's own text finds it
   **100%** of the time, so indexing and protocol are sound;
@@ -573,6 +651,20 @@ plainly rather than hiding inside an aggregate.
 - **One control is weaker than intended.** The shuffle requires the substituted
   question to come from another conversation; for 132 questions the fallback
   permutation could not honour that, and the harness says so on each run.
+- **Figures are reproducible to ±0.1 point, not bit-for-bit.** Six identical
+  runs of the same arm returned 54.8/54.9/54.9/54.9/54.9/54.8. The cause is
+  time: without `ASOF` freshness is measured from *now*, so seconds between runs
+  perturb scores in their low bits and reorder near-ties. An `ASOF` arm — both
+  ends dated from the data — returned 51.0%/44.8% three times out of three. This
+  is not a defect (freshness is part of the score by design), but it means
+  **repeatable retrieval requires a dated query**, and any conclusion resting on
+  less than 0.2 points is not supported. Every conclusion here rests on 4 to 18.
+- **`bge-m3` cannot be measured on this GPU at all.** In f16 on a GTX 1650
+  (Turing) it emits NaN for roughly 37% of ordinary English turns; ollama cannot
+  serialise NaN and answers 500. Batches of 4 pass, batches of 8 do not, and the
+  identical text returns a clean 1024-float vector with `num_gpu: 0`. Its
+  figures above were taken on CPU (`--embed-cpu`), which is a workaround for the
+  environment, not a property of the model.
 
 Harness: `scripts/locomo_bench.py` (oracle, three negative controls and two
 no-op checks are part of the run; any failure exits non-zero).
@@ -676,10 +768,16 @@ curl -L -o scratch/locomo/locomo10.json \
   https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json
 ./.venv/bin/python scripts/locomo_bench.py --unit turn        # strict, 588 candidates
 ./.venv/bin/python scripts/locomo_bench.py --unit session     # soft, 27 candidates
-# best measured configuration (needs a local ollama serving nomic-embed-text):
-./.venv/bin/python scripts/locomo_bench.py --unit turn --embedder nomic --halflife 365
+# best measured configuration (needs a local ollama serving nomic-embed-text).
+# Role prefixes are on by default for nomic — they are worth +6.3 points and
+# --no-prefix exists only to measure that:
+./.venv/bin/python scripts/locomo_bench.py --unit turn --embedder nomic
 # what the default half-life costs on an eight-month corpus:
 ./.venv/bin/python scripts/locomo_bench.py --unit turn --sweep-halflife 30,90,365,1095
+# the arm-weight lever against the loss it addresses (MiniLM, weak vector arm):
+./.venv/bin/python scripts/locomo_bench.py --unit session --arms bm25,vmem0 --weights 1,0
+# bge-m3 needs --embed-cpu on Turing GPUs; it returns NaN in f16 there:
+./.venv/bin/python scripts/locomo_bench.py --unit turn --embedder bge --embed-cpu
 # Check ollama by calling /api/embed, not `systemctl --user is-active ollama` —
 # the unit reports inactive while the server answers fine.
 ```

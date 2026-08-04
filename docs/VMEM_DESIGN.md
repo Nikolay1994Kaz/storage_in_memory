@@ -725,10 +725,13 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
   we do not have one — tuning against the harness that would grade the tuning
   is fitting to your own instrument.
 - **The trade has a direction, and a second benchmark measured its sign.** On
-  LoCoMo (`BENCHMARKS.md` §9) fusion is worth **+6.2 points** when the vector
-  and lexical arms are comparable (57.0 vs 54.9 alone → 61.1 fused) and
+  LoCoMo (`BENCHMARKS.md` §9) fusion is worth **+4.1 points** over the better
+  arm when the two are comparable (57.0 vs 54.9 alone → 61.1 fused) and
   **−18.3** when one is far weaker (51.8 vs 90.4 alone → 72.1 fused). Same rule,
-  same corpus, opposite outcome depending only on arm balance. This sharpens the
+  same corpus, opposite outcome depending only on arm balance. Six
+  configurations now sit on that curve, and the sign has flipped both ways: once
+  the vector arm leads (63.3 vs 54.8 under role prefixes) fusion's payoff falls
+  to +1.3, and the arm it can no longer afford to trust is the lexical one. This sharpens the
   entry above: the missing knob is not "weight by confidence" in the abstract,
   it is "detect that one arm is out of its depth on *this* query".
   **Half-fixed on 2026-08-04**: `WEIGHTS wtext wvec` now scales each arm's vote
@@ -738,15 +741,22 @@ thresholds fixed **before** running, canon numbers to `BENCHMARKS.md`.
   be calibrated against the same benchmark that then grades the calibration,
   which is fitting to your own instrument. Automatic arm weighting stays
   unfixed, for the unchanged reason: no independent oracle for the fused path.
-- **The default half-life is a short-history default.** `BENCHMARKS.md` §9
-  measures it: on conversations spanning 184–293 days, the 30-day default costs
+  **Measured the same day**: `WEIGHTS 1 0` recovers *all* of the −18.3 (72.1% →
+  90.4%), and `1 0.3` lands between the ends, so it is a dial rather than a
+  switch. But muting an arm is itself a trade — on multi-hop questions the weak
+  vector arm was still worth **+5.0**, because that is where no literal overlap
+  exists to match. The optimum follows the question mix, which is exactly what
+  the client knows and the engine does not.
+- **The default half-life was a short-history default** (fixed 2026-08-04:
+  30 d → 365 d). `BENCHMARKS.md` §9 measured it: on conversations spanning
+  184–293 days, the old 30-day default cost
   **11.8 points** of recall@5 (turn unit) and 27.2 (session unit), because the
   rank penalty `5·age/half_life` reaches +39.7 for an eight-month-old fact and
   sinks it below fresher but less relevant ones. A half-life of a year or more
   restores recall to the no-decay baseline exactly while still buying +2.5
-  points on targets younger than 30 days. Nothing here is broken — the policy is
-  per-request by design — but a deployment holding months of memory that never
-  sets `half_life` has silently chosen the wrong one.
+  points on targets younger than 30 days. The policy stays per-request by
+  design; what changed is that a deployment holding months of memory and never
+  setting `half_life` no longer inherits a default calibrated for days.
 - **Idempotency**: agent retries of REMEMBER without client `ID=` create
   duplicate facts; documented, client `ID=` is the remedy.
 - **Clock skew** on client-supplied `valid_from` is accepted (import

@@ -23,12 +23,13 @@ breakdown, the one type where our hybrid ranking *loses*, and the stated limits
 of that evidence.
 
 A second benchmark, **LoCoMo**, is reported the same way and is less flattering
-on purpose: **61.2% recall@5** against annotated evidence turns (1 536
+on purpose: **64.6% recall@5** against annotated evidence turns (1 536
 questions, retrieval-only). It is a stricter unit — the correct *turn* out of
-588 candidates, not the correct session — and it is the run that found two
-things worth knowing before you deploy: the default recency half-life is wrong
-for memories spanning months, and hybrid fusion *costs* recall when one arm is
-much weaker than the other. Both are quantified in
+588 candidates, not the correct session — and it is the run that found three
+things worth knowing before you deploy: the default recency half-life was wrong
+for memories spanning months, hybrid fusion *costs* recall when one arm is much
+weaker than the other, and an embedder used in the wrong mode costs more than a
+weak embedder does. All three are quantified in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) §9.
 
 Under the memory surface sits a single-node in-memory engine built for the
@@ -384,16 +385,17 @@ honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md) states exactly how far this evidence
   reaches.
 - **Retrieval quality on a second public benchmark (LoCoMo, 1 536 questions):**
-  **61.2% recall@5** against annotated evidence *turns* — 588 candidates per
-  question, retrieval-only, no LLM. Two findings the aggregate would have
-  hidden: the **default 30-day half-life costs 11.8 points** on conversations
-  spanning eight months (a half-life of a year restores it exactly), and
-  **hybrid fusion is directional** — worth +6.2 points when the vector and
-  lexical arms are comparable, worth −18.3 when one is far weaker. The
-  remaining gap to systems that store LLM-extracted facts is in the *write
-  path*, not the search: querying by the target's own text finds it 100% of the
-  time, and 66.9% of queries already land within the right stretch of the
-  conversation.
+  **64.6% recall@5** against annotated evidence *turns* — 588 candidates per
+  question, retrieval-only, no LLM. Three findings the aggregate would have
+  hidden: the **default 30-day half-life cost 11.8 points** on conversations
+  spanning eight months (fixed — a half-life of a year restores recall exactly);
+  **hybrid fusion is directional**, worth points when the two arms are
+  comparable and worth −18.3 when one is far weaker (hence the `WEIGHTS` lever,
+  which recovers all of it); and **feeding an embedder its role prefixes was
+  worth +6.3 points**, while a model four times larger *lost* 5.0 — using the
+  tool correctly outranked replacing it. The remaining gap to systems that store
+  LLM-extracted facts is in the *write path*, not the search: querying by the
+  target's own text finds it 100% of the time.
 - **Agent memory (VMEM):** on a 27.5k-event synthetic "agent life" —
   known-item hit@1 **0.982** / MRR **0.991**, paraphrase hit@10 1.000,
   temporal accuracy (`ASOF` + supersession chains) **1.000**, scope isolation
