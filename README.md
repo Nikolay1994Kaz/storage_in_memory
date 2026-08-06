@@ -44,9 +44,8 @@ replacement — the KV surface exists to serve the memory core.
 
 ```bash
 # 1. get the two binaries — server (Linux) and MCP adapter (Linux/macOS/Windows)
-#    from https://github.com/Nikolay1994Kaz/storage_in_memory/releases, or build them:
-make build                                     # -> ./kvstore-server
-go build -o vmem-mcp ./kvstore/cmd/vmem-mcp    # -> ./vmem-mcp
+#    from https://github.com/Nikolay1994Kaz/storage_in_memory/releases, or build both:
+make build                                     # -> ./kvstore-server, ./vmem-mcp
 
 # 2. the server — one static binary; the working dir keeps WAL + snapshots
 ./kvstore-server --port 6380
@@ -286,8 +285,7 @@ short Go file: [`kvstore/examples/quickstart`](kvstore/examples/quickstart/).
 ### Build from source
 
 ```bash
-make build                                     # server only -> ./kvstore-server
-go build -o vmem-mcp ./kvstore/cmd/vmem-mcp    # the MCP adapter, if you need it
+make build          # -> ./kvstore-server and ./vmem-mcp (server only: make build-server)
 ./kvstore-server --port 6380
 
 # With AUTH
