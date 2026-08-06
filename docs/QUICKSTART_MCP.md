@@ -72,6 +72,10 @@ into writing a false fact must not also be able to choose which origin that
 fact is filed under. Later you can ask "what did this channel write?" with
 `VMEM.RECALL <scope> <k> <query> SOURCE claude-code`.
 
+**Restart the host session after registering.** MCP servers are discovered at
+startup, so the three tools appear only in a session started after this step —
+verify they are listed before moving on.
+
 ## 3. Try it
 
 In one session:

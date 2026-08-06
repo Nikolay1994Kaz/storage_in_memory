@@ -43,12 +43,19 @@ replacement — the KV surface exists to serve the memory core.
 ## Agent memory in two minutes
 
 ```bash
-# 1. the server — one static binary; the working dir keeps WAL + snapshots
+# 1. get the two binaries — server (Linux) and MCP adapter (Linux/macOS/Windows)
+#    from https://github.com/Nikolay1994Kaz/storage_in_memory/releases, or build them:
+make build                                     # -> ./kvstore-server
+go build -o vmem-mcp ./kvstore/cmd/vmem-mcp    # -> ./vmem-mcp
+
+# 2. the server — one static binary; the working dir keeps WAL + snapshots
 ./kvstore-server --port 6380
 
-# 2. the MCP adapter — plug into Claude Code (or any MCP host)
-claude mcp add memory -- vmem-mcp -addr 127.0.0.1:6380 -default-scope myproject
+# 3. the MCP adapter — plug into Claude Code (or any MCP host)
+claude mcp add memory -- "$PWD/vmem-mcp" -addr 127.0.0.1:6380 -default-scope myproject
 ```
+
+Restart the host session afterwards — MCP servers are picked up at startup.
 
 The agent now has three tools — `memory_remember`, `memory_recall`,
 `memory_forget` — and its facts survive restarts, sessions and model
@@ -213,11 +220,15 @@ Static Linux binaries (amd64/arm64, zero dependencies, ~13MB) are published on
 the [Releases page](https://github.com/Nikolay1994Kaz/storage_in_memory/releases):
 
 ```bash
+# checksums.txt covers every platform, so verify only what you downloaded —
+# without --ignore-missing sha256sum reports the absent archives as failures
+sha256sum --ignore-missing -c checksums.txt
 tar xzf kvstore-server_*_linux_amd64.tar.gz
 ./kvstore-server --port 6380
 ```
 
-Linux only — the network layer is built on epoll.
+Linux only — the network layer is built on epoll. The MCP adapter `vmem-mcp` is
+published on the same page for Linux, macOS and Windows.
 
 The engine is **BYO-embeddings**: it takes pre-computed vectors over RESP from
 any embedding provider (OpenAI, Ollama, sentence-transformers, …):
@@ -275,7 +286,8 @@ short Go file: [`kvstore/examples/quickstart`](kvstore/examples/quickstart/).
 ### Build from source
 
 ```bash
-make build
+make build                                     # server only -> ./kvstore-server
+go build -o vmem-mcp ./kvstore/cmd/vmem-mcp    # the MCP adapter, if you need it
 ./kvstore-server --port 6380
 
 # With AUTH
