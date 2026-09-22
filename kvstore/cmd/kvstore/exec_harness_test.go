@@ -36,7 +36,6 @@ type execEnv struct {
 	bw   *wal.BatchWAL
 	ttl  *store.TTLManager
 	hub  *pubsub.Hub
-	wasm computeRuntime
 	vec  vector.VectorIndex
 	zset *zset.ZSetRegistry
 	cs   *server.ConnState
@@ -72,7 +71,6 @@ func newExecEnv(t *testing.T) *execEnv {
 		bw:          bw,
 		ttl:         ttl,
 		hub:         hub,
-		wasm:        nopCompute{},
 		vec:         vec,
 		zset:        zreg,
 		iterateAll:  func(func(op byte, key string, value []byte)) {}, // COMPACT-тесты подменяют
@@ -102,8 +100,8 @@ func (e *execEnv) do(cmd string, args ...string) protocol.Value {
 		byteArgs[i] = []byte(a)
 	}
 
-	executeCommand(e.s, e.bw, e.ttl, e.hub, nil, e.wasm, e.vec, e.zset,
-		nil, nil, e.iterateAll, e.saveVectors, e.cs, cmd, byteArgs)
+	executeCommand(e.s, e.bw, e.ttl, e.hub, nil, e.vec, e.zset,
+		e.iterateAll, e.saveVectors, e.cs, cmd, byteArgs)
 
 	if err := e.cs.Buf.Flush(); err != nil {
 		e.t.Fatalf("Buf.Flush(%s): %v", cmd, err)

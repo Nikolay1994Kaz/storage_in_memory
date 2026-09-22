@@ -36,8 +36,7 @@ payload/state layer, not a Redis replacement.
 |---|---|---|
 | **Frozen** | KV, TTL, Pub/Sub, ZSET, transactions, admin | Closed for extension |
 | **Product** | `VSIM.*` | Grows with vector roadmap |
-| **Demand-driven** | `AI.*` | Extended only on real demand |
-| **Experimental** | `WASM.*`, `CLUSTER`/`MIGRATE`/`PSYNC` | Behind build tags; excluded from prod builds |
+| **Experimental** | `CLUSTER`/`MIGRATE`/`PSYNC` | Behind a build tag; excluded from prod builds |
 
 ---
 
@@ -60,14 +59,14 @@ Every command is classified against two independent gates (single choke point in
 
 - **OOM gate** (`isMemoryGrowingCmd`): when used memory > `maxmemory`, memory-growing
   commands are rejected with `OOM command not allowed…`. Applies to: `SET`, `ZADD`,
-  `VSIM.ADD`, `VSIM.ADDBIN`, `VSIM.ADDATTR`, `VSIM.ADDDOC`, `WASM.LOAD`,
-  `WASM.LOADFILE`, `AI.INGEST`.
+  `VSIM.ADD`, `VSIM.ADDBIN`, `VSIM.ADDATTR`, `VSIM.ADDDOC`, `VMEM.REMEMBER`,
+  `VMEM.QUARANTINE`, `VMEM.BACKFILL`, `VMEM.RESEAL`.
   Deleting/reading commands are always allowed (the only way out of OOM).
 - **Durability fail-stop** (`isWriteCmd`): when the WAL can no longer write durably
   (ENOSPC, I/O error), *all* mutating commands are rejected — including deletes
   (a delete must be logged too, or it resurrects on restart). Applies to: `SET`,
   `DEL`, `EXPIRE`, `PERSIST`, `VSIM.ADD`, `VSIM.ADDBIN`, `VSIM.ADDATTR`,
-  `VSIM.ADDDOC`, `VSIM.DEL`, `ZADD`, `ZREM`, `AI.INGEST`. Reads stay available.
+  `VSIM.ADDDOC`, `VSIM.DEL`, `ZADD`, `ZREM`, `VMEM.*` writes. Reads stay available.
 
 A new mutating command (any tier) MUST be added to both classifiers explicitly.
 
@@ -161,8 +160,7 @@ bad keys are rejected so poison never survives via replay), and all `Add`s happe
 
 **Cross-engine joins** (why KV/zset live in the same process as the index):
 `VSIM.SEARCHFILTER` reads KV metadata per candidate; `VSIM.SEARCHRANGE` joins the
-zset B+Tree with HNSW; `DEL`/TTL expiry atomically covers both stores; `AI.ASK`
-joins vector search with KV documents; `VMEM.RECALL` joins the index with the
+zset B+Tree with HNSW; `DEL`/TTL expiry atomically covers both stores; `VMEM.RECALL` joins the index with the
 verbatim KV anchors. These joins are only cheap and consistent because there is
 one process, one WAL, one memory space.
 
@@ -295,30 +293,8 @@ first reply element (`journal_links`, `head_seq`, `leaves_read`,
 live forever, so a year-old instance legitimately cannot account for its early
 facts, and `unrecorded` has to be read against how much journal survives.
 
-## Demand-driven tier — `AI.*` (optional, requires a reachable Ollama)
-
-`AI.*` is an optional RAG demo layer, **off by default** — the engine itself is
-BYO-embeddings (`VSIM.ADD*`). Enable it by pointing `--ollama-url` at a running
-Ollama (in Docker: `docker compose --profile ai up`). The server pings Ollama in
-the background and enables `AI.*` the moment it comes up — startup order doesn't
-matter and no restart is needed.
-
-| Command | Syntax | Reply |
-|---|---|---|
-| `AI.EMBED` | `AI.EMBED text` | array of floats |
-| `AI.SEARCH` | `AI.SEARCH K text` | flat array `key, dist, …` |
-| `AI.ASK` | `AI.ASK question` | bulk — RAG: embed → vector top-3 → KV docs → LLM |
-| `AI.INGEST` | `AI.INGEST key text` | `+QUEUED` — async embed+store; OOM- and WAL-gated |
-
-Until Ollama is reachable all `AI.*` reply `ERR Ollama not available …` (with a
-hint how to enable). `AI.ASK` additionally needs the chat model pulled
-(`gemma4:e2b`, ~7GB); the first call after startup loads it into memory and may
-take tens of seconds (command deadline 90s, warm calls ~13s).
-
 ## Experimental tier (build-tag gated)
 
-- **`WASM.*`** — compute runtime, `-tags experimental` only; prod builds reply
-  "WASM disabled" and do not link the engine.
 - **`CLUSTER` / `MIGRATE` / `PSYNC`** — cluster mode, experimental build only;
   prod builds reply `ERR cluster mode is not enabled`. The replication protocol is
   deliberately undefined until alem.ai RPO/RTO requirements exist (see LSN design).

@@ -1,9 +1,7 @@
 services:
   # ─── KVStore ──────────────────────────────────────
-  # Основной сервер. Ollama НЕ обязательна: без профиля `ai` сервер стартует
-  # сразу, работает всё, кроме AI.* (они отвечают внятной ошибкой). Если
-  # профиль включён — сервер сам подхватит Ollama, когда та поднимется
-  # (фоновый re-ping), рестарт не нужен.
+  # Основной сервер. Эмбеддинги приносит клиент (BYO): движок не ходит ни в
+  # какой внешний сервис, кроме опционального WAL-shipping.
   kvstore:
     build: .
     container_name: kvstore
@@ -16,54 +14,8 @@ services:
       # 0.0.0.0 внутри контейнера безопасно: наружу торчат только порты из ports:
       - "--bind=0.0.0.0"
       - "--port=6380"
-      - "--ollama-url=http://ollama:11434"
       - "--metrics-port=9090"
     restart: unless-stopped
-
-  # ─── Ollama (опционально: --profile ai) ───────────
-  # RAG-демо-слой для команд AI.*. Ядро (VSIM.*/KV) в нём не нуждается —
-  # векторы можно приносить от любого провайдера (BYO-embeddings).
-  # Запуск: docker compose --profile ai up -d --build
-  # GPU пробрасывается автоматически, если доступен (deploy.resources).
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    profiles: ["ai"]
-    ports:
-      - "11435:11434"
-    volumes:
-      - ollama-models:/root/.ollama
-    restart: unless-stopped
-
-  # ─── Ollama Init (опционально: --profile ai) ──────
-  # Одноразовый контейнер: скачивает модели при первом запуске.
-  #   nomic-embed-text (~0.3GB) — embeddings: AI.EMBED / AI.INGEST / AI.SEARCH
-  #   gemma4:e2b       (~7GB)   — chat-модель: AI.ASK (RAG)
-  # Если 7GB не нужны (только embeddings):
-  #   OLLAMA_SKIP_CHAT_MODEL=1 docker compose --profile ai up -d
-  ollama-init:
-    image: ollama/ollama:latest
-    container_name: ollama-init
-    profiles: ["ai"]
-    depends_on:
-      - ollama
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-      - OLLAMA_SKIP_CHAT_MODEL=${OLLAMA_SKIP_CHAT_MODEL:-0}
-    entrypoint: |
-      sh -c "
-        echo 'Waiting for Ollama to start...'
-        until ollama list > /dev/null 2>&1; do
-          sleep 1
-        done
-        echo 'Pulling embedding model...'
-        ollama pull nomic-embed-text
-        if [ \"$$OLLAMA_SKIP_CHAT_MODEL\" != \"1\" ]; then
-          echo 'Pulling chat model for AI.ASK (~7GB, skip with OLLAMA_SKIP_CHAT_MODEL=1)...'
-          ollama pull gemma4:e2b
-        fi
-        echo 'Models ready!'
-      "
 
   # ─── VictoriaMetrics ──────────────────────────────
   # Time Series Database для сбора и хранения метрик
@@ -103,6 +55,5 @@ services:
 
 volumes:
   kvstore-data:
-  ollama-models:
   vm-data:
   grafana-data:

@@ -28,17 +28,14 @@ func TestMetricsRecordAndExpose(t *testing.T) {
 		func() float64 { return 10 * 1024 * 1024 },
 	)
 
-	// 4. Test WASM metrics
-	RecordWasm("fraud_detector", "process", 3*time.Millisecond)
-
-	// 5. Output Prometheus format
+	// 4. Output Prometheus format
 	var buf bytes.Buffer
 	metrics.WritePrometheus(&buf, false)
 	output := buf.String()
 
 	t.Log(output)
 
-	// 6. Assertions
+	// 5. Assertions
 	if !strings.Contains(output, "kvstore_network_active_connections 1") {
 		t.Errorf("Expected active connections to be 1, output:\n%s", output)
 	}
@@ -59,8 +56,5 @@ func TestMetricsRecordAndExpose(t *testing.T) {
 	}
 	if !strings.Contains(output, "kvstore_memory_limit_bytes 10485760") {
 		t.Errorf("Expected limit to be 10485760, output:\n%s", output)
-	}
-	if !strings.Contains(output, `kvstore_wasm_executions_total{module="fraud_detector",function="process"} 1`) {
-		t.Errorf("Expected WASM executions total to be 1, output:\n%s", output)
 	}
 }

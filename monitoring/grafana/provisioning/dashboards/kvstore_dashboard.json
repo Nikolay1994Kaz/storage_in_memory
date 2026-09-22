@@ -306,95 +306,12 @@
     },
     {
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 12
-      },
-      "id": 6,
-      "title": "WASM Reactor Executions",
-      "type": "timeseries",
-      "datasource": "VictoriaMetrics",
-      "targets": [
-        {
-          "datasource": "VictoriaMetrics",
-          "editorMode": "code",
-          "expr": "sum(rate(kvstore_wasm_executions_total[10s])) by (module, function)",
-          "legendFormat": "{{module}}.{{function}} RPS",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "legend": {
-          "calcs": [
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10
-          },
-          "unit": "requests/sec"
-        }
-      }
-    },
-    {
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 12
-      },
-      "id": 7,
-      "title": "WASM Execution Latency (Avg in Microseconds)",
-      "type": "timeseries",
-      "datasource": "VictoriaMetrics",
-      "targets": [
-        {
-          "datasource": "VictoriaMetrics",
-          "editorMode": "code",
-          "expr": "(sum(rate(kvstore_wasm_execution_duration_seconds_sum[1m])) by (module, function) / sum(rate(kvstore_wasm_executions_total[1m])) by (module, function)) * 1000000",
-          "legendFormat": "{{module}}.{{function}} latency",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth"
-          },
-          "unit": "µs"
-        }
-      }
-    },
-    {
-      "gridPos": {
         "h": 6,
         "w": 12,
         "x": 0,
         "y": 20
       },
-      "id": 8,
+      "id": 6,
       "title": "Epoll Greedy Drain Efficiency",
       "type": "timeseries",
       "datasource": "VictoriaMetrics",
@@ -434,7 +351,7 @@
         "x": 12,
         "y": 20
       },
-      "id": 9,
+      "id": 7,
       "title": "WAL Sync Latency (p99)",
       "type": "timeseries",
       "datasource": "VictoriaMetrics",

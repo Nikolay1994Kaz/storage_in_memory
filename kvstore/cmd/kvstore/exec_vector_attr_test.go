@@ -50,8 +50,8 @@ func newAttrEnv(t *testing.T, partitionAttr string) *attrEnv {
 		for i, a := range args {
 			byteArgs[i] = []byte(a)
 		}
-		executeCommand(s, bw, ttl, hub, nil, nopCompute{}, vec, zreg,
-			nil, nil, func(func(byte, string, []byte)) {}, func() error { return nil },
+		executeCommand(s, bw, ttl, hub, nil, vec, zreg,
+			func(func(byte, string, []byte)) {}, func() error { return nil },
 			cs, cmd, byteArgs)
 		if err := cs.Buf.Flush(); err != nil {
 			t.Fatalf("Buf.Flush(%s): %v", cmd, err)

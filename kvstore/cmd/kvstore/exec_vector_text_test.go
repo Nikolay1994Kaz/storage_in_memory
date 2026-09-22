@@ -106,8 +106,8 @@ func TestExec_VsimAddDocWALCarriesTerms(t *testing.T) {
 		for i, a := range args {
 			byteArgs[i] = []byte(a)
 		}
-		executeCommand(s, bw, ttl, hub, nil, nopCompute{}, vec, zreg,
-			nil, nil, func(func(byte, string, []byte)) {}, func() error { return nil },
+		executeCommand(s, bw, ttl, hub, nil, vec, zreg,
+			func(func(byte, string, []byte)) {}, func() error { return nil },
 			cs, cmd, byteArgs)
 		_ = cs.Buf.Flush()
 	}

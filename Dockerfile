@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ─── Stage 2: Runtime ───────────────────────────────
 FROM alpine:3.20
 
-# ca-certificates — для исходящих TLS (Ollama и пр.). wget (busybox) уже есть в
+# ca-certificates — для исходящих TLS (WAL-shipping в S3). wget (busybox) уже есть в
 # alpine и используется в HEALTHCHECK.
 RUN apk add --no-cache ca-certificates
 

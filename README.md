@@ -194,7 +194,6 @@ RESP on a 2019 laptop.
 - **Tamper-evident audit chain** *(opt-in)* — `-audit-chain` records every memory-changing command in a hash-chained journal (Merkle-batched, one link per second; fingerprints, never content), so a `SHRED` receipt is producible months later rather than read once; `VMEM.AUDIT VERIFY / EXPORT / PROVE / RECONCILE` — Ed25519-signed statements an auditor checks without holding your secret, inclusion proofs that disclose one event and not its batch, and a live-memory-vs-journal reconciliation
 - **BM25 full-text + hybrid** — `VSIM.SEARCHTEXT` / `VSIM.HYBRID` (RRF fusion), embedder-free known-item search, query-side common-term pruning, attribute filters on both
 - **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization; non-blocking bulk ingest (per-shard delta freeze + batched LSM merges)
-- **AI / RAG** *(optional, off by default)* — Ollama embeddings, async ingestion, semantic queries (`AI.INGEST` / `AI.ASK`); the engine itself is BYO-embeddings
 - **WAL + Snapshots** — CRC32-protected, batch writes, crash recovery
 - **WAL-shipping** — continuous async replication of WAL+snapshots to S3/MinIO or a mounted dir (Litestream-style); restore on any machine with `-ship-restore` (see [docs/BACKUP.md](docs/BACKUP.md))
 - **TCMalloc-style allocator** — per-worker MCache, lock-free GET, zero GC pressure
@@ -203,7 +202,6 @@ RESP on a 2019 laptop.
 - **Pub/Sub** — back-pressure, sync.Pool, per-subscriber goroutines
 - **AUTH + TLS/mTLS** — constant-time password auth, encrypted connections, optional client-cert verification
 - **Observability** — Prometheus `/metrics`, `/health`, `/ready`; structured logging (slog, text/JSON); Grafana stack in `docker-compose.yml`
-- **WASM Compute** *(experimental, behind a build tag, not in the default build)* — Reactor pattern (worker-local slots) + Command modules
 - **Cluster** *(experimental, behind a build tag, not in the default build)* — hash-slot sharding, gossip protocol, live migration
 
 The RESP command surface is deliberately small and **frozen**: the KV/state layer
@@ -254,33 +252,9 @@ docker compose up -d --build     # or: make up
 leaves you on a cached binary that lacks newer commands. That's it — KVStore is
 on `localhost:6380`, Grafana on `localhost:3000`.
 
-### Optional: RAG demo (Ollama)
-
-The `AI.*` commands (`AI.EMBED` / `AI.INGEST` / `AI.SEARCH` / `AI.ASK`) are a
-self-contained RAG demo on top of the engine — they are the only part that
-talks to Ollama, and they are **off by default**. Enable with the `ai` profile:
-
-```bash
-docker compose --profile ai up -d --build     # or: make up-ai
-```
-
-The first run downloads models: `nomic-embed-text` (~0.3GB, embeddings) and
-`gemma4:e2b` (~7GB, the chat model behind `AI.ASK`). Embeddings only:
-`OLLAMA_SKIP_CHAT_MODEL=1 docker compose --profile ai up -d --build`.
-
-```bash
-redis-cli -p 6380
-> AI.INGEST doc:1 "Go is a statically typed language"   # async: returns QUEUED
-> AI.ASK "What is Go?"
-```
-
-Notes: `AI.INGEST` indexes asynchronously (subscribe to `ai:indexed` for
-completion); the first `AI.ASK` after startup loads the 7GB model into memory
-and may take tens of seconds. The server detects Ollama in the background — no
-restart needed, in whatever order the containers come up.
-
-Then take the guided tour — real embeddings, tenant/attribute filtering, one
-short Go file: [`kvstore/examples/quickstart`](kvstore/examples/quickstart/).
+Then take the guided tour — real embeddings computed on the client side,
+tenant/attribute filtering, one short Go file:
+[`kvstore/examples/quickstart`](kvstore/examples/quickstart/).
 
 ### Build from source
 
@@ -319,7 +293,6 @@ including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
 | `--requirepass` / `--requirepass-file` | `""` | AUTH password inline or from a file (empty = no auth) |
 | `--tls-cert` / `--tls-key` | `""` | TLS certificate and private key (PEM) |
 | `--tls-client-ca` | `""` | CA for client-certificate verification (mTLS) |
-| `--ollama-url` | `http://localhost:11434` | Ollama API URL for the optional `AI.*` layer; the server pings it in the background and enables `AI.*` whenever Ollama comes up (no restart needed) |
 | `--ship-url` | `""` | Continuous WAL-shipping target: `file:///path` or `s3://bucket/prefix?endpoint=...` (creds via env, see [docs/BACKUP.md](docs/BACKUP.md)) |
 | `--ship-interval` | `1s` | Shipping period (≈ crash RPO) |
 | `--ship-retain` | `3` | Restore points kept on the remote |
@@ -336,8 +309,7 @@ The full command manifest (syntax, replies, gate semantics, WAL ops) lives in
 Families: agent memory (`VMEM.*`, incl. `SHRED`/`RESEAL`/`AUDIT`), vector +
 full-text search (`VSIM.*`, incl.
 `SEARCHTEXT`/`HYBRID`), KV/TTL (`SET`/`GET`/`DEL`/`EXPIRE`/…), transactions
-(`MULTI`/`EXEC`/`DISCARD`), Pub/Sub, sorted sets (`ZADD`/…), AI/RAG (`AI.*`,
-optional — requires a reachable Ollama).
+(`MULTI`/`EXEC`/`DISCARD`), Pub/Sub, sorted sets (`ZADD`/…).
 
 > **Isolation contract (read this).** `MULTI`/`EXEC` provides command **grouping and
 > pipelining** with EXECABORT on a bad queued command — it does **not** provide
@@ -373,10 +345,10 @@ optional — requires a reachable Ollama).
 ├──────────────┬───────────────────────────────┤
 │   TCMalloc   │  TTL    │ WAL    │ Pub/Sub   │
 │   Store      │  Heap   │ Batch  │ Hub       │
-├──────────────┼─────────┼────────┼───────────┤
-│ HNSW + BM25  │  WASM   │   AI   │  Cluster  │
-│ Search       │  Engine │ Worker │  (gossip) │
-└──────────────┴─────────┴────────┴───────────┘
+├──────────────┴─────────┴────────┼───────────┤
+│ HNSW + BM25 search, LSM segments │  Cluster  │
+│ SQ8, RRF fusion, tenant filters  │  (gossip) │
+└─────────────────────────────────┴───────────┘
 ```
 
 ## Benchmarks
@@ -445,29 +417,11 @@ honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
   embedding datasets at default settings) but not 1.0; under heavy churn a small fraction
   of stored vectors may temporarily miss from top-K results. `VSIM.EXISTS`
   gives an exact existence check.
-- **Experimental gates.** WASM compute and cluster mode are compiled out of the
-  default build (`experimental` build tag) — their surfaces are not hardened to
-  the same bar as the core.
+- **Experimental gate.** Cluster mode is compiled out of the default build
+  (`experimental` build tag) — its surface is not hardened to the same bar as
+  the core.
 - **Validated by soak testing**: multi-hour runs at ~6k RPS mixed load with
   graceful/crash restarts, ship-restore and corrupted-snapshot drills.
-
-## WASM Modules
-
-> WASM compute is **experimental** and excluded from the default build — compile
-> the server with the `experimental` build tag to enable it.
-
-Pre-compiled example modules are in `kvstore/examples/fraud_scorer/`.
-
-To compile from source (requires [TinyGo](https://tinygo.org/getting-started/install/)):
-
-```bash
-# Command module
-tinygo build -o fraud_scorer.wasm -target=wasi ./kvstore/examples/fraud_scorer/
-
-# Reactor module (zero-alloc hot path)
-tinygo build -o fraud_scorer_reactor.wasm -target=wasi -buildmode=c-shared \
-  ./kvstore/examples/fraud_scorer/
-```
 
 ## Testing
 
@@ -507,8 +461,6 @@ kvstore/
 │   ├── auditchain/       # Hash-chained journal, Merkle batching, Ed25519 export
 │   ├── pubsub/           # Pub/Sub hub (classic + semantic)
 │   ├── btree/            # Sorted-set backing structure
-│   ├── compute/          # WASM engine (wazero), triggers, worker slots
-│   ├── ai/               # Ollama client, async worker
 │   ├── cluster/          # Hash slots, gossip, replication (experimental)
 │   ├── logging/          # slog setup (levels, text/JSON)
 │   ├── monitoring/       # Prometheus-style metrics
@@ -516,7 +468,7 @@ kvstore/
 │   ├── vmemcorpus/       # Deterministic "agent life" corpus generator (benches)
 │   └── vmemmcp/          # MCP adapter logic (JSON-RPC loop, tool mapping)
 ├── vector/               # HNSW graph, SQ8, BM25 text index, VMEM layer, tenant/attr filtering
-└── examples/             # WASM module examples
+└── examples/quickstart/  # End-to-end tour over RESP with client-side embeddings
 docs/                     # Command manifest, VMEM design, MCP quickstart, backup, benchmarks, format compat
 monitoring/               # Grafana/VictoriaMetrics provisioning for the local stack
 scripts/                  # Soak harness, backup/restore, poisoning-recovery comparison, live drills (shred, audit chain, agent)

@@ -21,7 +21,7 @@ import (
 //
 // Осознанно НЕ aws-sdk-go: проекту нужны 4 операции (PUT/GET/DELETE/LIST), а
 // SDK тянет мегабайты зависимостей в бинарь, который до сих пор обходился
-// stdlib+wazero+metrics. Path-style addressing — работает с MinIO/Ceph/
+// stdlib+metrics. Path-style addressing — работает с MinIO/Ceph/
 // LocalStack и с региональными endpoint'ами AWS.
 //
 // Креды и настройки:

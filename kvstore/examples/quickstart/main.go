@@ -1,31 +1,36 @@
 // Quickstart: сквозной пример продуктового пути на РЕАЛЬНЫХ эмбеддингах.
 //
-// Что показывает (весь путь через RESP, без клиентских библиотек):
-//  1. AI.EMBED        — реальные эмбеддинги (nomic-embed-text через Ollama);
+// Что показывает (весь путь к серверу через RESP, без клиентских библиотек):
+//  1. embed           — реальные эмбеддинги СЧИТАЕТ КЛИЕНТ (nomic-embed-text через
+//     Ollama на этой машине); сервер получает готовые векторы —
+//     это и есть BYO-embeddings, любой провайдер даёт тот же []float32;
 //  2. VSIM.ADDATTR    — ингест вектора с колоночными атрибутами (tenant/категория/год);
 //  3. VSIM.SEARCH     — глобальный ANN-поиск;
-//  4. VSIM.FILTER     — тот же поиск, но суженный на тенант и числовой диапазон;
-//  5. AI.SEARCH       — то же одной командой (embed на стороне сервера).
+//  4. VSIM.FILTER     — тот же поиск, но суженный на тенант и числовой диапазон.
 //
-// Запуск: docker compose up -d && go run ./kvstore/examples/quickstart
+// Запуск: ollama pull nomic-embed-text && docker compose up -d && go run ./kvstore/examples/quickstart
 // Подробности — в README.md рядом.
 package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // ─── Минимальный RESP-клиент ────────────────────────────────────────────────
 // Намеренно без зависимостей: весь протокол сервера — это RESP-массивы bulk-строк,
-// клиент на любом языке пишется за экран кода (см. sdk/python для Python-версии).
+// клиент на любом языке пишется за экран кода.
 
 type client struct {
 	conn net.Conn
@@ -114,6 +119,45 @@ func toStrings(v any) []string {
 	return out
 }
 
+// ─── Эмбеддер на стороне клиента ────────────────────────────────────────────
+// Сервер про Ollama не знает: он принимает готовые float32 через VSIM.ADD*.
+// Здесь Ollama только потому, что пример должен быть воспроизводим без ключей
+// к платным API; подставьте любой провайдер, формат вектора тот же.
+
+type embedder struct {
+	baseURL string
+	model   string
+	http    *http.Client
+}
+
+// embed возвращает вектор текста как строки для RESP (VEC f1 … fN).
+func (e *embedder) embed(text string) ([]string, error) {
+	body, _ := json.Marshal(map[string]any{"model": e.model, "input": text})
+	resp, err := e.http.Post(e.baseURL+"/api/embed", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ollama %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	var out struct {
+		Embeddings [][]float32 `json:"embeddings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if len(out.Embeddings) == 0 || len(out.Embeddings[0]) == 0 {
+		return nil, errors.New("ollama returned no embedding")
+	}
+	vec := make([]string, len(out.Embeddings[0]))
+	for i, v := range out.Embeddings[0] {
+		vec[i] = strconv.FormatFloat(float64(v), 'f', 6, 32)
+	}
+	return vec, nil
+}
+
 // ─── Демо-корпус ────────────────────────────────────────────────────────────
 // Два тенанта с разной предметной областью, чтобы фильтрация была видна глазами:
 // поисковая выдача обязана поменяться при сужении на тенант.
@@ -144,7 +188,7 @@ func fatalf(format string, a ...any) {
 	os.Exit(1)
 }
 
-// printHits печатает плоский массив key,dist,key,dist... из VSIM.*/AI.SEARCH.
+// printHits печатает плоский массив key,dist,key,dist... из VSIM.*.
 func printHits(v any) {
 	hits := toStrings(v)
 	if len(hits) == 0 {
@@ -165,7 +209,10 @@ func printHits(v any) {
 
 func main() {
 	addr := flag.String("addr", "localhost:6380", "kvstore-server address")
+	ollamaURL := flag.String("ollama", "http://localhost:11434", "Ollama base URL (client-side embeddings)")
+	model := flag.String("model", "nomic-embed-text", "Ollama embedding model")
 	flag.Parse()
+	emb := &embedder{baseURL: *ollamaURL, model: *model, http: &http.Client{Timeout: 60 * time.Second}}
 
 	c, err := dial(*addr)
 	if err != nil {
@@ -177,19 +224,18 @@ func main() {
 		fatalf("PING failed: %v", err)
 	}
 
-	// Ollama обязателен для этого примера: без него нет реальных эмбеддингов.
-	if _, err := c.do("AI.EMBED", "warmup"); err != nil {
-		fatalf("AI.EMBED failed: %v\n\nThis example needs Ollama with the embedding model.\nEasiest path: docker compose up -d (pulls nomic-embed-text automatically),\nthen run this example against localhost:6380.", err)
+	// Ollama нужна ПРИМЕРУ, не серверу: без неё нет реальных эмбеддингов.
+	if _, err := emb.embed("warmup"); err != nil {
+		fatalf("embedding failed: %v\n\nThis example computes embeddings on the client via Ollama.\nInstall it, then: ollama pull %s  (server URL: -ollama %s)", err, *model, *ollamaURL)
 	}
 
 	// ── 1. Ингест: реальный эмбеддинг + колоночные атрибуты ──
-	fmt.Printf("Ingesting %d documents (embed via Ollama + VSIM.ADDATTR)...\n", len(corpus))
+	fmt.Printf("Ingesting %d documents (client-side embed + VSIM.ADDATTR)...\n", len(corpus))
 	for _, d := range corpus {
-		emb, err := c.do("AI.EMBED", d.text)
+		vec, err := emb.embed(d.text)
 		if err != nil {
 			fatalf("embed %s: %v", d.key, err)
 		}
-		vec := toStrings(emb)
 		// VSIM.ADDATTR <key> CAT tenant <t> CAT topic <c> NUM year <y> VEC f1..fN —
 		// атрибуты ложатся в колоночный слой и durable через WAL (OpVSimAddAttrs).
 		args := append([]string{"VSIM.ADDATTR", d.key,
@@ -212,11 +258,10 @@ func main() {
 	// ── 2. Глобальный семантический поиск ──
 	query := "how does a spacecraft survive the heat of returning to Earth"
 	fmt.Printf("Query: %q\n", query)
-	emb, err := c.do("AI.EMBED", query)
+	qvec, err := emb.embed(query)
 	if err != nil {
 		fatalf("embed query: %v", err)
 	}
-	qvec := toStrings(emb)
 
 	fmt.Println("  VSIM.SEARCH 3 (all tenants):")
 	res, err := c.do(append([]string{"VSIM.SEARCH", "3"}, qvec...)...)
@@ -236,25 +281,16 @@ func main() {
 	// ── 4. Тенант + числовой диапазон ──
 	query2 := "quick dinner idea with fish"
 	fmt.Printf("\nQuery: %q\n", query2)
-	emb2, err := c.do("AI.EMBED", query2)
+	q2, err := emb.embed(query2)
 	if err != nil {
 		fatalf("embed query: %v", err)
 	}
-	q2 := toStrings(emb2)
 
 	fmt.Println("  VSIM.FILTER 3 EQ tenant globex RANGE year 2024 2026:")
 	res, err = c.do(append([]string{"VSIM.FILTER", "3",
 		"EQ", "tenant", "globex", "RANGE", "year", "2024", "2026", "VEC"}, q2...)...)
 	if err != nil {
 		fatalf("VSIM.FILTER: %v", err)
-	}
-	printHits(res)
-
-	// ── 5. Однострочный вариант: embed на стороне сервера ──
-	fmt.Println("\n  AI.SEARCH 3 (server-side embedding, one round-trip):")
-	res, err = c.do("AI.SEARCH", "3", query2)
-	if err != nil {
-		fatalf("AI.SEARCH: %v", err)
 	}
 	printHits(res)
 

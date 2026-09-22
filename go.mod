@@ -5,7 +5,6 @@ go 1.25.4
 require (
 	github.com/VictoriaMetrics/metrics v1.43.2
 	github.com/kljensen/snowball v0.10.0
-	github.com/tetratelabs/wazero v1.11.0
 	golang.org/x/sys v0.38.0
 )
 

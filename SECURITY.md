@@ -36,11 +36,9 @@ denial-of-service issues reachable from a connected client.
 
 Out of scope:
 
-- **WASM compute and cluster mode.** Both are compiled out of the default build
-  behind the `experimental` build tag and are explicitly not hardened to the
-  same bar; issues there are ordinary bugs, not advisories.
-- **`AI.*` / Ollama integration.** Off by default, opt-in, and it talks to a
-  third-party runtime you supply.
+- **Cluster mode.** Compiled out of the default build behind the `experimental`
+  build tag and explicitly not hardened to the same bar; issues there are
+  ordinary bugs, not advisories.
 - **Running the server exposed without `AUTH`.** The default bind is loopback
   by design. Binding to `0.0.0.0` without authentication is a deployment
   choice, not a vulnerability in the engine.

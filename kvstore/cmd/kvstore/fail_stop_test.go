@@ -15,7 +15,7 @@ func TestIsWriteCmd(t *testing.T) {
 	writes := []string{
 		"SET", "DEL", "EXPIRE", "PERSIST",
 		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.DEL",
-		"ZADD", "ZREM", "AI.INGEST",
+		"ZADD", "ZREM",
 	}
 	for _, c := range writes {
 		if !isWriteCmd(c) {

@@ -228,7 +228,7 @@ func benchmarkDistanceGo(b *testing.B, dim int) {
 	}
 }
 
-// dim=128 (Ollama nomic-embed-text по умолчанию)
+// dim=128
 func BenchmarkDistance_Go_128(b *testing.B) { benchmarkDistanceGo(b, 128) }
 
 // dim=256

@@ -41,17 +41,6 @@ var (
 	commandCounters   = make(map[string]*metrics.Counter)
 	commandHistograms = make(map[string]*metrics.Histogram)
 
-	// WASM execution metrics
-	wasmMu         sync.RWMutex
-	wasmCounters   = make(map[string]*metrics.Counter)
-	wasmHistograms = make(map[string]*metrics.Histogram)
-	WasmRecycles   = metrics.NewCounter("kvstore_wasm_memory_recycles_total")
-
-	// AI Engine metrics
-	AiQueueLen      = metrics.NewCounter("kvstore_ai_worker_queue_len")
-	AiEmbedDuration = metrics.NewHistogram("kvstore_ai_embedding_duration_seconds")
-	AiChatDuration  = metrics.NewHistogram("kvstore_ai_chat_duration_seconds")
-
 	// WAL metrics
 	WalWriteDuration = metrics.NewHistogram("kvstore_wal_write_duration_seconds")
 
@@ -150,33 +139,6 @@ func RecordCommand(cmd string, duration time.Duration) {
 			commandHistograms[cmd] = h
 		}
 		commandsMu.Unlock()
-	}
-
-	c.Inc()
-	h.Update(duration.Seconds())
-}
-
-// RecordWasm records WASM execution metrics with caching.
-func RecordWasm(module, function string, duration time.Duration) {
-	key := module + "." + function
-	wasmMu.RLock()
-	c, okC := wasmCounters[key]
-	h, okH := wasmHistograms[key]
-	wasmMu.RUnlock()
-
-	if !okC || !okH {
-		wasmMu.Lock()
-		c, okC = wasmCounters[key]
-		if !okC {
-			c = metrics.GetOrCreateCounter(fmt.Sprintf(`kvstore_wasm_executions_total{module="%s",function="%s"}`, module, function))
-			wasmCounters[key] = c
-		}
-		h, okH = wasmHistograms[key]
-		if !okH {
-			h = metrics.GetOrCreateHistogram(fmt.Sprintf(`kvstore_wasm_execution_duration_seconds{module="%s",function="%s"}`, module, function))
-			wasmHistograms[key] = h
-		}
-		wasmMu.Unlock()
 	}
 
 	c.Inc()

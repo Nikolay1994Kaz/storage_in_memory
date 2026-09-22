@@ -8,6 +8,5 @@ kvstore-*
 kvstore_*
 !kvstore_*.go
 !kvstore_*.md
-fraud_scorer.wasm
 data/
 test_cluster/

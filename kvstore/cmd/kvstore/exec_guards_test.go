@@ -2,20 +2,12 @@ package main
 
 import "testing"
 
-// Общие ветки диспетчера: неизвестная команда, WASM-заглушка, pub/sub счётчик,
-// кластер выключен.
+// Общие ветки диспетчера: неизвестная команда, pub/sub счётчик, кластер выключен.
 
 func TestExec_UnknownCommand(t *testing.T) {
 	e := newExecEnv(t)
 	// Неизвестная команда → явная ошибка, а не тишина/паника.
 	e.wantErrPrefix(e.do("NOSUCHCMD", "x"), "ERR unknown command")
-}
-
-func TestExec_WasmDisabledInProdBuild(t *testing.T) {
-	e := newExecEnv(t)
-	// Прод-сборка (без -tags experimental): WASM.* обслуживает nopCompute →
-	// явная ошибка «выключено», а не выполнение произвольного модуля (ACE-фенс).
-	e.wantErrPrefix(e.do("WASM.EXEC", "module"), "ERR WASM support is disabled")
 }
 
 func TestExec_PublishNoSubscribers(t *testing.T) {

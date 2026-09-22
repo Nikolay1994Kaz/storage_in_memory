@@ -24,12 +24,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
-	"kvstore/kvstore/internal/ai"
 	"kvstore/kvstore/internal/auditchain"
 	"kvstore/kvstore/internal/btree"
 	"kvstore/kvstore/internal/keyring"
@@ -160,7 +158,6 @@ func main() {
 	clusterEnabled := flag.Bool("cluster", false, "включить кластерный режим")
 	clusterSlotStart := flag.Int("slot-start", 0, "начало диапазона слотов")
 	clusterSlotEnd := flag.Int("slot-end", 16383, "конец диапазона слотов")
-	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "URL Ollama API")
 	requirePass := flag.String("requirepass", "", "пароль для AUTH через флаг (НЕБЕЗОПАСНО: виден в ps/history/proc; для прода см. -requirepass-file или env KVSTORE_REQUIREPASS)")
 	requirePassFile := flag.String("requirepass-file", "", "путь к файлу с паролем для AUTH (приоритетнее env и -requirepass; секрет не светится в списке процессов)")
 	tlsCert := flag.String("tls-cert", "", "путь к TLS сертификату (PEM)")
@@ -660,94 +657,6 @@ func main() {
 		defer cl.StopGossip()
 	}
 
-	// === 7. WASM Compute Engine (за build-tag experimental; в прод-сборке no-op) ===
-	// Реальный движок и вся wazero-зависимость линкуются только с -tags experimental
-	// (см. wasm_seam.go / wasm_stub.go / wasm_experimental.go). Небезопасная ACE-
-	// поверхность (WASM.EXEC) в прод-бинарь не попадает.
-	wasm := newComputeEngine(computeDeps{
-		store:    s,
-		ttl:      ttl,
-		bw:       bw,
-		hub:      hub,
-		vecStore: vecStore,
-		globalMu: &globalTxMu,
-	})
-	defer wasm.Close()
-
-	// === 8. AI Engine (Ollama) ===
-	// Ollama — ОПЦИОНАЛЬНЫЙ слой: ядро (VSIM.*/KV/pubsub) работает без неё,
-	// embeddings можно приносить свои (BYO). Подключение НЕ одноразовое:
-	// в `docker compose --profile ai` сервер стартует раньше, чем ollama-init
-	// скачает модели, поэтому при недоступности на старте пингуем в фоне и
-	// включаем AI.* в тот момент, когда Ollama поднялась, — без рестарта.
-	// Публикация через atomic.Pointer: handler читает клиента/воркера из
-	// нескольких epoll-горутин, а включает их фоновая горутина-пингер.
-	ollamaClient := ai.NewClient(*ollamaURL, "nomic-embed-text", "gemma4:e2b")
-	var aiClientRef atomic.Pointer[ai.Client]
-	var aiWorkerRef atomic.Pointer[ai.Worker]
-
-	// WASM-мостик навешиваем сразу: Embed/Chat — обычные HTTP-вызовы, до
-	// поднятия Ollama они просто вернут ошибку (в прод-сборке SetAI — no-op).
-	wasm.SetAI(ollamaClient.Embed, ollamaClient.Chat)
-
-	// enableAI вызывается РОВНО один раз: либо здесь (Ollama уже доступна),
-	// либо из горутины-пингера ниже.
-	enableAI := func() {
-		// Background Worker: асинхронный embedding с PubSub-нотификациями
-		aiWorker := ai.NewWorker(ollamaClient, 256)
-		aiWorker.VecStoreAdd = func(key string, vec []float32) error {
-			// WAL: без этого AI-проиндексированные векторы терялись при рестарте.
-			// Записываем сериализованный вектор — при восстановлении OpVSimAdd
-			// вставит его обратно в HNSW без повторного вызова Ollama.
-			walValue := vector.SerializeVector(vec)
-			bw.Write(wal.Entry{Op: wal.OpVSimAdd, Key: key, Value: walValue})
-			return vecStore.Add(key, vec)
-		}
-		aiWorker.KVStoreSet = func(key string, value []byte) {
-			s.Set(0, key, value)
-		}
-		aiWorker.Publish = func(channel, message string) {
-			hub.Publish(channel, message)
-		}
-		aiWorker.Start(2) // 2 горутины (Ollama сама батчит)
-		// Stop() вызывается явно в упорядоченном shutdown до bw.Close()
-		// (AI-воркер пишет OpVSimAdd в WAL-канал).
-		aiWorkerRef.Store(aiWorker)
-		aiClientRef.Store(ollamaClient) // публикуем клиента ПОСЛЕ воркера: гейт единый
-		slog.Info("Ollama connected, AI commands enabled", "embed", "nomic-embed-text", "chat", "gemma4:e2b")
-	}
-
-	aiPingerStop := make(chan struct{})
-	aiPingerDone := make(chan struct{})
-	pingCtx, pingCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	pingErr := ollamaClient.Ping(pingCtx)
-	pingCancel()
-	if pingErr == nil {
-		enableAI()
-		close(aiPingerDone)
-	} else {
-		slog.Warn("Ollama not available, AI commands disabled; will keep retrying in background", "err", pingErr)
-		go func() {
-			defer close(aiPingerDone)
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-aiPingerStop:
-					return
-				case <-ticker.C:
-					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					err := ollamaClient.Ping(ctx)
-					cancel()
-					if err == nil {
-						enableAI()
-						return
-					}
-				}
-			}
-		}()
-	}
-
 	// ═══════════════════════════════════════════════════
 	// HANDLER — zero-alloc: args = [][]byte из ring buffer
 	// ═══════════════════════════════════════════════════
@@ -848,7 +757,7 @@ func main() {
 			// per-worker zero-alloc модель. Контракт сознательно сужен, а не расширен.
 			execQueuedTx(cs.TxQueue, cs.Buf.WriteArrayHeader, func(qCmd string, qCmdArgs [][]byte) {
 				startCmd := time.Now()
-				executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClientRef.Load(), aiWorkerRef.Load(), iterateAll, saveVectors, cs, qCmd, qCmdArgs)
+				executeCommand(s, bw, ttl, hub, cl, vecStore, zsetReg, iterateAll, saveVectors, cs, qCmd, qCmdArgs)
 				monitoring.RecordCommand(qCmd, time.Since(startCmd))
 			})
 			cs.InTx = false
@@ -863,7 +772,7 @@ func main() {
 		}
 
 		start := time.Now()
-		executeCommand(s, bw, ttl, hub, cl, wasm, vecStore, zsetReg, aiClientRef.Load(), aiWorkerRef.Load(), iterateAll, saveVectors, cs, cmd, cmdArgs)
+		executeCommand(s, bw, ttl, hub, cl, vecStore, zsetReg, iterateAll, saveVectors, cs, cmd, cmdArgs)
 		monitoring.RecordCommand(cmd, time.Since(start))
 	}
 
@@ -928,20 +837,11 @@ func main() {
 	//   1. srv.Stop()   — перестаём принимать команды и ДОЖИДАЕМСЯ завершения
 	//                      in-flight обработчиков (их bw.Write уже в канале).
 	//   2. ttl.Stop()   — глушим TTL-эвиктор (пишет OpVSimDel в WAL-канал).
-	//   3. aiWorker     — глушим AI-воркер (пишет OpVSimAdd в WAL-канал).
-	//      Перед этим останавливаем пингер и ДОЖИДАЕМСЯ его выхода: иначе он
-	//      может включить воркер параллельно с shutdown (воркер без Stop →
-	//      запись в закрытый WAL-канал).
-	//   4. syncer.Stop()— останавливаем периодический fsync/compaction.
-	//   5. bw.Close()   — дренаж WAL-канала + flush + fsync последнего батча.
-	// Только после (1)-(4) закрываем канал в (5): все писатели уже заглушены.
+	//   3. syncer.Stop()— останавливаем периодический fsync/compaction.
+	//   4. bw.Close()   — дренаж WAL-канала + flush + fsync последнего батча.
+	// Только после (1)-(3) закрываем канал в (4): все писатели уже заглушены.
 	srv.Stop()
 	ttl.Stop()
-	close(aiPingerStop)
-	<-aiPingerDone
-	if w := aiWorkerRef.Load(); w != nil {
-		w.Stop()
-	}
 	syncer.Stop()
 	// Цепь закрывается ПОСЛЕ srv.Stop(): её пишут только обработчики команд, и
 	// к этому моменту их уже нет. Close сбрасывает остаток буфера — без него
@@ -1121,8 +1021,7 @@ func isMemoryGrowingCmd(cmd string) bool {
 	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC",
 		// VMEM.RESEAL здесь по той же причине, что QUARANTINE и BACKFILL:
 		// перешифровка дописывает НОВУЮ версию факта, а не правит старую.
-		"VMEM.REMEMBER", "VMEM.QUARANTINE", "VMEM.BACKFILL", "VMEM.RESEAL",
-		"WASM.LOAD", "WASM.LOADFILE", "AI.INGEST":
+		"VMEM.REMEMBER", "VMEM.QUARANTINE", "VMEM.BACKFILL", "VMEM.RESEAL":
 		return true
 	}
 	return false
@@ -1145,7 +1044,7 @@ func isWriteCmd(cmd string) bool {
 		// иначе уничтожение ключа прошло бы под -restore-to-lsn, то есть
 		// расследование могло бы испортить вещдок, по которому ведётся.
 		"VMEM.SHRED",
-		"ZADD", "ZREM", "AI.INGEST":
+		"ZADD", "ZREM":
 		return true
 	}
 	return false
@@ -1313,10 +1212,9 @@ func parseRecallArgs(args [][]byte) (vector.RecallRequest, string) {
 }
 
 func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
-	hub *pubsub.Hub, cl clusterNode, wasm computeRuntime,
+	hub *pubsub.Hub, cl clusterNode,
 	vecStore vector.VectorIndex,
 	zsetReg *zset.ZSetRegistry,
-	aiClient *ai.Client, aiWorker *ai.Worker,
 	iterateAll func(fn func(op byte, key string, value []byte)),
 	saveVectors func() error,
 	cs *server.ConnState, cmd string, args [][]byte) {
@@ -1355,14 +1253,6 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteError("WAL persistence failed, writes are blocked (durability fail-stop): " + err.Error())
 			return
 		}
-	}
-
-	// WASM.* команды обслуживает compute-шов (за build-tag experimental). В прод-
-	// сборке это no-op-заглушка, отвечающая «WASM disabled» — весь код движка и
-	// wazero в бинарь не входят.
-	if strings.HasPrefix(cmd, "WASM.") {
-		wasm.HandleCommand(cmd, args, buf)
-		return
 	}
 
 	switch cmd {
@@ -1435,7 +1325,6 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		if cl != nil {
 			cl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
 		}
-		wasm.FireSet(key, workerID)
 
 		if len(args) >= 4 && strings.ToUpper(string(args[2])) == "EX" {
 			seconds, err := strconv.Atoi(string(args[3]))
@@ -1506,7 +1395,6 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		if cl != nil {
 			cl.ForwardWrite(fmt.Sprintf("DEL %s", key))
 		}
-		wasm.FireDel(key, workerID)
 		if ok {
 			buf.WriteInt(1)
 		} else {
@@ -3487,135 +3375,6 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			buf.WriteBulkString(r.Key)
 			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
 		}
-
-	// === AI Commands ===
-	case "AI.EMBED":
-		if aiClient == nil {
-			buf.WriteError("ERR Ollama not available — AI.* is an optional layer; start Ollama (docker compose --profile ai up, or --ollama-url), the server picks it up automatically")
-			return
-		}
-		if len(args) < 1 {
-			buf.WriteError("ERR usage: AI.EMBED <text>")
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		embedding, err := aiClient.Embed(ctx, string(args[0]))
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		buf.WriteArrayHeader(len(embedding))
-		for _, v := range embedding {
-			buf.WriteBulkString(fmt.Sprintf("%.6f", v))
-		}
-
-	case "AI.SEARCH":
-		if aiClient == nil {
-			buf.WriteError("ERR Ollama not available — AI.* is an optional layer; start Ollama (docker compose --profile ai up, or --ollama-url), the server picks it up automatically")
-			return
-		}
-		if len(args) < 2 {
-			buf.WriteError("ERR usage: AI.SEARCH <K> <text>")
-			return
-		}
-		K, err := strconv.Atoi(string(args[0]))
-		if err != nil || K <= 0 || K > vector.MaxSearchK {
-			buf.WriteError("ERR invalid K (must be 1..100000)")
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		embedding, err := aiClient.Embed(ctx, string(args[1]))
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR embed: %v", err))
-			return
-		}
-		monitoring.VectorSearchTotal.Inc()
-		searchStart := time.Now()
-		results, err := vecStore.Search(embedding, K, nil)
-		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR search: %v", err))
-			return
-		}
-		buf.WriteArrayHeader(len(results) * 2)
-		for _, r := range results {
-			buf.WriteBulkString(r.Key)
-			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Distance))
-		}
-
-	case "AI.ASK":
-		if aiClient == nil {
-			buf.WriteError("ERR Ollama not available — AI.* is an optional layer; start Ollama (docker compose --profile ai up, or --ollama-url), the server picks it up automatically")
-			return
-		}
-		if len(args) < 1 {
-			buf.WriteError("ERR usage: AI.ASK <question>")
-			return
-		}
-		question := string(args[0])
-		// 90с, а не 30с: первый AI.ASK после старта грузит chat-модель (~7GB)
-		// в память Ollama — холодный вызов не укладывался в 30с и отваливался.
-		// Прогретый ~13с. Цена: команда держит epoll-worker до 90с — приемлемо
-		// для демо-слоя AI.*, ядро (VSIM.*/KV) этим путём не ходит.
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
-
-		// RAG Step 1: вопрос → embedding
-		embedding, err := aiClient.Embed(ctx, question)
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR embed: %v", err))
-			return
-		}
-
-		// RAG Step 2: поиск похожих документов
-		monitoring.VectorSearchTotal.Inc()
-		searchStart := time.Now()
-		results, err := vecStore.Search(embedding, 3, nil)
-		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR search: %v", err))
-			return
-		}
-
-		// RAG Step 3: достаём оригинальные тексты из KV Store
-		var contextParts []string
-		for _, r := range results {
-			if val, ok := s.Get(r.Key); ok {
-				contextParts = append(contextParts, fmt.Sprintf("[%s]: %s", r.Key, string(val)))
-			}
-		}
-		if len(contextParts) == 0 {
-			buf.WriteError("ERR no documents found for context")
-			return
-		}
-
-		// RAG Step 4: собираем промпт и отправляем в LLM
-		prompt := fmt.Sprintf("Контекст:\n%s\n\nВопрос: %s\n\nОтветь кратко на основе контекста выше.",
-			strings.Join(contextParts, "\n"), question)
-
-		answer, err := aiClient.Chat(ctx, prompt)
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR chat: %v", err))
-			return
-		}
-		buf.WriteBulkString(answer)
-
-	case "AI.INGEST":
-		if aiWorker == nil {
-			buf.WriteError("ERR Ollama not available — AI.* is an optional layer; start Ollama (docker compose --profile ai up, or --ollama-url), the server picks it up automatically")
-			return
-		}
-		if len(args) < 2 {
-			buf.WriteError("ERR usage: AI.INGEST <key> <text>")
-			return
-		}
-		if err := aiWorker.Submit(string(args[0]), string(args[1])); err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		buf.WriteSimpleString("QUEUED")
 
 	default:
 		buf.WriteError(fmt.Sprintf("ERR unknown command '%s'", cmd))

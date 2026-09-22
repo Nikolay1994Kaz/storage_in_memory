@@ -3,11 +3,10 @@
 End-to-end tour of the product path in ~200 lines of Go with **zero client
 dependencies** (the wire protocol is plain RESP):
 
-1. `AI.EMBED` — real embeddings (`nomic-embed-text` via Ollama, 768-dim);
+1. client-side embeddings — real vectors (`nomic-embed-text` via a local Ollama, 768-dim), computed by the example itself; the server only ever sees `float32`s (BYO-embeddings);
 2. `VSIM.ADDATTR` — vector ingest with columnar attributes (`tenant`, `topic`, numeric `year`), WAL-durable;
 3. `VSIM.SEARCH` — global ANN search;
-4. `VSIM.FILTER` — the same query scoped to a tenant (`EQ`) and a numeric range (`RANGE`);
-5. `AI.SEARCH` — the one-round-trip variant (embedding computed server-side).
+4. `VSIM.FILTER` — the same query scoped to a tenant (`EQ`) and a numeric range (`RANGE`).
 
 The demo corpus is two tenants with deliberately different domains (a space
 company and a restaurant), so you can *see* tenant isolation working: the same
@@ -16,19 +15,19 @@ query returns different results once scoped.
 ## Run
 
 ```bash
-# 1. Build + start the server and Ollama (the `ai` profile; the embedding model
-#    is pulled automatically). This tour only needs embeddings, so
-#    OLLAMA_SKIP_CHAT_MODEL=1 skips the ~7GB chat model used by AI.ASK.
-#    --build rebuilds from the current sources so you never run a cached image
-#    that predates a command like VSIM.ADDATTR. The server picks Ollama up in
-#    the background — no ordering or restart concerns.
-OLLAMA_SKIP_CHAT_MODEL=1 docker compose --profile ai up -d --build
+# 1. An embedder for the CLIENT (the server never talks to it):
+#    https://ollama.com/download, then
+ollama pull nomic-embed-text
 
-# 2. Run the example
+# 2. The server. --build rebuilds from the current sources so you never run a
+#    cached image that predates a command like VSIM.ADDATTR.
+docker compose up -d --build          # or: make build && ./kvstore-server --port 6380
+
+# 3. Run the example
 go run ./kvstore/examples/quickstart
 
-# Against a non-default address:
-go run ./kvstore/examples/quickstart -addr 127.0.0.1:6380
+# Non-default addresses / model:
+go run ./kvstore/examples/quickstart -addr 127.0.0.1:6380 -ollama http://localhost:11434 -model nomic-embed-text
 ```
 
 Expected output (distances will vary slightly):
@@ -52,8 +51,8 @@ Query: "how does a spacecraft survive the heat of returning to Earth"
   and small-tenant filtered queries drop to brute-force over the tenant block
   (orders of magnitude faster than graph traversal; see
   [docs/BENCHMARKS.md](../../../docs/BENCHMARKS.md)).
-- **No Ollama?** The vector engine itself does not need it — you can ingest
-  pre-computed embeddings with `VSIM.ADD`/`VSIM.ADDBIN`/`VSIM.ADDATTR` from any
-  embedding provider. Ollama is only used here so the example is fully
-  self-contained.
+- **No Ollama?** The engine never needs it — ingest pre-computed embeddings with
+  `VSIM.ADD`/`VSIM.ADDBIN`/`VSIM.ADDATTR` from any embedding provider. Ollama is
+  used *by this example* only so the tour runs without API keys; swap the
+  `embed` function for any provider and nothing on the server side changes.
 - The full command reference lives in [docs/COMMANDS.md](../../../docs/COMMANDS.md).
