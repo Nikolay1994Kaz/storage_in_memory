@@ -79,4 +79,4 @@ catalog version) и RocksDB (format_version): несовместимый on-disk
    Триггер тот же, что у конвертера: появление данных, которые жалко.
 2. Перечитать этот документ и убедиться, что правила 1–4 контракта
    отражены в review-чек-листе изменений `internal/wal/` и
-   `vector/snapshot_binary.go`.
+   `vector/leveled_store.go` (SaveBinary/LoadBinary) и `vector/snapshot_sealed_*.go`.

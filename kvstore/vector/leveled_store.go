@@ -3352,34 +3352,6 @@ func (lvs *LeveledVectorStore) startFreezeShardsGoroutine(oldDelta *DeltaSegment
 	}()
 }
 
-// startMergeGoroutine запускает goroutine для BUILD merge-сегмента.
-// Результат возвращается через resultChan. Сегменты НЕ удаляются из levels
-// до получения результата (applyResult).
-func (lvs *LeveledVectorStore) startMergeGoroutine(task *compactionTask) {
-	sourceLvl := task.sourceLvl
-	targetLvl := task.targetLvl
-	epoch := task.epoch
-	segs := task.segs
-	go func() {
-		mergeStart := time.Now()
-		seg, applied := lvs.mergeSegmentsWithAllocator(segs, lvs.pickMergeAllocator(sourceLvl))
-		monitoring.VectorMergeDuration.Update(time.Since(mergeStart).Seconds())
-		res := compactionResult{
-			kind:              taskMergeLevel,
-			sourceLvl:         sourceLvl,
-			targetLvl:         targetLvl,
-			epoch:             epoch,
-			result:            seg,
-			oldSegs:           segs,
-			appliedTombstones: applied,
-		}
-		select {
-		case lvs.resultChan <- res:
-		case <-lvs.done:
-		}
-	}()
-}
-
 // maybeScheduleMerges проверяет переполненные уровни и запускает merge goroutines.
 // По одному merge на уровень одновременно (mergeInFlight[L]). Сегменты НЕ убираются
 // из levels[] — старые остаются видимы для search до замены.
@@ -3609,17 +3581,6 @@ func (lvs *LeveledVectorStore) removeSegments(lyr int, toRemove []segment) {
 	lvs.levels[lyr] = kept
 }
 
-// pickBuildWorkerID — round-robin по buildAllocators.
-// Каждый вызов возвращает следующий ID (atomic). Обеспечивает изоляцию
-// TCMallocStore при параллельных delta-flush goroutines (каждый — свой аллокатор).
-func (lvs *LeveledVectorStore) pickBuildWorkerID() int {
-	n := len(lvs.buildAllocators)
-	if n == 0 {
-		return 0
-	}
-	return int(lvs.buildWorkerIDCounter.Add(1)-1) % n
-}
-
 // pickMergeAllocator возвращает изолированный аллокатор для merge уровня sourceLvl.
 // Каждый уровень имеет свой allocator → параллельные merge разных уровней
 // не конкурируют. mergeAllocators имеет maxLevels элементов.
@@ -3628,18 +3589,6 @@ func (lvs *LeveledVectorStore) pickMergeAllocator(sourceLvl int) *tcmalloc.TCMal
 		return lvs.mergeAllocators[sourceLvl]
 	}
 	return lvs.mergeAllocators[0]
-}
-
-// enqueueTask кладёт task в buildQueue, уважая shutdown.
-// Может блокироваться при полном буфере (backpressure).
-// Increment inFlightBuilds — buildWorker декремтит после publish.
-func (lvs *LeveledVectorStore) enqueueTask(task *compactionTask) {
-	lvs.inFlightBuilds.Add(1)
-	select {
-	case lvs.buildQueue <- task:
-	case <-lvs.done:
-		lvs.inFlightBuilds.Add(-1)
-	}
 }
 
 // buildWorker — пуловый воркер delta-flush задач. Получает задачу из buildQueue,
@@ -3771,29 +3720,9 @@ func (lvs *LeveledVectorStore) anyMergeInFlight() bool {
 	return lvs.anyMergeInFlightLocked()
 }
 
-// waitForBuildCompletion — не используется, оставлен для совместимости.
-func (lvs *LeveledVectorStore) waitForBuildCompletion() {
-	for lvs.inFlightBuilds.Load() > 0 {
-		select {
-		case <-lvs.done:
-			return
-		default:
-			runtime.Gosched()
-		}
-	}
-}
-
 // flushDeltaToSegment удалён — логика delta-flush интегрирована в coordinateCompaction
 // (Build Pool). Coordinator забирает delta и создаёт task{taskFlushDelta}, buildWorker
 // строит сегмент через buildSegment.
-
-// mergeSegments сливает несколько сегментов в один новый.
-// Ключи из tombstone-слоя физически пропускаются — это единственный момент,
-// когда tombstones «применяются» и после merge перестают быть нужны.
-func (lvs *LeveledVectorStore) mergeSegments(segs []segment, workerID int) segment {
-	seg, _ := lvs.mergeSegmentsWithAllocator(segs, lvs.buildAllocators[workerID%len(lvs.buildAllocators)])
-	return seg
-}
 
 // mergeSegmentsWithAllocator — merge с явным аллокатором (для coordinator-driven merge,
 // использует lvs.mergeAllocator, изолированный от build workers).

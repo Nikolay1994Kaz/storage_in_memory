@@ -13,8 +13,6 @@ import (
 	"bytes"
 	"fmt"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // indexImpl описывает одну реализацию VectorIndex для конформанс-прогона.
@@ -30,13 +28,6 @@ type indexImpl struct {
 
 func conformanceImpls() []indexImpl {
 	return []indexImpl{
-		{
-			name: "VectorStore",
-			make: func(t *testing.T) VectorIndex {
-				return NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
-			},
-			syncForSave: func(VectorIndex) {},
-		},
 		{
 			name: "LeveledVectorStore",
 			make: func(t *testing.T) VectorIndex {
