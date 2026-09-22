@@ -1,11 +1,14 @@
 package vector
 
 import (
+	"encoding/binary"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 // Общие хелперы замеров: расчёт ground truth перебором, recall с предикатом,
@@ -68,7 +71,7 @@ func l3StatusStr(mb float64) string {
 }
 
 // —— перенесено из ivf_big_dim_test.go ——
-// measureQPSBatch — вспомогательный для testQPSAtScale
+// measureQPSBatch — замер QPS: workers воркеров гоняют searchFn по queries в течение duration
 func measureQPSBatch(searchFn func(q []float32), queries [][]float32, workers int, duration time.Duration) float64 {
 	var count atomic.Int64
 	done := make(chan struct{})
@@ -182,4 +185,55 @@ func recallVsGT(foundIDs []int, gt []int, K int) float64 {
 		}
 	}
 	return float64(hit) / float64(K)
+}
+
+// loadSIFTRaw читает сырой бинарный датасет формата конвертеров scripts/convert_annbench.py
+// и scripts/convert_dbpedia.py: <u32 n><u32 dim> train(f32) [<u32 nTest> test(f32)].
+// Перенесён из удалённого прототипа IVF/PQ: его зовут dataset-тесты за тегом datasets.
+// loadSIFTRaw загружает SIFT данные из простого raw binary файла.
+// Формат: [4B n_train][4B dim][n_train*dim*4B train][4B n_test][n_test*dim*4B test]
+func loadSIFTRaw(path string) (train [][]float32, test [][]float32, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(data) < 8 {
+		return nil, nil, fmt.Errorf("file too small")
+	}
+
+	n := int(binary.LittleEndian.Uint32(data[0:4]))
+	dim := int(binary.LittleEndian.Uint32(data[4:8]))
+	off := 8
+
+	trainSize := n * dim * 4
+	if off+trainSize > len(data) {
+		return nil, nil, fmt.Errorf("train data truncated")
+	}
+
+	// Zero-copy: reinterpret float32 from byte slice.
+	trainFlat := unsafe.Slice((*float32)(unsafe.Pointer(&data[off])), n*dim)
+	train = make([][]float32, n)
+	for i := 0; i < n; i++ {
+		train[i] = trainFlat[i*dim : (i+1)*dim]
+	}
+	off += trainSize
+
+	if off+4 > len(data) {
+		return nil, nil, fmt.Errorf("test count missing")
+	}
+	nTest := int(binary.LittleEndian.Uint32(data[off : off+4]))
+	off += 4
+
+	testSize := nTest * dim * 4
+	if off+testSize > len(data) {
+		// Maybe no test set; return train only.
+		return train, nil, nil
+	}
+	testFlat := unsafe.Slice((*float32)(unsafe.Pointer(&data[off])), nTest*dim)
+	test = make([][]float32, nTest)
+	for i := 0; i < nTest; i++ {
+		test[i] = testFlat[i*dim : (i+1)*dim]
+	}
+
+	return train, test, nil
 }

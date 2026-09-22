@@ -700,49 +700,6 @@ func bruteFloat32(vecs [][]float32, q []float32, K int) []int {
 	return topKIdx(len(vecs), K, func(i int) float32 { return EuclideanDistance(q, vecs[i]) })
 }
 
-// pqSearch — PQ-ADC через LUT. vecs==nil → PQ-only top-K; vecs!=nil → top-efRerank
-// по ADC, затем точный rerank по float32 → top-K (модель FrozenGraphPQ).
-func pqSearch(pq *pqIndex, q []float32, K, efRerank int, vecs [][]float32) []int {
-	M, dsub := pq.M, pq.dsub
-	lut := make([]float32, M*256) // LUT[m*256+c] = ||q_sub_m - centroid[m][c]||²
-	for m := 0; m < M; m++ {
-		sub := q[m*dsub : (m+1)*dsub]
-		base := m * 256
-		for c := 0; c < 256; c++ {
-			lut[base+c] = EuclideanDistance(sub, pq.centroids[m][c])
-		}
-	}
-	adc := func(i int) float32 {
-		code := pq.codes[i]
-		var d float32
-		for m := 0; m < M; m++ {
-			d += lut[m*256+int(code[m])]
-		}
-		return d
-	}
-	if vecs == nil {
-		return topKIdx(len(pq.codes), K, adc)
-	}
-	cand := topKIdx(len(pq.codes), efRerank, adc)
-	type vd struct {
-		idx int
-		d   float32
-	}
-	rr := make([]vd, len(cand))
-	for j, id := range cand {
-		rr[j] = vd{id, EuclideanDistance(q, vecs[id])}
-	}
-	sort.Slice(rr, func(a, b int) bool { return rr[a].d < rr[b].d })
-	if len(rr) > K {
-		rr = rr[:K]
-	}
-	ids := make([]int, len(rr))
-	for j := range rr {
-		ids[j] = rr[j].idx
-	}
-	return ids
-}
-
 func recallIDs(found, gt []int, K int) float64 {
 	gtset := make(map[int]struct{}, K)
 	for _, id := range gt {
@@ -755,45 +712,6 @@ func recallIDs(found, gt []int, K int) float64 {
 		}
 	}
 	return float64(hit) / float64(K)
-}
-
-// TestArch_PQ784 — валидация PQ на РЕАЛЬНЫХ 784-мерных данных (MNIST, ~ваши 768).
-// Решает: даёт ли PQ память (M байт/вектор) при приемлемом recall, и быстра ли ADC.
-func TestArch_PQ784(t *testing.T) {
-	if testing.Short() {
-		t.Skip("long")
-	}
-	train, test, err := loadSIFTRaw("/tmp/mnist784.bin")
-	if err != nil {
-		t.Skipf("no dataset: %v", err)
-	}
-	K := 10
-	dim := len(train[0])
-	qDur := 3 * time.Second
-	t.Logf("MNIST-784: n=%d dim=%d queries=%d", len(train), dim, len(test))
-	gt := bruteGT(train, test, K)
-	f32q := qpsGeneric(test, 12, qDur, func(q []float32) { _ = bruteFloat32(train, q, K) })
-
-	fmt.Println()
-	fmt.Printf("PQ на РЕАЛЬНЫХ 784-мерных (MNIST, n=%d, K=%d, efRerank=100):\n", len(train), K)
-	fmt.Printf("  float32 baseline: %d B/vec, recall=1.000, QPS_12=%.0f\n", dim*4, f32q)
-	fmt.Printf("  SQ8 (для справки): %d B/vec\n", dim)
-	fmt.Printf("%-10s %-9s %-12s %-15s %-12s %-10s\n",
-		"PQ", "B/vec", "recall_only", "recall+rerank", "QPS_only_12", "сжатие")
-	for _, M := range []int{16, 28, 49, 98} {
-		pq := trainPQ(train, M)
-		var sOnly, sRerank float64
-		for qi, q := range test {
-			sOnly += recallIDs(pqSearch(pq, q, K, 0, nil), gt[qi], K)
-			sRerank += recallIDs(pqSearch(pq, q, K, 100, train), gt[qi], K)
-		}
-		recOnly := sOnly / float64(len(test))
-		recRerank := sRerank / float64(len(test))
-		qOnly := qpsGeneric(test, 12, qDur, func(q []float32) { _ = pqSearch(pq, q, K, 0, nil) })
-		fmt.Printf("M=%-8d %-9d %-12.3f %-15.3f %-12.0f %-.0f×f32\n",
-			M, M, recOnly, recRerank, qOnly, float64(dim*4)/float64(M))
-	}
-	fmt.Println("Решение: если PQ+rerank recall ≥0.9 при M B/vec (десятки байт) — PQ оправдан для 768.")
 }
 
 // TestArch_SQ784 — проверка включённого SQ8 для 768 на РЕАЛЬНЫХ 784-мерных (MNIST).
