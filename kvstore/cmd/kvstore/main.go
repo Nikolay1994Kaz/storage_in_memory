@@ -234,21 +234,9 @@ func main() {
 	// === 2.5. Инициализация sorted sets (ZSet) ===
 	zsetReg := zset.New(s.MemoryCounter())
 
-	graphPath := filepath.Join(dataDir, "graph_leveled.bin")
-	graphLoaded := false
-
-	if _, err := os.Stat(graphPath); err == nil {
-		slog.Info("loading leveled vector store from binary snapshot", "path", graphPath)
-		f, err := os.Open(graphPath)
-		if err == nil {
-			if err := vecStore.LoadBinary(f); err != nil {
-				slog.Warn("failed to load vector snapshot, will rebuild from WAL", "err", err)
-			} else {
-				slog.Info("leveled vector store loaded from snapshot")
-				graphLoaded = true
-			}
-			f.Close()
-		}
+	graphLoaded, err := loadVectorSnapshot(vecStore, filepath.Join(dataDir, "graph_leveled.bin"))
+	if err != nil {
+		logging.Fatalf("%v", err)
 	}
 
 	// === 3. Восстановление состояния из WAL ===

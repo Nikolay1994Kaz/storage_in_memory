@@ -1,10 +1,15 @@
 package main
 
 // Состояние, которое уходит в журнал и снапшот помимо обработчиков команд:
-// снимок KV-состояния для компакции и TTL-эвиктор.
+// снимок KV-состояния для компакции, TTL-эвиктор и загрузка снапшота векторов
+// при старте.
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
 	"strings"
 
 	"kvstore/kvstore/internal/store"
@@ -83,4 +88,31 @@ func (e *compositeEvictor) Del(key string) bool {
 	}
 
 	return kvDeleted || vecDeleted
+}
+
+// loadVectorSnapshot загружает graph_leveled.bin, если он есть.
+//
+// Файл, который есть, но не читается, — отказ старта. После компакции это
+// единственная копия векторов старше неё: их записи в WAL удалены, а
+// snapshot.wal векторов не хранит. Прежде сервер писал «will rebuild from WAL»
+// и стартовал без них — то есть молча терял данные, а следующая компакция
+// перезаписывала файл неполным состоянием.
+func loadVectorSnapshot(vec *vector.LeveledVectorStore, path string) (bool, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("vector snapshot %s: %w", path, err)
+	}
+	defer f.Close()
+	slog.Info("loading vector snapshot", "path", path)
+	if err := vec.LoadBinary(f); err != nil {
+		return false, fmt.Errorf("vector snapshot %s is unreadable (%w). It is the only copy of vectors older than "+
+			"the last compaction — their WAL records were deleted after it — so starting without it would silently "+
+			"lose them. Restore the data directory from a backup or with -ship-restore; to start anyway and accept "+
+			"the loss, move the file away", path, err)
+	}
+	slog.Info("vector snapshot loaded")
+	return true, nil
 }

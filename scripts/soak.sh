@@ -5,7 +5,7 @@
 # Сценарий:
 #   build → seed oracle → фаза 1 → рестарт A + verify → фаза 2 → рестарт B + verify
 #   → дрилл 1: restore из shipped WAL (file://) в ЧИСТЫЙ каталог + полный verify
-#   → дрилл 2: битый CRC graph_leveled.bin → громкий rebuild-from-WAL + kv-only verify
+#   → дрилл 2: битый CRC graph_leveled.bin → отказ старта; файл убран → kv-only verify
 #
 # Линзы: дрейф RSS/goroutines/heap-vs-sys/tombstones/сегментов (drift.log, сэмплер
 # каждые SAMPLE сек) + окно p50/p95/p99 в stress-логах + durability-оракул
@@ -192,12 +192,13 @@ fi
 stop_server graceful
 
 # ─── дрилл 2: битый CRC вектор-снапшота ──────────────────────────────────────
-# Флипаем байт в середине graph_leveled.bin. Ожидание: сервер НЕ падает и НЕ
-# грузит мусор (LoadBinary всё-или-ничего) — громкий warn + rebuild from WAL.
-# KV обязан пережить полностью (snapshot.wal+WAL не тронуты) → verify -kv-only.
-# Векторы легитимно неполны: их операции до последней компакции жили только в
-# снапшоте. Полное восстановление от bit-rot — дрилл 1 (shipped копия).
-say "Дрилл 2: битый CRC graph_leveled.bin → громкий rebuild from WAL"
+# Флипаем байт в середине graph_leveled.bin. Ожидание: сервер НЕ стартует. После
+# компакции снапшот — единственная копия векторов старше неё (их WAL удалён), и
+# старт без него молча потерял бы их, а следующая компакция и шиппинг разнесли
+# бы неполное состояние по копиям. Оператор, сознательно принимая потерю,
+# убирает файл — тогда KV обязан пережить полностью → verify -kv-only.
+# Полное восстановление от bit-rot — дрилл 1 (shipped копия).
+say "Дрилл 2: битый CRC graph_leveled.bin → отказ старта"
 GRAPH="$WORK/data/graph_leveled.bin"
 if [ -f "$GRAPH" ]; then
   size=$(stat -c%s "$GRAPH")
@@ -207,17 +208,24 @@ if [ -f "$GRAPH" ]; then
   echo "байт @$off флипнут ($orig → $((orig ^ 255))), размер файла $size"
 
   if start_server server-crc.log; then
-    if grep -q "failed to load vector snapshot" "$LOGS/server-crc.log"; then
-      echo "OK: сервер громко отверг битый снапшот и перестроился из WAL"
-    else
-      fail "CRC-дрилл: в логе нет 'failed to load vector snapshot' (снапшот принят молча?)"
-    fi
-    "$WORK/soak-oracle" -mode verify -kv-only -addr "localhost:$PORT" -n "$NKEYS" \
-      || fail "oracle kv-only verify после битого CRC"
+    fail "CRC-дрилл: сервер поднялся с битым снапшотом — старт без старых векторов = тихая потеря"
+    stop_server graceful
   else
-    fail "CRC-дрилл: сервер не поднялся с битым снапшотом (ожидался rebuild from WAL)"
+    stop_server graceful
+    if grep -q "only copy of vectors" "$LOGS/server-crc.log"; then
+      echo "OK: сервер отказался стартовать с битым снапшотом и объяснил почему"
+    else
+      fail "CRC-дрилл: сервер не поднялся, но в логе нет объяснения"
+    fi
+    mv "$GRAPH" "$GRAPH.corrupt" # оператор сознательно принимает потерю векторов
+    if start_server server-crc2.log; then
+      "$WORK/soak-oracle" -mode verify -kv-only -addr "localhost:$PORT" -n "$NKEYS" \
+        || fail "oracle kv-only verify после удаления битого снапшота"
+      stop_server graceful
+    else
+      fail "CRC-дрилл: после удаления битого снапшота сервер не поднялся"
+    fi
   fi
-  stop_server graceful
 else
   fail "CRC-дрилл пропущен: $GRAPH не существует (компакция ни разу не прошла?)"
 fi
