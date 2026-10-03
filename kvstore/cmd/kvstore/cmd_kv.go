@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,23 @@ func (c *commands) cmdSet(cs *server.ConnState, args [][]byte) {
 	buf := cs.Buf
 	if len(args) < 2 {
 		buf.WriteError("ERR wrong number of arguments for 'SET'")
+		return
+	}
+	// Опции разбираются ДО любой записи: отклонённый SET не оставляет следа ни
+	// в памяти, ни в журнале. Поддерживается только EX; любая другая опция —
+	// синтаксическая ошибка, а не молча проигнорированный хвост.
+	var ttlDur time.Duration
+	switch {
+	case len(args) == 2:
+	case len(args) == 4 && strings.EqualFold(string(args[2]), "EX"):
+		d, ok := parseTTLSeconds(args[3])
+		if !ok {
+			buf.WriteError("ERR invalid expire time")
+			return
+		}
+		ttlDur = d
+	default:
+		buf.WriteError("ERR syntax error")
 		return
 	}
 	key := string(args[0])
@@ -49,18 +67,9 @@ func (c *commands) cmdSet(cs *server.ConnState, args [][]byte) {
 		c.cluster.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
 	}
 
-	if len(args) >= 4 && strings.ToUpper(string(args[2])) == "EX" {
-		seconds, err := strconv.Atoi(string(args[3]))
-		if err != nil || seconds <= 0 {
-			buf.WriteError("ERR invalid expire time")
-			return
-		}
-		dur := time.Duration(seconds) * time.Second
-		expiresAt := time.Now().Add(dur)
-		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], uint64(expiresAt.UnixNano()))
-		c.wal.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: b[:]})
-		c.ttl.Set(key, dur)
+	if ttlDur > 0 {
+		writeExpire(c.wal, key, ttlDur)
+		c.ttl.Set(key, ttlDur)
 	} else {
 		// Голый SET (без EX) снимает прежний TTL — семантика Redis без
 		// KEEPTTL. Иначе новое значение унаследует старый таймер и умрёт
@@ -149,16 +158,12 @@ func (c *commands) cmdExpire(cs *server.ConnState, args [][]byte) {
 		buf.WriteInt(0)
 		return
 	}
-	seconds, err := strconv.Atoi(string(args[1]))
-	if err != nil || seconds <= 0 {
+	dur, ok := parseTTLSeconds(args[1])
+	if !ok {
 		buf.WriteError("ERR invalid expire time")
 		return
 	}
-	dur := time.Duration(seconds) * time.Second
-	expiresAt := time.Now().Add(dur)
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], uint64(expiresAt.UnixNano()))
-	c.wal.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: b[:]})
+	writeExpire(c.wal, key, dur)
 	c.ttl.Set(key, dur)
 	buf.WriteInt(1)
 }
@@ -237,4 +242,25 @@ func setClearTTL(ttl *store.TTLManager, bw *wal.BatchWAL, key string) {
 	if ttl.Remove(key) {
 		bw.Write(wal.Entry{Op: wal.OpPersist, Key: key})
 	}
+}
+
+// maxTTLSeconds — предел срока жизни: больше time.Duration не вмещает, и
+// умножение на time.Second переполнилось бы в отрицательный срок.
+const maxTTLSeconds = math.MaxInt64 / int64(time.Second)
+
+// parseTTLSeconds разбирает срок жизни в секундах: целое от 1 до maxTTLSeconds.
+func parseTTLSeconds(b []byte) (time.Duration, bool) {
+	seconds, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil || seconds <= 0 || seconds > maxTTLSeconds {
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
+}
+
+// writeExpire пишет в журнал абсолютное время смерти ключа: реплей после
+// рестарта считает остаток от него, а не от момента старта.
+func writeExpire(w *wal.BatchWAL, key string, dur time.Duration) {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(time.Now().Add(dur).UnixNano()))
+	w.Write(wal.Entry{Op: wal.OpExpire, Key: key, Value: b[:]})
 }

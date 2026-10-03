@@ -90,10 +90,10 @@ A new mutating command (any tier) MUST be added to both classifiers explicitly.
 
 | Command | Syntax | Reply | Notes |
 |---|---|---|---|
-| `SET` | `SET key value [EX seconds]` | `+OK` | Only `EX` is supported (no `PX/NX/XX/KEEPTTL/GET`). Bare `SET` **clears** an existing TTL (Redis-without-KEEPTTL semantics), logging `OpPersist` only if a TTL actually existed. WAL: `OpSet` (+`OpExpire`). |
+| `SET` | `SET key value [EX seconds]` | `+OK` | Only `EX` is supported; any other option (`PX/NX/XX/KEEPTTL/GET`, extra arguments) is `ERR syntax error`, and a rejected `SET` writes nothing — neither the value nor the WAL. Bare `SET` **clears** an existing TTL (Redis-without-KEEPTTL semantics), logging `OpPersist` only if a TTL actually existed. WAL: `OpSet` (+`OpExpire`). |
 | `GET` | `GET key` | bulk / nil | Lazy-expiry aware: expired key reads as nil. |
 | `DEL` | `DEL key` | `:1` / `:0` | Single key only (no variadic). **Composite:** also deletes the vector stored under the same key and drops its TTL. WAL: `OpDel`. |
-| `EXPIRE` | `EXPIRE key seconds` | `:1` / `:0` | `seconds` must be > 0 (no delete-on-nonpositive). WAL: `OpExpire` with absolute deadline. |
+| `EXPIRE` | `EXPIRE key seconds` | `:1` / `:0` | `seconds` must be > 0 (no delete-on-nonpositive) and fit a Go duration (≤ 9 223 372 036, ~292 years); the same bound applies to `SET … EX`. WAL: `OpExpire` with absolute deadline. |
 | `TTL` | `TTL key` | `:sec` / `:-1` / `:-2` | `-1` = no TTL, `-2` = no key. |
 | `PERSIST` | `PERSIST key` | `:1` / `:0` | WAL: `OpPersist` only when a TTL was removed. |
 | `DBSIZE` | `DBSIZE` | `:n` | KV key count. |
