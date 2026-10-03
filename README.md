@@ -196,8 +196,9 @@ RESP on a 2019 laptop.
 - **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization; non-blocking bulk ingest (per-shard delta freeze + batched LSM merges)
 - **WAL + Snapshots** — CRC32-protected, batch writes, crash recovery
 - **WAL-shipping** — continuous async replication of WAL+snapshots to S3/MinIO or a mounted dir (Litestream-style); restore on any machine with `-ship-restore` (see [docs/BACKUP.md](docs/BACKUP.md))
-- **TCMalloc-style allocator** — per-worker MCache, lock-free GET, zero GC pressure
-- **Epoll networking** — per-worker event loops, zero-alloc RESP parser, greedy drain
+- **KV store** — 256-shard `map` under `RWMutex`; GET does no allocations (49 ns single-threaded, 11.5 ns ×12), accounted memory shrinks on delete so `maxmemory` recovers after cleanup. It replaced a TCMalloc-style arena after an A/B — see [docs/BENCHMARKS.md §10](docs/BENCHMARKS.md#10-removing-the-custom-allocator-and-the-epoll-layer)
+- **Networking** — goroutine per connection on Go's netpoller, zero-alloc RESP parser, greedy drain (one write per pipelined batch)
+- **Sorted sets** — B+-tree keyed by (score, member) in Redis order, ranges via the leaf chain; `VSIM.SEARCHRANGE` filters HNSW candidates by a score range
 - **TTL** — 256-shard heap with lazy + active expiration
 - **Pub/Sub** — back-pressure, sync.Pool, per-subscriber goroutines
 - **AUTH + TLS/mTLS** — constant-time password auth, encrypted connections, optional client-cert verification
@@ -224,8 +225,9 @@ tar xzf kvstore-server_*_linux_amd64.tar.gz
 ./kvstore-server --port 6380
 ```
 
-Linux only — the network layer is built on epoll. The MCP adapter `vmem-mcp` is
-published on the same page for Linux, macOS and Windows.
+Linux only — the audit-chain journal calls `fdatasync` (the network layer no
+longer depends on epoll). The MCP adapter `vmem-mcp` is published on the same
+page for Linux, macOS and Windows.
 
 The engine is **BYO-embeddings**: it takes pre-computed vectors over RESP from
 any embedding provider (OpenAI, Ollama, sentence-transformers, …):
@@ -332,7 +334,7 @@ full-text search (`VSIM.*`, incl.
 └──────────────┬───────────────────────────────┘
                │ TCP / TLS
 ┌──────────────▼───────────────────────────────┐
-│          Epoll Server (per-worker)           │
+│     Server (goroutine per connection)        │
 │     ConnBuf (ring buffer, zero-alloc)        │
 ├──────────────────────────────────────────────┤
 │              AUTH Guard                      │
@@ -343,8 +345,8 @@ full-text search (`VSIM.*`, incl.
 │  Persistence boundary: keyring envelope seal │
 │  + audit chain (both opt-in)                 │
 ├──────────────┬───────────────────────────────┤
-│   TCMalloc   │  TTL    │ WAL    │ Pub/Sub   │
-│   Store      │  Heap   │ Batch  │ Hub       │
+│   KV Store   │  TTL    │ WAL    │ Pub/Sub   │
+│ (shard map)  │  Heap   │ Batch  │ Hub       │
 ├──────────────┴─────────┴────────┼───────────┤
 │ HNSW + BM25 search, LSM segments │  Cluster  │
 │ SQ8, RRF fusion, tenant filters  │  (gossip) │
@@ -451,16 +453,16 @@ kvstore/
 ├── cmd/kvstore/          # Server entry point (main.go)
 ├── cmd/vmem-mcp/         # MCP stdio adapter (agent memory tools)
 ├── internal/
-│   ├── server/           # Epoll server, ConnBuf, Handler
-│   ├── store/            # KV store, TTL manager
-│   │   ├── tcmalloc/     # TCMalloc-style allocator (MCache, MCentral, MHeap)
+│   ├── server/           # TCP/TLS server, ConnBuf, Handler
+│   ├── store/            # TTL manager
+│   │   ├── kv/           # KV store (sharded map, maxmemory accounting)
 │   │   └── zset/         # Sorted-set registry
 │   ├── wal/              # Write-Ahead Log, snapshots, batch writer
 │   ├── ship/             # Continuous WAL-shipping (file://, s3://) + restore
 │   ├── keyring/          # Per-scope KEK, envelope seal/unseal, crypto-erasure
 │   ├── auditchain/       # Hash-chained journal, Merkle batching, Ed25519 export
 │   ├── pubsub/           # Pub/Sub hub (classic + semantic)
-│   ├── btree/            # Sorted-set backing structure
+│   ├── btree/            # B+-tree backing sorted sets
 │   ├── cluster/          # Hash slots, gossip, replication (experimental)
 │   ├── logging/          # slog setup (levels, text/JSON)
 │   ├── monitoring/       # Prometheus-style metrics

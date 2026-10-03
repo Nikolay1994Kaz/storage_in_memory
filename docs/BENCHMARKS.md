@@ -69,7 +69,9 @@ Notes, honestly:
   single-segment shape takes a long tail — the final large merge is
   single-threaded and competes with search for cores. In write silence, idle
   consolidation reaches terminal shape in minutes.
-- RESP + epoll cost ~10–20% vs the in-process harness. Pipelining
+- RESP + network cost ~10–20% vs the in-process harness (measured with the
+  earlier epoll layer; the goroutine-per-connection server that replaced it
+  is at parity, see section 10). Pipelining
   (`insertload -pipeline`) buys +52% ingest on a single connection; at 12
   connections the server is CPU-bound and pipelining adds nothing.
 
@@ -668,6 +670,90 @@ plainly rather than hiding inside an aggregate.
 
 Harness: `scripts/locomo_bench.py` (oracle, three negative controls and two
 no-op checks are part of the run; any failure exits non-zero).
+
+---
+
+## 10. Removing the custom allocator and the epoll layer
+
+The server used to carry two pieces of infrastructure built before any
+profile asked for them: a TCMalloc-style allocator (per-worker MCache, size
+classes, QSBR reclamation) under the KV store, the sorted-set B+-tree and the
+HNSW neighbor lists, and its own per-worker epoll loop on top of Go's
+netpoller, whose one real job was a stable worker id for that allocator. Both
+were replaced and measured A/B. Same laptop as above; A and B runs interleaved
+(A, B, A, B, …); `redis-benchmark` 7 with 4 client threads on the same
+machine; medians of 3 rounds (2 for the 1M-key run), AC power, background
+load average ~8 of 12 — differences under ~10% are inside the noise.
+
+**KV store, in-process** (`go test ./kvstore/internal/store/kv -bench .`;
+the old side is the same benchmark bodies against `TCMallocStore` at
+`bd60927`; battery power, n=6, p=0.002):
+
+| | TCMalloc arena | sharded `map` |
+|---|---|---|
+| GET, 1 thread | 162 ns, 2 allocs | **49 ns, 0 allocs** |
+| GET, 12 threads | 28 ns | **11.5 ns** |
+| SET (overwrite) | 138 ns | **79 ns** |
+| full GC with 1M live keys | **0.7 ms** | 29 ms |
+
+The arena's single win is the full-GC price with a million live keys. Whether
+that matters is answered by the server run below, not by this table.
+
+**Whole server with ~950k live keys** (64-byte values; `ab_server.sh gc1m`;
+`bd60927` vs the current tree):
+
+| | before | after |
+|---|---|---|
+| GET rps / p99 | 210k / 1.04 ms | **222k / 0.59 ms** |
+| SET rps / p99 | 194k / 1.33 ms | **210k / 0.76 ms** |
+| RSS | ~500 MB | **~368 MB** |
+| concurrent GC marking per ~12 s window | **8–15 ms** | 128–133 ms |
+| longest stop-the-world pause | 0.32 / 1.73 ms | 0.36 / 0.16 ms |
+
+The map pays ~120 ms more background marking per 12 s (about 1% of one core)
+and nothing on latency: pauses stay sub-millisecond, p99 and memory improve.
+
+**Whole server, small key space** (`ab_server.sh load`, 100k keys, 20-byte
+values): rps within −0…+9% for the new tree in every scenario (50 and 500
+clients, 16-command pipelines, PING); p99 lower in 6 of 7 (e.g. SET at 50
+clients 1.01 → 0.73 ms, PING 0.69 → 0.38 ms), higher for pipelined GET
+(1.53 → 1.78 ms); RSS at 500 clients 182–201 → 120–150 MB.
+
+**Network layer alone** (same store on both sides, epoll at `253f354` vs
+goroutine-per-connection): differences −9…+25% in both directions with
+overlapping ranges — parity. Threads at 500 clients 27–29 → 22–23. The price
+of a goroutine per connection is its stack: with **10 000 idle connections**
+RSS is 148 MB with epoll and 311 MB without it (stacks are 16 KB right after
+the first command and shrink to ~4 KB at the next GC: 157 → 40 MB in use).
+
+**Vector engine.** The HNSW neighbor lists moved into an arena owned by each
+graph. Graph build time is unchanged (2000 vectors, dim 128 and 768:
+p=0.80 and p=0.96, n=8), bytes allocated per build −28% / −8%, upsert churn
+−21% (p=0.015). Two memory defects went away with the allocator: a merge
+built its temporary graph in pooled allocators that were never reset, so
+with a constant 2000 vectors the heap grew +17.9 MB over 6 merge rounds
+(now +1.0 MB, `TestMergeReleasesGraphMemory`); and every store held 12+
+empty allocators at 5.3 MB each, kept alive forever by their background
+goroutines — the vector test suite peaked above 7 GB and now peaks at 412 MB.
+
+**Defects the old layers hid**, each reproduced on `bd60927` before the fix:
+TLS mode (`-tls-cert`) panicked on the first connection (`*tls.Conn` cast to
+`*net.TCPConn`), and fixing the cast alone leaves pipelined TLS records stuck;
+`ZRANGEBYSCORE` returned 1 of 300 members sharing a score once they spanned
+several B+-tree leaves (and `VSIM.SEARCHRANGE` lost candidates the same way);
+`ZADD` accepted `nan`; after hitting `-maxmemory` once, writes were refused
+until restart even with every key deleted; one `EMFILE` from `Accept` stopped
+the listener for good.
+
+```bash
+git worktree add /tmp/kv-before bd60927 && (cd /tmp/kv-before && go build -o /tmp/kv-before.bin ./kvstore/cmd/kvstore)
+go build -o /tmp/kv-after.bin ./kvstore/cmd/kvstore
+scripts/ab_server.sh load    /tmp/kv-before.bin /tmp/kv-after.bin 3
+scripts/ab_server.sh gc1m    /tmp/kv-before.bin /tmp/kv-after.bin 2
+scripts/ab_server.sh idle10k /tmp/kv-epoll.bin  /tmp/kv-after.bin   # epoll side: build at 253f354
+go test ./kvstore/internal/store/kv -run '^$' -bench . -benchmem
+go test ./kvstore/vector -run TestMergeReleasesGraphMemory -v
+```
 
 ---
 

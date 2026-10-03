@@ -25,8 +25,9 @@ mkdir -p ~/.vmem && cd ~/.vmem                # data dir: WAL + snapshots live h
 /path/to/kvstore-server --port 6380
 ```
 
-macOS / Windows (the server is epoll-based, so it runs in Docker; the image
-builds from this repo's Dockerfile):
+macOS / Windows (the server builds for Linux only — its audit-chain journal
+calls `fdatasync` — so it runs in Docker; the image builds from this repo's
+Dockerfile):
 
 ```bash
 git clone https://github.com/Nikolay1994Kaz/storage_in_memory && cd storage_in_memory
