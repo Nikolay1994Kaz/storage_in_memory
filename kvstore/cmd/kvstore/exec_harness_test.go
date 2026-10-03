@@ -9,7 +9,7 @@ import (
 	"kvstore/kvstore/internal/pubsub"
 	"kvstore/kvstore/internal/server"
 	"kvstore/kvstore/internal/store"
-	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/internal/store/zset"
 	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
@@ -32,7 +32,7 @@ import (
 type execEnv struct {
 	t    *testing.T
 	dir  string // t.TempDir окружения; WAL живёт в dir/t.wal (рестарт-тесты VMEM)
-	s    *tcmalloc.TCMallocStore
+	s    *kv.Store
 	bw   *wal.BatchWAL
 	ttl  *store.TTLManager
 	hub  *pubsub.Hub
@@ -54,12 +54,11 @@ func newExecEnv(t *testing.T) *execEnv {
 	}
 	bw := wal.NewBatchWAL(w)
 
-	s := tcmalloc.NewTCMallocStore(1)
-	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
+	s := kv.New()
+	ttl := store.NewTTLManager(s)
 	hub := pubsub.NewHub(nil)
 	vec := vector.NewLeveledVectorStore(vector.LeveledConfig{
 		Distance:    vector.EuclideanDistance,
-		Allocator:   s,
 		NumBuilders: 1,
 	})
 	zreg := zset.New(s.MemoryCounter())
@@ -80,7 +79,9 @@ func newExecEnv(t *testing.T) *execEnv {
 	t.Cleanup(func() {
 		ttl.Stop()
 		_ = bw.Close()
-		s.Close()
+		// Без Close горутины векторного стора держат его (и все его
+		// сегменты) живым до конца тестового бинаря.
+		vec.Close()
 	})
 	return e
 }

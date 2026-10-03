@@ -49,7 +49,7 @@ func TestSnapshotSealsVMEMAnchors(t *testing.T) {
 	e.do("VMEM.REMEMBER", "alice", "TEXT", aliceText)
 	e.do("VMEM.REMEMBER", "bob", "TEXT", bobText)
 	// Посторонний KV-ключ: у него нет скоупа, значит нет и ключа шифрования.
-	e.s.Set(0, "plainkey", []byte("not a fact"))
+	e.s.Set("plainkey", []byte("not a fact"))
 
 	entries := snapshotEntriesOf(t, e)
 

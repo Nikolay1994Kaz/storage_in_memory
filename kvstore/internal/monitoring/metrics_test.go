@@ -23,9 +23,8 @@ func TestMetricsRecordAndExpose(t *testing.T) {
 	// 3. Test memory metrics callbacks
 	InitMemoryMetrics(
 		func() float64 { return 1024 * 1024 },
-		func() float64 { return 5 },
-		func() float64 { return 42 },
 		func() float64 { return 10 * 1024 * 1024 },
+		func() float64 { return 42 },
 	)
 
 	// 4. Output Prometheus format
@@ -48,11 +47,8 @@ func TestMetricsRecordAndExpose(t *testing.T) {
 	if !strings.Contains(output, "kvstore_memory_used_bytes 1048576") {
 		t.Errorf("Expected memory used bytes to be 1048576, output:\n%s", output)
 	}
-	if !strings.Contains(output, "kvstore_tcmalloc_chunks_total 5") {
-		t.Errorf("Expected chunks total to be 5, output:\n%s", output)
-	}
-	if !strings.Contains(output, "kvstore_tcmalloc_spans_total 42") {
-		t.Errorf("Expected spans total to be 42, output:\n%s", output)
+	if !strings.Contains(output, "kvstore_keys 42") {
+		t.Errorf("Expected keys to be 42, output:\n%s", output)
 	}
 	if !strings.Contains(output, "kvstore_memory_limit_bytes 10485760") {
 		t.Errorf("Expected limit to be 10485760, output:\n%s", output)

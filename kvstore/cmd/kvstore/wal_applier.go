@@ -20,7 +20,7 @@ import (
 
 	"kvstore/kvstore/internal/keyring"
 	"kvstore/kvstore/internal/store"
-	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/internal/store/zset"
 	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
@@ -29,7 +29,7 @@ import (
 // walApplier — состояние, к которому применяются записи, плюс счётчики
 // восстановления. Живёт ровно один старт.
 type walApplier struct {
-	s       *tcmalloc.TCMallocStore
+	s       *kv.Store
 	ttl     *store.TTLManager
 	vec     vector.VectorIndex
 	zsetReg *zset.ZSetRegistry
@@ -76,10 +76,10 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 	}
 	switch entry.Op {
 	case wal.OpSet:
-		a.s.Set(0, entry.Key, entry.Value)
+		a.s.Set(entry.Key, entry.Value)
 		a.restored++
 	case wal.OpDel:
-		a.s.Del(0, entry.Key)
+		a.s.Del(entry.Key)
 		// Векторный эффект гейтуем watermark'ом: старый DEL (LSN ≤ watermark),
 		// уже отражённый в снапшоте, не должен удалять вектор, воскрешённый
 		// более поздним re-add (который тоже в снапшоте).
@@ -95,7 +95,7 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 			if remaining > 0 {
 				a.ttl.Set(entry.Key, remaining)
 			} else {
-				a.s.Del(0, entry.Key)
+				a.s.Del(entry.Key)
 				if !a.skipVec(entry, isFromSnapshot) {
 					a.vec.Delete(entry.Key) // Также удаляем вектор, если ключ просрочен в оффлайне
 				}

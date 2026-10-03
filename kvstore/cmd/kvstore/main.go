@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +36,7 @@ import (
 	"kvstore/kvstore/internal/server"
 	"kvstore/kvstore/internal/ship"
 	"kvstore/kvstore/internal/store"
+	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/internal/store/tcmalloc"
 	"kvstore/kvstore/internal/store/zset"
 	"kvstore/kvstore/internal/wal"
@@ -229,25 +229,17 @@ func main() {
 	authEnabled := authPassword != ""
 	authHash := sha256.Sum256([]byte(authPassword))
 
-	// TCMallocStore: per-worker MCache (lock-free alloc) + lock-free HashTable (GET)
-	s := tcmalloc.NewTCMallocStore(runtime.NumCPU())
-	defer s.Close() // останавливает внутреннюю горутину deferred free
+	// KV-хранилище: 256 шардов map[string][]byte под RWMutex (internal/store/kv).
+	s := kv.New()
 
 	// build-info метрика: kvstore_build_info{version="..."} = 1
 	monitoring.SetBuildInfo(version)
 
-	// Инициализация метрик памяти TCMalloc
+	// Метрики памяти: учтённый объём (гейт maxmemory), лимит, число ключей.
 	monitoring.InitMemoryMetrics(
 		func() float64 { return float64(s.UsedMemory()) },
-		func() float64 {
-			numChunks, _, _, _ := s.HeapStats()
-			return float64(numChunks)
-		},
-		func() float64 {
-			_, _, _, numSpans := s.HeapStats()
-			return float64(numSpans)
-		},
 		func() float64 { return float64(s.MaxMemory()) },
+		func() float64 { return float64(s.Len()) },
 	)
 
 	// Лимит памяти
@@ -366,7 +358,7 @@ func main() {
 	// Инициализация перенесена после WAL (строка ниже), потому что
 	// CompositeEvictor при TTL-expire записывает OpVSimDel в WAL.
 	// Для фазы WAL replay используем временный KV-only evictor.
-	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
+	ttl := store.NewTTLManager(s)
 	// ttl.Stop() вызывается явно в упорядоченном shutdown (не через defer):
 	// TTL-эвиктор пишет в WAL-канал, поэтому его надо заглушить ДО bw.Close().
 
@@ -377,7 +369,6 @@ func main() {
 		EfConstruction: *hnswEfConstruction,
 		EfSearch:       *hnswEfSearch,
 		Distance:       vector.EuclideanDistance,
-		Allocator:      s,
 		UseSQ:          *hnswUseSQ,
 		NumBuilders:    *compactionWorkers,
 		PartitionAttr:  *partitionAttr,
@@ -545,7 +536,7 @@ func main() {
 	//   1. Удаляет значение из KV Store (как раньше)
 	//   2. Удаляет вектор из HNSW графа (если ключ есть в VectorStore)
 	//   3. Записывает OpVSimDel в WAL (чтобы удаление пережило рестарт)
-	ttl.SetEvictor(&compositeEvictor{kv: s, vec: vecStore, wal: bw})
+	ttl.SetEvictor(&compositeEvictor{kvs: s, vec: vecStore, wal: bw})
 
 	// === 4. Syncer ===
 	// iterateAll — переснимает ВСЁ KV-состояние, живущее только в реплее WAL,
@@ -799,9 +790,6 @@ func main() {
 	srv.IdleExempt = hub.IsSubscriber
 	// H3: медленный подписчик отключается через единую точку учёта epoll.
 	hub.SetOnSlowClose(srv.CloseConn)
-	// T2 (QSBR): воркеры рапортуют quiescence аллокатору — deferred-free слоты
-	// освобождаются по кворуму «тихих» состояний, а не по таймеру (фикс UAF).
-	srv.Reclaimer = s
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
 	if *tlsCert != "" && *tlsKey != "" {
@@ -1210,7 +1198,7 @@ func parseRecallArgs(args [][]byte) (vector.RecallRequest, string) {
 	return rreq, ""
 }
 
-func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLManager,
+func executeCommand(s *kv.Store, bw *wal.BatchWAL, ttl *store.TTLManager,
 	hub *pubsub.Hub, cl clusterNode,
 	vecStore vector.VectorIndex,
 	zsetReg *zset.ZSetRegistry,
@@ -1219,7 +1207,6 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 	cs *server.ConnState, cmd string, args [][]byte) {
 
 	buf := cs.Buf
-	workerID := cs.WorkerID
 
 	// OOM-гейт (единая точка для всех растущих в памяти команд). Раньше проверка
 	// висела только на SET — LPUSH/HSET-класс и, главное, ZADD/VSIM.ADD/VSIM.ADDBIN
@@ -1314,12 +1301,14 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 		}
 		// OOM защищён единым гейтом в начале executeCommand.
-		// args[1] — слайс ring buffer. Нужна копия для TCMalloc (буфер будет перезаписан).
+		// args[1] — срез буфера соединения, он будет перезаписан следующей
+		// командой. Копия одна на всех: её читает WAL и забирает во владение
+		// стор (kv.Store не копирует), никто из них её не меняет.
 		value := make([]byte, len(args[1]))
 		copy(value, args[1])
 
 		bw.Write(wal.Entry{Op: wal.OpSet, Key: key, Value: value})
-		s.Set(workerID, key, value)
+		s.Set(key, value)
 
 		if cl != nil {
 			cl.ForwardWrite(fmt.Sprintf("SET %s %s", key, string(value)))
@@ -1388,7 +1377,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			}
 		}
 		bw.Write(wal.Entry{Op: wal.OpDel, Key: key})
-		ok := s.Del(workerID, key)
+		ok := s.Del(key)
 		vecStore.Delete(key) // Также удаляем вектор при ручном DEL
 		ttl.OnDelete(key)
 		if cl != nil {
@@ -1975,7 +1964,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		// В журнал уезжает конверт, в памяти остаётся открытый текст: граница
 		// шифротекста — это граница персистентности, а не путь чтения.
 		bw.Write(wal.Entry{Op: wal.OpSet, Key: textKey, Value: sealValue(req.Scope, textVal)})
-		s.Set(workerID, textKey, textVal)
+		s.Set(textKey, textVal)
 		if req.TTL > 0 {
 			// Абсолютное время смерти якоря = expires_at факта (дверь 1: OpExpire
 			// и так везёт абсолютный nano). Расхождение таймеров некритично:
@@ -2679,7 +2668,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: id})
 		textKey := "vmem:" + id
 		bw.Write(wal.Entry{Op: wal.OpDel, Key: textKey})
-		s.Del(workerID, textKey)
+		s.Del(textKey)
 		ttl.OnDelete(textKey)
 		auditForget(scope, id)
 		buf.WriteInt(1)
@@ -2732,7 +2721,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: id})
 			textKey := "vmem:" + id
 			bw.Write(wal.Entry{Op: wal.OpDel, Key: textKey})
-			s.Del(workerID, textKey)
+			s.Del(textKey)
 			ttl.OnDelete(textKey)
 		}
 
@@ -3389,7 +3378,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 // Когда TTLManager обнаруживает просроченный ключ, он вызывает Del(key).
 // compositeEvictor выполняет три действия:
 //
-//  1. Удаляет значение из KV Store (TCMalloc)
+//  1. Удаляет значение из KV Store
 //  2. Если ключ имеет ассоциированный вектор в HNSW графе — удаляет его,
 //     освобождая память в VectorArena и TCMalloc (neighbors блок)
 //  3. Записывает OpVSimDel в WAL, чтобы удаление пережило рестарт
@@ -3397,13 +3386,13 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 // Без этого векторы с TTL «утекали» — KV-ключ удалялся,
 // а вектор оставался навечно в графе HNSW, занимая RAM.
 type compositeEvictor struct {
-	kv  *tcmalloc.TCMallocStore
+	kvs *kv.Store
 	vec vector.VectorIndex
 	wal *wal.BatchWAL
 }
 
 func (e *compositeEvictor) Del(key string) bool {
-	kvDeleted := e.kv.Del(0, key)
+	kvDeleted := e.kvs.Del(key)
 
 	vecDeleted := e.vec.Delete(key)
 	if vecDeleted {
@@ -3484,7 +3473,7 @@ func SendVectorToNode(addr, key string, vec []float32) error {
 // Обратный путь уже готов: applyEntry разворачивает конверт единой точкой и
 // для snapshot.wal тоже, а уничтоженный ключ там — ШТАТНЫЙ пропуск записи.
 func snapshotIterateSealed(
-	s *tcmalloc.TCMallocStore,
+	s *kv.Store,
 	ttl *store.TTLManager,
 	zsetReg *zset.ZSetRegistry,
 	factScopes map[string]string,
@@ -3503,7 +3492,7 @@ func snapshotIterateSealed(
 }
 
 func snapshotIterate(
-	s *tcmalloc.TCMallocStore,
+	s *kv.Store,
 	ttl *store.TTLManager,
 	zsetReg *zset.ZSetRegistry,
 	fn func(op byte, key string, value []byte),

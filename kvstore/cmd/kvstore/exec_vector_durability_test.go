@@ -7,7 +7,7 @@ import (
 	"kvstore/kvstore/internal/pubsub"
 	"kvstore/kvstore/internal/server"
 	"kvstore/kvstore/internal/store"
-	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/internal/store/zset"
 	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
@@ -53,16 +53,16 @@ func TestExec_VsimAddFailDoesNotWriteWAL(t *testing.T) {
 		t.Fatalf("wal.Open: %v", err)
 	}
 	bw := wal.NewBatchWAL(w)
-	s := tcmalloc.NewTCMallocStore(1)
-	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
+	s := kv.New()
+	ttl := store.NewTTLManager(s)
 	hub := pubsub.NewHub(nil)
 	vec := vector.NewLeveledVectorStore(vector.LeveledConfig{
-		Distance: vector.EuclideanDistance, Allocator: s, NumBuilders: 1,
+		Distance: vector.EuclideanDistance, NumBuilders: 1,
 	})
 	zreg := zset.New(s.MemoryCounter())
 	defer func() {
 		ttl.Stop()
-		s.Close()
+		vec.Close()
 	}()
 
 	do := func(cmd string, args ...string) {

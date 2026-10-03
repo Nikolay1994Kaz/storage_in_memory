@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"kvstore/kvstore/internal/store"
-	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/internal/wal"
 )
 
@@ -26,9 +26,8 @@ func TestSetClearsTTL(t *testing.T) {
 	}
 	bw := wal.NewBatchWAL(w)
 
-	s := tcmalloc.NewTCMallocStore(1)
-	defer s.Close()
-	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
+	s := kv.New()
+	ttl := store.NewTTLManager(s)
 	defer ttl.Stop()
 
 	// Ключ с TTL — как после SET k v EX 100.

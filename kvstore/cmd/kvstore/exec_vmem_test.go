@@ -199,9 +199,9 @@ func replayVMEMWAL(t *testing.T, path string, e *execEnv) {
 	for _, entry := range entries {
 		switch entry.Op {
 		case wal.OpSet:
-			e.s.Set(0, entry.Key, entry.Value)
+			e.s.Set(entry.Key, entry.Value)
 		case wal.OpDel:
-			e.s.Del(0, entry.Key)
+			e.s.Del(entry.Key)
 			e.vec.Delete(entry.Key)
 		case wal.OpVSimDel:
 			e.vec.Delete(entry.Key)

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"kvstore/kvstore/internal/store"
-	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/internal/store/zset"
 	"kvstore/kvstore/internal/wal"
 )
@@ -24,17 +24,16 @@ func TestSnapshotIterate_TTLAndZSetSurviveCompaction(t *testing.T) {
 	dir := t.TempDir()
 
 	// ── Источник: реальные store/ttl/zsetReg ──
-	s := tcmalloc.NewTCMallocStore(2)
-	defer s.Close()
-	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
+	s := kv.New()
+	ttl := store.NewTTLManager(s)
 	defer ttl.Stop()
 	zsetReg := zset.New(s.MemoryCounter())
 
 	// Обычный KV-ключ.
-	s.Set(0, "plainkey", []byte("plainval"))
+	s.Set("plainkey", []byte("plainval"))
 
 	// Ключ с TTL.
-	s.Set(0, "sessionkey", []byte("sessionval"))
+	s.Set("sessionkey", []byte("sessionval"))
 	ttl.Set("sessionkey", time.Hour)
 
 	// Sorted set с двумя членами (ZAdd пишет и дерево, и обратный индекс).
@@ -45,7 +44,7 @@ func TestSnapshotIterate_TTLAndZSetSurviveCompaction(t *testing.T) {
 	var entries []wal.Entry
 	sawZidxOpSet := false
 	snapshotIterate(s, ttl, zsetReg, func(op byte, key string, value []byte) {
-		cp := append([]byte(nil), value...) // value указывает в span — копируем
+		cp := append([]byte(nil), value...)
 		entries = append(entries, wal.Entry{Op: op, Key: key, Value: cp})
 		if op == wal.OpSet && strings.HasPrefix(key, "__zidx:") {
 			sawZidxOpSet = true
@@ -72,16 +71,15 @@ func TestSnapshotIterate_TTLAndZSetSurviveCompaction(t *testing.T) {
 	}
 
 	// ── Recovery в СВЕЖИЕ структуры (зеркалит applyEntry в main) ──
-	s2 := tcmalloc.NewTCMallocStore(2)
-	defer s2.Close()
-	ttl2 := store.NewTTLManager(tcmalloc.NewEvictor(s2))
+	s2 := kv.New()
+	ttl2 := store.NewTTLManager(s2)
 	defer ttl2.Stop()
 	zset2 := zset.New(s2.MemoryCounter())
 
 	for _, e := range restored {
 		switch e.Op {
 		case wal.OpSet:
-			s2.Set(0, e.Key, e.Value)
+			s2.Set(e.Key, e.Value)
 		case wal.OpExpire:
 			expiresAt := time.Unix(0, int64(binary.BigEndian.Uint64(e.Value)))
 			if rem := time.Until(expiresAt); rem > 0 {

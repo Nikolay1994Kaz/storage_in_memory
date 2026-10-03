@@ -10,7 +10,7 @@ import (
 	"kvstore/kvstore/internal/cluster"
 	"kvstore/kvstore/internal/protocol"
 	"kvstore/kvstore/internal/store"
-	"kvstore/kvstore/internal/store/tcmalloc"
+	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/vector"
 )
 
@@ -45,7 +45,7 @@ func (a clusterAdapter) StopGossip() { a.c.StopGossip() }
 // newClusterRouter поднимает кластерный узел и связывает его с локальными KV/vector/TTL.
 // Вся обвязка репликации/миграции живёт здесь, под тегом `experimental`.
 func newClusterRouter(addr string, gossipPort, slotStart, slotEnd int,
-	s *tcmalloc.TCMallocStore, vecStore vector.VectorIndex, ttl *store.TTLManager) (clusterNode, error) {
+	s *kv.Store, vecStore vector.VectorIndex, ttl *store.TTLManager) (clusterNode, error) {
 
 	cl := cluster.New(addr, gossipPort)
 	cl.State.Self.AssignSlots(slotStart, slotEnd)
@@ -53,13 +53,19 @@ func newClusterRouter(addr string, gossipPort, slotStart, slotEnd int,
 	slog.Info("cluster mode (experimental)", "node", cl.State.Self.ID, "slotStart", slotStart, "slotEnd", slotEnd)
 
 	cl.GetKeysInSlotFunc = func(slot uint16, count int) []string {
-		return s.GetKeysInSlot(slot, count, cluster.KeySlot)
+		var keys []string
+		s.ForEach(func(key string, _ []byte) {
+			if len(keys) < count && cluster.KeySlot(key) == slot {
+				keys = append(keys, key)
+			}
+		})
+		return keys
 	}
 	cl.MigrateGetFunc = func(key string) ([]byte, bool) {
 		return s.Get(key)
 	}
 	cl.MigrateDelFunc = func(key string) {
-		s.Del(0, key)
+		s.Del(key)
 		vecStore.Delete(key)
 		ttl.OnDelete(key)
 	}
@@ -74,8 +80,8 @@ func newClusterRouter(addr string, gossipPort, slotStart, slotEnd int,
 	cl.Repl.VecStoreAdd = func(key string, vec []float32) { vecStore.Add(key, vec) }
 	cl.Repl.VecStoreDel = func(key string) { vecStore.Delete(key) }
 	cl.Repl.VecStoreForEach = func(fn func(key string, vec []float32)) { vecStore.ForEach(fn) }
-	cl.Repl.StoreSet = func(key string, value []byte) { s.Set(0, key, value) }
-	cl.Repl.StoreDel = func(key string) { s.Del(0, key) }
+	cl.Repl.StoreSet = func(key string, value []byte) { s.Set(key, value) }
+	cl.Repl.StoreDel = func(key string) { s.Del(key) }
 	cl.Repl.StoreClear = func() { s.Clear() }
 	cl.Repl.VecStoreClear = func() { vecStore.Clear() }
 

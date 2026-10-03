@@ -56,19 +56,18 @@ var (
 	ShipErrors = metrics.NewCounter("kvstore_ship_errors_total")
 	ShipBytes  = metrics.NewCounter("kvstore_ship_uploaded_bytes_total")
 
-	// Callbacks for memory/TCMalloc metrics
-	memUsedFunc   func() float64
-	memChunksFunc func() float64
-	memSpansFunc  func() float64
-	memLimitFunc  func() float64
+	// Callbacks for memory metrics of the KV store
+	memUsedFunc  func() float64
+	memLimitFunc func() float64
+	keysFunc     func() float64
 )
 
-// InitMemoryMetrics registers the TCMalloc memory stat callbacks.
-func InitMemoryMetrics(used, chunks, spans, limit func() float64) {
+// InitMemoryMetrics registers the KV store gauges: accounted memory (the
+// maxmemory gate), the limit and the number of keys.
+func InitMemoryMetrics(used, limit, keys func() float64) {
 	memUsedFunc = used
-	memChunksFunc = chunks
-	memSpansFunc = spans
 	memLimitFunc = limit
+	keysFunc = keys
 
 	metrics.NewGauge("kvstore_memory_used_bytes", func() float64 {
 		if memUsedFunc != nil {
@@ -76,21 +75,15 @@ func InitMemoryMetrics(used, chunks, spans, limit func() float64) {
 		}
 		return 0
 	})
-	metrics.NewGauge("kvstore_tcmalloc_chunks_total", func() float64 {
-		if memChunksFunc != nil {
-			return memChunksFunc()
-		}
-		return 0
-	})
-	metrics.NewGauge("kvstore_tcmalloc_spans_total", func() float64 {
-		if memSpansFunc != nil {
-			return memSpansFunc()
-		}
-		return 0
-	})
 	metrics.NewGauge("kvstore_memory_limit_bytes", func() float64 {
 		if memLimitFunc != nil {
 			return memLimitFunc()
+		}
+		return 0
+	})
+	metrics.NewGauge("kvstore_keys", func() float64 {
+		if keysFunc != nil {
+			return keysFunc()
 		}
 		return 0
 	})

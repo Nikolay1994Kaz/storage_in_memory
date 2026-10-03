@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/internal/store/tcmalloc"
 	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
@@ -514,13 +515,13 @@ func BenchmarkTTL_Set_Parallel(b *testing.B) {
 
 // compositeEvictor - тестовый клон структуры из main.go для проверки интеграции
 type compositeEvictor struct {
-	kv  *tcmalloc.TCMallocStore
+	kvs *kv.Store
 	vec *vector.VectorStore
 	wal *wal.BatchWAL
 }
 
 func (e *compositeEvictor) Del(key string) bool {
-	kvDeleted := e.kv.Del(0, key)
+	kvDeleted := e.kvs.Del(key)
 	vecDeleted := e.vec.Delete(key)
 	if vecDeleted {
 		e.wal.Write(wal.Entry{Op: wal.OpVSimDel, Key: key})
@@ -544,17 +545,17 @@ func TestCompositeEvictor_Integration(t *testing.T) {
 	bw := wal.NewBatchWAL(rawWAL)
 
 	// Инициализируем хранилища
-	s := tcmalloc.NewTCMallocStore(1)
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance, s)
-	ttl := NewTTLManager(tcmalloc.NewEvictor(s))
+	s := kv.New()
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	ttl := NewTTLManager(s)
 	defer ttl.Stop()
 
 	// Подключаем наш гибридный evictor
-	ttl.SetEvictor(&compositeEvictor{kv: s, vec: vecStore, wal: bw})
+	ttl.SetEvictor(&compositeEvictor{kvs: s, vec: vecStore, wal: bw})
 
 	// Добавляем значение и вектор
 	key := "test_key"
-	s.Set(0, key, []byte("val"))
+	s.Set(key, []byte("val"))
 	err = vecStore.Add(key, []float32{1, 2, 3})
 	if err != nil {
 		t.Fatalf("failed to add vector: %v", err)
@@ -600,18 +601,18 @@ func TestCompositeEvictor_Integration(t *testing.T) {
 // TestWALReplay_ExpiredKeyAndDel проверяет корректность наката WAL операций
 // для удаления просроченных векторов в оффлайне (OpExpire) и удаления по DEL (OpDel).
 func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
-	s := tcmalloc.NewTCMallocStore(1)
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance, s)
-	ttl := NewTTLManager(tcmalloc.NewEvictor(s))
+	s := kv.New()
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	ttl := NewTTLManager(s)
 	defer ttl.Stop()
 
 	// Логика-клон applyEntry для проверки реплея
 	applyEntry := func(entry wal.Entry) {
 		switch entry.Op {
 		case wal.OpSet:
-			s.Set(0, entry.Key, entry.Value)
+			s.Set(entry.Key, entry.Value)
 		case wal.OpDel:
-			s.Del(0, entry.Key)
+			s.Del(entry.Key)
 			vecStore.Delete(entry.Key)
 			ttl.OnDelete(entry.Key)
 		case wal.OpExpire:
@@ -621,7 +622,7 @@ func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
 				if remaining > 0 {
 					ttl.Set(entry.Key, remaining)
 				} else {
-					s.Del(0, entry.Key)
+					s.Del(entry.Key)
 					vecStore.Delete(entry.Key) // Исправление утечки при оффлайн-истечении TTL
 					ttl.OnDelete(entry.Key)
 				}
@@ -631,7 +632,7 @@ func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
 
 	// ─── Сценарий 1: Реплей OpExpire с датой в прошлом ───
 	keyExpired := "expired_offline_key"
-	s.Set(0, keyExpired, []byte("val"))
+	s.Set(keyExpired, []byte("val"))
 	err := vecStore.Add(keyExpired, []float32{1, 2, 3})
 	if err != nil {
 		t.Fatalf("failed to add vector: %v", err)
@@ -659,7 +660,7 @@ func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
 
 	// ─── Сценарий 2: Реплей OpDel ───
 	keyDel := "deleted_manual_key"
-	s.Set(0, keyDel, []byte("val"))
+	s.Set(keyDel, []byte("val"))
 	err = vecStore.Add(keyDel, []float32{4, 5, 6})
 	if err != nil {
 		t.Fatalf("failed to add vector: %v", err)
