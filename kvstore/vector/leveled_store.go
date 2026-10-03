@@ -83,11 +83,10 @@ const (
 // текстовый BM25-слой: frozen/SQ-сегменты сериализуют segmentText (writeSegText)
 // после segMeta, hnswSegment персистит термы по вектору (writeTerms) после
 // attrs — слой регенерируется buildSegment на load. Снапшоты v<7 читаются как
-// прежде (текста в них нет → слой nil). v8 — документная секция под конвертом
-// скоупа у frozen-сегмента. v9 — та же секция у SQ8- и hnsw-сегментов: до неё
-// запечатанный путь существовал ровно для одного типа из трёх, и факт,
-// записанный под шифрованием, но осевший в двух других, уезжал в снапшот
-// открытым. Снапшоты v8 читаются как прежде — секции у этих типов в них нет.
+// прежде (текста в них нет → слой nil). v8 — документная секция после
+// frozen-сегмента, v9 — та же секция у SQ8- и hnsw-сегментов. Сейчас секция
+// пишется пустой, а читается ради снапшотов прежних версий (см.
+// snapshot_docs_section.go).
 var leveledMagic = [8]byte{'L', 'V', 'L', 'V', 0, 9, 0, 0}
 
 // leveledMagicPrefix — общая часть ('LVLV') для проверки формата без версии.
@@ -177,8 +176,8 @@ func (s *frozenSegment) Text() *segmentText        { return s.text }
 func (s *frozenSegment) TextKey(doc uint32) string { return s.fg.viewKey(int(doc)) }
 
 // HasKey — O(1) по ленивому keySet. Исторически был линейным («редкие ручные
-// DEL»), затем бинпоиском по sorted-пермутации (TTL-жнец, порог 3 шага 6),
-// теперь map: строгое затенение П3 сделало HasKey горячим путём чтения.
+// DEL»), затем бинпоиском по sorted-пермутации, теперь map: строгое затенение
+// П3 сделало HasKey горячим путём чтения.
 func (s *frozenSegment) HasKey(key string) bool {
 	s.keySetOnce.Do(func() {
 		n := s.fg.keys.count()
@@ -393,7 +392,7 @@ type hnswSegment struct {
 	// keySet — ленивый обратный индекс user_key → ∃ для HasKey: keys иммутабелен
 	// после build (мутаций по месту нет, удаления идут tombstone'ами store-уровня),
 	// строится один раз при первом HasKey под mu.Lock. Цена: +~(16-48Б)/ключ
-	// памяти, платится только если сегмент вообще спрашивают (жнец, строгое
+	// памяти, платится только если сегмент вообще спрашивают (Delete, строгое
 	// затенение П3). До индекса HasKey был O(N)-сканом на каждый вызов.
 	keySet map[string]struct{}
 	mu     sync.RWMutex   // защита от чтения пока граф строится
@@ -650,8 +649,8 @@ type LeveledConfig struct {
 	// поиска (Search*/SearchTextFilter): хит сегмента гасится, если БОЛЕЕ СВЕЖИЙ
 	// сегмент содержит этот ключ, даже когда свежая копия не попала в свои хиты
 	// (отфильтрована атрибутами или не матчится запросом). Закрывает стейл-
-	// семантику переходных мульти-сегментных состояний (та же дыра, что чинил
-	// пере-суд VMEM.Recall, репро TestVMEMSupersedeTwoSegmentLeak) ценой
+	// семантику переходных мульти-сегментных состояний (стейл-копия из старого
+	// сегмента всплывала в фильтрованном поиске до компакции) ценой
 	// HasKey-лукапов по более свежим сегментам на каждый хит: O(log n) во
 	// frozen/SQ, O(N) в hnsw. false = прежняя семантика («затенение живёт
 	// только среди хитов», компакция нормализует). Экспериментальный флаг
@@ -687,11 +686,6 @@ type compactionResult struct {
 // LeveledVectorStore — основное хранилище с leveled compaction.
 type LeveledVectorStore struct {
 	cfg LeveledConfig
-
-	// snapshotCrypto — точка подмены шифрования бинарного снапшота (v8).
-	// nil = снапшот пишется как раньше. Устанавливается один раз при старте,
-	// до загрузки и до приёма запросов, поэтому без синхронизации.
-	snapshotCrypto *SnapshotCrypto
 
 	mu    sync.RWMutex
 	delta *DeltaSegment
@@ -808,13 +802,6 @@ type LeveledVectorStore struct {
 
 	// snapshotTime — UnixNano момента последнего успешного LoadBinary (для диагностики).
 	snapshotTime int64
-
-	// snapshotFormatVersion — версия формата ПРОЧИТАННОГО снапшота (0, если
-	// снапшота не было). Нужна не для диагностики: до v9 запечатанной секции у
-	// SQ8- и hnsw-сегментов не было, и файл, записанный такой сборкой при
-	// включённом шифровании, содержит факты открытым текстом. В памяти после
-	// загрузки этого уже не видно — оболочка предупреждает по этому числу.
-	snapshotFormatVersion int
 
 	// snapshotLSN — LSN-watermark снапшота: «graph_leveled.bin покрывает все
 	// векторные операции с LSN ≤ snapshotLSN». Пишется в заголовок при SaveBinary
@@ -990,12 +977,6 @@ func (lvs *LeveledVectorStore) addEntry(key string, vec []float32, attrs Attribu
 func (lvs *LeveledVectorStore) initDelta(dim int) error {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
-	return lvs.initDeltaLocked(dim)
-}
-
-// initDeltaLocked — тело initDelta для вызова под уже удерживаемым lvs.mu.Lock
-// (supersedes-путь VMEM держит замок на весь read-modify-write).
-func (lvs *LeveledVectorStore) initDeltaLocked(dim int) error {
 	if lvs.delta != nil {
 		if dim != lvs.dim {
 			return &dimMismatchError{expected: lvs.dim, got: dim}
@@ -1032,26 +1013,6 @@ func (lvs *LeveledVectorStore) removeTombstone(key string) {
 func (lvs *LeveledVectorStore) Delete(key string) bool {
 	lvs.mu.Lock()
 	defer lvs.mu.Unlock()
-	return lvs.deleteLocked(key)
-}
-
-// deleteLocked — тело Delete под уже взятым lvs.mu.Lock: жнец TTL (шаг 6 VMEM)
-// обязан перепроверить приговор и удалить атомарно под одним замком, иначе
-// между перепроверкой и Delete вклинился бы параллельный Remember.
-func (lvs *LeveledVectorStore) deleteLocked(key string) bool {
-	deleted, needTomb := lvs.deleteClassifyLocked(key)
-	if needTomb {
-		addTombstone(&lvs.tombstones, key)
-	}
-	return deleted
-}
-
-// deleteClassifyLocked — логика Delete БЕЗ вставки в tombstone-карту: решает
-// судьбу ключа, а нужный tombstone отдаёт флагом. Единственная причина
-// расщепления — COW карты: одиночный Delete платит копию за ключ (редкая
-// операция), а массовая жатва (reapKeys) обязана батчировать — одна копия на
-// батч, иначе O(n²) под write-замком (порог 3 шага 6 ловил именно это).
-func (lvs *LeveledVectorStore) deleteClassifyLocked(key string) (deleted, needTomb bool) {
 	lvs.touchMutation()
 
 	// Если в дельте — hard delete (вектор физически исчезает из дельты).
@@ -1061,26 +1022,28 @@ func (lvs *LeveledVectorStore) deleteClassifyLocked(key string) (deleted, needTo
 		// Тогда ставим tombstone на неё, иначе она воскреснет при чтении/merge.
 		// Иначе — снимаем возможный прежний tombstone.
 		if lvs.keyInFlushingLocked(key) || lvs.keyPhysicallyInSegmentsLocked(key) {
-			return true, true
+			addTombstone(&lvs.tombstones, key)
+			return true
 		}
 		deleteTombstone(&lvs.tombstones, key)
-		return true, false
+		return true
 	}
 
 	// Не в активной дельте. Уже tombstoned → уже удалён.
 	if t := lvs.tombstones.Load(); t != nil {
 		if _, ok := (*t)[key]; ok {
-			return false, false
+			return false
 		}
 	}
 	// Ключ мог быть в сфлашиваемой дельте (flush-окно) ИЛИ в сегменте. В обоих
 	// случаях ставим tombstone: сфлашиваемую дельту мутировать НЕЛЬЗЯ (её читает
 	// build-горутина), а tombstone замаскирует ключ и в получившемся сегменте.
 	if !lvs.keyInFlushingLocked(key) && !lvs.keyPhysicallyInSegmentsLocked(key) {
-		return false, false
+		return false
 	}
 	monitoring.VectorTombstoneTotal.Inc()
-	return true, true
+	addTombstone(&lvs.tombstones, key)
+	return true
 }
 
 // keyInFlushingLocked — есть ли живой ключ в какой-либо сфлашиваемой дельте
@@ -1170,30 +1133,6 @@ func addTombstone(p *atomic.Pointer[map[string]struct{}], key string) {
 		return
 	}
 	nw := map[string]struct{}{key: {}}
-	p.Store(&nw)
-}
-
-// addTombstones: батчевое COW-добавление — ОДНА копия карты на весь батч.
-// Вызывать под lvs.mu (write). Массовое удаление (TTL-жнец) с per-key COW
-// стоило бы O(n²) переносов записей под write-замком.
-func addTombstones(p *atomic.Pointer[map[string]struct{}], keys []string) {
-	if len(keys) == 0 {
-		return
-	}
-	old := p.Load()
-	nOld := 0
-	if old != nil {
-		nOld = len(*old)
-	}
-	nw := make(map[string]struct{}, nOld+len(keys))
-	if old != nil {
-		for k, v := range *old {
-			nw[k] = v
-		}
-	}
-	for _, k := range keys {
-		nw[k] = struct{}{}
-	}
 	p.Store(&nw)
 }
 
@@ -1355,11 +1294,11 @@ func (lvs *LeveledVectorStore) SearchFilter(query []float32, K int, f Filter) ([
 	// которые подаёт шард из-под своего RLock (см. deltaFilterFn): ни снапшота,
 	// ни лукапов, ни замков. Flushing-дельты покрыты устройством search()
 	// (memtable-набор = активная + flushing, грабля окна flush-visibility,
-	// вскрытая VMEM-оракулом). История: здесь был ПОЛНЫЙ снимок AttrsSnapshot
+	// вскрытая оракульным тестом). История: здесь был ПОЛНЫЙ снимок атрибутов
 	// всех дельт на КАЖДЫЙ запрос — O(|delta|) map-аллокация и конвой на
-	// runtime-локах аллокатора под конкуренцией (E2E vmemload 23.07,
-	// mutex-профиль: 88% в maps.newTable); затем freshest-лукап GetAttrs —
-	// дедлок рекурсивного RLock из-под шардового замка. Стейл-копию, прошедшую
+	// runtime-локах аллокатора под конкуренцией (нагрузочный прогон 23.07,
+	// mutex-профиль: 88% в maps.newTable); затем лукап атрибутов свежайшей
+	// копии — дедлок рекурсивного RLock из-под шардового замка. Стейл-копию, прошедшую
 	// суд по своим атрибутам, гасит Contains/дедуп-затенение merge.
 	var memAttrFilter deltaFilterFn
 	if !f.empty() {
@@ -2111,16 +2050,6 @@ func (lvs *LeveledVectorStore) SnapshotTime() int64 { return lvs.snapshotTime }
 // с LSN ≤ этого значения — они уже в снапшоте.
 func (lvs *LeveledVectorStore) SnapshotLSN() uint64 { return lvs.snapshotLSN }
 
-// SnapshotFormatVersion — версия формата прочитанного снапшота (0 — снапшота не
-// было). Оболочка предупреждает по ней о файле, записанном до v9: там факты
-// SQ8- и hnsw-сегментов лежат открытым текстом, а после загрузки в памяти это
-// уже неразличимо.
-func (lvs *LeveledVectorStore) SnapshotFormatVersion() int { return lvs.snapshotFormatVersion }
-
-// SealedSegmentsFormatVersion — версия, начиная с которой запечатаны ВСЕ типы
-// сегмента. Снапшот старее хранит часть фактов открытым текстом.
-const SealedSegmentsFormatVersion = 9
-
 // SetSnapshotWatermark выставляет LSN-watermark, записываемый следующим SaveBinary.
 //
 // Вызывать ПЕРЕД SaveBinary со значением LastLSN() на момент НАЧАЛА сохранения
@@ -2243,59 +2172,34 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 				if _, err := w.Write([]byte{segTypeFrozen}); err != nil {
 					return fmt.Errorf("leveled: write segType[%d][%d]: %w", lyr, si, err)
 				}
-				// v8: содержание фактов изымается из графа и слоёв и уезжает в
-				// документную секцию под конвертом своего скоупа. Форматы графа,
-				// колонок и текстового слоя при этом не меняются — меняется их
-				// наполнение (см. snapshot_sealed_segment.go).
-				entries := frozenEntries(s)
-				mask, public, anySealed := splitBySealed(entries, vmemScopeOf)
-				pubAttrs, pubText := s.attrs, s.text
-				if anySealed {
-					pubAttrs = buildSegmentAttrs(public, nil)
-					pubText = buildSegmentText(public)
-				} else {
-					mask = nil // ни одного факта — прежний zero-alloc путь записи
-				}
-				if err := s.fg.WriteGraphToMasked(w, mask); err != nil {
+				if err := s.fg.WriteGraphTo(w); err != nil {
 					return fmt.Errorf("leveled: write frozen[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSegMeta(w, s.cat, pubAttrs); err != nil {
+				if err := writeSegMeta(w, s.cat, s.attrs); err != nil {
 					return fmt.Errorf("leveled: write frozenMeta[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSegText(w, pubText); err != nil {
+				if err := writeSegText(w, s.text); err != nil {
 					return fmt.Errorf("leveled: write frozenText[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSealedDocs(w, sealedOnly(entries, mask), vmemScopeOf, lvs.snapshotCrypto); err != nil {
-					return fmt.Errorf("leveled: write frozenSealed[%d][%d]: %w", lyr, si, err)
+				if err := writeEmptyDocsSection(w); err != nil {
+					return fmt.Errorf("leveled: write frozenDocs[%d][%d]: %w", lyr, si, err)
 				}
 
 			case *frozenSQSegment:
 				if _, err := w.Write([]byte{segTypeFrozenSQ8}); err != nil {
 					return fmt.Errorf("leveled: write segType[%d][%d]: %w", lyr, si, err)
 				}
-				// v9: то же изъятие содержания, что у frozenSegment выше.
-				// Делители набора общие, типозависимы только разворот сегмента
-				// в документы и возврат векторов (snapshot_sealed_sq.go).
-				sqEntries := frozenSQEntries(s)
-				sqMask, sqPublic, sqAnySealed := splitBySealed(sqEntries, vmemScopeOf)
-				sqAttrs, sqText := s.attrs, s.text
-				if sqAnySealed {
-					sqAttrs = buildSegmentAttrs(sqPublic, nil)
-					sqText = buildSegmentText(sqPublic)
-				} else {
-					sqMask = nil // ни одного факта — прежний zero-alloc путь записи
-				}
-				if err := s.fg.WriteGraphToSQMasked(w, sqMask); err != nil {
+				if err := s.fg.WriteGraphToSQ(w); err != nil {
 					return fmt.Errorf("leveled: write frozenSQ[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSegMeta(w, s.cat, sqAttrs); err != nil {
+				if err := writeSegMeta(w, s.cat, s.attrs); err != nil {
 					return fmt.Errorf("leveled: write frozenSQMeta[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSegText(w, sqText); err != nil {
+				if err := writeSegText(w, s.text); err != nil {
 					return fmt.Errorf("leveled: write frozenSQText[%d][%d]: %w", lyr, si, err)
 				}
-				if err := writeSealedDocs(w, sealedOnly(sqEntries, sqMask), vmemScopeOf, lvs.snapshotCrypto); err != nil {
-					return fmt.Errorf("leveled: write frozenSQSealed[%d][%d]: %w", lyr, si, err)
+				if err := writeEmptyDocsSection(w); err != nil {
+					return fmt.Errorf("leveled: write frozenSQDocs[%d][%d]: %w", lyr, si, err)
 				}
 
 			case *hnswSegment:
@@ -2321,18 +2225,8 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 					return fmt.Errorf("leveled: write nVecs[%d][%d]: %w", lyr, si, err)
 				}
 
-				// v9: содержание фактов изымается НА ЛЕТУ. Скоуп читается из
-				// колонки за O(1) (scopeColumnReader) — собирать список всех
-				// документов только ради решения «маскировать ли» не нужно, а
-				// nil-читатель (колонки нет) означает не-VMEM-стор, который
-				// пишется потоком ровно как до v9 и за чужую фичу не платит.
-				scopeAt := scopeColumnReader(s.attrs)
-				var sealedDocs []DeltaEntry // выделяется, только если есть что изымать
-				var zeroVec []byte
-
 				var klen [2]byte
 				var writeErr error
-				pos := 0
 				for id, key := range s.keys {
 					if key == "" || !s.g.nodes[id].Alive {
 						continue
@@ -2343,21 +2237,6 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 					}
 					vec := s.g.arena.Get(s.g.nodes[id].VectorOffset)
 
-					sealed := scopeAt != nil && scopeAt(int(id)) != ""
-					if sealed {
-						if sealedDocs == nil {
-							sealedDocs = make([]DeltaEntry, nVecs)
-							zeroVec = make([]byte, dim*4)
-						}
-						// Позиция в секции = порядковый номер живого документа:
-						// читатель складывает entries тем же порядком.
-						sealedDocs[pos] = DeltaEntry{
-							Key: key, Vec: vec,
-							Attrs: s.attrs.decodeAt(int(id)), Terms: entryTerms,
-						}
-					}
-					pos++
-
 					binary.LittleEndian.PutUint16(klen[:], uint16(len(key)))
 					if _, err := w.Write(klen[:]); err != nil {
 						writeErr = err
@@ -2367,14 +2246,8 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 						writeErr = err
 						break
 					}
-					// Вектор запечатанного документа уходит нулями: читатель
-					// всегда берёт ровно dim*4 байта, поэтому подменяется
-					// содержимое, а не длина — позиции не должны разъехаться.
-					if dim > 0 {
-						b := zeroVec
-						if !sealed && len(vec) > 0 {
-							b = unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), len(vec)*4)
-						}
+					if dim > 0 && len(vec) > 0 {
+						b := unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), len(vec)*4)
 						if _, err := w.Write(b); err != nil {
 							writeErr = err
 							break
@@ -2383,16 +2256,9 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 					// Атрибуты вектора (v3): node id = индекс колонки → decodeAt(id).
 					// hnsw-сегмент на load перестраивается buildSegment(entries), который
 					// регенерирует колонки+каталог из entries[].Attrs (см. readAttrs ниже).
-					attrs := Attributes{}
-					if !sealed {
-						attrs = s.attrs.decodeAt(int(id))
-					}
-					if err := writeAttrs(w, attrs); err != nil {
+					if err := writeAttrs(w, s.attrs.decodeAt(int(id))); err != nil {
 						writeErr = err
 						break
-					}
-					if sealed {
-						entryTerms = nil
 					}
 					if err := writeTerms(w, entryTerms); err != nil {
 						writeErr = err
@@ -2400,7 +2266,7 @@ func (lvs *LeveledVectorStore) SaveBinary(w io.Writer) error {
 					}
 				}
 				if writeErr == nil {
-					writeErr = writeSealedDocs(w, sealedDocs, vmemScopeOf, lvs.snapshotCrypto)
+					writeErr = writeEmptyDocsSection(w)
 				}
 				s.mu.RUnlock()
 				if writeErr != nil {
@@ -2460,12 +2326,6 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	crcSource := r
 	hasher := crc32.NewIEEE()
 	r = io.TeeReader(r, hasher)
-
-	// deadKeys — ключи документов, чей скоуп крипто-стёрт: их группа в снапшоте
-	// не открылась, потому что KEK уничтожен. Позиции в графе остаются (иначе
-	// поехали бы все остальные), но сами документы мертвы и уходят в tombstones
-	// после публикации сегментов. Это ШТАТНЫЙ исход, не порча.
-	var deadKeys []string
 
 	// Проверяем магию: префикс 'LVLV' обязателен, версия в байте [5].
 	var magic [8]byte
@@ -2562,16 +2422,13 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 					}
 				}
 				if version >= 8 {
-					sealedDocs, dead, err := readSealedDocs(r, fg.n, lvs.snapshotCrypto)
+					docs, err := readDocsSection(r, fg.n)
 					if err != nil {
-						return fmt.Errorf("leveled: read frozenSealed[%d][%d]: %w", lyr, si, err)
+						return fmt.Errorf("leveled: read frozenDocs[%d][%d]: %w", lyr, si, err)
 					}
-					// Ключи стёртого скоупа — в tombstones: их позиции в графе
-					// остаются, но документов больше нет (см. deadKeys ниже).
-					deadKeys = append(deadKeys, dead...)
-					if hasAnyDoc(sealedDocs) {
-						all := mergeSealedIntoEntries(frozenEntries(seg), sealedDocs)
-						restoreSealedVectors(fg, sealedDocs)
+					if hasAnyDoc(docs) {
+						all := mergeDocsIntoEntries(frozenEntries(seg), docs)
+						restoreDocVectors(fg, docs)
 						seg.attrs = buildSegmentAttrs(all, nil)
 						seg.text = buildSegmentText(all)
 					}
@@ -2594,18 +2451,15 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 						return fmt.Errorf("leveled: read frozenSQText[%d][%d]: %w", lyr, si, err)
 					}
 				}
-				// v9: документная секция появилась у SQ8 позже, чем у frozen
-				// (v8). Снапшоты v8 её не содержат — читать нечего, и это не
-				// ошибка, а честное «тогда мы этого не умели».
+				// У SQ8 секция появилась в v9; в снапшотах v8 её нет.
 				if version >= 9 {
-					sealedDocs, dead, err := readSealedDocs(r, fg.n, lvs.snapshotCrypto)
+					docs, err := readDocsSection(r, fg.n)
 					if err != nil {
-						return fmt.Errorf("leveled: read frozenSQSealed[%d][%d]: %w", lyr, si, err)
+						return fmt.Errorf("leveled: read frozenSQDocs[%d][%d]: %w", lyr, si, err)
 					}
-					deadKeys = append(deadKeys, dead...)
-					if hasAnyDoc(sealedDocs) {
-						all := mergeSealedIntoEntries(frozenSQEntries(seg), sealedDocs)
-						restoreSealedVectorsSQ(fg, sealedDocs)
+					if hasAnyDoc(docs) {
+						all := mergeDocsIntoEntries(frozenSQEntries(seg), docs)
+						restoreDocVectorsSQ(fg, docs)
 						seg.attrs = buildSegmentAttrs(all, nil)
 						seg.text = buildSegmentText(all)
 					}
@@ -2659,20 +2513,15 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 					entries = append(entries, DeltaEntry{Key: key, Vec: vec, Attrs: attrs, Terms: terms})
 				}
 
-				// v9: содержание фактов лежит в документной секции, а в цикле
-				// выше вместо них прочитаны нули и пустые атрибуты. Позиция —
-				// индекс в entries: писатель шёл по тому же порядку.
+				// Документы секции (снапшоты прежних версий) лежат на тех же
+				// позициях, где в цикле выше прочитаны нули и пустые атрибуты.
 				if version >= 9 {
-					sealedDocs, dead, err := readSealedDocs(r, len(entries), lvs.snapshotCrypto)
+					docs, err := readDocsSection(r, len(entries))
 					if err != nil {
-						return fmt.Errorf("leveled: read hnswSealed[%d][%d]: %w", lyr, si, err)
+						return fmt.Errorf("leveled: read hnswDocs[%d][%d]: %w", lyr, si, err)
 					}
-					// Стёртый скоуп: позиция остаётся пустышкой из нулей, а ключ
-					// уезжает в tombstones — как у frozen. Выбросить запись
-					// нельзя, иначе сегмент пересобрался бы со сдвигом.
-					deadKeys = append(deadKeys, dead...)
-					if hasAnyDoc(sealedDocs) {
-						entries = mergeSealedIntoEntries(entries, sealedDocs)
+					if hasAnyDoc(docs) {
+						entries = mergeDocsIntoEntries(entries, docs)
 					}
 				}
 
@@ -2729,7 +2578,6 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 
 	lvs.snapshotTime = snapTime
 	lvs.snapshotLSN = snapLSN
-	lvs.snapshotFormatVersion = int(version)
 	lvs.dim = dim
 
 	for i := range lvs.levels {
@@ -2762,14 +2610,6 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	if dim > 0 {
 		max := deltaMax(dim, lvs.cfg.DeltaMax)
 		lvs.delta = NewDeltaSegmentSharded(dim, max, lvs.cfg.Distance, lvs.cfg.M, lvs.cfg.EfConstruction, lvs.deltaShardCount())
-	}
-
-	// Крипто-стёртые документы: их группы не открылись, потому что KEK
-	// уничтожен. Метим tombstone'ами ЗДЕСЬ, после публикации сегментов —
-	// позиции в графе остались (иначе съехали бы все остальные), но выдавать
-	// их поиск не должен, а ближайшая консолидация вынесет физически.
-	for _, key := range deadKeys {
-		lvs.deleteLocked(key)
 	}
 
 	lvs.touchMutation()
@@ -2879,15 +2719,6 @@ func (lvs *LeveledVectorStore) handleIdleTick() {
 	if time.Now().UnixNano()-lvs.lastMutation.Load() < int64(lvs.cfg.IdleConsolidateAfter) {
 		return
 	}
-
-	// Жатва TTL (шаг 6 VMEM) — ДО консолидации: Delete истёкших ставит
-	// tombstones, и консолидация ниже выметает их физически тем же циклом
-	// простоя (стор становится и чистым, и плотным). Пожатые удаления трогают
-	// lastMutation → следующий тик отсчитает окно затишья заново; это принято.
-	// Часы легальны (дверь 1): решение жнеца локально, в WAL не едет — после
-	// реплея истёкшие воскресают физически, невидимы фильтром чтения и будут
-	// пожаты заново.
-	lvs.ReapExpired(time.Now().Unix(), vmemReapTickLimit)
 
 	lvs.mu.Lock()
 	epoch := lvs.compactionEpoch.Load()
@@ -3644,7 +3475,7 @@ func (lvs *LeveledVectorStore) FlushDeltaSync() {
 			// maybeScheduleMergesLocked). Наблюдалось: upsert сразу после
 			// FlushDeltaSync попадал во второй сегмент, и старая копия факта
 			// всплывала в текстовом поиске, где сегмент-vs-сегмент гасится лишь
-			// дедупом хитов (TestVMEMReapOracleParity/upsert_same_id/mixed).
+			// дедупом хитов (страж — TestFlushDeltaSyncDoesNotFlushLaterWrites).
 			lvs.maybeScheduleMergesLocked(lvs.compactionEpoch.Load())
 			return
 		}

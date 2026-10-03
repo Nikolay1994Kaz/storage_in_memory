@@ -433,43 +433,6 @@ func (d *DeltaSegment) Get(key string) ([]float32, bool) {
 	return out, true
 }
 
-// GetDoc возвращает материализованный док по ключу (шаг 4 VMEM: чтение цели
-// supersedes перед re-ingest). Vec и Terms — копии (слэб шарда растёт append'ом,
-// термы живут до clearTextLocked при upsert — ссылки наружу пережили бы RLock);
-// Attrs — struct по значению, его мапы делятся с исходной вставкой и ЧИТАЮТСЯ
-// как иммутабельные (мутация valid_to при закрытии интервала обязана идти через
-// глубокую копию — см. closeFactDoc).
-func (d *DeltaSegment) GetDoc(key string) (DeltaEntry, bool) {
-	s := d.shardFor(key)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	idx, ok := s.keyIdx[key]
-	if !ok || s.keys[idx] == "" {
-		return DeltaEntry{}, false
-	}
-	vec := make([]float32, d.dim)
-	copy(vec, s.data[idx*d.dim:(idx+1)*d.dim])
-	e := DeltaEntry{Key: key, Vec: vec, Attrs: s.attrs[idx]}
-	if idx < len(s.terms) && len(s.terms[idx]) > 0 {
-		e.Terms = append([]TermTF(nil), s.terms[idx]...)
-	}
-	return e, true
-}
-
-// GetAttrs возвращает атрибуты живого дока по ключу — O(1) по keyIdx шарда
-// (шаг 5 VMEM: проекция NUM-значений кандидатам RECALL без цены GetDoc —
-// вектор и термы не копируются). Мапы Attributes читать как иммутабельные.
-func (d *DeltaSegment) GetAttrs(key string) (Attributes, bool) {
-	s := d.shardFor(key)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	idx, ok := s.keyIdx[key]
-	if !ok || s.keys[idx] == "" {
-		return Attributes{}, false
-	}
-	return s.attrs[idx], true
-}
-
 // ForEachLive вызывает fn(key, vec) для каждого живого вектора во всех шардах.
 // vec — ссылка во внутренний slab (не копия): не сохранять между вызовами.
 // Под shard RLock каждого шарда поочерёдно.
@@ -491,9 +454,9 @@ func (d *DeltaSegment) ForEachLive(fn func(key string, vec []float32)) {
 // результатов сохранён (как у одного графа). filterFn применяется к РЕЗУЛЬТАТАМ.
 // deltaFilterFn — фильтр кандидата дельты. attrs — атрибуты ЭТОЙ копии дока,
 // поданные шардом из-под его же RLock (слот лежит рядом с ключом): суд Eq/Range
-// не делает ни лукапов, ни аллокаций и, главное, не берёт замков — вызов
-// внешнего GetAttrs из-под шардового RLock был бы рекурсивным RLock и дедлочил
-// при ждущем писателе (вскрыто vmemload 23.07, mix-фаза). Стейл-копию,
+// не делает ни лукапов, ни аллокаций и, главное, не берёт замков — внешний
+// лукап атрибутов из-под шардового RLock был бы рекурсивным RLock и дедлочил
+// при ждущем писателе (вскрыто нагрузочным прогоном 23.07). Стейл-копию,
 // прошедшую суд по СВОИМ атрибутам, гасит Contains-затенение merge — семантика
 // «свежайшая копия решает» сохраняется без freshest-лукапа здесь.
 type deltaFilterFn func(key string, attrs Attributes) bool
@@ -648,71 +611,6 @@ func (d *DeltaSegment) BruteForce(query []float32, K int, distFn DistanceFunc, f
 
 	slices.SortFunc(heap, cmpDeltaResult)
 	return heap
-}
-
-// AttrsSnapshot возвращает снимок атрибутов живых записей (key → Attributes).
-// Используется SearchFilter: дельта не имеет колонок, поэтому её атрибуты судятся
-// по этому снимку (matchAttrs). Bounded (delta ограничена), копия безопасна от гонок.
-func (d *DeltaSegment) AttrsSnapshot() map[string]Attributes {
-	out := make(map[string]Attributes, int(d.live.Load()))
-	for _, s := range d.shards {
-		s.mu.RLock()
-		for i, key := range s.keys {
-			if key == "" || i >= len(s.attrs) {
-				continue
-			}
-			out[key] = s.attrs[i]
-		}
-		s.mu.RUnlock()
-	}
-	return out
-}
-
-// KeysNumLE — ключи живых записей с NUM-атрибутом name <= hi. Скан-фаза
-// TTL-жнеца (шаг 6 VMEM) по memtable: без полного снимка атрибутов, только
-// попавшие под порог. Отсутствующий атрибут не проходит сравнение — не-VMEM
-// доки и сентинел «без TTL» (2^53 > любого now) отсеиваются без веток.
-func (d *DeltaSegment) KeysNumLE(name string, hi float64) []string {
-	if !d.HasAttrs() {
-		return nil
-	}
-	var out []string
-	for _, s := range d.shards {
-		s.mu.RLock()
-		for i, key := range s.keys {
-			if key == "" || i >= len(s.attrs) {
-				continue
-			}
-			if v, ok := s.attrs[i].Num[name]; ok && v <= hi {
-				out = append(out, key)
-			}
-		}
-		s.mu.RUnlock()
-	}
-	return out
-}
-
-// KeysCatEq — ключи живых записей с CAT-атрибутом name == want. Категориальное
-// зеркало KeysNumLE для скан-фазы карантина (отзыв по источнику): отсутствующий
-// атрибут не проходит сравнение, поэтому не-VMEM доки отсеиваются без веток.
-func (d *DeltaSegment) KeysCatEq(name, want string) []string {
-	if !d.HasAttrs() {
-		return nil
-	}
-	var out []string
-	for _, s := range d.shards {
-		s.mu.RLock()
-		for i, key := range s.keys {
-			if key == "" || i >= len(s.attrs) {
-				continue
-			}
-			if v, ok := s.attrs[i].Cat[name]; ok && v == want {
-				out = append(out, key)
-			}
-		}
-		s.mu.RUnlock()
-	}
-	return out
 }
 
 // deltaTextResult — результат текстового BM25-поиска по дельте.

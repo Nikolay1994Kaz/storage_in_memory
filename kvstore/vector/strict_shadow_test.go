@@ -3,8 +3,8 @@ package vector
 // =============================================================================
 // П3-эксперимент (23.07): стейл-семантика публичных путей поиска
 // (VSIM.SEARCHTEXT/HYBRID/SEARCH+фильтры) в переходных мульти-сегментных
-// состояниях LSM — та же дыра, что чинил пере-суд VMEM.Recall (a77924b,
-// TestVMEMSupersedeTwoSegmentLeak), но на публичной поверхности.
+// состояниях LSM: стейл-копия из старого сегмента всплывала в выдаче, пока
+// компакция не сольёт сегменты.
 //
 // Пороги назначены ДО прогона (утверждены Николаем 23.07):
 //   цена фикса: QPS strict/QPS baseline ≥ 0.9× → фикс дешёвый, включать
@@ -145,7 +145,7 @@ func strictShadowCorpus(t *testing.T, dim, nSeg, batch, upserts, vocab, nTok, nS
 			for u := 0; u < upserts; u++ {
 				doc := rng.Intn(k * batch) // случайный док из предыдущих батчей
 				id := fmt.Sprintf("doc:%06d", doc)
-				if err := lvs.AddDoc(id, mkv(doc), scopeOf(doc, k), vmemSynthText(rng, vocab, nTok)); err != nil {
+				if err := lvs.AddDoc(id, mkv(doc), scopeOf(doc, k), synthText(rng, vocab, nTok)); err != nil {
 					t.Fatalf("upsert %s: %v", id, err)
 				}
 			}
@@ -153,7 +153,7 @@ func strictShadowCorpus(t *testing.T, dim, nSeg, batch, upserts, vocab, nTok, nS
 		for i := 0; i < batch; i++ {
 			doc := k*batch + i
 			id := fmt.Sprintf("doc:%06d", doc)
-			if err := lvs.AddDoc(id, mkv(doc), scopeOf(doc, 0), vmemSynthText(rng, vocab, nTok)); err != nil {
+			if err := lvs.AddDoc(id, mkv(doc), scopeOf(doc, 0), synthText(rng, vocab, nTok)); err != nil {
 				t.Fatalf("AddDoc %s: %v", id, err)
 			}
 		}
@@ -224,7 +224,7 @@ func TestStrictShadowQPSProbe(t *testing.T) {
 		queries := make([]string, nQ)
 		scopes := make([]Filter, nQ)
 		for i := range queries {
-			queries[i] = vmemSynthText(rng, vocab, 4)
+			queries[i] = synthText(rng, vocab, 4)
 			scopes[i] = Filter{Eq: map[string]string{"scope": fmt.Sprintf("user:%03d", rng.Intn(nScopes))}}
 		}
 		qpsOff, qpsOn := strictShadowMeasure(t, lvs, func() int {
@@ -279,7 +279,7 @@ func TestStrictShadowQPSProbe(t *testing.T) {
 		queries := make([]string, nQ)
 		scopes := make([]Filter, nQ)
 		for i := range queries {
-			queries[i] = vmemSynthText(rng, vocab, 4)
+			queries[i] = synthText(rng, vocab, 4)
 			scopes[i] = Filter{Eq: map[string]string{"scope": fmt.Sprintf("user:%03d", rng.Intn(nScopes))}}
 		}
 		qpsOff, qpsOn := strictShadowMeasure(t, lvs, func() int {
@@ -296,4 +296,19 @@ func TestStrictShadowQPSProbe(t *testing.T) {
 		verdict("SEARCHTEXT+EQ hnsw(3seg)", qpsOff, qpsOn)
 		lvs.Close()
 	}
+}
+
+// synthText — синтетический текст из словаря word00000..wordNNNNN со смещением
+// к частым словам (квадрат равномерной величины), чтобы BM25 видел и частые,
+// и редкие термы.
+func synthText(rng *rand.Rand, vocab, nTok int) string {
+	buf := make([]byte, 0, nTok*8)
+	for i := 0; i < nTok; i++ {
+		if i > 0 {
+			buf = append(buf, ' ')
+		}
+		w := int(float64(vocab) * rng.Float64() * rng.Float64())
+		buf = append(buf, fmt.Sprintf("word%05d", w)...)
+	}
+	return string(buf)
 }

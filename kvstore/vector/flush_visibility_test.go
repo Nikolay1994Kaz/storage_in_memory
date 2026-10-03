@@ -147,8 +147,8 @@ func TestFlushVisibility_ConcurrentAddSearch(t *testing.T) {
 }
 
 // TestFlushVisibility_FilterAttrsInWindow — страж атрибут-фильтра в окне
-// flush-visibility. Дефект (pre-existing, вскрыт VMEM-оракулом шага 2,
-// mixed-состояние): SearchFilter снимал атрибуты ТОЛЬКО активной дельты, а
+// flush-visibility. Дефект (pre-existing, вскрыт оракульным тестом в
+// смешанном состоянии): SearchFilter снимал атрибуты ТОЛЬКО активной дельты, а
 // pass-through «не delta-ключ → пусть судят колонки сегмента» пропускал доки
 // из flushing-дельт (swap сделан, сегмент не опубликован) мимо фильтра —
 // любой Eq/Range для них молча игнорировался (утечка между тенантами).

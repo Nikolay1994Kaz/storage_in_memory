@@ -3,231 +3,97 @@
 [![CI](https://github.com/Nikolay1994Kaz/storage_in_memory/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Nikolay1994Kaz/storage_in_memory/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Nikolay1994Kaz/storage_in_memory)](https://github.com/Nikolay1994Kaz/storage_in_memory/releases)
 
-**Self-hosted memory engine for AI agents.** One process gives your agents
-durable, queryable memory: facts with validity intervals and supersession
-history ("what was true in March?"), erasure at two levels — immediate
-revocation with its physical horizon stated, and cryptographic erasure of a
-whole scope that reaches copies already shipped to an archive — an optional
-tamper-evident audit chain over every memory-changing command, and
-recency×importance-ranked recall — BM25 out of the box, hybrid BM25+vector
-when you bring embeddings. Agents plug in over **MCP** in two minutes
-([docs/QUICKSTART_MCP.md](docs/QUICKSTART_MCP.md)); everything is also
-scriptable over **RESP** from any Redis client library.
+**A single-node in-memory data store that speaks RESP and does vector and
+full-text search in the same process.** Vectors live in HNSW indexes organised
+as an LSM of immutable segments (fp32 or SQ8); BM25 full-text sits next to them,
+with reciprocal-rank fusion for hybrid queries; attribute filters and a
+tenant-aware layout narrow the search. Everything is durable through a
+write-ahead log and snapshots and can be shipped continuously to S3. A small
+key-value / TTL / sorted-set / pub-sub layer rides along for metadata and joins.
+One static binary, no external services.
 
-Retrieval quality is measured against public benchmarks rather than asserted:
-**97.4% R@5 on LongMemEval_S** (500 questions, retrieval-only, no LLM in the
-loop) — in a run that also reproduces the published 96.6% baseline, so the
-comparison is checkable rather than claimed. Read it as parity with a good
-vector store, and see [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the per-type
-breakdown, the one type where our hybrid ranking *loses*, and the stated limits
-of that evidence.
+## What is inside
 
-A second benchmark, **LoCoMo**, is reported the same way and is less flattering
-on purpose: **64.6% recall@5** against annotated evidence turns (1 536
-questions, retrieval-only). It is a stricter unit — the correct *turn* out of
-588 candidates, not the correct session — and it is the run that found three
-things worth knowing before you deploy: the default recency half-life was wrong
-for memories spanning months, hybrid fusion *costs* recall when one arm is much
-weaker than the other, and an embedder used in the wrong mode costs more than a
-weak embedder does. All three are quantified in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) §9.
+- **Vector search** — HNSW in an LSM of segments. Writes land in a sharded
+  in-memory delta; a full delta freezes into an immutable segment in
+  milliseconds (no graph rebuild on the flush path); background merges
+  consolidate levels; after a write lull the index consolidates back into a
+  single segment by itself (`-idle-consolidate`). Segments are fp32 or SQ8
+  (int8 codes, asymmetric distance and rerank). Deletes are tombstones until
+  the next merge.
+- **Full-text and hybrid** — a BM25 inverted index per segment
+  (`VSIM.SEARCHTEXT`) and BM25+vector fusion by reciprocal rank
+  (`VSIM.HYBRID`), with filters applied to both arms *before* fusion. The WAL
+  carries tokenized terms, not raw text, so replay is bit-exact whatever the
+  stemmer version.
+- **Filters and tenants** — categorical and numeric attribute columns per
+  segment (`VSIM.FILTER`, `EQ`/`RANGE`), and a tenant-contiguous layout
+  (`-partition-attr`) that brute-forces a small tenant over its own range
+  instead of traversing the whole graph.
+- **Durability** — WAL with LSNs and group commit; fail-stop on I/O errors
+  (writes are refused, reads keep working); CRC-checked snapshots with an LSN
+  watermark, so replay skips what a snapshot already holds; read-only
+  point-in-time restore (`-restore-to-lsn`); continuous WAL shipping to S3 or a
+  directory, restorable on any machine.
+- **KV layer** — strings with TTL, sorted sets on a B+-tree, pub/sub (classic
+  channels and vector-routed subscriptions), `MULTI`/`EXEC` grouping. It exists
+  for metadata and cross-engine joins (`VSIM.SEARCHFILTER`,
+  `VSIM.SEARCHRANGE`); the surface is small and frozen on purpose — this is not
+  a Redis replacement ([docs/COMMANDS.md](docs/COMMANDS.md)).
+- **Server** — RESP over TCP, TLS or mTLS; `AUTH`; a goroutine per connection
+  on Go's netpoller with a zero-alloc parser and one write per pipelined batch;
+  a `maxmemory` gate; Prometheus `/metrics`, `/health`, `/ready`; structured
+  logs.
 
-Under the memory surface sits a single-node in-memory engine built for the
-job: HNSW vector search with SQ8 quantization, BM25 full-text with RRF hybrid
-fusion, tenant/attribute filtering, a small frozen KV/TTL/Pub-Sub layer, and
-WAL-based durability with continuous shipping to S3. One static ~13MB binary —
-no Postgres+Qdrant+Neo4j zoo — and self-hosted by design: your agents' memory
-runs where your data must live (laptop, VPC, air-gapped on-prem). Not a Redis
-replacement — the KV surface exists to serve the memory core.
+## Numbers
 
-## Agent memory in two minutes
+Laptop i7-9750H (6 cores), same machine for both sides of every comparison.
+Methodology, caveats and reproduction commands are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-```bash
-# 1. get the two binaries — server (Linux) and MCP adapter (Linux/macOS/Windows)
-#    from https://github.com/Nikolay1994Kaz/storage_in_memory/releases, or build both:
-make build                                     # -> ./kvstore-server, ./vmem-mcp
+| Workload | Result |
+|---|---|
+| End-to-end over RESP, MNIST-784, SQ8 | **12 985 QPS** at recall@10 0.9996 |
+| End-to-end over RESP, dbpedia ada-002 (1536-dim) | **3 928 QPS** at recall@10 0.9888 |
+| GIST-960, SQ8 vs hnswlib fp32 | **2.5–2.7×** multithreaded QPS at equal recall, 4× less vector memory |
+| SIFT-1M, consolidated index vs hnswlib | **1.36–1.38×** (25 697 vs 18 833 QPS at recall 0.96) |
+| SIFT-1M, fragmented index right after a load | hnswlib ~3× faster — the price of an LSM that takes concurrent writes and deletes |
+| Tenant-routed filtered search | **5.8×–28 620×** faster than post-filtering, recall 1.0 |
+| Search while 12 clients bulk-load dbpedia | **750–800 QPS** floor, 3 544 QPS at 0.99 after the load |
+| KV `GET`, store level | 49 ns, zero allocations |
 
-# 2. the server — one static binary; the working dir keeps WAL + snapshots
-./kvstore-server --port 6380
+## Measured decisions
 
-# 3. the MCP adapter — plug into Claude Code (or any MCP host)
-claude mcp add memory -- "$PWD/vmem-mcp" -addr 127.0.0.1:6380 -default-scope myproject
-```
+The parts of the design that were settled by measurement rather than by taste:
 
-Restart the host session afterwards — MCP servers are picked up at startup.
+- **No custom allocator, no own epoll.** Both were built: a TCMalloc-style arena
+  for the KV store and HNSW neighbour lists, and an epoll layer on top of Go's
+  netpoller. An A/B against a sharded `map` and goroutine-per-connection showed
+  the arena made `GET` 3× slower (with two allocations per call), and the epoll
+  layer gave nothing back. Both were removed: with ~950k live keys p99 `GET`
+  went from 1.04 to 0.59 ms, p99 `SET` from 1.33 to 0.76 ms, RSS from ~500 to
+  ~368 MB ([BENCHMARKS §7](docs/BENCHMARKS.md#7-removing-the-custom-allocator-and-the-epoll-layer)).
+- **Flush without rebuild.** Freezing a delta shard into a segment instead of
+  rebuilding a graph, plus merging whole level prefixes at once, took the search
+  floor during bulk loads from ~34 QPS to 750–800 QPS.
+- **The LSM cost is stated, not hidden.** A freshly loaded, fragmented index is
+  slower than a single hnswlib graph; idle consolidation returns it to the
+  faster shape.
 
-The agent now has three tools — `memory_remember`, `memory_recall`,
-`memory_forget` — and its facts survive restarts, sessions and model
-switches. Full setup incl. Claude Desktop and Docker:
-[docs/QUICKSTART_MCP.md](docs/QUICKSTART_MCP.md); agent-driven install:
-[INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md).
-
-What makes it a memory engine rather than a search index (`VMEM.*` —
-semantics in [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md)):
-
-- **Validity time.** A fact that replaces another (`supersedes`) closes the
-  old one's interval instead of deleting it; `RECALL … ASOF <ts>` answers
-  "what was true then".
-- **Erasure beats time travel.** `FORGET` and TTL expiry make a fact
-  unreachable in every read mode, `ASOF` included — the right to be forgotten
-  wins over the time machine. That is *revocation*: the bytes leave the main
-  store at the next consolidation and can outlive the call in the WAL, in
-  earlier snapshots and in shipped archives.
-- **Cryptographic erasure, for the stronger claim.** With `-encrypt-at-rest`
-  facts are sealed under a per-scope key at the persistence boundary, so
-  `VMEM.SHRED` destroying that key makes the journal, the snapshots and **the
-  archives already shipped to S3 unreadable at once** — including a
-  point-in-time restore to before the call. This is the thing deletion cannot
-  do in principle: it never catches copies that already left. It is
-  scope-granular (a scope *is* whose memory it is), it cannot reach facts
-  written before the keyring existed (`VMEM.RESEAL` migrates those forward,
-  `VMEM.COVERAGE` measures what is genuinely covered), and the receipt claims
-  only what is checkable — *this key id was destroyed*, never "the data is
-  gone". Both horizons are stated, not glossed —
-  [docs/VMEM_DESIGN.md](docs/VMEM_DESIGN.md) ("Erasure guarantee").
-- **Evidence, not just state.** With `-audit-chain` every memory-changing
-  command leaves a record in a hash-chained, Merkle-batched journal — a
-  fingerprint, never the content, since putting fact text in an append-only
-  log would keep alive exactly what `SHRED` destroys. `VMEM.AUDIT EXPORT`
-  signs the head with **Ed25519**, so an auditor verifies without holding your
-  secret; `PROVE` gives an inclusion proof for one event without disclosing
-  the others; `RECONCILE` compares live memory against the journal and names
-  what disagrees (`resurrected`, `missing`, `unrecorded`).
-- **Ranking is not truth.** Recency decay and importance reorder results but
-  are mathematically floored so old facts stay reachable — judged on real
-  embeddings, not vibes ([docs/BENCHMARKS.md §7](docs/BENCHMARKS.md)).
-- **Verbatim anchor.** Recall returns the original stored text, never a lossy
-  rewrite; every derived structure is recomputable from the anchors.
-
-These properties are described against a published framework rather than our
-own vocabulary. [docs/MEMORY_GOVERNANCE.md](docs/MEMORY_GOVERNANCE.md) walks the
-nine governance primitives from the *Mnemonic Sovereignty* survey
-([arXiv 2604.16548](https://arxiv.org/abs/2604.16548)) one at a time and marks
-each **implemented**, **partial**, **out of scope by design**, or a **gap** —
-including the two where this engine is weakest and the boundary it will not
-cross (it never decides which fact is true).
-
-### Recovery after memory corruption
-
-Prevention has a ceiling: a plausible false statement arriving from a
-compromised channel is, at write time, indistinguishable from a new fact —
-both are simply a contradiction with the past. So the interesting question is
-not "can it be blocked" but "what does it cost to undo once it is in". These
-four primitives answer that:
-
-- **Provenance** (`SOURCE`) — every fact records where it came from. In the
-  MCP adapter the *adapter* stamps it, never the agent: an attacker who can
-  influence the agent must not be able to sign a fact with someone else's
-  origin.
-- **Localisation** (`VMEM.EXPLAIN`) — corruption shows up as a wrong *answer*,
-  while revocation works on *provenance*. `EXPLAIN` decomposes the ranking of
-  a query — which facts produced this answer, from which sources, and which
-  axis dropped the ones that are missing. It does not recompute the score: the
-  trace comes from the live recall path, so the explanation cannot drift from
-  the ranking it explains.
-- **Selective revocation** (`VMEM.QUARANTINE`) — revoke everything one origin
-  wrote. The facts stay: `ASOF` before the revocation still returns them (what
-  the agent believed is evidence, not noise), `ALL` always does.
-- **Point-in-time restore** (`-restore-to-lsn`) — raise the whole store as of
-  a past LSN, read-only, without touching the data directory.
-
-Measured on one incident, same data, four strategies — two of them executed by
-the real [OWASP Agent Memory Guard](https://owasp.org/www-project-agent-memory-guard/)
-(`scripts/poison_recovery_compare.py`; `docker compose -f docker-compose.recovery.yml run --rm recovery`):
-
-| | Guard `rollback()` | Guard `retire_if()` | our `-restore-to-lsn` | our `QUARANTINE` |
-|---|---|---|---|---|
-| lie no longer served | yes | yes | yes | yes |
-| lawful facts written **after** the poison | **0/4** | **4/4** | **0/4** | **4/4** |
-| revoked fact still queryable as evidence | no | no | no | **yes** |
-| `ASOF` before the revocation returns it | no | no | no | **yes** |
-
-Read the second row as an argument about *axes*, not effort: rolling back a
-linear log cannot separate a lie from the truth written next to it, because on
-that axis the distinction does not exist. Both whole-store rollbacks land on
-the same number, in two independent implementations. The third and fourth rows
-are what actually remains ours — a layer that owns no storage can delete
-selectively (Guard's `retire_if` does, and it loses nothing), but it cannot
-keep the revoked fact as queryable evidence, and it has no time axis to answer
-"what did the agent believe at 14:32".
-
-**Honesty about coverage.** Both recovery levers select on something a fact
-must actually carry, so `VMEM.COVERAGE` reports two independent axes — and a
-scope can be fully revocable while not being erasable at all. Revocation
-selects **by origin**: a fact written before provenance existed carries no
-`source` column and mass revocation matches nothing (`VMEM.BACKFILL` stamps
-those forward — its one predicate is exactly "attribute absent" — and it never
-overwrites a source someone already declared). Crypto-erasure reaches only
-what went to disk **under an envelope**, which is measured by a stamp taken at
-write time rather than by asking the keyring whether a key exists now: a scope
-half-written before encryption would otherwise report as covered, an error in
-our own favour.
-
-We ran it against our own personal store and it reported **0 on both axes** —
-every fact predated both features. The honest repair was not a migration: a
-`RESEAL` cannot reach copies that already left, so the plaintext sitting in
-old WAL segments would have stayed readable whatever the coverage report said
-afterwards. The store was rebuilt from scratch under both flags instead. That
-is the shape of the limit, stated rather than left to be discovered.
-
-Measured (reproducible canon, §7): known-item hit@1 **0.982** / MRR **0.991**;
-temporal accuracy (`ASOF`, supersession chains) **1.000**; scope isolation
-**0 violations**; end-to-end `RECALL` p99 **0.29 ms** at **64 426 QPS** over
-RESP on a 2019 laptop.
-
-> **What "scope isolation" does and does not mean.** It is a correctness
-> property: the engine never returns another scope's fact *by mistake* — the
-> failure mode being guarded is a filter applied after fusion, an unmerged
-> delta filtered differently from frozen segments, a graph traversal crossing a
-> tenant block. It is **not** an access-control boundary. `AUTH` is a single
-> shared secret with no per-principal authorization, so any authenticated
-> connection may address any scope by name, including `VMEM.SHRED`. The trust
-> boundary is the **process**: run one per trust domain. See
-> [SECURITY.md](SECURITY.md) and
-> [docs/MEMORY_GOVERNANCE.md](docs/MEMORY_GOVERNANCE.md) (primitive 6).
-
-## Features
-
-- **VMEM agent memory** — `VMEM.REMEMBER` / `VMEM.RECALL` / `VMEM.FORGET`: validity intervals + supersession history (`ASOF` time travel), TTL + erasure (immediate unreachability, physical horizon stated in `docs/VMEM_DESIGN.md`), recency×importance recall over BM25 or hybrid; verbatim KV anchors; MCP adapter `vmem-mcp` (Linux/macOS/Windows) for Claude Code/Desktop and any MCP host
-- **Recovery after memory corruption** — `SOURCE` provenance on every fact, `VMEM.EXPLAIN` (which facts produced this answer, from which origins, and what dropped the rest), `VMEM.QUARANTINE` (revoke one origin, keep the fact as evidence), `VMEM.COVERAGE` + `VMEM.BACKFILL` (measure and repair provenance coverage), and point-in-time `-restore-to-lsn`; measured against the real OWASP Agent Memory Guard, reproducible with one `docker compose` command
-- **Cryptographic erasure** *(opt-in)* — `-encrypt-at-rest` seals VMEM payload at the persistence boundary under a per-scope key (envelope: the wrapped DEK rides with the record, the KEK lives in a keyring that is never shipped and never snapshotted); `VMEM.SHRED` destroys that key and takes the WAL, the snapshots and the shipped archives with it; `VMEM.RESEAL` migrates pre-keyring facts forward. The read path pays nothing — the engine works on plaintext in memory; cost lands on write (~1.9 µs/fact, ≈1% of the insert budget)
-- **Tamper-evident audit chain** *(opt-in)* — `-audit-chain` records every memory-changing command in a hash-chained journal (Merkle-batched, one link per second; fingerprints, never content), so a `SHRED` receipt is producible months later rather than read once; `VMEM.AUDIT VERIFY / EXPORT / PROVE / RECONCILE` — Ed25519-signed statements an auditor checks without holding your secret, inclusion proofs that disclose one event and not its batch, and a live-memory-vs-journal reconciliation
-- **BM25 full-text + hybrid** — `VSIM.SEARCHTEXT` / `VSIM.HYBRID` (RRF fusion), embedder-free known-item search, query-side common-term pruning, attribute filters on both
-- **Vector Search (HNSW)** — the core: arena-based graph, SQ8 quantization, tenant/attribute filtering, bitset visited, DotProduct optimization; non-blocking bulk ingest (per-shard delta freeze + batched LSM merges)
-- **WAL + Snapshots** — CRC32-protected, batch writes, crash recovery
-- **WAL-shipping** — continuous async replication of WAL+snapshots to S3/MinIO or a mounted dir (Litestream-style); restore on any machine with `-ship-restore` (see [docs/BACKUP.md](docs/BACKUP.md))
-- **KV store** — 256-shard `map` under `RWMutex`; GET does no allocations (49 ns single-threaded, 11.5 ns ×12), accounted memory shrinks on delete so `maxmemory` recovers after cleanup. It replaced a TCMalloc-style arena after an A/B — see [docs/BENCHMARKS.md §10](docs/BENCHMARKS.md#10-removing-the-custom-allocator-and-the-epoll-layer)
-- **Networking** — goroutine per connection on Go's netpoller, zero-alloc RESP parser, greedy drain (one write per pipelined batch)
-- **Sorted sets** — B+-tree keyed by (score, member) in Redis order, ranges via the leaf chain; `VSIM.SEARCHRANGE` filters HNSW candidates by a score range
-- **TTL** — 256-shard heap with lazy + active expiration
-- **Pub/Sub** — back-pressure, sync.Pool, per-subscriber goroutines
-- **AUTH + TLS/mTLS** — constant-time password auth, encrypted connections, optional client-cert verification
-- **Observability** — Prometheus `/metrics`, `/health`, `/ready`; structured logging (slog, text/JSON); Grafana stack in `docker-compose.yml`
-- **Cluster** *(experimental, behind a build tag, not in the default build)* — hash-slot sharding, gossip protocol, live migration
-
-The RESP command surface is deliberately small and **frozen**: the KV/state layer
-is a payload layer for the vector engine, not a Redis replacement. The full
-command manifest, gate semantics, and the unfreeze policy live in
-[docs/COMMANDS.md](docs/COMMANDS.md).
-
-## Quick Start
+## Quick start
 
 ### One binary
 
-Static Linux binaries (amd64/arm64, zero dependencies, ~13MB) are published on
-the [Releases page](https://github.com/Nikolay1994Kaz/storage_in_memory/releases):
+Static Linux binaries (amd64/arm64) are published on the
+[Releases page](https://github.com/Nikolay1994Kaz/storage_in_memory/releases):
 
 ```bash
-# checksums.txt covers every platform, so verify only what you downloaded —
-# without --ignore-missing sha256sum reports the absent archives as failures
 sha256sum --ignore-missing -c checksums.txt
 tar xzf kvstore-server_*_linux_amd64.tar.gz
 ./kvstore-server --port 6380
 ```
 
-Linux only — the audit-chain journal calls `fdatasync` (the network layer no
-longer depends on epoll). The MCP adapter `vmem-mcp` is published on the same
-page for Linux, macOS and Windows.
+The code also compiles for macOS but is only tested on Linux.
 
 The engine is **BYO-embeddings**: it takes pre-computed vectors over RESP from
 any embedding provider (OpenAI, Ollama, sentence-transformers, …):
@@ -237,12 +103,14 @@ redis-cli -p 6380
 > VSIM.ADD doc:1 0.12 0.90 0.31
 > VSIM.ADD doc:2 0.85 0.05 0.48
 > VSIM.SEARCH 2 0.10 0.88 0.30
+> VSIM.ADDDOC doc:3 TEXT "vacuum and table bloat" CAT lang en VEC 0.20 0.70 0.40
+> VSIM.ADDDOC doc:4 TEXT "graph deletes and tombstones" CAT lang en VEC 0.80 0.10 0.40
+> VSIM.SEARCHTEXT 5 tombstones
+> VSIM.HYBRID 5 TEXT "graph deletes" EQ lang en VEC 0.80 0.10 0.40
 > SET hello world
 ```
 
 ### Docker Compose — server + metrics
-
-kvstore plus the Grafana/VictoriaMetrics observability stack:
 
 ```bash
 git clone https://github.com/Nikolay1994Kaz/storage_in_memory.git
@@ -250,240 +118,168 @@ cd storage_in_memory
 docker compose up -d --build     # or: make up
 ```
 
-`--build` rebuilds the image from the current sources, so a `git pull` never
-leaves you on a cached binary that lacks newer commands. That's it — KVStore is
-on `localhost:6380`, Grafana on `localhost:3000`.
-
-Then take the guided tour — real embeddings computed on the client side,
-tenant/attribute filtering, one short Go file:
-[`kvstore/examples/quickstart`](kvstore/examples/quickstart/).
+KVStore is on `localhost:6380`, Grafana on `localhost:3000`. A guided tour with
+real embeddings computed on the client side and tenant filtering, in one short
+Go file: [`kvstore/examples/quickstart`](kvstore/examples/quickstart/).
 
 ### Build from source
 
 ```bash
-make build          # -> ./kvstore-server and ./vmem-mcp (server only: make build-server)
+make build          # -> ./kvstore-server
 ./kvstore-server --port 6380
 
 # With AUTH
-./kvstore-server --port 6380 --requirepass "s3cret"
+./kvstore-server --port 6380 --requirepass-file /etc/kvstore/pass
 
 # With AUTH + TLS
-./kvstore-server --port 6380 --requirepass "s3cret" \
+./kvstore-server --port 6380 --requirepass-file /etc/kvstore/pass \
   --tls-cert cert.pem --tls-key key.pem
 
 # Accept remote connections (localhost-only by default; requires AUTH in practice)
 ./kvstore-server --bind 0.0.0.0 --port 6380 --requirepass-file /etc/kvstore/pass
 ```
 
-## CLI Flags
+## CLI flags
 
-The most commonly used flags (run `./kvstore-server --help` for the full list,
-including HNSW tuning `--hnsw-*`, `--partition-attr`, cluster slots, etc.):
+The most commonly used flags (`./kvstore-server --help` lists all of them):
 
 | Flag | Default | Description |
 |---|---|---|
-| `--bind` | `127.0.0.1` | Listen interface for both the data port and the metrics port. Localhost-only by default — to accept remote connections set `--bind 0.0.0.0` **and configure AUTH (+TLS)** |
+| `--bind` | `127.0.0.1` | Listen interface for the data port and the metrics port. Localhost-only by default — to accept remote connections set `--bind 0.0.0.0` **and configure AUTH (+TLS)** |
 | `--port` | `6380` | Listen port |
-| `--metrics-port` | `9090` | HTTP port for `/metrics`, `/health`, `/ready` |
-| `--data-dir` | `data` | Directory for WAL, snapshots, the keyring and the audit chain (a relative path is resolved against the working directory) |
-| `--encrypt-at-rest` | `false` | Seal VMEM payload at the persistence boundary with a per-scope key from `keyring.dat`, and enable `VMEM.SHRED`. An existing keyring is opened regardless of the flag — otherwise earlier envelopes would become unreadable |
-| `--audit-chain` | `false` | Record memory-changing commands in a hash-chained journal under `<data-dir>/auditchain/`. Never compacted (it is evidence): ≈3.6 GB/year |
-| `--maxmemory` | `0` | Memory limit in MB (0 = unlimited); writes are rejected above the limit |
+| `--metrics-port` | `9090` | HTTP port for `/metrics`, `/health`, `/ready` (0 = off) |
+| `--data-dir` | `data` | Directory for the WAL and snapshots |
+| `--maxmemory` | `0` | Memory limit in MB (0 = unlimited); memory-growing writes are rejected above it |
+| `--hnsw-use-sq` | `false` | SQ8 quantization of frozen segments: 4× less vector memory, higher QPS |
+| `--partition-attr` | `""` | Categorical attribute that defines tenants for the tenant-contiguous layout |
+| `--idle-consolidate` | `60s` | Write lull after which the index consolidates into one segment (0 = off) |
 | `--max-connections` | `10000` | Cap on concurrent connections (0 = unlimited) |
 | `--idle-timeout` | `5m` | Close connections idle longer than this (pub/sub subscribers are exempt); 0 = off |
 | `--write-timeout` | `30s` | Max time to flush a response to a slow reader; 0 = off |
 | `--requirepass` / `--requirepass-file` | `""` | AUTH password inline or from a file (empty = no auth) |
 | `--tls-cert` / `--tls-key` | `""` | TLS certificate and private key (PEM) |
 | `--tls-client-ca` | `""` | CA for client-certificate verification (mTLS) |
-| `--ship-url` | `""` | Continuous WAL-shipping target: `file:///path` or `s3://bucket/prefix?endpoint=...` (creds via env, see [docs/BACKUP.md](docs/BACKUP.md)) |
+| `--ship-url` | `""` | Continuous WAL shipping: `file:///path` or `s3://bucket/prefix?endpoint=...` (credentials via env, see [docs/BACKUP.md](docs/BACKUP.md)) |
 | `--ship-interval` | `1s` | Shipping period (≈ crash RPO) |
 | `--ship-retain` | `3` | Restore points kept on the remote |
-| `--ship-restore` | `false` | Restore data dir from `--ship-url` before start |
-| `--restore-to-lsn` | `0` | Forensic point-in-time start: raise the store as it was after this LSN and serve **reads only**; the data directory is not modified (0 = normal start) |
+| `--ship-restore` | `false` | Restore the data directory from `--ship-url` before start |
+| `--restore-to-lsn` | `0` | Start as of this LSN and serve **reads only**; the data directory is not modified (0 = normal start) |
 | `--wal-inspect` | `false` | Print the journal (LSN, op, key) and exit — how you find the LSN for `--restore-to-lsn` |
-| `--log-level` / `--log-format` | `info` / `text` | Structured logging level and format (`text`/`json`) |
+| `--log-level` / `--log-format` | `info` / `text` | Logging level and format (`text`/`json`) |
 | `--pprof` | `false` | Expose `/debug/pprof/*` on the metrics port — **never in production** |
 
-## Supported Commands
+## Commands
 
-The full command manifest (syntax, replies, gate semantics, WAL ops) lives in
-[docs/COMMANDS.md](docs/COMMANDS.md) — the surface is deliberately small and frozen.
-Families: agent memory (`VMEM.*`, incl. `SHRED`/`RESEAL`/`AUDIT`), vector +
-full-text search (`VSIM.*`, incl.
-`SEARCHTEXT`/`HYBRID`), KV/TTL (`SET`/`GET`/`DEL`/`EXPIRE`/…), transactions
-(`MULTI`/`EXEC`/`DISCARD`), Pub/Sub, sorted sets (`ZADD`/…).
+The full manifest (syntax, replies, gate semantics, WAL ops) is in
+[docs/COMMANDS.md](docs/COMMANDS.md). Families: vector and full-text search
+(`VSIM.*`), KV/TTL (`SET`/`GET`/`DEL`/`EXPIRE`/…), sorted sets (`ZADD`/…),
+pub/sub, transactions (`MULTI`/`EXEC`/`DISCARD`), admin (`COMPACT`).
 
-> **Isolation contract (read this).** `MULTI`/`EXEC` provides command **grouping and
-> pipelining** with EXECABORT on a bad queued command — it does **not** provide
-> Redis-grade isolation. Unlike single-threaded Redis, this engine executes commands
-> across per-worker shards, and the transaction lock only serializes `EXEC`-vs-`EXEC`.
-> A plain command from another connection (e.g. `SET`) can interleave *between* the
-> queued commands of an in-flight `EXEC`, so the queue is **not** isolated from
-> concurrent traffic. Do not rely on `EXEC` for atomic read-modify-write against keys
-> that other clients touch concurrently. This is a deliberate design choice: true
-> isolation would require globally serializing every write for the duration of each
-> `EXEC`, which defeats the per-worker, zero-alloc model the engine is built on.
-> Durability (WAL + fsync) is unaffected and holds.
+> **Isolation contract.** `MULTI`/`EXEC` gives grouping and pipelining with
+> `EXECABORT` on a bad queued command — not Redis-grade isolation. Commands run
+> concurrently, and the transaction lock only serializes `EXEC` against `EXEC`,
+> so a plain command from another connection can interleave between the queued
+> commands of an in-flight `EXEC`. Do not rely on `EXEC` for atomic
+> read-modify-write on keys other clients touch. True isolation would mean
+> serializing every write for the duration of each `EXEC`. Durability (WAL +
+> fsync) is unaffected.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│                  Clients                     │
-│              (redis-cli, etc.)               │
-└──────────────┬───────────────────────────────┘
-               │ TCP / TLS
-┌──────────────▼───────────────────────────────┐
-│     Server (goroutine per connection)        │
-│     ConnBuf (ring buffer, zero-alloc)        │
-├──────────────────────────────────────────────┤
-│              AUTH Guard                      │
-├──────────────────────────────────────────────┤
-│   VMEM memory layer (validity / erasure /    │
-│   recency-ranked recall; MCP via vmem-mcp)   │
-├──────────────────────────────────────────────┤
-│  Persistence boundary: keyring envelope seal │
-│  + audit chain (both opt-in)                 │
-├──────────────┬───────────────────────────────┤
-│   KV Store   │  TTL    │ WAL    │ Pub/Sub   │
-│ (shard map)  │  Heap   │ Batch  │ Hub       │
-├──────────────┴─────────┴────────┼───────────┤
-│ HNSW + BM25 search, LSM segments │  Cluster  │
-│ SQ8, RRF fusion, tenant filters  │  (gossip) │
-└─────────────────────────────────┴───────────┘
+┌───────────────────────────────────────────────┐
+│        Clients (redis-cli, any RESP lib)      │
+└───────────────┬───────────────────────────────┘
+                │ TCP / TLS
+┌───────────────▼───────────────────────────────┐
+│ Server: goroutine per connection, ConnBuf     │
+│ AUTH · maxmemory gate · WAL fail-stop gate    │
+├────────────┬─────────┬──────────┬─────────────┤
+│ KV store   │ TTL     │ Sorted   │ Pub/Sub     │
+│ (shard map)│ (heaps) │ sets     │ hub         │
+│            │         │ (B+tree) │             │
+├────────────┴─────────┴──────────┴─────────────┤
+│ Vector + text engine: LSM of segments         │
+│ delta (sharded HNSW) → frozen fp32 / SQ8 /    │
+│ HNSW segments → merges, idle consolidation    │
+│ BM25 per segment · attribute columns · tenants│
+├───────────────────────────────────────────────┤
+│ WAL (LSN, group commit) · snapshots (CRC)     │
+│ WAL shipping → S3 / directory                 │
+└───────────────────────────────────────────────┘
 ```
 
-## Benchmarks
+## Status and scope
 
-Measured on standard ANN datasets and real OpenAI embeddings, including
-same-machine head-to-head runs against hnswlib — full tables, methodology and
-honest caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines:
-
-- **Retrieval quality on a public benchmark (LongMemEval_S, 500 questions):**
-  **97.4% R@5** through `VMEM.RECALL`, **96.6%** on the pure vector path. The
-  same run reproduces the published **96.6%** ChromaDB/MiniLM baseline exactly —
-  that reproduction, not the headline, is what makes the comparison mean
-  anything. Retrieval-only metric, no LLM anywhere. Treat it as **parity, not a
-  lead**: 487 versus 483 questions of 500. The per-type breakdown shows the
-  hybrid arm is a trade (−16.7 points on indirectly-stated preferences), and
-  [docs/BENCHMARKS.md](docs/BENCHMARKS.md) states exactly how far this evidence
-  reaches.
-- **Retrieval quality on a second public benchmark (LoCoMo, 1 536 questions):**
-  **64.6% recall@5** against annotated evidence *turns* — 588 candidates per
-  question, retrieval-only, no LLM. Three findings the aggregate would have
-  hidden: the **default 30-day half-life cost 11.8 points** on conversations
-  spanning eight months (fixed — a half-life of a year restores recall exactly);
-  **hybrid fusion is directional**, worth points when the two arms are
-  comparable and worth −18.3 when one is far weaker (hence the `WEIGHTS` lever,
-  which recovers all of it); and **feeding an embedder its role prefixes was
-  worth +6.3 points**, while a model four times larger *lost* 5.0 — using the
-  tool correctly outranked replacing it. The remaining gap to systems that store
-  LLM-extracted facts is in the *write path*, not the search: querying by the
-  target's own text finds it 100% of the time.
-- **Agent memory (VMEM):** on a 27.5k-event synthetic "agent life" —
-  known-item hit@1 **0.982** / MRR **0.991**, paraphrase hit@10 1.000,
-  temporal accuracy (`ASOF` + supersession chains) **1.000**, scope isolation
-  **0 violations**; decay formula judged on 20k real ada-002 embeddings
-  (hit@10 = 1.000 in every age bucket). End-to-end over RESP: `RECALL` p50
-  110 µs / p99 **0.29 ms** at **64 426 QPS**, p99 13.3 ms under a mixed
-  read/write soak — zero errors.
-- **End-to-end through the server (RESP, real query vectors):**
-  **12 985 QPS** @ recall@10 0.9996 on MNIST-784 (SQ8) and **3 928 QPS** @
-  0.9888 on dbpedia-1536; ingest up to **5 533 vec/s** over the wire with
-  sharded delta. After bulk loads the index consolidates back to peak shape
-  automatically (`-idle-consolidate`).
-- **Search stays online during bulk loads:** per-shard delta freeze + batched
-  L0 merges hold a **750–800 QPS** search floor on dbpedia-1536 (100k, SQ8)
-  while 12 connections ingest concurrently at **673 vec/s**, converging to
-  **3 544 QPS** @ 0.9900 after the load — no brownout window (earlier builds
-  dipped to double-digit QPS in this state).
-- **High-dim (GIST-960, target path):** SQ8 beats hnswlib float32 **2.5–2.7×**
-  in multithreaded QPS at equal recall, with 4× less vector memory.
-- **Real embeddings (dbpedia ada-002, 1536-dim):** recall@10 0.977 (SQ8) /
-  0.984 (fp32); SQ8 gives ~2.3× QPS and 3.7× less memory.
-- **Multi-tenant filtered search:** tenant-routed queries are **5.8×–28 620×**
-  faster than post-filtering a full graph traversal, at recall 1.0.
-- **Low-dim float32 (SIFT-1M):** on a consolidated index the engine beats
-  hnswlib **1.36–1.38×** multithreaded (25 697 vs 18 833 QPS @ recall 0.96;
-  scaling 5.0× vs 3.2× on 6 cores); on a freshly loaded fragmented index
-  hnswlib is ~3× faster — the honest cost of an LSM design that supports
-  concurrent writes, deletes and crash recovery. Idle consolidation converges
-  to the fast state automatically.
-
-## Status & Scope
-
-- **Single-node by design.** Durability and disaster recovery come from WAL +
-  snapshots + continuous WAL-shipping (restore on any machine), not from
-  replicas. Cluster mode exists behind a build tag and is not production-ready.
-- **ANN search is approximate.** HNSW recall is high (0.99 end-to-end on real
-  embedding datasets at default settings) but not 1.0; under heavy churn a small fraction
-  of stored vectors may temporarily miss from top-K results. `VSIM.EXISTS`
-  gives an exact existence check.
-- **Experimental gate.** Cluster mode is compiled out of the default build
-  (`experimental` build tag) — its surface is not hardened to the same bar as
-  the core.
+- **Single node by design.** Durability and disaster recovery come from the WAL,
+  snapshots and continuous WAL shipping, not from replicas. A cluster mode
+  exists behind the `experimental` build tag; it is compiled out of the default
+  build and not production-ready.
+- **ANN search is approximate.** Recall is high (0.99 end-to-end on real
+  embedding datasets at default settings) but not 1.0; under heavy churn a small
+  fraction of stored vectors can temporarily miss from top-K. `VSIM.EXISTS` is
+  the exact membership check.
+- **No encryption at rest and no secure erasure.** Deleted data can outlive the
+  delete in segments until the next merge, in the WAL and in shipped archives;
+  use disk encryption if the data directory needs it ([SECURITY.md](SECURITY.md)).
 - **Validated by soak testing**: multi-hour runs at ~6k RPS mixed load with
-  graceful/crash restarts, ship-restore and corrupted-snapshot drills.
+  graceful and crash restarts, ship-restore and corrupted-snapshot drills.
 
 ## Testing
 
 ```bash
-go test -short ./...   # Fast run — heavy benchmarks/soak tests are gated off (~30s)
 make test              # The gate: exactly what CI runs (-short, ~1 min)
 make test-race         # Race detector over the subsystems, as in ci.yml
 make test-full         # Everything, no -short: search-quality validation + 500k stress
-make bench             # Run benchmarks
+make test-datasets     # Recall/QPS validation on real datasets (needs the files)
+make bench             # Benchmarks
 make vet               # Static analysis
 ```
 
-`make test-full` is **not** a gate and CI never runs it: it takes tens of minutes and
-exists to exercise scale (500k vectors) and search quality on real datasets. Read a
-failure there as a *measurement* first — re-check it on an idle machine before
-concluding the code broke.
+`make test-full` is **not** a gate and CI never runs it: it takes tens of minutes
+and exists to exercise scale (500k vectors) and search quality on real datasets.
+Read a failure there as a *measurement* first — re-check it on an idle machine
+before concluding the code broke.
 
-Insert throughput is guarded by `TestShardedInsertScaling`, which runs in CI. It
-asserts a *ratio* (sharded delta vs a single shard) rather than an absolute vec/s
-figure, because an absolute floor measures the hardware as much as the code — and a
-ratio compares two arms recorded on the same machine in the same run.
+Snapshot compatibility is pinned by fixtures written by earlier releases
+(`kvstore/vector/testdata/snapshots`): a new reader must load what an old writer
+produced ([docs/FORMAT_COMPAT.md](docs/FORMAT_COMPAT.md)).
 
-## Project Structure
+## Project structure
 
 ```
 kvstore/
-├── cmd/kvstore/          # Server entry point (main.go)
-├── cmd/vmem-mcp/         # MCP stdio adapter (agent memory tools)
+├── cmd/kvstore/          # Server: flags, startup and recovery, command dispatch
+├── cmd/soak_oracle/      # Durability oracle for soak runs
+├── cmd/insertload/       # Ingest load tool (raw float32 files)
+├── cmd/searchload/       # Search load tool
+├── cmd/stress_test/      # Mixed-load stress client
 ├── internal/
-│   ├── server/           # TCP/TLS server, ConnBuf, Handler
+│   ├── server/           # TCP/TLS server, ConnBuf, connection lifecycle
+│   ├── protocol/         # RESP parser and writer
 │   ├── store/            # TTL manager
 │   │   ├── kv/           # KV store (sharded map, maxmemory accounting)
 │   │   └── zset/         # Sorted-set registry
-│   ├── wal/              # Write-Ahead Log, snapshots, batch writer
-│   ├── ship/             # Continuous WAL-shipping (file://, s3://) + restore
-│   ├── keyring/          # Per-scope KEK, envelope seal/unseal, crypto-erasure
-│   ├── auditchain/       # Hash-chained journal, Merkle batching, Ed25519 export
-│   ├── pubsub/           # Pub/Sub hub (classic + semantic)
 │   ├── btree/            # B+-tree backing sorted sets
+│   ├── wal/              # Write-ahead log, snapshots, batch writer
+│   ├── ship/             # Continuous WAL shipping (file://, s3://) + restore
+│   ├── pubsub/           # Pub/Sub hub
 │   ├── cluster/          # Hash slots, gossip, replication (experimental)
-│   ├── logging/          # slog setup (levels, text/JSON)
-│   ├── monitoring/       # Prometheus-style metrics
-│   ├── protocol/         # RESP parser and writer
-│   ├── vmemcorpus/       # Deterministic "agent life" corpus generator (benches)
-│   └── vmemmcp/          # MCP adapter logic (JSON-RPC loop, tool mapping)
-├── vector/               # HNSW graph, SQ8, BM25 text index, VMEM layer, tenant/attr filtering
+│   ├── monitoring/       # Metrics
+│   └── logging/          # slog setup
+├── vector/               # LSM of HNSW segments, SQ8, BM25, filters, tenants
 └── examples/quickstart/  # End-to-end tour over RESP with client-side embeddings
-docs/                     # Command manifest, VMEM design, MCP quickstart, backup, benchmarks, format compat
+docs/                     # Commands, benchmarks, backup, format compatibility, BM25 design
 monitoring/               # Grafana/VictoriaMetrics provisioning for the local stack
-scripts/                  # Soak harness, backup/restore, poisoning-recovery comparison, live drills (shred, audit chain, agent)
+scripts/                  # Soak harness, A/B harness, backup/restore, dataset converters
 ```
 
 ## Commercial use
 
 MIT — use it in a commercial product without asking. If you need something the
 licence does not cover — support with a response time, an integration built to
-your requirements, an answer to a procurement questionnaire (data residency,
-what the erasure guarantee is and where it ends, "what did the agent know at
-time T"), a deployment in a closed network, or terms other than MIT — write to
-dubovoinikolai@gmail.com. The copyright is held by one person, so dual
+your requirements, a deployment in a closed network, or terms other than MIT —
+write to dubovoinikolai@gmail.com. The copyright is held by one person, so dual
 licensing is a conversation, not a legal project.
 
 ## License

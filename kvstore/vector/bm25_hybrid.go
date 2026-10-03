@@ -42,7 +42,7 @@ func (lvs *LeveledVectorStore) SearchHybrid(query string, vec []float32, K int) 
 }
 
 // SearchHybridFilter — гибрид с мульти-атрибутным фильтром, применённым к
-// ОБОИМ плечам ДО RRF (filter-then-fuse, правило шага 3а VMEM_DESIGN):
+// ОБОИМ плечам ДО RRF (filter-then-fuse):
 // каждое плечо формирует свой top-depth уже из прошедших фильтр доков.
 // Пост-фьюжн отсев недопустим: top-depth плеча был бы занят чужими доками,
 // и после отсева маленькому scope доставался бы огрызок или пусто

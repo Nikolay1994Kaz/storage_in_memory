@@ -7,10 +7,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -27,8 +24,6 @@ import (
 	"time"
 	"unsafe"
 
-	"kvstore/kvstore/internal/auditchain"
-	"kvstore/kvstore/internal/keyring"
 	"kvstore/kvstore/internal/logging"
 	"kvstore/kvstore/internal/monitoring"
 	"kvstore/kvstore/internal/protocol"
@@ -48,63 +43,6 @@ const syncInterval = 100 * time.Millisecond
 // каталога), переопределяется флагом -data-dir. var, а не const: присваивается
 // один раз в main() сразу после flag.Parse(), до любого использования.
 var dataDir = "data"
-
-// sealValue упаковывает полезную нагрузку записи журнала в конверт ключа
-// скоупа. Пакетная переменная по той же причине, что и dataDir: executeCommand
-// вызывается и из тестов, и протаскивать кейринг ещё одним параметром через
-// всю сигнатуру дороже, чем одна точка подмены. Дефолт — тождественная
-// функция: без -encrypt-at-rest и в тестах поведение прежнее байт в байт.
-var sealValue = func(scope string, v []byte) []byte { return v }
-
-// sealingActive — уходят ли НОВЫЕ записи в журнал под конвертом. Отдельно от
-// sealValue, потому что это нужно знать ДО записи: факт получает атрибут
-// sealed в момент создания, и по нему потом считается покрытие. Пакетная
-// переменная по той же причине, что sealValue.
-var sealingActive bool
-
-// activeKeyring — кейринг этого процесса или nil, если шифрование выключено.
-// Пакетная переменная по той же причине, что sealValue (см. выше).
-var activeKeyring *keyring.Keyring
-
-// snapshotCryptoFor строит шифрование бинарного снапшота (формат v8) поверх
-// кейринга. Отдельной функцией, а не внутри main: иначе проверить её можно
-// было бы только ЗЕРКАЛОМ в тесте, а зеркало расходится с оригиналом молча —
-// ровно тот разрыв харнесса, что уже есть у applyEntry.
-//
-// sealing разводит чтение и запись. Unseal подключается, как только кейринг
-// вообще есть: иначе прежние снапшоты стали бы нечитаемы от одной смены
-// флага. Seal — только под -encrypt-at-rest и вне восстановления на момент,
-// теми же условиями, что sealValue для журнала.
-func snapshotCryptoFor(ring *keyring.Keyring, sealing bool) *vector.SnapshotCrypto {
-	crypto := &vector.SnapshotCrypto{
-		Unseal: func(envelope []byte) ([]byte, bool, error) {
-			plain, err := ring.Unseal(envelope)
-			if errors.Is(err, keyring.ErrKeyDestroyed) {
-				// Скоуп крипто-стёрт. ШТАТНЫЙ исход: документы группы не
-				// восстанавливаются, их ключи уходят в tombstones.
-				return nil, true, nil
-			}
-			if err != nil {
-				return nil, false, err
-			}
-			return plain, false, nil
-		},
-	}
-	if sealing {
-		crypto.Seal = func(scope string, plain []byte) ([]byte, error) {
-			if _, err := ring.EnsureScope(scope); err != nil {
-				return nil, err
-			}
-			return ring.Seal(scope, plain)
-		}
-	}
-	return crypto
-}
-
-// vmemAnchorPrefix — префикс KV-ключа, под которым лежит дословный якорь факта
-// (`vmem:<id>`). Вынесен в константу: по нему опознаёт факт уже не только
-// запись REMEMBER, но и обход состояния при записи снапшота.
-const vmemAnchorPrefix = "vmem:"
 
 // version — версия сборки. Дефолт "dev" для локальных прогонов; в релизных
 // сборках проставляется через -ldflags "-X main.version=$(git describe ...)"
@@ -184,8 +122,6 @@ func main() {
 	logFormat := flag.String("log-format", "text", "формат логов: text (человекочитаемый) | json (для агрегаторов)")
 	enablePprof := flag.Bool("pprof", false, "включить /debug/pprof/* на metrics-порту для диагностики утечек/профилирования (НЕ для прода)")
 	dataDirFlag := flag.String("data-dir", "data", "каталог для WAL и снапшотов (относительный путь считается от рабочего каталога)")
-	encryptAtRest := flag.Bool("encrypt-at-rest", false, "шифровать полезную нагрузку VMEM на границе персистентности (WAL, снапшоты и, следовательно, отгружаемые архивы) ключом скоупа из "+keyring.FileName+". Включает VMEM.SHRED — криптостирание всего скоупа разом, действующее и на уже отгруженные копии. Путь чтения не дорожает: в памяти движок работает с открытым текстом. Если файл кейринга уже есть, он открывается независимо от флага — иначе прежние конверты стали бы нечитаемы")
-	auditChainOn := flag.Bool("audit-chain", false, "вести журнал событий памяти, связанный цепью хешей ("+auditChainDir+"/ внутри каталога данных): создание, отзыв, карантин, криптостирание. Делает квитанцию VMEM.SHRED предъявляемой позже, а не только в ответе команде. Рядовые события пишутся батчем раз в "+auditTickInterval.String()+"; SHRED и QUARANTINE форсируют запись до себя. Цепь НЕ компактится — это улика, и растёт она навсегда (≈3.6 ГБ/год)")
 	restoreToLSN := flag.Uint64("restore-to-lsn", 0, "форензическое восстановление на момент: поднять состояние, каким оно было после записи с этим LSN, и обслуживать ТОЛЬКО чтение (0 = обычный старт). Каталог данных не изменяется")
 	walInspect := flag.Bool("wal-inspect", false, "напечатать журнал (LSN, операция, ключ) и выйти — как найти LSN для -restore-to-lsn")
 	showVersion := flag.Bool("version", false, "вывести версию и выйти")
@@ -248,6 +184,9 @@ func main() {
 	}
 
 	os.MkdirAll(dataDir, 0755)
+	if err := checkDataDirSupported(dataDir); err != nil {
+		logging.Fatalf("%v", err)
+	}
 
 	// outDir — куда пишет ЭТОТ процесс. В обычном режиме = dataDir; в режиме
 	// восстановления на момент — временный каталог, поэтому оригинал остаётся
@@ -261,72 +200,6 @@ func main() {
 	if restoreLSN > 0 {
 		slog.Warn("point-in-time restore mode: read-only, data directory is not modified",
 			"restore_to_lsn", restoreLSN, "data_dir", dataDir, "scratch_dir", outDir)
-	}
-
-	// === Кейринг: ключи скоупов для шифрования на границе персистентности ===
-	//
-	// Читается из dataDir, а НЕ из outDir. Два следствия, и оба намеренные:
-	// при -restore-to-lsn расследование идёт во временном каталоге, но ключи
-	// нужны те же, иначе восстановленный момент нечитаем; и наоборот — ключ,
-	// уничтоженный сегодня, делает факт нечитаемым в ЛЮБОМ прошлом моменте.
-	// Второе и есть разрешение конфликта «стирание против восстановления на
-	// момент», названного в docs/VMEM_DESIGN.md: откат до FORGET прежде
-	// воскрешал факт, откат после SHRED отдаёт шифротекст.
-	//
-	// Файл открывается и без флага, если он уже существует: иначе прежние
-	// конверты молча стали бы нечитаемы — то есть потерей данных, замаскированной
-	// под смену настройки.
-	var ring *keyring.Keyring
-	if _, statErr := os.Stat(filepath.Join(dataDir, keyring.FileName)); *encryptAtRest || statErr == nil {
-		ring, err = keyring.Open(dataDir)
-		if err != nil {
-			logging.Fatalf("failed to open keyring: %v", err)
-		}
-		defer ring.Close()
-		activeKeyring = ring
-		slog.Info("encryption at rest enabled", "keyring", filepath.Join(dataDir, keyring.FileName),
-			"scopes", len(ring.Scopes()), "sealing_new_writes", *encryptAtRest)
-	}
-
-	// === Цепь аудита: журнал того, ЧТО с памятью делали ===
-	//
-	// ⚠В режиме -restore-to-lsn не открывается вовсе, и это не экономия.
-	// Открытие носителя чинит оборванный хвост — то есть ПИШЕТ в журнал; на
-	// форензической сессии, которая обязана только смотреть, это была бы
-	// правка улики при попытке её прочесть. Расследование и так идёт во
-	// временном каталоге, а цепь лежит в настоящем.
-	var stopAuditChain func()
-	if *auditChainOn && restoreLSN == 0 {
-		stopAuditChain, err = startAuditChain(dataDir)
-		if err != nil {
-			logging.Fatalf("failed to open audit chain: %v", err)
-		}
-	} else if *auditChainOn {
-		slog.Warn("audit chain not opened: -restore-to-lsn is a read-only forensic session")
-	}
-
-	// sealValue упаковывает полезную нагрузку записи журнала в конверт скоупа.
-	// Без кейринга (или в режиме восстановления, где писать нельзя) отдаёт
-	// значение как есть — легаси-записи и остаются легаси, о чём честно
-	// отчитывается VMEM.COVERAGE.
-	sealingActive = ring != nil && *encryptAtRest && restoreLSN == 0
-	sealValue = func(scope string, v []byte) []byte {
-		if ring == nil || !*encryptAtRest || restoreLSN > 0 {
-			return v
-		}
-		if _, err := ring.EnsureScope(scope); err != nil {
-			// Не молчать и не писать открытым текстом «на всякий случай»:
-			// тихая деградация до plaintext — ровно та ложь, против которой
-			// весь механизм. Запись отклоняется вызывающим по nil.
-			slog.Error("keyring: cannot ensure scope key, write left unsealed", "scope", scope, "err", err)
-			return v
-		}
-		sealed, err := ring.Seal(scope, v)
-		if err != nil {
-			slog.Error("keyring: seal failed, write left unsealed", "scope", scope, "err", err)
-			return v
-		}
-		return sealed
 	}
 
 	// === WAL-shipping: remote + restore (до загрузки снапшотов/реплея) ===
@@ -385,19 +258,6 @@ func main() {
 	// Provider вызывается только при scrape /metrics — 0 overhead на hot path.
 	if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
 		monitoring.SetVectorStateProvider(leveledStatsAdapter{lvs: lvs})
-
-		// Шифрование бинарного снапшота (формат v8). Ставится ЗДЕСЬ — до
-		// загрузки graph_leveled.bin ниже: снапшот уже может быть запечатан, и
-		// без ключей он прочитается неполно.
-		//
-		// Read-only и read-write разведены намеренно. Unseal подключается,
-		// как только кейринг вообще есть: иначе прежние снапшоты стали бы
-		// нечитаемы от одной смены флага. Seal — только под -encrypt-at-rest
-		// и вне режима восстановления на момент, теми же условиями, что
-		// sealValue для журнала.
-		if ring != nil {
-			lvs.SetSnapshotCrypto(snapshotCryptoFor(ring, *encryptAtRest && restoreLSN == 0))
-		}
 	}
 
 	// HTTP-сервер метрик/здоровья поднимаем ДО реплея WAL. Восстановление после
@@ -425,7 +285,6 @@ func main() {
 			} else {
 				slog.Info("leveled vector store loaded from snapshot")
 				graphLoaded = true
-				warnPreSealedSnapshot(vecStore, *encryptAtRest, graphPath)
 			}
 			f.Close()
 		}
@@ -473,7 +332,7 @@ func main() {
 	}
 
 	applier := &walApplier{
-		s: s, ttl: ttl, vec: vecStore, zsetReg: zsetReg, ring: ring,
+		s: s, ttl: ttl, vec: vecStore, zsetReg: zsetReg,
 		graphLoaded: graphLoaded, vecWatermark: vecWatermark,
 	}
 
@@ -505,14 +364,6 @@ func main() {
 	if applier.restored > 0 {
 		slog.Info("restored from WAL", "operations", applier.restored, "vectors", applier.vecRestored)
 	}
-	// Пропущенное криптостиранием обязано быть ВИДНО оператору: молчаливая
-	// разница между «в журнале было N записей» и «восстановлено N-M» выглядит
-	// как потеря данных, а это штатное исполнение VMEM.SHRED. Счётчик считался
-	// и раньше, но никуда не выводился.
-	if applier.erasedByShred > 0 {
-		slog.Warn("skipped journal records of crypto-shredded scopes",
-			"records", applier.erasedByShred)
-	}
 
 	// === 3. WAL ===
 	walPath := filepath.Join(outDir, fmt.Sprintf("wal_%s.log", time.Now().Format("20060102_150405")))
@@ -542,15 +393,7 @@ func main() {
 	// для snapshot.wal (векторы хранятся отдельно). Компакция удаляет старые
 	// WAL, поэтому всё, что не попадёт сюда, теряется после рестарта.
 	iterateAll := func(fn func(op byte, key string, value []byte)) {
-		// Карта «ключ факта → scope» готовится ЗДЕСЬ, один раз на снапшот:
-		// якорь `vmem:<id>` scope в себе не несёт, а без него нечем выбрать
-		// ключ шифрования. Обход векторного стора стоит O(N) и платится раз в
-		// компакцию, не на горячем пути.
-		var factScopes map[string]string
-		if lvs, ok := vecStore.(*vector.LeveledVectorStore); ok {
-			factScopes = lvs.FactScopes()
-		}
-		snapshotIterateSealed(s, ttl, zsetReg, factScopes, fn)
+		snapshotIterate(s, ttl, zsetReg, fn)
 	}
 
 	// saveVectors — сохраняет LeveledVectorStore в graph_leveled.bin.
@@ -824,14 +667,6 @@ func main() {
 	srv.Stop()
 	ttl.Stop()
 	syncer.Stop()
-	// Цепь закрывается ПОСЛЕ srv.Stop(): её пишут только обработчики команд, и
-	// к этому моменту их уже нет. Close сбрасывает остаток буфера — без него
-	// штатная остановка теряла бы доказуемость последних событий ровно так же,
-	// как авария, и «выключили аккуратно» ничем не отличалось бы от «выдернули
-	// шнур».
-	if stopAuditChain != nil {
-		stopAuditChain()
-	}
 	if err := bw.Close(); err != nil {
 		slog.Error("WAL close error", "err", err)
 	}
@@ -842,39 +677,6 @@ func main() {
 		slog.Info("WAL-shipping: финальная доставка завершена")
 	}
 	slog.Info("shutdown complete: WAL flushed and fsynced")
-}
-
-// warnPreSealedSnapshot предупреждает о снапшоте, записанном ДО формата v9.
-//
-// ЗАЧЕМ ЛОГ, А НЕ СТРОЧКА В ДОКАХ. До v9 запечатанная секция была только у
-// frozen-сегмента: факт, записанный под шифрованием, но осевший в SQ8- или
-// flat-HNSW-сегменте, уезжал в graph_leveled.bin ОТКРЫТЫМ ТЕКСТОМ. После
-// загрузки в памяти это уже неразличимо, а VMEM.COVERAGE смотрит на текущее
-// место хранения и покажет полное покрытие — правдиво про то, что будет
-// записано дальше, и обманчиво про файл, который уже лежит на диске.
-//
-// Предупреждение в документации не путешествует вместе с квитанцией, а лог при
-// старте — путешествует: он попадает туда же, куда смотрит оператор, когда
-// разбирается, почему стирание не сработало.
-//
-// Починка forward-only: пересохранить снапшот. Старый файл своих открытых
-// байтов не теряет, и уничтожение ключа скоупа до них не достаёт.
-func warnPreSealedSnapshot(vs any, encryptAtRest bool, path string) {
-	if !encryptAtRest {
-		return // без шифрования запечатывать было нечего, претензий к файлу нет
-	}
-	lvs, ok := vs.(*vector.LeveledVectorStore)
-	if !ok {
-		return
-	}
-	v := lvs.SnapshotFormatVersion()
-	if v == 0 || v >= vector.SealedSegmentsFormatVersion {
-		return
-	}
-	slog.Warn("snapshot predates sealed SQ8/flat-HNSW segments: facts that settled in those segment types were written in the clear, and destroying a scope key will not reach them. Re-save the snapshot to seal them going forward — the existing file keeps its plaintext",
-		"path", path,
-		"snapshot_format", v,
-		"sealed_since", vector.SealedSegmentsFormatVersion)
 }
 
 // writeValue — helper для записи protocol.Value в ConnBuf.
@@ -999,10 +801,7 @@ func isLoopbackBind(bind string) bool {
 // освобождением памяти, а не заблокировать себе единственный путь наружу.
 func isMemoryGrowingCmd(cmd string) bool {
 	switch cmd {
-	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC",
-		// VMEM.RESEAL здесь по той же причине, что QUARANTINE и BACKFILL:
-		// перешифровка дописывает НОВУЮ версию факта, а не правит старую.
-		"VMEM.REMEMBER", "VMEM.QUARANTINE", "VMEM.BACKFILL", "VMEM.RESEAL":
+	case "SET", "ZADD", "VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC":
 		return true
 	}
 	return false
@@ -1019,12 +818,6 @@ func isWriteCmd(cmd string) bool {
 	switch cmd {
 	case "SET", "DEL", "EXPIRE", "PERSIST",
 		"VSIM.ADD", "VSIM.ADDBIN", "VSIM.ADDATTR", "VSIM.ADDDOC", "VSIM.DEL",
-		"VMEM.REMEMBER", "VMEM.FORGET", "VMEM.QUARANTINE", "VMEM.BACKFILL", "VMEM.RESEAL",
-		// VMEM.SHRED — write, но НЕ memory-growing: как и FORGET, стирание
-		// обязано оставаться доступным под OOM. Гейт write при этом нужен —
-		// иначе уничтожение ключа прошло бы под -restore-to-lsn, то есть
-		// расследование могло бы испортить вещдок, по которому ведётся.
-		"VMEM.SHRED",
 		"ZADD", "ZREM":
 		return true
 	}
@@ -1062,8 +855,8 @@ func (a leveledStatsAdapter) Stats() monitoring.VectorStats {
 }
 
 // parseAttrFilter парсит хвост [EQ <attr> <val>]... [RANGE <attr> <lo> <hi>]...
-// начиная с args[start] (синтаксис VSIM.FILTER, шаг 3а VMEM_DESIGN: паритет
-// фильтров в SEARCHTEXT/HYBRID). Останавливается на первом токене, не
+// начиная с args[start] (синтаксис VSIM.FILTER; тот же разбор у SEARCHTEXT и
+// HYBRID, чтобы фильтры не разъехались). Останавливается на первом токене, не
 // являющемся EQ/RANGE (например VEC), и возвращает фильтр, индекс этого
 // токена и текст ошибки (""=ок). Без токенов возвращает нулевой Filter
 // (f.empty()=true — команды сохраняют старое поведение бит-в-бит).
@@ -1100,96 +893,6 @@ func parseAttrFilter(args [][]byte, start int) (vector.Filter, int, string) {
 		}
 	}
 	return f, i, ""
-}
-
-// parseRecallArgs — ОБЩИЙ разбор аргументов VMEM.RECALL и VMEM.EXPLAIN.
-// Общий сознательно: EXPLAIN обязан отвечать про ТОТ ЖЕ запрос, что задают
-// RECALL, а разъехавшийся разбор модификаторов даёт объяснение чужого запроса
-// — худший вид неправды в разборе инцидента (то же соображение, что заставило
-// EXPLAIN жить внутри Recall, а не рядом). Возвращает текст ошибки без
-// префикса ERR; пустой — разбор удался.
-func parseRecallArgs(args [][]byte) (vector.RecallRequest, string) {
-	var rreq vector.RecallRequest
-	if len(args) < 3 {
-		return rreq, "usage"
-	}
-	K, err := strconv.Atoi(unsafeString(args[1]))
-	if err != nil || K <= 0 || K > vector.MaxSearchK {
-		return rreq, "invalid K (must be 1..100000)"
-	}
-	rreq = vector.RecallRequest{Scope: string(args[0]), K: K, Query: string(args[2])}
-	for i := 3; i < len(args); {
-		switch strings.ToUpper(string(args[i])) {
-		case "ASOF":
-			if i+1 >= len(args) {
-				return rreq, "ASOF requires <unix seconds>"
-			}
-			v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
-			if err != nil {
-				return rreq, "ASOF not an integer"
-			}
-			rreq.AsOf = &v
-			i += 2
-		case "ALL":
-			rreq.All = true
-			i++
-		case "TYPE":
-			if i+1 >= len(args) {
-				return rreq, "TYPE requires <type>"
-			}
-			rreq.TypeEq = string(args[i+1])
-			i += 2
-		case "SOURCE":
-			if i+1 >= len(args) {
-				return rreq, "SOURCE requires <source>"
-			}
-			rreq.SourceEq = string(args[i+1])
-			i += 2
-		case "HALFLIFE":
-			if i+1 >= len(args) {
-				return rreq, "HALFLIFE requires <seconds>"
-			}
-			v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
-			if err != nil {
-				return rreq, "HALFLIFE not an integer"
-			}
-			rreq.HalfLifeSec = v
-			i += 2
-		case "WEIGHTS":
-			// Веса плеч RRF: <текст> <вектор>. Рычаг, а не автоматика — движок
-			// не угадывает сам, какое плечо гасить (см. RecallRequest).
-			if i+2 >= len(args) {
-				return rreq, "WEIGHTS requires <text> <vector>"
-			}
-			wt, err := strconv.ParseFloat(unsafeString(args[i+1]), 64)
-			if err != nil {
-				return rreq, "WEIGHTS text weight not a number"
-			}
-			wv, err := strconv.ParseFloat(unsafeString(args[i+2]), 64)
-			if err != nil {
-				return rreq, "WEIGHTS vector weight not a number"
-			}
-			rreq.WeightText, rreq.WeightVec = &wt, &wv
-			i += 3
-		case "VEC":
-			rreq.Vector = make([]float32, 0, len(args)-i-1)
-			for j := i + 1; j < len(args); j++ {
-				f, err := strconv.ParseFloat(unsafeString(args[j]), 32)
-				if err != nil {
-					return rreq, fmt.Sprintf("invalid float %q", unsafeString(args[j]))
-				}
-				rreq.Vector = append(rreq.Vector, float32(f))
-			}
-			return rreq, ""
-		default:
-			return rreq, fmt.Sprintf("unexpected token %q (want ASOF|ALL|TYPE|SOURCE|HALFLIFE|WEIGHTS|VEC)", unsafeString(args[i]))
-		}
-	}
-	// ⚠«WEIGHTS без VEC» здесь НЕ проверяется намеренно: правило живёт в ядре
-	// (ErrVMEMWeightsNoVec), и вторая его копия на разборе аргументов разошлась
-	// бы с первой ровно тогда, когда одну из них поправят. Ошибка ядра
-	// доезжает до клиента тем же путём, что остальные.
-	return rreq, ""
 }
 
 func executeCommand(s *kv.Store, bw *wal.BatchWAL, ttl *store.TTLManager,
@@ -1806,952 +1509,6 @@ func executeCommand(s *kv.Store, bw *wal.BatchWAL, ttl *store.TTLManager,
 		// Репликация в кластере не проброшена — как у ADDATTR (CheckKey-редирект есть).
 		buf.WriteSimpleString("OK")
 
-	// === VMEM — слой памяти агентов (шаг 7, docs/VMEM_DESIGN.md) ===
-	case "VMEM.REMEMBER":
-		// VMEM.REMEMBER <scope> TEXT <text> [ID <id>] [TYPE <t>] [IMPORTANCE <0..1>]
-		//   [VALIDFROM <unix>] [TTL <sec>] [SUPERSEDES <id>] [SOURCE <s>] [VEC <f1> ... <fN>]
-		// SOURCE — происхождение факта; не задан → пишется явное "unknown"
-		// (см. vmemSourceUnknown): отзыв по источнику обязан видеть и те
-		// факты, за которые никто не расписался.
-		// Ответ: id факта (серверный ULID, если ID не задан). Вся
-		// недетерминированность (часы, ULID, placeholder-вектор) умирает в
-		// store.Remember ДО WAL (дверь 1) — журнал везёт материализованный
-		// результат. Пара supersedes (закрытая цель + наследник) едет ОДНОЙ
-		// записью OpVSimAddDocBatch: один CRC — краш не воспроизводит
-		// полуправду. Дословный текст факта — «якорь» контракта — кладётся в
-		// KV (vmem:<id>, OpSet; TTL зеркалится OpExpire; FORGET удаляет):
-		// термы индекса lossy, RECALL обязан вернуть сам факт. Кластерная
-		// маршрутизация не проброшена (single-node продукт, id генерится
-		// сервером). Порядок в WAL: доки → текст (факт без текста деградирует
-		// мягче, чем сирота-текст копился бы без TTL).
-		if len(args) < 3 {
-			buf.WriteError("ERR usage: VMEM.REMEMBER <scope> TEXT <text> [ID id] [TYPE t] [IMPORTANCE 0..1] [VALIDFROM unix] [TTL sec] [SUPERSEDES id] [SOURCE s] [VEC v1 ... vN]")
-			return
-		}
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		// SealedAtRest ставится ЗДЕСЬ, а не внутри движка: командный слой знает
-		// про кейринг, движок — нет. Атрибут отражает, уйдёт ли эта запись под
-		// конвертом, и потому считается в момент создания факта, а не позже.
-		req := vector.RememberRequest{Scope: string(args[0]), SealedAtRest: sealingActive}
-		textSeen := false
-		parseErr := ""
-	rememberParse:
-		for i := 1; i < len(args); {
-			switch strings.ToUpper(string(args[i])) {
-			case "TEXT":
-				if i+1 >= len(args) {
-					parseErr = "TEXT requires <text>"
-					break rememberParse
-				}
-				req.Text = string(args[i+1])
-				textSeen = true
-				i += 2
-			case "ID":
-				if i+1 >= len(args) {
-					parseErr = "ID requires <id>"
-					break rememberParse
-				}
-				req.ID = string(args[i+1])
-				i += 2
-			case "TYPE":
-				if i+1 >= len(args) {
-					parseErr = "TYPE requires <type>"
-					break rememberParse
-				}
-				req.Type = string(args[i+1])
-				i += 2
-			case "IMPORTANCE":
-				if i+1 >= len(args) {
-					parseErr = "IMPORTANCE requires <0..1>"
-					break rememberParse
-				}
-				f, err := strconv.ParseFloat(unsafeString(args[i+1]), 64)
-				if err != nil {
-					parseErr = "IMPORTANCE not a float"
-					break rememberParse
-				}
-				req.Importance = &f
-				i += 2
-			case "VALIDFROM":
-				if i+1 >= len(args) {
-					parseErr = "VALIDFROM requires <unix seconds>"
-					break rememberParse
-				}
-				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
-				if err != nil {
-					parseErr = "VALIDFROM not an integer"
-					break rememberParse
-				}
-				req.ValidFrom = v
-				i += 2
-			case "TTL":
-				if i+1 >= len(args) {
-					parseErr = "TTL requires <seconds>"
-					break rememberParse
-				}
-				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
-				if err != nil {
-					parseErr = "TTL not an integer"
-					break rememberParse
-				}
-				req.TTL = v
-				i += 2
-			case "SUPERSEDES":
-				if i+1 >= len(args) {
-					parseErr = "SUPERSEDES requires <id>"
-					break rememberParse
-				}
-				req.Supersedes = string(args[i+1])
-				i += 2
-			case "SOURCE":
-				if i+1 >= len(args) {
-					parseErr = "SOURCE requires <source>"
-					break rememberParse
-				}
-				req.Source = string(args[i+1])
-				i += 2
-			case "VEC":
-				req.Vector = make([]float32, 0, len(args)-i-1)
-				for j := i + 1; j < len(args); j++ {
-					f, err := strconv.ParseFloat(unsafeString(args[j]), 32)
-					if err != nil {
-						parseErr = fmt.Sprintf("invalid float %q", unsafeString(args[j]))
-						break rememberParse
-					}
-					req.Vector = append(req.Vector, float32(f))
-				}
-				break rememberParse
-			default:
-				parseErr = fmt.Sprintf("unexpected token %q (want TEXT|ID|TYPE|IMPORTANCE|VALIDFROM|TTL|SUPERSEDES|SOURCE|VEC)", unsafeString(args[i]))
-				break rememberParse
-			}
-		}
-		if parseErr == "" && !textSeen {
-			parseErr = "TEXT is required"
-		}
-		if parseErr != "" {
-			buf.WriteError("ERR " + parseErr)
-			return
-		}
-		monitoring.VectorAddTotal.Inc()
-		// Remember ДО bw.Write (watermark-safety, как VSIM.ADDDOC).
-		res, err := lvs.Remember(req, time.Now().Unix())
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		if res.Closed != nil {
-			pair := vector.SerializeDocBatch([]vector.BatchDoc{
-				{Key: res.Closed.ID, Vec: res.Closed.Vec, Attrs: res.Closed.Attrs, Terms: res.Closed.Terms},
-				{Key: res.Doc.ID, Vec: res.Doc.Vec, Attrs: res.Doc.Attrs, Terms: res.Doc.Terms},
-			})
-			bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Doc.ID, Value: sealValue(req.Scope, pair)})
-		} else {
-			bw.Write(wal.Entry{Op: wal.OpVSimAddDoc, Key: res.Doc.ID, Value: sealValue(req.Scope, vector.SerializeVectorWithDoc(res.Doc.Vec, res.Doc.Attrs, res.Doc.Terms))})
-		}
-		textKey := "vmem:" + res.Doc.ID
-		textVal := []byte(req.Text)
-		// В журнал уезжает конверт, в памяти остаётся открытый текст: граница
-		// шифротекста — это граница персистентности, а не путь чтения.
-		bw.Write(wal.Entry{Op: wal.OpSet, Key: textKey, Value: sealValue(req.Scope, textVal)})
-		s.Set(textKey, textVal)
-		if req.TTL > 0 {
-			// Абсолютное время смерти якоря = expires_at факта (дверь 1: OpExpire
-			// и так везёт абсолютный nano). Расхождение таймеров некритично:
-			// авторитет видимости — Range-фильтр RECALL, якорь лишь догоняет.
-			dur := time.Duration(req.TTL) * time.Second
-			var b [8]byte
-			binary.BigEndian.PutUint64(b[:], uint64(time.Now().Add(dur).UnixNano()))
-			bw.Write(wal.Entry{Op: wal.OpExpire, Key: textKey, Value: b[:]})
-			ttl.Set(textKey, dur)
-		} else {
-			ttl.Remove(textKey) // upsert без TTL снимает прежний таймер якоря
-		}
-		// В цепь — ПОСЛЕ того, как факт создан: запись о том, чего не было,
-		// хуже отсутствия записи.
-		//
-		// Срок жизни берётся из АТРИБУТА факта, а не пересчитывается из
-		// req.TTL: сверка потом сравнивает с ним же, и два независимых
-		// вычисления одного времени разошлись бы молча. Но ЗАПИСЫВАЕТСЯ он
-		// только если TTL действительно задавали.
-		//
-		// ⚠У факта без TTL в этом атрибуте лежит не срок, а сентинел
-		// «открытого интервала» (1<<53). Первая версия клала его в лист как
-		// есть: поведение не ломалось (такой «срок» не наступит никогда), зато
-		// каждый лист нёс 24 байта бессмыслицы и утверждал про факт то, чего у
-		// него нет. Поймано глазами на живой службе, а не тестом — мутации
-		// такого класса не ловят, потому что ошибка не в ветвлении, а в
-		// значении.
-		var expiresAt int64
-		if req.TTL > 0 {
-			expiresAt = int64(res.Doc.Attrs.Num["expires_at"])
-		}
-		auditRemember(req.Scope, res.Doc.ID, req.Source, sealingActive, req.Supersedes, expiresAt, textVal)
-		buf.WriteBulkString(res.Doc.ID)
-
-	case "VMEM.RECALL":
-		// VMEM.RECALL <scope> <K> <query> [ASOF <unix> | ALL] [TYPE <t>] [SOURCE <s>] [HALFLIFE <sec>] [WEIGHTS <wtext> <wvec>] [VEC <f1> ... <fN>]
-		// Ответ: тройки [id, score, text]. Скор = fused × 2^(−age/halfLife) ×
-		// (0.5+imp) — сравним только внутри выдачи. text — дословный якорь из
-		// KV (пустая строка, если якоря нет: не-VMEM док, попавший в scope).
-		// Без VEC — осознанная деградация в BM25-only (ступень 0). Дефолт =
-		// валидное-сейчас; ASOF ts — машина времени (сквозь supersession, но
-		// НЕ сквозь erasure); ALL — без суда интервалов.
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		rreq, parseErr := parseRecallArgs(args)
-		if parseErr == "usage" {
-			buf.WriteError("ERR usage: VMEM.RECALL <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [WEIGHTS wtext wvec] [VEC v1 ... vN]")
-			return
-		}
-		if parseErr != "" {
-			buf.WriteError("ERR " + parseErr)
-			return
-		}
-		monitoring.VectorSearchTotal.Inc()
-		searchStart := time.Now()
-		results, err := lvs.Recall(rreq, time.Now().Unix())
-		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		buf.WriteArrayHeader(len(results) * 3)
-		for _, r := range results {
-			buf.WriteBulkString(r.Key)
-			buf.WriteBulkString(fmt.Sprintf("%.6f", r.Score))
-			if text, ok := s.Get("vmem:" + r.Key); ok {
-				buf.WriteBulkString(string(text))
-			} else {
-				buf.WriteBulkString("")
-			}
-		}
-
-	case "VMEM.EXPLAIN":
-		// VMEM.EXPLAIN <scope> <K> <query> [те же модификаторы, что у RECALL]
-		// Разложение ТОГО ЖЕ запроса: почему факт в выдаче и почему другой —
-		// нет. Недостающее звено «обнаружили → локализовали → отозвали»:
-		// порча видна как неверный ОТВЕТ, а отзыв идёт по ПРОИСХОЖДЕНИЮ, и
-		// между этими двумя фактами нужен шаг «покажи, кто это сказал».
-		//
-		// Ответ: массив записей «имя, значение, имя, значение …». Первая
-		// запись — сводка запроса (mode/t_eff/half_life/candidates/returned),
-		// дальше по факту: сначала попавшие в выдачу по рангу, затем
-		// отсеянные по убыванию базового скора. verdict = kept | причина
-		// отсева (erasure|validity|quarantine|type|source). Отсутствующий
-		// атрибут печатается как none — это НЕ то же самое, что явный
-		// unknown у source: у фактов, записанных до провенанса, колонки нет
-		// физически.
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		xreq, parseErr := parseRecallArgs(args)
-		if parseErr == "usage" {
-			buf.WriteError("ERR usage: VMEM.EXPLAIN <scope> <K> <query> [ASOF unix | ALL] [TYPE t] [SOURCE s] [HALFLIFE sec] [WEIGHTS wtext wvec] [VEC v1 ... vN]")
-			return
-		}
-		if parseErr != "" {
-			buf.WriteError("ERR " + parseErr)
-			return
-		}
-		ex, err := lvs.Explain(xreq, time.Now().Unix())
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		num := func(v float64) string { // NaN = атрибута нет, а не ноль
-			if math.IsNaN(v) {
-				return "none"
-			}
-			return fmt.Sprintf("%.6f", v)
-		}
-		rankStr := func(r int) string {
-			if r == 0 {
-				return "-"
-			}
-			return strconv.Itoa(r)
-		}
-		mode := "bm25-only"
-		if ex.Hybrid {
-			mode = "hybrid"
-		}
-		returned := 0
-		for _, f := range ex.Facts {
-			if f.Drop == "" {
-				returned++
-			}
-		}
-		buf.WriteArrayHeader(len(ex.Facts) + 1)
-		buf.WriteArrayHeader(10)
-		for _, kv := range [][2]string{
-			{"mode", mode},
-			{"t_eff", strconv.FormatInt(ex.TEff, 10)},
-			{"half_life", strconv.FormatInt(ex.HalfLife, 10)},
-			{"candidates", strconv.Itoa(len(ex.Facts))},
-			{"returned", strconv.Itoa(returned)},
-		} {
-			buf.WriteBulkString(kv[0])
-			buf.WriteBulkString(kv[1])
-		}
-		for _, f := range ex.Facts {
-			verdict := "kept"
-			if f.Drop != "" {
-				verdict = string(f.Drop)
-			}
-			text := ""
-			if t, ok := s.Get("vmem:" + f.Key); ok {
-				text = string(t)
-			}
-			fields := [][2]string{
-				{"id", f.Key},
-				{"verdict", verdict},
-				{"rank", rankStr(f.Rank)},
-				{"source", f.Source},
-				{"type", f.Type},
-				{"text_rank", rankStr(f.TextRank)},
-				{"vec_rank", rankStr(f.VecRank)},
-				{"base", fmt.Sprintf("%.6f", f.Base)},
-				{"age_sec", num(f.AgeSec)},
-				{"age_penalty", fmt.Sprintf("%.6f", f.AgePenalty)},
-				{"decay_mul", fmt.Sprintf("%.6f", f.DecayMul)},
-				{"imp_mul", fmt.Sprintf("%.6f", f.ImpMul)},
-				{"final", num(f.Final)},
-				{"valid_from", num(f.ValidFrom)},
-				{"valid_to", num(f.ValidTo)},
-				{"quarantined_at", num(f.QuarantinedAt)},
-				{"text", text},
-			}
-			buf.WriteArrayHeader(len(fields) * 2)
-			for _, kv := range fields {
-				buf.WriteBulkString(kv[0])
-				buf.WriteBulkString(kv[1])
-			}
-		}
-
-	case "VMEM.BACKFILL":
-		// VMEM.BACKFILL <scope> SOURCE <s> [LIMIT <n>]
-		// Миграция легаси: проставить источник фактам, у которых колонки
-		// source НЕТ физически (записаны до появления провенанса). Без неё
-		// весь слой восстановления над старыми данными мёртв — отзыв идёт по
-		// источнику, а пустота нефильтруема (см. VMEM.COVERAGE).
-		//
-		// Значение задаёт ОПЕРАТОР: обычный ответ — литеральный `unknown`
-		// («никто не расписался»), но знающий происхождение корпуса вправе
-		// поставить своё. Провенанс — вход, утверждение владельца данных, а
-		// не наше суждение о факте.
-		//
-		// Уже объявленный источник НЕ перезаписывается никогда: команда,
-		// умеющая это, умеет уничтожить след того, кто наполнил память.
-		// Предикат ровно один и неотключаемый — атрибута нет; отсюда
-		// идемпотентность. Ответ: число мигрированных фактов.
-		if len(args) < 3 {
-			buf.WriteError("ERR usage: VMEM.BACKFILL <scope> SOURCE <s> [LIMIT n]")
-			return
-		}
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		breq := vector.BackfillSourceRequest{Scope: string(args[0])}
-		parseErr := ""
-	backfillParse:
-		for i := 1; i < len(args); {
-			switch strings.ToUpper(string(args[i])) {
-			case "SOURCE":
-				if i+1 >= len(args) {
-					parseErr = "SOURCE requires <source>"
-					break backfillParse
-				}
-				breq.Source = string(args[i+1])
-				i += 2
-			case "LIMIT":
-				if i+1 >= len(args) {
-					parseErr = "LIMIT requires <n>"
-					break backfillParse
-				}
-				v, err := strconv.Atoi(unsafeString(args[i+1]))
-				if err != nil {
-					parseErr = "LIMIT not an integer"
-					break backfillParse
-				}
-				breq.Limit = v
-				i += 2
-			default:
-				parseErr = fmt.Sprintf("unexpected token %q (want SOURCE|LIMIT)", unsafeString(args[i]))
-				break backfillParse
-			}
-		}
-		if parseErr != "" {
-			buf.WriteError("ERR " + parseErr)
-			return
-		}
-		bres, err := lvs.BackfillSource(breq, time.Now().Unix())
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		if len(bres.Docs) == 0 {
-			buf.WriteInt(0)
-			return
-		}
-		bbatch := make([]vector.BatchDoc, len(bres.Docs))
-		for i, d := range bres.Docs {
-			bbatch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
-		}
-		bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: bres.Docs[0].ID, Value: sealValue(breq.Scope, vector.SerializeDocBatch(bbatch))})
-		// Батчем: миграция провенанса — администраторская правка прошлого, а не
-		// доказываемый момент. Но в журнале она обязана быть: ОПЕРАТОР объявил
-		// источник задним числом, и следующий отзыв по источнику опирается на
-		// его утверждение, а не на наблюдение.
-		auditBackfill(breq.Scope, breq.Source, len(bres.Docs))
-		buf.WriteInt(len(bres.Docs))
-
-	case "VMEM.RESEAL":
-		// VMEM.RESEAL <scope> [LIMIT <n>]
-		// Перешифровка легаси: переписать под конвертом факты, записанные до
-		// -encrypt-at-rest. Без неё VMEM.SHRED на старом корпусе отработает
-		// честно и не даст НИЧЕГО: ключа, под которым эти байты лежат, не
-		// существует (см. VMEM.COVERAGE, поле sealed_share).
-		//
-		// ⚠Ответ — квитанция, и в ней есть поле, которое хочется опустить:
-		// перешифровка НЕ достаёт копии, уже уехавшие в архив. Она переводит
-		// факт в стираемое состояние начиная с этого момента. Без этой оговорки
-		// выросшая до 1.0 доля будет прочитана как «всё стираемо», что неправда
-		// для всего, что успело уехать раньше.
-		if len(args) < 1 {
-			buf.WriteError("ERR usage: VMEM.RESEAL <scope> [LIMIT n]")
-			return
-		}
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		if !sealingActive {
-			// Перешифровывать нечем: без активного конверта новая версия уехала
-			// бы в журнал таким же открытым текстом, а атрибут sealed при этом
-			// сказал бы «1». Это не деградация, а ЛОЖЬ в отчёте о покрытии,
-			// поэтому команда отвергается, а не «делает что может».
-			buf.WriteError("ERR encryption at rest is off: start with -encrypt-at-rest, otherwise resealing would stamp facts it did not seal")
-			return
-		}
-		rreq := vector.ResealRequest{Scope: string(args[0])}
-		resealErr := ""
-		for i := 1; i+1 < len(args); i += 2 {
-			switch strings.ToUpper(string(args[i])) {
-			case "LIMIT":
-				v, err := strconv.Atoi(unsafeString(args[i+1]))
-				if err != nil {
-					resealErr = "LIMIT not an integer"
-				}
-				rreq.Limit = v
-			default:
-				resealErr = fmt.Sprintf("unexpected token %q (want LIMIT)", unsafeString(args[i]))
-			}
-		}
-		if resealErr != "" {
-			buf.WriteError("ERR " + resealErr)
-			return
-		}
-		rres, err := lvs.Reseal(rreq, time.Now().Unix())
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		if len(rres.Docs) > 0 {
-			rbatch := make([]vector.BatchDoc, len(rres.Docs))
-			for i, d := range rres.Docs {
-				rbatch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
-			}
-			bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: rres.Docs[0].ID, Value: sealValue(rreq.Scope, vector.SerializeDocBatch(rbatch))})
-			// Якорь-текст тоже: он лежит в KV отдельной записью, и без
-			// перезаписи дословный текст остался бы в журнале открытым — то
-			// есть покрытие выросло бы, а самое читаемое осталось бы на виду.
-			for _, d := range rres.Docs {
-				textKey := "vmem:" + d.ID
-				if text, ok := s.Get(textKey); ok {
-					bw.Write(wal.Entry{Op: wal.OpSet, Key: textKey, Value: sealValue(rreq.Scope, text)})
-				}
-			}
-		}
-		var kr vector.KeyReport
-		if reps := lvs.KeyCoverage(rreq.Scope); len(reps) > 0 {
-			kr = reps[0]
-		}
-		auditReseal(rreq.Scope, len(rres.Docs))
-		buf.WriteArrayHeader(10)
-		buf.WriteBulkString("scope")
-		buf.WriteBulkString(rreq.Scope)
-		buf.WriteBulkString("resealed")
-		buf.WriteBulkString(strconv.Itoa(len(rres.Docs)))
-		buf.WriteBulkString("sealed_share")
-		buf.WriteBulkString(fmt.Sprintf("%.4f", kr.SealedShare()))
-		// exposed рядом с resealed намеренно: перезапись НЕ поднимает долю,
-		// если факт осел в типе сегмента без запечатанного пути. Без этого
-		// поля оператор прочитал бы «resealed=N» как «сделано», а доля
-		// осталась бы низкой без объяснения.
-		buf.WriteBulkString("exposed")
-		buf.WriteBulkString(strconv.Itoa(kr.Exposed))
-		buf.WriteBulkString("earlier_copies")
-		buf.WriteBulkString("not_covered")
-
-	case "VMEM.AUDIT":
-		// VMEM.AUDIT VERIFY [FROM <seq>] | EXPORT | PROVE <scope> [ID id] [TYPE t] | RECONCILE [scope]
-		//
-		// Всё только читает: цепь пишется командами памяти, а не этой.
-		// ⭐PROVE и EXPORT — то, что предъявляют ТРЕТЬЕЙ СТОРОНЕ, и потому
-		// отдаются текстом (JSON), а не RESP-структурой: документ должен
-		// сохраняться в файл и проверяться чужим инструментом, не знающим
-		// нашего протокола.
-		if auditChain == nil {
-			buf.WriteError("ERR audit chain is off: start with -audit-chain")
-			return
-		}
-		if len(args) < 1 {
-			buf.WriteError("ERR usage: VMEM.AUDIT VERIFY [FROM seq] | EXPORT | PROVE <scope> [ID id] [TYPE t] | RECONCILE [scope]")
-			return
-		}
-		switch strings.ToUpper(string(args[0])) {
-		case "VERIFY":
-			var from uint64
-			if len(args) >= 3 && strings.ToUpper(string(args[1])) == "FROM" {
-				v, err := strconv.ParseUint(unsafeString(args[2]), 10, 64)
-				if err != nil {
-					buf.WriteError("ERR FROM not an unsigned integer")
-					return
-				}
-				from = v
-			} else if len(args) != 1 {
-				buf.WriteError("ERR usage: VMEM.AUDIT VERIFY [FROM seq]")
-				return
-			}
-			head := auditChain.Head()
-			got, checked, err := auditChainVerify(from, head)
-			if err != nil {
-				buf.WriteError("ERR " + err.Error())
-				return
-			}
-			writePairs(buf, [][2]string{
-				{"from", strconv.FormatUint(from, 10)},
-				{"links_checked", strconv.Itoa(checked)},
-				{"head_seq", strconv.FormatUint(got.Seq, 10)},
-				{"head_hash", base64.RawStdEncoding.EncodeToString(got.Hash[:])},
-				{"status", "ok"},
-			})
-
-		case "EXPORT":
-			doc, err := auditChainExport(time.Now().Unix())
-			if err != nil {
-				buf.WriteError("ERR " + err.Error())
-				return
-			}
-			buf.WriteBulkString(string(doc))
-
-		case "PROVE":
-			if len(args) < 2 {
-				buf.WriteError("ERR usage: VMEM.AUDIT PROVE <scope> [ID id] [TYPE t]")
-				return
-			}
-			q := auditchain.LeafQuery{Scope: string(args[1]), Type: auditchain.EventRemember}
-			for i := 2; i+1 < len(args); i += 2 {
-				switch strings.ToUpper(string(args[i])) {
-				case "ID":
-					q.Subject = string(args[i+1])
-				case "TYPE":
-					t, ok := auditEventTypeByName(string(args[i+1]))
-					if !ok {
-						buf.WriteError("ERR TYPE must be one of remember|forget|quarantine|shred|backfill")
-						return
-					}
-					q.Type = t
-				default:
-					buf.WriteError(fmt.Sprintf("ERR unexpected token %q (want ID|TYPE)", unsafeString(args[i])))
-					return
-				}
-			}
-			doc, err := auditChainProve(q, time.Now().Unix())
-			if err != nil {
-				buf.WriteError("ERR " + err.Error())
-				return
-			}
-			buf.WriteBulkString(string(doc))
-
-		case "RECONCILE":
-			lvs, ok := vecStore.(*vector.LeveledVectorStore)
-			if !ok {
-				buf.WriteError("ERR vmem not supported by this vector store")
-				return
-			}
-			if len(args) > 2 {
-				buf.WriteError("ERR usage: VMEM.AUDIT RECONCILE [scope]")
-				return
-			}
-			reports, cov, err := auditReconcile(lvs, auditChainPath(), arg(args, 1), time.Now().Unix())
-			if err != nil {
-				buf.WriteError("ERR " + err.Error())
-				return
-			}
-			// Два элемента: сначала — сколько журнала вообще уцелело, потом
-			// расхождения. ⚠Порядок не косметика: числа второго элемента
-			// читаются только вместе с первым, потому что истёкшие по
-			// retention листья выглядят как незаписанные факты.
-			buf.WriteArrayHeader(2)
-			writePairs(buf, [][2]string{
-				{"journal_links", strconv.Itoa(cov.Links)},
-				{"head_seq", strconv.FormatUint(cov.HeadSeq, 10)},
-				{"leaves_read", strconv.Itoa(cov.LeavesRead)},
-				{"leaves_expired", strconv.FormatUint(cov.LeavesExpired, 10)},
-			})
-			buf.WriteArrayHeader(len(reports))
-			for _, r := range reports {
-				writePairs(buf, [][2]string{
-					{"scope", r.Scope},
-					{"in_memory", strconv.Itoa(r.InMemory)},
-					{"recorded", strconv.Itoa(r.Recorded)},
-					{"revoked", strconv.Itoa(r.Revoked)},
-					{"unrecorded", strconv.Itoa(r.Unrecorded)},
-					{"resurrected", strconv.Itoa(r.Resurrected)},
-					{"missing", strconv.Itoa(r.Missing)},
-					{"expired", strconv.Itoa(r.Expired)},
-				})
-			}
-
-		default:
-			buf.WriteError("ERR usage: VMEM.AUDIT VERIFY [FROM seq] | EXPORT | PROVE <scope> [ID id] [TYPE t] | RECONCILE [scope]")
-		}
-
-	case "VMEM.COVERAGE":
-		// VMEM.COVERAGE [scope]
-		// Покрытие провенансом: доля фактов с объявленным источником. Метрика
-		// честности механизма отзыва — карантин отбирает ПО ИСТОЧНИКУ, и если
-		// источник объявлен у меньшинства, восстановление декоративно.
-		//
-		// Три состояния источника, из которых предикатами доступны два:
-		// конкретное значение, литеральный unknown и — главное — ОТСУТСТВИЕ
-		// атрибута у фактов, записанных до провенанса. Последнее не выражается
-		// никаким Eq (пустота нефильтруема) и потому не видно массовому
-		// отзыву; доля таких фактов и есть слепое пятно, ради которого команда
-		// существует. Ответ: по записи на scope, поля
-		// scope/total/declared/unknown/absent/revocable_share + разбивка
-		// source:<имя>. Стоит полного скана — операция админская.
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		reports := lvs.ProvenanceCoverage(arg(args, 0))
-		// Вторая ось покрытия — ключом. Отзыв по источнику и криптостирание
-		// защищают от разного и слепые пятна имеют РАЗНЫЕ, поэтому обе доли
-		// показываются рядом: скоуп может быть полностью отзываемым и при этом
-		// полностью не стираемым.
-		keyByScope := make(map[string]vector.KeyReport)
-		for _, kr := range lvs.KeyCoverage(arg(args, 0)) {
-			keyByScope[kr.Scope] = kr
-		}
-		buf.WriteArrayHeader(len(reports))
-		for _, rep := range reports {
-			kr := keyByScope[rep.Scope]
-			// has_key говорит только о НАСТОЯЩЕМ моменте: ключ может быть уже
-			// уничтожен (скоуп стёрт) или не создаваться никогда. Сам по себе
-			// он не означает, что копии под ним, — для этого sealed_share.
-			hasKey := "0"
-			if activeKeyring != nil && activeKeyring.HasScope(rep.Scope) {
-				hasKey = "1"
-			}
-			fields := [][2]string{
-				{"scope", rep.Scope},
-				{"total", strconv.Itoa(rep.Total)},
-				{"sealed", strconv.Itoa(kr.Sealed)},
-				{"unsealed", strconv.Itoa(kr.Unsealed)},
-				// exposed отделён от unsealed, потому что лечение разное:
-				// unsealed перезаписывается VMEM.RESEAL, exposed не чинится
-				// командой вовсе — факт лежит в типе сегмента, у которого нет
-				// запечатанного пути. Слитые в одно число, они бы означали
-				// «перезапиши и всё», что для второй половины неправда.
-				{"exposed", strconv.Itoa(kr.Exposed)},
-				{"sealed_share", fmt.Sprintf("%.4f", kr.SealedShare())},
-				{"has_key", hasKey},
-				{"declared", strconv.Itoa(rep.Total - rep.BySource["unknown"] - rep.BySource[""])},
-				{"unknown", strconv.Itoa(rep.BySource["unknown"])},
-				{"absent", strconv.Itoa(rep.BySource[""])},
-				{"declared_share", fmt.Sprintf("%.4f", rep.Declared())},
-				{"revocable_share", fmt.Sprintf("%.4f", rep.Revocable())},
-			}
-			// Граница сортируемого хвоста берётся ИЗ ДЛИНЫ, а не константой:
-			// зашитое число молча разъезжается при добавлении поля, и
-			// фиксированное поле уезжает в сортировку разбивки.
-			fixedFields := len(fields)
-			for src, n := range rep.BySource {
-				if src == "" || src == "unknown" {
-					continue
-				}
-				fields = append(fields, [2]string{"source:" + src, strconv.Itoa(n)})
-			}
-			sort.Slice(fields[fixedFields:], func(i, j int) bool {
-				return fields[fixedFields+i][0] < fields[fixedFields+j][0]
-			})
-			buf.WriteArrayHeader(len(fields) * 2)
-			for _, kv := range fields {
-				buf.WriteBulkString(kv[0])
-				buf.WriteBulkString(kv[1])
-			}
-		}
-
-	case "VMEM.QUARANTINE":
-		// VMEM.QUARANTINE <scope> SOURCE <s> [SINCE <unix>] [LIMIT <n>]
-		// Массовый отзыв убеждений по происхождению: факты остаются в сторе
-		// целиком (текст, вектор, прикладное время), но получают ось
-		// quarantined_at — RECALL их больше не выдаёт, AS_OF до момента
-		// отзыва выдаёт по-прежнему (история веры не переписывается), ALL
-		// показывает всегда. Ответ — квитанция: что сделано и ЧТО ОСТАЛОСЬ
-		// (см. still_trusted ниже).
-		//
-		// Весь батч едет ОДНОЙ записью OpVSimAddDocBatch — один CRC: краш не
-		// может оставить «часть лжи отозвана, часть жива». Отсюда потолок
-		// батча; хвост берётся повторным вызовом (операция идемпотентна —
-		// уже отозванные кандидаты отсеиваются приговором).
-		if len(args) < 3 {
-			buf.WriteError("ERR usage: VMEM.QUARANTINE <scope> SOURCE <s> [SINCE unix] [LIMIT n]")
-			return
-		}
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		qreq := vector.QuarantineRequest{Scope: string(args[0])}
-		parseErr := ""
-	quarantineParse:
-		for i := 1; i < len(args); {
-			switch strings.ToUpper(string(args[i])) {
-			case "SOURCE":
-				if i+1 >= len(args) {
-					parseErr = "SOURCE requires <source>"
-					break quarantineParse
-				}
-				qreq.Source = string(args[i+1])
-				i += 2
-			case "SINCE":
-				if i+1 >= len(args) {
-					parseErr = "SINCE requires <unix seconds>"
-					break quarantineParse
-				}
-				v, err := strconv.ParseInt(unsafeString(args[i+1]), 10, 64)
-				if err != nil {
-					parseErr = "SINCE not an integer"
-					break quarantineParse
-				}
-				qreq.Since = v
-				i += 2
-			case "LIMIT":
-				if i+1 >= len(args) {
-					parseErr = "LIMIT requires <n>"
-					break quarantineParse
-				}
-				v, err := strconv.Atoi(unsafeString(args[i+1]))
-				if err != nil {
-					parseErr = "LIMIT not an integer"
-					break quarantineParse
-				}
-				qreq.Limit = v
-				i += 2
-			default:
-				parseErr = fmt.Sprintf("unexpected token %q (want SOURCE|SINCE|LIMIT)", unsafeString(args[i]))
-				break quarantineParse
-			}
-		}
-		if parseErr != "" {
-			buf.WriteError("ERR " + parseErr)
-			return
-		}
-		res, err := lvs.Quarantine(qreq, time.Now().Unix())
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		if len(res.Docs) > 0 {
-			batch := make([]vector.BatchDoc, len(res.Docs))
-			for i, d := range res.Docs {
-				batch[i] = vector.BatchDoc{Key: d.ID, Vec: d.Vec, Attrs: d.Attrs, Terms: d.Terms}
-			}
-			bw.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: res.Docs[0].ID, Value: sealValue(qreq.Scope, vector.SerializeDocBatch(batch))})
-			// Карантин — доказываемый момент: поимённо в цепь и синхронно.
-			// Отказ записи в цепь не отменяет самого отзыва (он уже в WAL),
-			// поэтому команда не падает, но пробел в журнале называется вслух.
-			qids := make([]string, len(res.Docs))
-			for i, d := range res.Docs {
-				qids[i] = d.ID
-			}
-			if _, err := auditQuarantine(qreq.Scope, qreq.Source, qreq.Since, qids); err != nil {
-				slog.Error("audit chain: quarantine not recorded, retirement itself succeeded",
-					"scope", qreq.Scope, "source", qreq.Source, "facts", len(qids), "err", err)
-			}
-		}
-		// ⭐Ответ — квитанция, а не число отозванных, и разница ровно в том
-		// поле, которое отвечает на «а всё ли снято». Голое `:3` одинаково
-		// звучит и когда лжи больше нет, и когда двенадцать фактов того же
-		// канала остались за границей окна: полноту лечения по нему не
-		// восстановить, а окно вводит компромисс цена↔полнота, который до сих
-		// пор был МОЛЧАЛИВЫМ — считался снаружи и оператору не предъявлялся.
-		//
-		// still_trusted — единственное число, которое здесь измерено по
-		// памяти, а не выведено; остальные два раскладывают его по причинам.
-		// Ноль означает «в пределах этого предиката не осталось ничего», и
-		// граница названа соседним полем: other_origins всегда not_covered —
-		// ложь, пришедшая ДРУГИМ каналом или выведенная агентом из отозванного
-		// (её происхождение уже чистое), этим счётом не покрыта и покрыта быть
-		// не может. Обе дыры измерены (scripts/revocation_limits.py, L1/L4/L5),
-		// и умолчать о них в квитанции значило бы выдать «0» за конец истории.
-		buf.WriteArrayHeader(16)
-		buf.WriteBulkString("scope")
-		buf.WriteBulkString(qreq.Scope)
-		buf.WriteBulkString("source")
-		buf.WriteBulkString(qreq.Source)
-		buf.WriteBulkString("since")
-		if qreq.Since > 0 {
-			buf.WriteBulkString(strconv.FormatInt(qreq.Since, 10))
-		} else {
-			buf.WriteBulkString("none")
-		}
-		buf.WriteBulkString("revoked")
-		buf.WriteBulkString(strconv.Itoa(len(res.Docs)))
-		buf.WriteBulkString("still_trusted")
-		buf.WriteBulkString(strconv.Itoa(res.Remainder.StillTrusted))
-		buf.WriteBulkString("outside_window")
-		buf.WriteBulkString(strconv.Itoa(res.Remainder.OutsideWindow))
-		buf.WriteBulkString("over_limit")
-		buf.WriteBulkString(strconv.Itoa(res.Remainder.OverLimit))
-		buf.WriteBulkString("other_origins")
-		buf.WriteBulkString("not_covered")
-
-	case "VMEM.FORGET":
-		// VMEM.FORGET <scope> <id> — erasure: физически, из истории тоже
-		// (AS_OF не видит), без обхода цепочек supersedes. Чужой scope —
-		// ошибка (стирание через границу памяти запрещено); повторный FORGET
-		// того же id → :0 (идемпотентность). Стирает и якорь-текст из KV.
-		if len(args) != 2 {
-			buf.WriteError("ERR usage: VMEM.FORGET <scope> <id>")
-			return
-		}
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		scope, id := string(args[0]), string(args[1])
-		monitoring.VectorDeleteTotal.Inc()
-		deleted, err := lvs.ForgetInScope(id, scope)
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		if !deleted {
-			buf.WriteInt(0)
-			return
-		}
-		bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: id})
-		textKey := "vmem:" + id
-		bw.Write(wal.Entry{Op: wal.OpDel, Key: textKey})
-		s.Del(textKey)
-		ttl.OnDelete(textKey)
-		auditForget(scope, id)
-		buf.WriteInt(1)
-
-	case "VMEM.SHRED":
-		// VMEM.SHRED <scope> — криптостирание ВСЕГО скоупа: уничтожение ключа
-		// скоупа делает нечитаемыми все персистентные копии сразу — WAL,
-		// снапшоты, отгруженные архивы и любое восстановление из них. Это то,
-		// чего FORGET сделать не может в принципе: удалением догнать копии,
-		// уже уехавшие в архив, нельзя (docs/VMEM_DESIGN.md, «Erasure
-		// guarantee»).
-		//
-		// Ответ — КВИТАНЦИЯ, и она утверждает строго проверяемое: «ключ с
-		// идентификатором K уничтожен». Не «данные стёрты»: подписанная
-		// расписка о стирании при живых байтах была бы уже не неточностью, а
-		// документом. Проверяющий сопоставляет kek_id с отсутствием ключа в
-		// кейринге.
-		if len(args) != 1 {
-			buf.WriteError("ERR usage: VMEM.SHRED <scope>")
-			return
-		}
-		lvs, ok := vecStore.(*vector.LeveledVectorStore)
-		if !ok {
-			buf.WriteError("ERR vmem not supported by this vector store")
-			return
-		}
-		if activeKeyring == nil {
-			buf.WriteError("ERR encryption at rest is off: start with -encrypt-at-rest, otherwise there is no key to destroy")
-			return
-		}
-		scope := string(args[0])
-		if scope == "" {
-			buf.WriteError("ERR usage: VMEM.SHRED <scope>")
-			return
-		}
-		if !activeKeyring.HasScope(scope) {
-			// Ключа нет: либо уже стёрт, либо скоуп писался до кейринга. Второе
-			// НЕ стирание, и молчать об этом нельзя — иначе квитанция припишет
-			// уничтожение тому, что никогда не было под ключом.
-			buf.WriteError("ERR no key for this scope: already shredded, or its facts predate the keyring (see VMEM.COVERAGE)")
-			return
-		}
-
-		// СНАЧАЛА память, ПОТОМ ключ: при отказе между фазами должно
-		// выполняться «в памяти нет» ⊇ «на диске нет», иначе остаётся окно, в
-		// котором объявленное стёртым ещё отдаётся из RECALL.
-		ids := lvs.ShredScope(scope)
-		for _, id := range ids {
-			monitoring.VectorDeleteTotal.Inc()
-			bw.Write(wal.Entry{Op: wal.OpVSimDel, Key: id})
-			textKey := "vmem:" + id
-			bw.Write(wal.Entry{Op: wal.OpDel, Key: textKey})
-			s.Del(textKey)
-			ttl.OnDelete(textKey)
-		}
-
-		kekID, destroyed, err := activeKeyring.Destroy(scope)
-		if err != nil {
-			buf.WriteError(fmt.Sprintf("ERR key destruction failed, nothing is claimed erased: %v", err))
-			return
-		}
-		if !destroyed {
-			buf.WriteError("ERR key vanished between check and destruction; no receipt issued")
-			return
-		}
-		slog.Warn("scope crypto-shredded", "scope", scope, "kek_id", hex.EncodeToString(kekID[:]), "facts", len(ids))
-
-		// Квитанция ложится в цепь — ради этого цепь и строилась. Ключ уже
-		// уничтожен, стирание ПРОИЗОШЛО; отказ записи не отменяет его и не
-		// имеет права отменить ответ. Поэтому исход записи не схлопывается в
-		// молчание, а едет отдельным полем.
-		chainSeq, chainErr := auditShred(scope, kekID[:], len(ids))
-		if chainErr != nil {
-			slog.Error("audit chain: shred receipt not recorded, the erasure itself did happen",
-				"scope", scope, "err", chainErr)
-		}
-
-		buf.WriteArrayHeader(10)
-		buf.WriteBulkString("scope")
-		buf.WriteBulkString(scope)
-		buf.WriteBulkString("kek_id")
-		buf.WriteBulkString(hex.EncodeToString(kekID[:]))
-		buf.WriteBulkString("facts_removed_from_memory")
-		buf.WriteBulkString(strconv.Itoa(len(ids)))
-		buf.WriteBulkString("destroyed_at")
-		buf.WriteBulkString(strconv.FormatInt(time.Now().Unix(), 10))
-		buf.WriteBulkString("chain_seq")
-		buf.WriteBulkString(auditSeqField(chainSeq, chainErr))
-
 	case "VSIM.DEL":
 		if len(args) < 1 {
 			buf.WriteError("ERR usage: VSIM.DEL <key>")
@@ -2889,7 +1646,7 @@ func executeCommand(s *kv.Store, bw *wal.BatchWAL, ttl *store.TTLManager,
 	case "VSIM.SEARCHTEXT":
 		// VSIM.SEARCHTEXT <K> <query> [EQ <attr> <val>]... [RANGE <attr> <lo> <hi>]...
 		// Лексический BM25 top-K, embedder-free путь («шаг 0» без эмбеддера).
-		// EQ/RANGE (синтаксис VSIM.FILTER, шаг 3а VMEM_DESIGN) судятся ДО
+		// EQ/RANGE (синтаксис VSIM.FILTER) судятся ДО
 		// формирования top-K (пре-фильтр); статистика BM25 глобальная.
 		// Ответ зеркалит VSIM.SEARCH: пары [key, score, ...], но score — BM25
 		// (БОЛЬШЕ = лучше, не дистанция).
@@ -2933,8 +1690,8 @@ func executeCommand(s *kv.Store, bw *wal.BatchWAL, ttl *store.TTLManager,
 		// VSIM.HYBRID <K> TEXT <query> [EQ <attr> <val>]... [RANGE <attr> <lo> <hi>]... VEC <v1> ... <vN>
 		// Гибрид: top-100 лексический + top-100 векторный → Reciprocal Rank
 		// Fusion (k=60, docs/BM25_HYBRID_DESIGN.md). EQ/RANGE применяются к
-		// ОБОИМ плечам ДО RRF (filter-then-fuse, шаг 3а VMEM_DESIGN) — пост-
-		// фьюжн отсев морил бы маленький scope голодом. Ответ
+		// ОБОИМ плечам ДО RRF (filter-then-fuse) — отсев после слияния морил
+		// бы голодом маленький тенант. Ответ
 		// [key, rrf_score, ...]; RRF-скор НЕ сравним ни с BM25, ни с
 		// дистанцией — полезен только порядок.
 		if len(args) < 5 || strings.ToUpper(string(args[1])) != "TEXT" {
@@ -3446,45 +2203,6 @@ func SendVectorToNode(addr, key string, vec []float32) error {
 //     ключи с TTL становятся бессмертными (correctness + утечка памяти);
 //   - zset → OpZAdd (score+member) (S2): реплей восстанавливает и дерево, и
 //     обратный индекс member → score.
-//
-// snapshotIterateSealed — тот же обход, но VMEM-якоря уезжают в снапшот под
-// конвертом своего скоупа.
-//
-// ЗАЧЕМ ОТДЕЛЬНАЯ ОБЁРТКА. Конверт стоит на границе персистентности, и до сих
-// пор эта граница была закрыта только со стороны WAL: snapshot.wal пишется
-// обходом состояния В ПАМЯТИ, где факты по решению 1 лежат открытым текстом.
-// Снапшот, снятый ДО VMEM.SHRED, хранил якоря скоупа в открытом виде — и, что
-// хуже, уезжал шиппером в архив, куда удаление не дотягивается в принципе.
-// Уничтожение ключа такой снапшот не догоняло, то есть стирание было неполным
-// ровно в том месте, где оно и должно работать.
-//
-// ЧЕГО ЗДЕСЬ НЕТ. scope не выводится из ключа: якорь `vmem:<id>` его не несёт,
-// поэтому карта готовится ЗАРАНЕЕ (vector.FactScopes) одним проходом по
-// векторному стору. Ключ, которого в карте нет, — не VMEM-факт либо факт без
-// scope; такой пишется как есть, потому что запечатывать его нечем, и это
-// видно в VMEM.COVERAGE, а не замалчивается.
-//
-// Обратный путь уже готов: applyEntry разворачивает конверт единой точкой и
-// для snapshot.wal тоже, а уничтоженный ключ там — ШТАТНЫЙ пропуск записи.
-func snapshotIterateSealed(
-	s *kv.Store,
-	ttl *store.TTLManager,
-	zsetReg *zset.ZSetRegistry,
-	factScopes map[string]string,
-	fn func(op byte, key string, value []byte),
-) {
-	snapshotIterate(s, ttl, zsetReg, func(op byte, key string, value []byte) {
-		// Только OpSet: OpExpire везёт время смерти, OpZAdd — score+member, в
-		// них содержания факта нет.
-		if op == wal.OpSet && strings.HasPrefix(key, vmemAnchorPrefix) {
-			if scope := factScopes[strings.TrimPrefix(key, vmemAnchorPrefix)]; scope != "" {
-				value = sealValue(scope, value)
-			}
-		}
-		fn(op, key, value)
-	})
-}
-
 func snapshotIterate(
 	s *kv.Store,
 	ttl *store.TTLManager,

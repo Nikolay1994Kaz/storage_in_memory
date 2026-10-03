@@ -615,24 +615,6 @@ func (fg *FrozenGraphSQ) searchWithIdx(query []float32, K, efSearch int, dst []F
 
 // WriteGraphToSQ сериализует FrozenGraphSQ. Zero-alloc для codes (unsafe.Slice).
 func (fg *FrozenGraphSQ) WriteGraphToSQ(w io.Writer) error {
-	return fg.WriteGraphToSQMasked(w, nil)
-}
-
-// WriteGraphToSQMasked — то же, но КОДЫ позиций, помеченных в mask, пишутся
-// нулями: их настоящие значения уезжают в документную секцию под конвертом
-// своего скоупа (зеркало FrozenGraph.WriteGraphToMasked). Структура графа
-// содержания не раскрывает, а вектор — раскрывает, пусть и квантованный:
-// эмбеддинг восстанавливается в текст.
-//
-// mask == nil → путь прежний байт в байт, одним zero-alloc Write.
-//
-// ЧТО ОСТАЁТСЯ ОТКРЫТЫМ. sqMin/sqScale не маскируются, и это вынужденно:
-// калибровка посчитана по ВСЕМУ сегменту, включая запечатанные векторы, и
-// именно ею восстановленные из конверта float32 переквантуются обратно в те же
-// коды (restoreSealedVectorsSQ). Спрятав её, мы потеряли бы обратимость. След,
-// который при этом остаётся, — покомпонентные min/max по сегменту: диапазон
-// значений эмбеддингов, агрегат по тысячам векторов, без привязки к документу.
-func (fg *FrozenGraphSQ) WriteGraphToSQMasked(w io.Writer, mask []bool) error {
 	var hdr [16]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], uint32(fg.n))
 	binary.LittleEndian.PutUint32(hdr[4:8], uint32(fg.dim))
@@ -658,13 +640,9 @@ func (fg *FrozenGraphSQ) WriteGraphToSQMasked(w io.Writer, mask []bool) error {
 	}
 	// codes [n*dim] — 1 байт/элемент (int8 = byte по размеру)
 	if fg.n > 0 && fg.dim > 0 {
-		if mask == nil {
-			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.codes[0])), len(fg.codes))
-			if _, err := w.Write(b); err != nil {
-				return fmt.Errorf("frozenSQ: write codes: %w", err)
-			}
-		} else if err := writeCodesMasked(w, fg.codes, fg.dim, fg.n, mask); err != nil {
-			return err
+		b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.codes[0])), len(fg.codes))
+		if _, err := w.Write(b); err != nil {
+			return fmt.Errorf("frozenSQ: write codes: %w", err)
 		}
 	}
 
@@ -825,4 +803,18 @@ func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 	fg.keys = newInternedKeys(blob, offs)
 
 	return fg, nil
+}
+
+// dequantAt — вектор позиции i в float32. Формула та же, что в горячем пути
+// обхода (sqBruteDist): v[d] = sqMin[d] + code[d]*sqScale[d].
+func (fg *FrozenGraphSQ) dequantAt(i int) []float32 {
+	if fg.dim == 0 || i >= fg.n {
+		return nil
+	}
+	out := make([]float32, fg.dim)
+	base := i * fg.dim
+	for d := 0; d < fg.dim; d++ {
+		out[d] = fg.sqMin[d] + float32(fg.codes[base+d])*fg.sqScale[d]
+	}
+	return out
 }

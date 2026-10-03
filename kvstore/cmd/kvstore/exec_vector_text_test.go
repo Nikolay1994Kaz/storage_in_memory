@@ -147,7 +147,7 @@ func TestExec_VsimAddDocWALCarriesTerms(t *testing.T) {
 	}
 }
 
-// Шаг 3а VMEM-спринта: паритет фильтров — EQ/RANGE в SEARCHTEXT/HYBRID
+// Паритет фильтров: EQ/RANGE в SEARCHTEXT/HYBRID
 // (синтаксис VSIM.FILTER). В гибриде фильтр применяется к ОБОИМ плечам ДО
 // RRF (filter-then-fuse); без фильтра поведение команд прежнее.
 func TestExec_VsimTextFilterParity(t *testing.T) {

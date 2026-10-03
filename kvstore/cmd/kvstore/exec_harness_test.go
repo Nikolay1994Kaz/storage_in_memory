@@ -31,7 +31,7 @@ import (
 // один переиспользуемый ConnState. Всё чистится через t.Cleanup.
 type execEnv struct {
 	t    *testing.T
-	dir  string // t.TempDir окружения; WAL живёт в dir/t.wal (рестарт-тесты VMEM)
+	dir  string // t.TempDir окружения; WAL живёт в dir/t.wal (рестарт-тесты)
 	s    *kv.Store
 	bw   *wal.BatchWAL
 	ttl  *store.TTLManager

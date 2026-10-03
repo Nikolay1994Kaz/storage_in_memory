@@ -27,11 +27,9 @@ support branches.
 
 ## Scope
 
-In scope — the default build: the RESP surface (KV, `VSIM.*`, `VMEM.*`, Pub/Sub,
+In scope — the default build: the RESP surface (KV, `VSIM.*`, Pub/Sub,
 transactions), `AUTH` and TLS/mTLS handling, WAL and snapshot handling
-including replay of untrusted files, WAL-shipping, envelope encryption and
-keyring handling (`-encrypt-at-rest`), the audit chain and its Ed25519
-statements (`-audit-chain`), the `vmem-mcp` adapter, and memory-safety or
+including replay of untrusted files, WAL-shipping, and memory-safety or
 denial-of-service issues reachable from a connected client.
 
 Out of scope:
@@ -51,59 +49,18 @@ findings will only cost you time:
 
 - **`AUTH` is one shared secret, and the trust boundary is the process.** There
   is no per-principal authorization: after a successful `AUTH` the connection
-  carries a boolean, not an identity. Every authenticated connection therefore
-  has full authority over **every** scope — read it, quarantine it, and
-  `VMEM.SHRED` it, which is irreversible and reaches shipped archives. Everyone
-  who holds the password shares one trust domain; run one process per trust
-  domain. Scope isolation is a **correctness** property of retrieval (the
-  engine never returns another scope's fact *by mistake*, measured at 0
-  violations in 9 219) and **not an access-control boundary** — asking for
-  another scope by name is permitted. Reporting the absence of ACLs is not a
-  finding; reporting a place where the docs imply scopes are a security
-  boundary is.
+  carries a boolean, not an identity, and has full authority over all data.
+  Everyone who holds the password shares one trust domain; run one process per
+  trust domain. Tenant attributes (`-partition-attr`, `EQ` filters) are a
+  retrieval feature, not an access-control boundary.
 - **`MULTI`/`EXEC` is grouping, not isolation.** Commands from other
   connections can interleave between queued commands. The reasoning is in
   README ("Isolation contract") and `docs/COMMANDS.md`.
-- **Erasure beats time travel.** `VMEM.FORGET` and TTL expiry hide a fact from
-  every read mode including `ASOF`; a quarantined fact, by contrast, stays
-  visible to `ASOF` before the revocation *on purpose* — the record of what an
-  agent believed is evidence. See `docs/VMEM_DESIGN.md`.
-- **`FORGET` is revocation, not cryptographic erasure — and we say so.** The
-  fact is unreachable immediately, but its bytes can survive in sealed
-  segments until the next consolidation, in the WAL, in snapshots taken
-  earlier, and in shipped archives, which retention keeps by generation count
-  and never by content. Restoring to an LSN before the call brings the fact
-  back. This is inherent to a journalled store, the full horizon is written
-  down in `docs/VMEM_DESIGN.md` ("Erasure guarantee"), and no part of the
-  project claims GDPR Art. 17 compliance. Reporting the gap is not a finding;
-  reporting a case where the engine claims *more* than that section does is.
-- **`VMEM.SHRED` is the cryptographic path, with its own stated limits.** With
-  `-encrypt-at-rest` the VMEM payload is sealed at the persistence boundary,
-  and destroying the scope's KEK makes the journal, the snapshots and the
-  shipped archives unreadable at once. What it deliberately does *not* claim:
-  a live process holds plaintext in memory by design (a core dump of a running
-  server contains facts); facts written before the keyring existed are under no
-  key at all and cannot be shredded (`VMEM.RESEAL` moves them forward,
-  `VMEM.COVERAGE` shows the gap, and neither can reach copies that already
-  left); and a snapshot written by an **older build** can still hold the facts
-  in the clear — snapshot format v8 sealed only `frozenSegment`, so with
-  `-hnsw-use-sq` or fp32 dimensions above 256 the payload was exposed. Format
-  **v9 seals all three segment types** (`frozenSegment`, `frozenSQSegment`,
-  `hnswSegment`); re-saving a snapshot migrates an old file forward, and the
-  coverage report answers by a **whitelist** — an unknown segment type counts
-  as uncovered and drops the ratio on its own rather than inheriting trust.
-  The receipt asserts only
-  *this key id was destroyed*, never "the data is gone". All of this is in
-  `docs/VMEM_DESIGN.md`; a finding is a way to recover sealed payload without
-  the KEK, or a claim the engine makes beyond these.
-- **The audit chain is tamper-*evident*, not tamper-proof.** Whoever owns both
-  the journal and the head file can truncate the tail and recompute the head;
-  Ed25519 proves *this key signed this head*, and its value is that an auditor
-  can check without holding a secret and can detect a swapped instance against
-  a previously pinned key. Reporting "the owner could rewrite their own
-  journal" is not a finding — it is written down in `docs/COMMANDS.md`.
-- **Provenance is an input, not a verdict.** `SOURCE` records what the writer
-  claims about origin; the engine never derives trust from content.
+- **Deletion is logical first, physical later.** A deleted key is unreachable
+  immediately, but its bytes can survive in immutable segments until the next
+  merge, in the WAL, in earlier snapshots and in shipped archives. The engine
+  makes no secure-erasure claim; there is no encryption at rest — use disk
+  encryption if the data directory needs it.
 - **Snapshot/WAL files are trusted input.** They are CRC-checked and load
   all-or-nothing, but the data directory is assumed to be under the operator's
   control. Feeding a hostile data directory is out of scope.

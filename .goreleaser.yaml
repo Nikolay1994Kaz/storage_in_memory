@@ -1,8 +1,6 @@
 # Релизная сборка: goreleaser собирает бинарники на тег v* (см.
-# .github/workflows/release.yml). Сервер — только Linux (сетевой слой сидит на
-# epoll, internal/server/epoll.go, darwin/windows не собираются принципиально);
-# MCP-адаптер vmem-mcp — чистый Go без epoll, собирается под все три ОС
-# (сценарий: Claude Desktop на маке/винде + сервер в Docker).
+# .github/workflows/release.yml). Публикуется только Linux: на нём сервер
+# гоняют тесты и soak. Под macOS код собирается, но там его никто не запускал.
 # Локальная проверка без публикации: goreleaser release --snapshot --clean
 version: 2
 
@@ -24,20 +22,6 @@ builds:
     ldflags:
       # Тот же контракт версии, что в Makefile: -X main.version.
       - -s -w -X main.version={{.Version}}
-  - id: vmem-mcp
-    binary: vmem-mcp
-    main: ./kvstore/cmd/vmem-mcp
-    env:
-      - CGO_ENABLED=0
-    goos:
-      - linux
-      - darwin
-      - windows
-    goarch:
-      - amd64
-      - arm64
-    ldflags:
-      - -s -w
 
 archives:
   - id: server
@@ -53,16 +37,6 @@ archives:
       # (v0.3.0 читает до v8) — документ о совместимости нужен ровно в момент
       # распаковки, а не после того, как старая версия откажется читать данные.
       - docs/FORMAT_COMPAT.md
-  - id: vmem-mcp
-    ids: [vmem-mcp]
-    formats: [tar.gz]
-    name_template: "vmem-mcp_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    files:
-      - LICENSE
-      - docs/QUICKSTART_MCP.md
-    format_overrides:
-      - goos: windows
-        formats: [zip]
 
 checksum:
   name_template: "checksums.txt"
@@ -80,8 +54,5 @@ release:
   # footer дописывается к автоген-ченджлогу релиза.
   footer: |
     ---
-    The server binary is static (CGO_ENABLED=0), Linux only — it is built on
-    epoll. The `vmem-mcp` MCP adapter ships for Linux/macOS/Windows and
-    connects to the server over RESP (run the server in Docker on non-Linux).
-    Quick start: `./kvstore-server --port 6380`, then `redis-cli -p 6380`;
-    agent memory setup: docs/QUICKSTART_MCP.md.
+    The server binary is static (CGO_ENABLED=0) and published for Linux.
+    Quick start: `./kvstore-server --port 6380`, then `redis-cli -p 6380`.

@@ -2,15 +2,14 @@
 
 Status: **approved design, pre-implementation** (2026-07-18).
 Scope: lexical (BM25) search and BM25+vector hybrid fusion inside the existing
-LSM vector engine. This is sprint 1 of the memory-engine track; the future
-`VMEM.*` layer will call these paths internally.
+LSM vector engine.
 
 ## Motivation
 
 - Hybrid BM25+vector retrieval is table stakes for retrieval engines in 2026;
   pure-vector search misses exact names, IDs, and rare terms.
-- The agent-memory direction (VMEM) needs a lexical tier that works with **no
-  embedder configured** ("step 0" of the embedding ladder).
+- A lexical tier works with **no embedder configured**: a client that has text
+  but no embeddings still gets useful search.
 - All required machinery (per-segment columns, dict interning, tenant-sorted
   layout, idle tasks, WAL/snapshot lifecycle) already exists.
 
@@ -26,8 +25,7 @@ to the frozen row order, rebuilt on merge by decoding, immutable afterwards.
 Decisive advantage: after `sortEntriesByTenant` a tenant is a contiguous range
 `[lo, hi)` of row indices. Postings keep doc indices sorted, so scoped lexical
 search = binary search of the range bounds inside each postings list. Scoped
-RECALL (the hot path for VMEM) is nearly free; an external engine cannot use
-this layout.
+lexical search is nearly free; an external engine cannot use this layout.
 
 Estimated size: ~1k lines + tests (tokenizer ~100, segment build ~150,
 query/scoring ~200, delta path ~100, WAL/snapshot ~150, fusion+commands ~150).
@@ -48,7 +46,7 @@ segmentText {
 - The engine stores **postings only, not raw text**. Merge rebuilds postings by
   decoding `(term, tf, docLen)` from inputs — same as attribute columns; raw
   text is not needed for the lifecycle. Returning text to clients is the job of
-  the KV tier / future VMEM layer.
+  the KV tier.
   - Accepted cost: changing the tokenizer/stemmer cannot re-index existing
     data; it requires re-ingest. Documented, not worked around.
 

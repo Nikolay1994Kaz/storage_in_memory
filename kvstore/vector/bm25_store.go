@@ -102,7 +102,7 @@ func (lvs *LeveledVectorStore) SearchText(query string, K int) ([]VTextResult, e
 // 20.07: дёшево (статистика уже собрана), стабильно на крошечных scope
 // (N=5 даёт вырожденный IDF), консистентно с SearchText/golden-оракулом.
 // Цена: локально-частое слово тенанта скорится как глобально-редкое.
-// Пересмотр — по измеренному профиту (бенч шага 8 VMEM), не по «честнее».
+// Пересмотр — по измеренному профиту, не по «честнее».
 func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) ([]VTextResult, error) {
 	terms := bm25Tokenize(query)
 	if len(terms) == 0 || K <= 0 {
@@ -208,8 +208,8 @@ func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) (
 	// которые подаёт шард из-под своего RLock (см. deltaFilterFn в delta.go):
 	// ни снапшота, ни лукапов, ни замков. Стейл-копия, прошедшая суд по своим
 	// атрибутам, гасится Contains-правилом merge (свежая memtable глушит) —
-	// семантика полной замены upsert сохранена. История (E2E vmemload 23.07):
-	// (1) полный снимок AttrsSnapshot всех дельт на КАЖДЫЙ запрос — O(|delta|)
+	// семантика полной замены upsert сохранена. История (нагрузочный прогон
+	// 23.07): (1) полный снимок атрибутов всех дельт на КАЖДЫЙ запрос — O(|delta|)
 	// map-аллокация: 80µs/запрос на непустой дельте (~5.5k фактов) и конвой на
 	// runtime-локах аллокатора под конкуренцией (8 воркеров → p50 11ms, QPS
 	// 6469→620; mutex-профиль: 88% в maps.newTable); (2) freshest-лукап
@@ -250,10 +250,10 @@ func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) (
 	//     всплывает и в переходных состояниях.
 	strictShadow := lvs.cfg.StrictSegShadow
 	dedup := make(map[string]int)
-	// Ёмкость по факту, не по K: RECALL шага 5 оверфетчит K=100 при типичных
-	// единицах хитов на scope-запрос — преаллокация полного K дала бы ~4КБ
-	// мусора на каждый запрос (GC-просадка QPS, замер шага 5); рост append
-	// амортизирован для редких больших выдач.
+	// Ёмкость по факту, не по K: при оверфетче (K=100) на узкий фильтр хитов
+	// обычно единицы — преаллокация полного K дала бы ~4КБ мусора на каждый
+	// запрос (GC-просадка QPS в замере); рост append амортизирован для редких
+	// больших выдач.
 	capHint := min(K, 16)
 	combined := make([]VTextResult, 0, capHint)
 	ranks := make([]int64, 0, capHint)
@@ -322,7 +322,7 @@ func (lvs *LeveledVectorStore) SearchTextFilter(query string, K int, f Filter) (
 		// двойной индирекцией по combined[idxs[i]] стоила ~13% QPS в замере №2/3
 		// П3), затем спуск по убыванию скора гасит сегментные хиты, чей ключ
 		// живёт в более свежем сегменте. Судятся только кандидаты до наполнения
-		// top-K (обычно ровно K) — та же экономия, что пере-суд VMEM.Recall.
+		// top-K (обычно ровно K).
 		type rankedHit struct {
 			hit  VTextResult
 			rank int64

@@ -1,24 +1,14 @@
-.PHONY: build build-server build-mcp test test-race test-full bench vet clean run backup restore
+.PHONY: build build-server test test-race test-full bench vet clean run backup restore
 
 # Версия сборки: git-тег/коммит, вшивается в бинарь через -ldflags.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
 
 # ─── Build ──────────────────────────────────────────
-#
-# Собираются ОБА бинаря: движок и MCP-адаптер. Раньше цель делала только сервер,
-# и человек, шедший по README, оставался без vmem-mcp на шаге «подключи агента» —
-# путь «поставил → получил пользу» спотыкался ровно там. Сборка адаптера стоит
-# пару секунд, поэтому дешевле собрать его всегда, чем объяснять, когда он нужен.
-build: build-server build-mcp
+build: build-server
 
 build-server:
 	go build -ldflags="$(LDFLAGS)" -o kvstore-server ./kvstore/cmd/kvstore/
-
-# Версия адаптера — константа vmemmcp.Version, а не -X main.version: вешать сюда
-# LDFLAGS значило бы обещать подстановку, которой нет (goreleaser тоже её не делает).
-build-mcp:
-	go build -o vmem-mcp ./kvstore/cmd/vmem-mcp/
 
 # ─── Run ────────────────────────────────────────────
 run: build
@@ -47,7 +37,7 @@ test:
 #
 # 🚨Вторая строка не декоративна: без неё vector — главный пакет проекта — под
 # -race не гонялся вовсе, и тесты, написанные РАДИ детектора гонок
-# (TestLSH_ConcurrentSearchNoRace, TestVMEMReapWritersRace), исполнялись с
+# (TestLSH_ConcurrentSearchNoRace), исполнялись с
 # выключенным оракулом. Весь пакет под -race идёт >5.5 мин, выборка по именам —
 # 5 секунд, поэтому она и стоит в гейте.
 test-race:
@@ -109,7 +99,7 @@ restore:
 
 # ─── Clean ──────────────────────────────────────────
 clean:
-	rm -f kvstore-server vmem-mcp
+	rm -f kvstore-server
 	rm -f *.prof *.out *.svg *.test *_bin
 	rm -rf data/ data_backup/
 

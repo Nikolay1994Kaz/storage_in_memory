@@ -71,3 +71,33 @@ func TestWalApplier_HonorsSnapshotWatermark(t *testing.T) {
 		t.Error("OpVSimAddAttrs с LSN > watermark потерян")
 	}
 }
+
+// TestWalApplier_ReplaysLegacyDocBatch — журнал прежней версии с пакетной
+// записью документов (OpVSimAddDocBatch) восстанавливается целиком. Новые
+// версии таких записей не пишут, поэтому без этого стража реплей мог бы
+// сломаться незаметно — и молча потерять документы при обновлении.
+func TestWalApplier_ReplaysLegacyDocBatch(t *testing.T) {
+	e := newExecEnv(t)
+	lvs := e.vec.(*vector.LeveledVectorStore)
+	applier := &walApplier{s: e.s, ttl: e.ttl, vec: e.vec, zsetReg: e.zset}
+
+	batch := vector.SerializeDocBatch([]vector.BatchDoc{
+		{Key: "a", Vec: []float32{1, 2, 3, 4}, Attrs: vector.Attributes{Cat: map[string]string{"lang": "ru"}},
+			Terms: []vector.TermTF{{Term: "alpha", TF: 1}}},
+		{Key: "b", Vec: []float32{5, 6, 7, 8}},
+	})
+	applier.apply(wal.Entry{Op: wal.OpVSimAddDocBatch, LSN: 1, Key: "a", Value: batch}, false)
+
+	for _, key := range []string{"a", "b"} {
+		if _, ok := lvs.Get(key); !ok {
+			t.Errorf("документ %s из пакетной записи не восстановился", key)
+		}
+	}
+	res, err := lvs.SearchText("alpha", 10)
+	if err != nil {
+		t.Fatalf("SearchText: %v", err)
+	}
+	if len(res) != 1 || res[0].Key != "a" {
+		t.Errorf("текст документа из пакетной записи не восстановился: %v", res)
+	}
+}

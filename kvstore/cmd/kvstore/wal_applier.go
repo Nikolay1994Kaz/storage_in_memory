@@ -3,8 +3,8 @@ package main
 // Применение записей журнала к состоянию — БОЕВОЙ путь восстановления.
 //
 // Вынесен из main отдельным типом не ради красоты. Пока это было замыкание
-// внутри main(), проверить его можно было только ЗЕРКАЛОМ в тесте
-// (replaySealedWAL), а зеркало расходится с оригиналом молча — и расходится
+// внутри main(), проверить его можно было только ЗЕРКАЛОМ в тесте, а зеркало
+// расходится с оригиналом молча — и расходится
 // оно в коде, который работает ровно один раз: при восстановлении после
 // аварии, когда проверять уже поздно. Теперь main и тесты зовут один и тот же
 // код.
@@ -14,11 +14,9 @@ package main
 
 import (
 	"encoding/binary"
-	"errors"
 	"log/slog"
 	"time"
 
-	"kvstore/kvstore/internal/keyring"
 	"kvstore/kvstore/internal/store"
 	"kvstore/kvstore/internal/store/kv"
 	"kvstore/kvstore/internal/store/zset"
@@ -33,7 +31,6 @@ type walApplier struct {
 	ttl     *store.TTLManager
 	vec     vector.VectorIndex
 	zsetReg *zset.ZSetRegistry
-	ring    *keyring.Keyring
 
 	// graphLoaded/vecWatermark — вход shouldSkipVecReplay: покрыт ли
 	// векторный эффект записи уже загруженным бинарным снапшотом.
@@ -42,10 +39,6 @@ type walApplier struct {
 
 	restored    int
 	vecRestored int
-	// erasedByShred — записи, пропущенные потому, что ключ их скоупа
-	// уничтожен. ШТАТНЫЙ исход криптостирания, а не порча: считаем и говорим
-	// вслух, но не падаем.
-	erasedByShred int
 }
 
 // skipVec решает, пропустить ли ВЕКТОРНЫЙ эффект записи как уже вошедший в
@@ -56,24 +49,6 @@ func (a *walApplier) skipVec(entry wal.Entry, isFromSnapshot bool) bool {
 
 // apply применяет одну запись журнала или снапшота.
 func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
-	// Конверт разворачивается ЗДЕСЬ, единой точкой на границе: дальше весь
-	// движок работает с открытым текстом и о шифровании не знает. Записи,
-	// сделанные до кейринга, конвертами не являются и проходят как есть.
-	if a.ring != nil && keyring.IsEnvelope(entry.Value) {
-		plain, err := a.ring.Unseal(entry.Value)
-		switch {
-		case err == nil:
-			entry.Value = plain
-		case errors.Is(err, keyring.ErrKeyDestroyed):
-			// Ключ уничтожен — факт стёрт. Пропускаем запись целиком:
-			// именно так стирание догоняет WAL, снапшоты и архивы.
-			a.erasedByShred++
-			return
-		default:
-			slog.Warn("failed to open envelope during replay", "key", entry.Key, "err", err)
-			return
-		}
-	}
 	switch entry.Op {
 	case wal.OpSet:
 		a.s.Set(entry.Key, entry.Value)
@@ -162,8 +137,8 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 		a.vecRestored++
 		a.restored++
 	case wal.OpVSimAddDocBatch:
-		// Атомарная пара supersedes VMEM.REMEMBER (шаг 7): один CRC на всю
-		// запись — DeserializeDocBatch либо отдаёт все доки, либо ошибку;
+		// Пакет доков одной записью (журналы прежних версий): один CRC на
+		// всю запись — DeserializeDocBatch либо отдаёт все доки, либо ошибку;
 		// частичное применение невозможно по построению.
 		if a.skipVec(entry, isFromSnapshot) {
 			return
