@@ -11,8 +11,25 @@ import (
 )
 
 const (
-	readBufSize = 65536 // 64KB — вмещает ~1000 команд SET
-	maxArgs     = 2048  // поддерживает высокоразмерные векторные команды (до 2046 floats)
+	// initialReadBuf — стартовый размер буфера чтения. Молчащее соединение
+	// держит только его; при нехватке буфер удваивается (ensureSpace), и
+	// рабочее соединение за несколько чтений выходит на свой размер.
+	initialReadBuf = 4096
+
+	// shrinkReadBuf — буфер больше этого отдаётся, когда опустеет: одна
+	// огромная команда не должна держать мегабайты до закрытия соединения.
+	shrinkReadBuf = 1 << 20
+
+	// readSlack — запас буфера чтения над maxBulkSize: рамка и пайплайн вокруг
+	// bulk максимального размера.
+	readSlack = 65536
+
+	// maxArgs — предел числа аргументов команды (векторные команды до 2046
+	// чисел). Буфер аргументов растёт до него по требованию.
+	maxArgs = 2048
+
+	// initialArgs — стартовая ёмкость буфера аргументов.
+	initialArgs = 16
 
 	// maxBulkSize — верхняя граница длины одного bulk-string (как Redis
 	// proto-max-bulk-len = 512 МБ). Без неё клиент объявляет "$<огромное>",
@@ -26,11 +43,11 @@ const (
 // всегда false → парсер не делает прогресс → ReadFromConn/TryRead удваивают rbuf
 // без предела → mem-DoS. По достижении потолка без полного кадра ставим protoErr.
 //
-// Запас readBufSize над maxBulkSize нужен, чтобы легитимный кадр максимального
+// Запас readSlack над maxBulkSize нужен, чтобы легитимный кадр максимального
 // bulk ("$<512МБ>\r\n<512МБ>\r\n" + рамка/пайплайн) поместился целиком.
 //
 // var (не const) — тесты понижают потолок, чтобы не аллоцировать 512 МБ.
-var maxRbufSize = maxBulkSize + readBufSize
+var maxRbufSize = maxBulkSize + readSlack
 
 // ConnBuf — per-connection zero-alloc буфер чтения/записи.
 //
@@ -69,15 +86,19 @@ type ConnBuf struct {
 	WriteTimeout time.Duration
 
 	// ─── Parser reuse ───
-	args [maxArgs][]byte
+	// args — буфер аргументов разобранной команды (слайсы внутрь rbuf).
+	// Растёт по требованию до maxArgs: молчащее соединение не платит за
+	// maxArgs слотов (48 КБ), как платило со встроенным массивом.
+	args [][]byte
 }
 
 // NewConnBuf создаёт буфер для соединения.
 func NewConnBuf(conn net.Conn) *ConnBuf {
 	cb := &ConnBuf{
 		conn: conn,
-		rbuf: make([]byte, readBufSize),
+		rbuf: make([]byte, initialReadBuf),
 		wbuf: make([]byte, 0, 4096),
+		args: make([][]byte, 0, initialArgs),
 	}
 
 	// Извлекаем RawConn для non-blocking read (TryRead).
@@ -177,6 +198,9 @@ func (cb *ConnBuf) compact() {
 	if cb.rpos == cb.rend {
 		cb.rpos = 0
 		cb.rend = 0
+		if len(cb.rbuf) > shrinkReadBuf {
+			cb.rbuf = make([]byte, initialReadBuf)
+		}
 		return
 	}
 	n := copy(cb.rbuf[:], cb.rbuf[cb.rpos:cb.rend])
@@ -236,9 +260,9 @@ func (cb *ConnBuf) parseArray() [][]byte {
 		return nil
 	}
 	if count > maxArgs {
-		// Объявлено больше аргументов, чем влезает в стековый args[maxArgs].
-		// Кадр невалиден и его нельзя «дождать» — иначе он застрянет в буфере
-		// (wedge + рост памяти). Сигналим handleConn закрыть соединение.
+		// Объявлено больше аргументов, чем допускает maxArgs. Кадр невалиден и
+		// его нельзя «дождать» — иначе он застрянет в буфере (wedge + рост
+		// памяти). Сигналим handleConn закрыть соединение.
 		cb.protoErr = true
 		return nil
 	}
@@ -247,6 +271,7 @@ func (cb *ConnBuf) parseArray() [][]byte {
 		return nil
 	}
 
+	args := cb.argsBuf(count)[:count]
 	for i := 0; i < count; i++ {
 		if cb.rpos >= cb.rend {
 			return nil
@@ -258,18 +283,26 @@ func (cb *ConnBuf) parseArray() [][]byte {
 			if arg == nil {
 				return nil
 			}
-			cb.args[i] = arg
+			args[i] = arg
 		default:
 			line, ok := cb.peekLine()
 			if !ok {
 				return nil
 			}
 			cb.rpos += len(line) + 2
-			cb.args[i] = line[1:]
+			args[i] = line[1:]
 		}
 	}
 
-	return cb.args[:count]
+	return args
+}
+
+// argsBuf возвращает буфер аргументов ёмкостью не меньше n (длина 0, не nil).
+func (cb *ConnBuf) argsBuf(n int) [][]byte {
+	if cap(cb.args) < n || cb.args == nil {
+		cb.args = make([][]byte, 0, max(n, initialArgs))
+	}
+	return cb.args[:0]
 }
 
 // parseBulkString разбирает: $5\r\nhello\r\n → []byte("hello")
@@ -327,26 +360,23 @@ func (cb *ConnBuf) parseInline() [][]byte {
 	}
 	cb.rpos += len(line) + 2
 
-	argc := 0
+	args := cb.argsBuf(initialArgs)
 	start := 0
 	for i := 0; i <= len(line); i++ {
 		if i == len(line) || line[i] == ' ' {
-			if i > start && argc < maxArgs {
-				cb.args[argc] = line[start:i]
-				argc++
+			if i > start && len(args) < maxArgs {
+				args = append(args, line[start:i])
 			}
 			start = i + 1
 		}
 	}
+	cb.args = args[:0] // сохранить выросший буфер для следующих команд
 
-	if argc == 0 {
-		// Пустая inline-строка (напр. одинокий "\r\n"): строка ПРОЧИТАНА целиком,
-		// rpos уже сдвинут. Возвращаем непустой пустой срез — обработчик ответит
-		// "ERR empty command". Вернуть nil нельзя: ParseCommand сбросил бы rpos на
-		// savedPos, и та же строка перечитывалась бы вечно (wedge). (M3)
-		return cb.args[:0]
-	}
-	return cb.args[:argc]
+	// Пустая inline-строка (напр. одинокий "\r\n"): строка ПРОЧИТАНА целиком,
+	// rpos уже сдвинут. Возвращаем НЕ nil пустой срез — обработчик ответит
+	// "ERR empty command". Вернуть nil нельзя: ParseCommand сбросил бы rpos на
+	// savedPos, и та же строка перечитывалась бы вечно (wedge). (M3)
+	return args
 }
 
 // peekLine ищет \r\n начиная с rpos.

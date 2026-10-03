@@ -16,7 +16,7 @@ import (
 //
 // КАК ЭТО РАБОТАЕТ:
 //
-//	rbuf — буфер чтения (64KB в проде, в тестах — размер input)
+//	rbuf — буфер чтения (в проде растёт от initialReadBuf, в тестах — не меньше input)
 //	rpos — текущая позиция чтения (всегда 0 для свежего ввода)
 //	rend — конец данных (= len(input))
 //
@@ -24,7 +24,7 @@ import (
 // Это и позволяет тестировать его изолированно.
 func newTestParser(input []byte) *ConnBuf {
 	cb := &ConnBuf{
-		rbuf: make([]byte, readBufSize),
+		rbuf: make([]byte, max(initialReadBuf, len(input))),
 		wbuf: make([]byte, 0, 4096),
 	}
 	copy(cb.rbuf, input)
@@ -518,8 +518,8 @@ func TestFlush_Empty(t *testing.T) {
 
 // TestParse_MaxArgsOverflow — команда с > 16 аргументами.
 //
-// maxArgs = 16. Если клиент пришлёт *17, парсер вернёт nil.
-// Это защита: массив args[maxArgs] на СТЕКЕ, переполнение = паника.
+// maxArgs = 2048. Если клиент пришлёт *2049, парсер вернёт nil и выставит
+// protoErr: кадр нельзя «дождать», соединение закрывается.
 func TestParse_MaxArgsOverflow(t *testing.T) {
 	input := []byte("*2049\r\n")
 	// Добавляем 2049 аргументов
