@@ -334,10 +334,30 @@ clients 1.01 → 0.73 ms, PING 0.69 → 0.38 ms), higher for pipelined GET
 
 **Network layer alone** (same store on both sides, epoll at `253f354` vs
 goroutine-per-connection): differences −9…+25% in both directions with
-overlapping ranges — parity. Threads at 500 clients 27–29 → 22–23. The price
-of a goroutine per connection is its stack: with **10 000 idle connections**
-RSS is 148 MB with epoll and 311 MB without it (stacks are 16 KB right after
-the first command and shrink to ~4 KB at the next GC: 157 → 40 MB in use).
+overlapping ranges — parity. Threads at 500 clients 27–29 → 22–23.
+
+The first measurement put a price on a goroutine per connection: with
+**10 000 idle connections** RSS was 147 MB with epoll and 311 MB without it.
+The price turned out to be the dispatcher, not the goroutine. All commands
+lived in one function with one `switch`, its stack frame was 9 256 bytes, and
+every command — even `PING` — grew the connection's stack to 16 KB. Removing
+the agent-memory commands shrank the frame to 3 968 bytes; splitting the
+dispatcher into one method per command brought it to 176 bytes plus at most
+488 for a handler; allocating connection buffers on demand cut the heap of an
+idle connection from 127 KB to 9 KB. The result is **below the epoll build,
+with 17 threads instead of 29** (`scripts/ab_server.sh idle10k`, same machine,
+two runs identical to the megabyte):
+
+| Build | RSS, 10k idle connections | Threads |
+|---|---|---|
+| `253f354` — own epoll layer | 147 MB | 29 |
+| `debb774` — goroutine per connection | 311 MB | 17 |
+| `205a95b` — agent-memory commands removed (frame 3 968 B) | 232 MB | 17 |
+| `c44e1d8` — dispatcher split into methods (frame 176 B) | 172 MB | 17 |
+| `d6b6c92` — connection buffers on demand | 134 MB | 17 |
+
+The frame sizes are the `locals=` of the function headers in
+`go build -gcflags=-S` output.
 
 **Vector engine.** The HNSW neighbor lists moved into an arena owned by each
 graph. Graph build time is unchanged (2000 vectors, dim 128 and 768:
@@ -367,6 +387,20 @@ scripts/ab_server.sh idle10k /tmp/kv-epoll.bin  /tmp/kv-after.bin   # epoll side
 go test ./kvstore/internal/store/kv -run '^$' -bench . -benchmem
 go test ./kvstore/vector -run TestMergeReleasesGraphMemory -v
 ```
+
+---
+
+## 8. Startup and memory after the cleanup
+
+Measured on the branch that removed the agent-memory layer; each line is an
+A/B on the same machine, numbers from the commit messages.
+
+| What | Before | After | Why |
+|---|---|---|---|
+| Loading an 18.3 MB `graph_leveled.bin` (50k documents × 30 terms) | 2.2–2.8 s | **0.11–0.15 s** | the loader read 2–4-byte fields from an unbuffered file — one syscall per field; the source is now buffered inside `LoadBinary` |
+| Text layer of a segment, 50k documents × 40 terms | 38.1 MB | **24.8 MB** | a document→terms forward index was built and rebuilt on load for the agent-memory layer only; nothing else read it |
+| Heap of an idle connection | 127 KB | **9 KB** | read buffer and argument slots allocated on demand |
+| 10 000 idle connections, RSS | 311 MB | **134 MB** | see the table in section 7 |
 
 ---
 

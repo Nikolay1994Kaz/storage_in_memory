@@ -61,6 +61,8 @@ Methodology, caveats and reproduction commands are in
 | Tenant-routed filtered search | **5.8×–28 620×** faster than post-filtering, recall 1.0 |
 | Search while 12 clients bulk-load dbpedia | **750–800 QPS** floor, 3 544 QPS at 0.99 after the load |
 | KV `GET`, store level | 49 ns, zero allocations |
+| 10 000 idle connections | 134 MB RSS, 17 threads |
+| Loading an 18 MB vector snapshot (50k documents with text) | 0.11–0.15 s |
 
 ## Measured decisions
 
@@ -73,6 +75,13 @@ The parts of the design that were settled by measurement rather than by taste:
   layer gave nothing back. Both were removed: with ~950k live keys p99 `GET`
   went from 1.04 to 0.59 ms, p99 `SET` from 1.33 to 0.76 ms, RSS from ~500 to
   ~368 MB ([BENCHMARKS §7](docs/BENCHMARKS.md#7-removing-the-custom-allocator-and-the-epoll-layer)).
+- **Stack frames count at 10 000 connections.** A goroutine per connection
+  first cost 311 MB with 10 000 idle clients against 147 MB for the epoll
+  layer. The cause was the dispatcher: one function for all commands with a
+  9 KB stack frame, which every command — even `PING` — pushed onto the
+  connection's stack. One method per command (176-byte frame) and buffers
+  allocated on demand brought it to 134 MB, below the epoll build
+  ([BENCHMARKS §7](docs/BENCHMARKS.md#7-removing-the-custom-allocator-and-the-epoll-layer)).
 - **Flush without rebuild.** Freezing a delta shard into a segment instead of
   rebuilding a graph, plus merging whole level prefixes at once, took the search
   floor during bulk loads from ~34 QPS to 750–800 QPS.
@@ -246,6 +255,9 @@ Snapshot compatibility is pinned by fixtures written by earlier releases
 produced ([docs/FORMAT_COMPAT.md](docs/FORMAT_COMPAT.md)).
 
 ## Project structure
+
+How the parts fit together, how a command and a recovery run through the code,
+and which tests pin which invariants: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```
 kvstore/
