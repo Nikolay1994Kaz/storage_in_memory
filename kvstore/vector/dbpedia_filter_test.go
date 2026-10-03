@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -107,8 +105,7 @@ func TestDBpedia_FilterTenant(t *testing.T) {
 
 	run := func(name string, useSQ bool) {
 		cfg := LeveledConfig{
-			Metric:         MetricCosine, // явная метрика (нормализ. → dot-ADC), не вывод по указателю
-			Allocator:      tcmalloc.NewTCMallocStore(8),
+			Metric:         MetricCosine,   // явная метрика (нормализ. → dot-ADC), не вывод по указателю
 			DeltaMax:       len(train) + 1, // один консолидированный сегмент
 			Fanout:         4,
 			EfConstruction: arEfConstruction,

@@ -5,8 +5,6 @@ import (
 	"sort"
 	"strconv"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestSQ8_CosineDotModeRecall — регрессия на dot-ADC режим SQ8 (cosine/dot метрика).
@@ -78,12 +76,11 @@ func TestSQ8_CosineDotModeRecall(t *testing.T) {
 	}
 
 	cfg := LeveledConfig{
-		Distance:  DotProductDistance,
-		Allocator: tcmalloc.NewTCMallocStore(4),
-		DeltaMax:  N + 1, // один SQ-сегмент
-		Fanout:    4,
-		EfSearch:  128,
-		UseSQ:     true,
+		Distance: DotProductDistance,
+		DeltaMax: N + 1, // один SQ-сегмент
+		Fanout:   4,
+		EfSearch: 128,
+		UseSQ:    true,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	for i, v := range train {

@@ -16,7 +16,6 @@ import (
 	"unsafe"
 
 	"kvstore/kvstore/internal/monitoring"
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -599,9 +598,6 @@ type LeveledConfig struct {
 	// чтобы не полагаться на хрупкий вывод по указателю. См. distance.go.
 	Metric Metric
 
-	// Allocator — менеджер памяти для HNSW.
-	Allocator *tcmalloc.TCMallocStore
-
 	// UseSQ — включить Scalar Quantization (int8) для frozen-сегментов (любая dim).
 	// Сжимает рабочий набор векторов 4× (float32→uint8), поднимает QPS за счёт
 	// cache-locality. Recall держится ≥96% (vs 97% float32) благодаря ADC+rerank.
@@ -771,30 +767,13 @@ type LeveledVectorStore struct {
 	// cond безусловно при снятии дельты с flushing (см. FlushDeltaSync).
 	flushCond *sync.Cond
 
-	// buildWorkerIDCounter — раздаёт уникальные workerID для параллельных buildSegment.
-	// TCMallocStore.Alloc(workerID, ...) шардирует по workerID; конкурентный доступ
-	// к одному caches[workerID] — data race. Каждый buildWorker берёт свой ID при старте.
-	buildWorkerIDCounter atomic.Int32
-
-	// buildAllocators — pool per-worker аллокаторов. TCMallocStore НЕ потокобезопасен
-	// для конкурентных Alloc через общий MCentral/MHeap, поэтому каждый buildWorker
-	// использует свой изолированный аллокатор. Создаются один раз при старте.
-	buildAllocators []*tcmalloc.TCMallocStore
-
-	// mergeAllocator — изолированный аллокатор для merge goroutines.
-	// Может быть несколько параллельных merge (разные уровни) → нужен pool.
-	// mergeAllocatorsCounter раздаёт round-robin.
-	mergeAllocators        []*tcmalloc.TCMallocStore
-	mergeAllocatorsCounter atomic.Int32
-
 	// inFlightBuilds — счётчик delta-flush задач в работе.
 	// Increment перед запуском горутины, decrement в applyResult после publish/drop.
 	inFlightBuilds atomic.Int32
 
 	// buildSem — семафор: не более numBuilders builds одновременно.
 	// Горутины ждут на семафоре; coordinator никогда не блокируется.
-	// Это обеспечивает изоляцию allocator (только numBuilders concurrent builds)
-	// и предотвращает TCMallocStore race без ограничения количества горутин.
+	// Ограничивает CPU и пиковую память одновременных сборок графов.
 	buildSem chan struct{}
 
 	// ─── Event Loop Coordinator ───
@@ -824,7 +803,7 @@ type LeveledVectorStore struct {
 	consolidateInFlight bool
 
 	// deltaFlushInFlight — true пока delta-flush goroutine не вернула результат.
-	// Только один delta-flush одновременно (один buildAllocators[0] → нет TCMalloc race).
+	// Только один delta-flush одновременно.
 	deltaFlushInFlight bool
 
 	// snapshotTime — UnixNano момента последнего успешного LoadBinary (для диагностики).
@@ -874,9 +853,6 @@ func NewLeveledVectorStore(cfg LeveledConfig) *LeveledVectorStore {
 	} else {
 		cfg.Distance = cfg.Metric.DistanceFunc()
 	}
-	if cfg.Allocator == nil {
-		cfg.Allocator = tcmalloc.NewTCMallocStore(1)
-	}
 
 	// NumBuilders: auto = NumCPU/2, clamped [2, 8].
 	numBuilders := cfg.NumBuilders
@@ -903,19 +879,6 @@ func NewLeveledVectorStore(cfg LeveledConfig) *LeveledVectorStore {
 	// Точка отсчёта затишья — старт стора: после рестарта/LoadBinary консолидация
 	// не стартует раньше полного окна IdleConsolidateAfter.
 	lvs.lastMutation.Store(time.Now().UnixNano())
-
-	// Per-worker изолированные аллокаторы для параллельных buildSegment.
-	// TCMallocStore НЕ потокобезопасен через общий MCentral/MHeap — каждый
-	// buildWorker получает свой аллокатор (свой MHeap/MCentral/MCache).
-	lvs.buildAllocators = make([]*tcmalloc.TCMallocStore, numBuilders)
-	for i := range lvs.buildAllocators {
-		lvs.buildAllocators[i] = tcmalloc.NewTCMallocStore(1)
-	}
-	// Изолированный аллокатор для coordinator-driven merge (не пересекается с build workers).
-	lvs.mergeAllocators = make([]*tcmalloc.TCMallocStore, maxLevels)
-	for i := range lvs.mergeAllocators {
-		lvs.mergeAllocators[i] = tcmalloc.NewTCMallocStore(1)
-	}
 
 	// Coordinator: 1 горутина, GRAB-only, кладёт tasks в buildQueue.
 	lvs.coordWG.Add(1)
@@ -2187,14 +2150,6 @@ func (lvs *LeveledVectorStore) Close() {
 		lvs.mu.Lock()
 		lvs.flushCond.Broadcast()
 		lvs.mu.Unlock()
-
-		// Останавливаем фоновые горутины runDeferredFree в per-worker аллокаторах.
-		for _, a := range lvs.buildAllocators {
-			a.Close()
-		}
-		for _, a := range lvs.mergeAllocators {
-			a.Close()
-		}
 	})
 }
 
@@ -2564,8 +2519,8 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 
 	// stagedSeg — сегмент, прочитанный, но ещё не закоммиченный в lvs.levels.
 	// frozen/frozenSQ читаются сразу (обычная Go-память — при abort подберёт GC);
-	// hnsw откладывается сырыми entries: buildSegment аллоцирует из tcmalloc-арен,
-	// строим его только после успешного CRC (заодно не жжём CPU на битом файле).
+	// hnsw откладывается сырыми entries: сборка графа дорогая, строим его только
+	// после успешного CRC (заодно не жжём CPU на битом файле).
 	type stagedSeg struct {
 		seg     segment
 		entries []DeltaEntry
@@ -2788,7 +2743,7 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		for _, ss := range staged[lyr] {
 			seg := ss.seg
 			if seg == nil {
-				seg = lvs.buildSegment(ss.entries, dim, 0)
+				seg = lvs.buildSegment(ss.entries, dim)
 			}
 			if seg != nil {
 				lvs.levels[lyr] = append(lvs.levels[lyr], seg)
@@ -2987,9 +2942,9 @@ func (lvs *LeveledVectorStore) handleIdleTick() {
 	}
 	lvs.mu.Unlock()
 
-	// Merge-горутина — зеркало maybeScheduleMerges. mergeAllocators[0] свободен:
-	// консолидация стартует только при полном отсутствии merge в полёте, а новые
-	// merge блокируются consolidateInFlight.
+	// Merge-горутина — зеркало maybeScheduleMerges. Консолидация стартует только
+	// при полном отсутствии merge в полёте, а новые merge блокируются
+	// consolidateInFlight.
 	go func(segs []segment, tgtLvl int, e uint64) {
 		mergeStart := time.Now()
 		var seg segment
@@ -3001,7 +2956,7 @@ func (lvs *LeveledVectorStore) handleIdleTick() {
 					applied = nil
 				}
 			}()
-			seg, applied = lvs.mergeSegmentsWithAllocator(segs, lvs.mergeAllocators[0])
+			seg, applied = lvs.mergeSegments(segs)
 		}()
 		monitoring.VectorMergeDuration.Update(time.Since(mergeStart).Seconds())
 		res := compactionResult{
@@ -3093,7 +3048,7 @@ func (lvs *LeveledVectorStore) handleCompactSignal() {
 			// RepairReachability тут НЕ зовём: verify стоит ~полсборки (см.
 			// graph.go), а достижимость мини = достижимость тех же графов, по
 			// которым поиск ходил в дельте только что; первый же merge пере-
-			// строит с шафлом+repair (buildSegmentWithAllocator).
+			// строит с шафлом+repair (buildSegment).
 			lvs.startFreezeShardsGoroutine(oldDelta, epoch)
 		default:
 			// Freeze неприменим (attrs/tenant: нужна пересортировка entries;
@@ -3155,9 +3110,8 @@ func (lvs *LeveledVectorStore) removeFlushingLocked(d *DeltaSegment) {
 //
 // Архитектура:
 //   - buildSem семафор ограничивает CPU-нагрузку: ≤ numBuilders горутин одновременно.
-//   - Каждая горутина создаёт СВОЙ свежий TCMallocStore → нет TCMalloc race (корень бага).
-//   - FrozenGraph копирует всё в Go memory → alloc можно закрыть после build.
-//   - defer alloc.Close() останавливает внутреннюю goroutine runDeferredFree (нет утечек).
+//   - Граф сборки — свой у каждой горутины (связи в его собственной арене):
+//     общего изменяемого состояния у параллельных сборок нет.
 func (lvs *LeveledVectorStore) startBuildGoroutine(task *compactionTask) {
 	// Синхронный инкремент ДО запуска горутины — критично для FlushDeltaSync.
 	lvs.inFlightBuilds.Add(1)
@@ -3182,11 +3136,6 @@ func (lvs *LeveledVectorStore) startBuildGoroutine(task *compactionTask) {
 			return
 		}
 
-		// Свежий аллокатор на каждый build: нет shared state, нет TCMalloc race.
-		// FrozenGraph не держит ссылку на аллокатор → можно закрыть после build.
-		alloc := tcmalloc.NewTCMallocStore(1)
-		defer alloc.Close() // остановить runDeferredFree goroutine
-
 		var seg segment
 		func() {
 			defer func() {
@@ -3194,7 +3143,7 @@ func (lvs *LeveledVectorStore) startBuildGoroutine(task *compactionTask) {
 					seg = nil // паника → rollback
 				}
 			}()
-			seg = lvs.buildSegmentWithAllocator(task.entries, task.dim, alloc)
+			seg = lvs.buildSegment(task.entries, task.dim)
 		}()
 
 		// flushDelta передаётся в результат — applyResult удалит её из flushing и
@@ -3404,7 +3353,7 @@ func (lvs *LeveledVectorStore) maybeScheduleMergesLocked(epoch uint64) {
 		// Batch-merge: берём ВЕСЬ накопившийся префикс уровня до капа, а не ровно
 		// fanout (см. LeveledConfig.MergeBatchMax — почему каскад по fanout штук
 		// проигрывает freeze-per-shard гонку). Префикс = oldest→newest порядок,
-		// обязательный для дедупа upsert в mergeSegmentsWithAllocator. Сегменты НЕ
+		// обязательный для дедупа upsert в mergeSegments. Сегменты НЕ
 		// удаляются из levels (copy slice header) — старые видимы для search до
 		// applyResult.
 		batch := len(lvs.levels[lyr])
@@ -3430,7 +3379,7 @@ func (lvs *LeveledVectorStore) maybeScheduleMergesLocked(epoch uint64) {
 						applied = nil
 					}
 				}()
-				seg, applied = lvs.mergeSegmentsWithAllocator(segs, lvs.pickMergeAllocator(srcLvl))
+				seg, applied = lvs.mergeSegments(segs)
 			}()
 			monitoring.VectorMergeDuration.Update(time.Since(mergeStart).Seconds())
 			res := compactionResult{
@@ -3581,21 +3530,9 @@ func (lvs *LeveledVectorStore) removeSegments(lyr int, toRemove []segment) {
 	lvs.levels[lyr] = kept
 }
 
-// pickMergeAllocator возвращает изолированный аллокатор для merge уровня sourceLvl.
-// Каждый уровень имеет свой allocator → параллельные merge разных уровней
-// не конкурируют. mergeAllocators имеет maxLevels элементов.
-func (lvs *LeveledVectorStore) pickMergeAllocator(sourceLvl int) *tcmalloc.TCMallocStore {
-	if sourceLvl >= 0 && sourceLvl < len(lvs.mergeAllocators) {
-		return lvs.mergeAllocators[sourceLvl]
-	}
-	return lvs.mergeAllocators[0]
-}
-
 // buildWorker — пуловый воркер delta-flush задач. Получает задачу из buildQueue,
 // строит сегмент, применяет результат напрямую в levels[0].
-// Каждый buildWorker имеет свой дедикированный allocator — без TCMalloc race.
 func (lvs *LeveledVectorStore) buildWorker() {
-	workerID := int(lvs.buildWorkerIDCounter.Add(1)-1) % len(lvs.buildAllocators)
 	for {
 		select {
 		case <-lvs.done:
@@ -3612,7 +3549,7 @@ func (lvs *LeveledVectorStore) buildWorker() {
 						seg = nil
 					}
 				}()
-				seg = lvs.buildSegment(task.entries, lvs.dim, workerID)
+				seg = lvs.buildSegment(task.entries, lvs.dim)
 			}()
 
 			// Применяем результат под write-lock и декрементируем счётчик DOPO применения.
@@ -3699,8 +3636,16 @@ func (lvs *LeveledVectorStore) FlushDeltaSync() {
 			}
 		}
 		if targetDone && pendingDone {
-			// Всё pre-call — в сегментах. Толкнём каскад merge (L0→L1→L2).
-			lvs.triggerCompact()
+			// Всё pre-call — в сегментах. Толкнём каскад merge (L0→L1→L2)
+			// напрямую, как applyResult, а НЕ через triggerCompact: сигнал
+			// заставил бы координатор сначала забрать текущую дельту, а в ней
+			// уже могут быть записи, сделанные ПОСЛЕ этого FlushDeltaSync, —
+			// они уехали бы лишним мини-сегментом (тот же шторм, что описан у
+			// maybeScheduleMergesLocked). Наблюдалось: upsert сразу после
+			// FlushDeltaSync попадал во второй сегмент, и старая копия факта
+			// всплывала в текстовом поиске, где сегмент-vs-сегмент гасится лишь
+			// дедупом хитов (TestVMEMReapOracleParity/upsert_same_id/mixed).
+			lvs.maybeScheduleMergesLocked(lvs.compactionEpoch.Load())
 			return
 		}
 
@@ -3724,9 +3669,9 @@ func (lvs *LeveledVectorStore) anyMergeInFlight() bool {
 // (Build Pool). Coordinator забирает delta и создаёт task{taskFlushDelta}, buildWorker
 // строит сегмент через buildSegment.
 
-// mergeSegmentsWithAllocator — merge с явным аллокатором (для coordinator-driven merge,
-// использует lvs.mergeAllocator, изолированный от build workers).
-func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, allocator *tcmalloc.TCMallocStore) (segment, map[string]struct{}) {
+// mergeSegments сливает сегменты в один: снимает их записи (без tombstoned,
+// с дедупликацией upsert) и строит новый сегмент через buildSegment.
+func (lvs *LeveledVectorStore) mergeSegments(segs []segment) (segment, map[string]struct{}) {
 	lvs.mu.RLock()
 	dim := lvs.dim
 	// Snapshot tombstones под RLock — tombstones актуальны на момент начала merge.
@@ -3860,7 +3805,7 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 		return nil, nil
 	}
 
-	newSeg := lvs.buildSegmentWithAllocator(entries, dim, allocator)
+	newSeg := lvs.buildSegment(entries, dim)
 
 	// Очистку применённых tombstones делает applyResult ПОСЛЕ атомарной публикации
 	// сегмента (свап под mu.Lock) и только для ключей, отсутствующих в остальных
@@ -3871,25 +3816,8 @@ func (lvs *LeveledVectorStore) mergeSegmentsWithAllocator(segs []segment, alloca
 
 // buildSegment строит сегмент из набора (key, vec) записей.
 // Dim-adaptive: dim ≤ csrDimThreshold → FrozenGraph, иначе → hnswSegment.
-func (lvs *LeveledVectorStore) buildSegment(entries []DeltaEntry, dim, workerID int) segment {
-	n := len(entries)
-	if n == 0 {
-		return nil
-	}
-	// Выбираем per-worker изолированный аллокатор.
-	allocator := lvs.cfg.Allocator
-	if workerID >= 0 && workerID < len(lvs.buildAllocators) {
-		allocator = lvs.buildAllocators[workerID]
-	}
-	if allocator == nil {
-		allocator = tcmalloc.NewTCMallocStore(1)
-	}
-	return lvs.buildSegmentWithAllocator(entries, dim, allocator)
-}
-
-// buildSegmentWithAllocator — ядро построения сегмента с явным аллокатором.
-// Используется build workers (per-worker allocators) и coordinator-merge (mergeAllocator).
-func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, dim int, allocator *tcmalloc.TCMallocStore) segment {
+// Используется сборкой при flush дельты, слиянием и загрузкой hnsw-сегментов.
+func (lvs *LeveledVectorStore) buildSegment(entries []DeltaEntry, dim int) segment {
 	n := len(entries)
 	if n == 0 {
 		return nil
@@ -3944,12 +3872,11 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 	// Текстовый BM25-слой — тем же правилом, что attrs: всегда, когда в entries
 	// есть термы (nil иначе — zero overhead). entries уже в финальном порядке →
 	// постинги лягут по frozen id. Merge-путь кладёт Terms декодом постингов
-	// входных сегментов (mergeSegmentsWithAllocator → decodeTerms).
+	// входных сегментов (mergeSegments → decodeTerms).
 	text := buildSegmentText(entries)
 
 	// Строим HNSW из всех векторов.
-	g := NewGraph(lvs.cfg.Distance, allocator)
-	g.workerID = 0 // изолированный allocator: всегда shard 0
+	g := NewGraph(lvs.cfg.Distance)
 	g.EfConstruction = lvs.cfg.EfConstruction
 
 	// Применяем параметр M если задан
@@ -3961,6 +3888,8 @@ func (lvs *LeveledVectorStore) buildSegmentWithAllocator(entries []DeltaEntry, d
 		g.pruneBufIDs = make([]uint64, 0, g.M0+1)
 		g.insertBuf = make([]uint64, 0, g.M0+1)
 	}
+	// n известно заранее: арена связей растёт один раз, без копирований.
+	g.reserveNodes(n)
 
 	// Порядок ВСТАВКИ в граф перемешиваем (детерминированно по n): entries к этому
 	// моменту блочно отсортированы (тенант-сорт выше; у клиента — батчи похожих
@@ -4038,7 +3967,7 @@ type LeveledStats struct {
 	MaxLevel        int   // максимальный заполненный уровень LSM (0-based)
 	SegmentsByLevel []int // [maxLevels] — число сегментов на каждом уровне
 	Tombstones      int   // активных tombstones (не применённых merge'ем)
-	AllocatorBytes  int64 // память под neighbors-блоки (tcmalloc)
+	AllocatorBytes  int64 // связи HNSW изменяемых графов (дельта, hnsw-сегменты); у frozen они в DataBytes
 	DataBytes       int64 // память под векторы (frozen.data + hnsw arena)
 }
 
@@ -4052,7 +3981,7 @@ func (lvs *LeveledVectorStore) Stats() LeveledStats {
 	segsByLevel := make([]int, maxLevels)
 	totalVectors := 0
 	maxLevel := 0
-	var dataBytes int64
+	var dataBytes, neighborBytes int64
 	for i, level := range lvs.levels {
 		segsByLevel[i] = len(level)
 		if len(level) > 0 && i > maxLevel {
@@ -4061,6 +3990,11 @@ func (lvs *LeveledVectorStore) Stats() LeveledStats {
 		for _, seg := range level {
 			totalVectors += seg.Len()
 			dataBytes += segMemoryBytes(seg)
+			if hs, ok := seg.(*hnswSegment); ok {
+				hs.mu.RLock()
+				neighborBytes += hs.g.NeighborBytes()
+				hs.mu.RUnlock()
+			}
 		}
 	}
 
@@ -4070,6 +4004,7 @@ func (lvs *LeveledVectorStore) Stats() LeveledStats {
 		deltaLen = lvs.delta.Len()
 		deltaMax = lvs.delta.MaxSize()
 		totalVectors += deltaLen
+		neighborBytes += lvs.delta.NeighborBytes()
 	}
 
 	tombstones := 0
@@ -4085,6 +4020,7 @@ func (lvs *LeveledVectorStore) Stats() LeveledStats {
 		MaxLevel:        maxLevel,
 		SegmentsByLevel: segsByLevel,
 		Tombstones:      tombstones,
+		AllocatorBytes:  neighborBytes,
 		DataBytes:       dataBytes,
 	}
 }
@@ -4102,7 +4038,7 @@ func segMemoryBytes(seg segment) int64 {
 	case *hnswSegment:
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		// arena.data (float32) + tcmalloc neighbors (через allocator, не здесь)
+		// arena.data (float32); связи графа считаются в AllocatorBytes
 		return int64(len(s.g.arena.data)) * 4
 	}
 	return 0

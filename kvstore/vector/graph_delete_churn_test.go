@@ -3,8 +3,6 @@ package vector
 import (
 	"math/rand"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // BenchmarkGraphDeleteUpsertChurn воспроизводит паттерн дельта-шарда под
@@ -19,7 +17,7 @@ func BenchmarkGraphDeleteUpsertChurn(b *testing.B) {
 		dim = 128
 	)
 	rng := rand.New(rand.NewSource(42))
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 	vecs := make([][]float32, n)
 	ids := make([]uint64, n)
 	for i := range vecs {

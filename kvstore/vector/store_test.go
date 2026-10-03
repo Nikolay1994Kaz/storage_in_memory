@@ -2,12 +2,10 @@ package vector
 
 import (
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 func TestVectorStore_AddAndSearch(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	vs.Add("cat", []float32{1, 0, 0})
 	vs.Add("dog", []float32{0.9, 0.1, 0})
@@ -34,7 +32,7 @@ func TestVectorStore_AddAndSearch(t *testing.T) {
 }
 
 func TestVectorStore_DimensionMismatch(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	// Первый вектор — dim=3
 	err := vs.Add("a", []float32{1, 2, 3})
@@ -56,7 +54,7 @@ func TestVectorStore_DimensionMismatch(t *testing.T) {
 }
 
 func TestVectorStore_Upsert(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	vs.Add("cat", []float32{1, 0, 0})
 	vs.Add("cat", []float32{0, 0, 1})
@@ -81,7 +79,7 @@ func TestVectorStore_Upsert(t *testing.T) {
 }
 
 func TestVectorStore_Delete(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	vs.Add("a", []float32{1, 0})
 	vs.Add("b", []float32{0, 1})
@@ -121,7 +119,7 @@ func TestVectorStore_Delete(t *testing.T) {
 }
 
 func TestVectorStore_Info(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	// Пустой стор
 	count, dim, _ := vs.Info()
@@ -158,7 +156,7 @@ func TestVectorStore_Info(t *testing.T) {
 // 4. Игнорирует длину вектора (только направление важно)
 
 func TestVectorStore_CosinePreNormalization(t *testing.T) {
-	vs := NewVectorStoreCosine(tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStoreCosine()
 
 	// A и B — одно направление, но РАЗНЫЕ длины
 	// C — перпендикулярно
@@ -200,9 +198,9 @@ func TestVectorStore_CosinePreNormalization(t *testing.T) {
 
 func TestVectorStore_CosineVsDotProduct(t *testing.T) {
 	// Вариант 1: «классический» CosineDistance
-	vsCosine := NewVectorStore(CosineDistance, tcmalloc.NewTCMallocStore(1))
+	vsCosine := NewVectorStore(CosineDistance)
 	// Вариант 2: pre-normalized DotProduct
-	vsDot := NewVectorStoreCosine(tcmalloc.NewTCMallocStore(1))
+	vsDot := NewVectorStoreCosine()
 
 	vecs := []struct {
 		key string
@@ -245,7 +243,7 @@ func TestVectorStore_CosineVsDotProduct(t *testing.T) {
 // ─────────────────────────────────────────────────
 
 func TestVectorStore_SearchFiltered_Basic(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	// Добавляем 6 векторов: 3 "животных" и 3 "транспорта"
 	// Животные — кластер вокруг (1,0,0)
@@ -295,7 +293,7 @@ func TestVectorStore_SearchFiltered_Basic(t *testing.T) {
 }
 
 func TestVectorStore_SearchFiltered_NoMatch(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	vs.Add("a", []float32{1, 0})
 	vs.Add("b", []float32{0, 1})
@@ -314,7 +312,7 @@ func TestVectorStore_SearchFiltered_NoMatch(t *testing.T) {
 }
 
 func TestVectorStore_SearchFiltered_AllMatch(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	vs.Add("a", []float32{1, 0, 0})
 	vs.Add("b", []float32{0.9, 0.1, 0})
@@ -342,7 +340,7 @@ func TestVectorStore_SearchFiltered_AllMatch(t *testing.T) {
 }
 
 func TestVectorStore_SearchFiltered_EmptyGraph(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	results, err := vs.SearchFiltered([]float32{1, 0}, 3, func(key string) bool {
 		return true
@@ -356,7 +354,7 @@ func TestVectorStore_SearchFiltered_EmptyGraph(t *testing.T) {
 }
 
 func TestVectorStore_SearchFiltered_HighSelectivity(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 
 	// 100 векторов, только 1 проходит фильтр
 	for i := 0; i < 100; i++ {
@@ -392,7 +390,7 @@ func TestVectorStore_SearchFiltered_HighSelectivity(t *testing.T) {
 }
 
 func TestVectorStore_SearchFiltered_DimensionMismatch(t *testing.T) {
-	vs := NewVectorStore(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStore(EuclideanDistance)
 	vs.Add("a", []float32{1, 2, 3})
 
 	_, err := vs.SearchFiltered([]float32{1, 2}, 1, func(key string) bool {

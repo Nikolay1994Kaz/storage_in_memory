@@ -6,18 +6,15 @@ import (
 	"runtime"
 	"slices"
 	"sync"
-	"unsafe"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // Node — одна точка в графе HNSW.
 type Node struct {
-	ID              uint64
-	VectorOffset    uint64
-	NeighborsHandle tcmalloc.Handle // Дескриптор блока связей в TCMalloc
-	Level           int             // максимальный слой, на котором нода присутствует
-	Alive           bool            // маркер «живая ли нода» (tombstone при Delete)
+	ID           uint64
+	VectorOffset uint64
+	NeighborsOff uint64 // смещение блока связей в арене графа (0 — блока нет)
+	Level        int    // максимальный слой, на котором нода присутствует
+	Alive        bool   // маркер «живая ли нода» (tombstone при Delete)
 }
 
 // Graph — HNSW-граф.
@@ -53,12 +50,8 @@ type Graph struct {
 	// Функция расстояния (Euclidean или Cosine).
 	Distance DistanceFunc
 
-	arena     *VectorArena
-	allocator *tcmalloc.TCMallocStore // Менеджер памяти для neighbors блоков
-
-	// workerID — shard для TCMallocStore.Alloc. Разные buildWorker'ы используют
-	// разные workerID → нет data race на caches[]. По умолчанию 0 (совместимость).
-	workerID int
+	arena *VectorArena
+	nbr   neighborArena // блоки связей всех нод (см. neighborArena)
 
 	// ─── Переиспользуемые буферы (zero-alloc pruning/insert) ───
 	pruneBufItems []item   // буфер для pruneNeighbors (capacity = M0)
@@ -67,7 +60,7 @@ type Graph struct {
 }
 
 // NewGraph создаёт пустой HNSW-граф с параметрами по умолчанию.
-func NewGraph(distance DistanceFunc, allocator *tcmalloc.TCMallocStore) *Graph {
+func NewGraph(distance DistanceFunc) *Graph {
 	m := 16
 	m0 := 2 * m
 	return &Graph{
@@ -79,19 +72,76 @@ func NewGraph(distance DistanceFunc, allocator *tcmalloc.TCMallocStore) *Graph {
 		EfConstruction:  200,
 		HeuristicSelect: true, // HNSW select-neighbors heuristic: +recall (2.66× QPS@equal-recall) и +insert. См. step_profit_test.go:TestStep4
 		Distance:        distance,
-		allocator:       allocator,
 		pruneBufItems:   make([]item, 0, m0+1),
 		pruneBufIDs:     make([]uint64, 0, m0+1),
 		insertBuf:       make([]uint64, 0, m0+1),
 	}
 }
 
-// bytesToUint64 делает zero-copy кастинг слайса байт в слайс uint64
-func bytesToUint64(b []byte) []uint64 {
-	if len(b) == 0 {
-		return nil
+// neighborArena — блоки связей HNSW подряд в одном []uint64, принадлежащем графу.
+//
+// Блок ноды уровня L: [len][M0 id] для слоя 0, затем по [len][M id] на слои
+// 1..L (раскладка neighborsBlockSize/offsetForLevel). Смещение блока лежит в
+// Node.NeighborsOff; слово 0 зарезервировано, поэтому смещение 0 значит «блока
+// нет». Указателей внутри нет — сборщик мусора арену не сканирует, как и
+// прежние чанки самописного аллокатора.
+//
+// Разница с прежней схемой — во владении. Блоки жили в TCMallocStore, а при
+// сборке и слиянии сегментов — в пуловых аллокаторах LeveledVectorStore,
+// которые никто не очищал: граф заморожен в сегмент и выброшен, а его блоки
+// остались в пуле. Замер на исходном коде: при постоянных 2000 векторах память
+// пулов слияния росла 2,2 → 35,1 МБ за 12 раундов upsert. Теперь граф,
+// ставший мусором, уходит вместе со своими связями.
+//
+// Рост — append: срезы, выданные getNeighbors до роста, смотрят в старый
+// массив. Поэтому alloc зовётся только в начале Insert, раньше любого
+// getNeighbors этой вставки; удаление и починка связей блоки не выделяют.
+type neighborArena struct {
+	data []uint64
+	free map[int][]uint64 // размер блока в словах → смещения освобождённых блоков
+}
+
+// alloc выдаёт обнулённый блок из words слов: освобождённый того же размера,
+// иначе новый в конце арены.
+func (a *neighborArena) alloc(words int) uint64 {
+	if offs := a.free[words]; len(offs) > 0 {
+		off := offs[len(offs)-1]
+		a.free[words] = offs[:len(offs)-1]
+		clear(a.data[off : off+uint64(words)])
+		return off
 	}
-	return unsafe.Slice((*uint64)(unsafe.Pointer(&b[0])), len(b)/8)
+	if len(a.data) == 0 {
+		a.data = append(a.data, 0) // слово 0 — «блока нет»
+	}
+	off := uint64(len(a.data))
+	a.data = slices.Grow(a.data, words)[:len(a.data)+words]
+	clear(a.data[off:])
+	return off
+}
+
+// release возвращает блок для переиспользования вставкой того же уровня.
+func (a *neighborArena) release(off uint64, words int) {
+	if off == 0 {
+		return
+	}
+	if a.free == nil {
+		a.free = make(map[int][]uint64)
+	}
+	a.free[words] = append(a.free[words], off)
+}
+
+// reserveNodes заранее растит арену под n нод (сборка сегмента знает n):
+// без этого рост удвоением копирует арену и оставляет до половины ёмкости
+// пустой на всю жизнь графа. Запас на верхние слои — 1/8 нод (при M=16 их
+// около 1/15).
+func (g *Graph) reserveNodes(n int) {
+	words := n*(1+g.M0) + n/8*(1+g.M)
+	g.nbr.data = slices.Grow(g.nbr.data, words)
+}
+
+// NeighborBytes — память, занятая ареной связей (по ёмкости, а не длине).
+func (g *Graph) NeighborBytes() int64 {
+	return int64(cap(g.nbr.data)) * 8
 }
 
 func (g *Graph) neighborsBlockSize(level int) int {
@@ -108,33 +158,28 @@ func (g *Graph) offsetForLevel(targetLevel int) int {
 	return 1 + g.M0 + (targetLevel-1)*(1+g.M)
 }
 
-func (g *Graph) getNeighbors(handle tcmalloc.Handle, targetLevel int) []uint64 {
-	if uint64(handle) == 0 {
+// getNeighbors — срез связей ноды на слое targetLevel прямо в арене. Ёмкость
+// среза обрезана по длине: append к нему уйдёт в новый массив и не затрёт
+// соседний блок.
+func (g *Graph) getNeighbors(off uint64, targetLevel int) []uint64 {
+	if off == 0 {
 		return nil
 	}
-	byteBuf := g.allocator.Resolve(handle)
-	uint64Buf := bytesToUint64(byteBuf)
-
-	offset := g.offsetForLevel(targetLevel)
-	length := int(uint64Buf[offset])
+	o := off + uint64(g.offsetForLevel(targetLevel))
+	length := g.nbr.data[o]
 	if length == 0 {
 		return nil
 	}
-	return uint64Buf[offset+1 : offset+1+length]
+	return g.nbr.data[o+1 : o+1+length : o+1+length]
 }
 
-func (g *Graph) setNeighbors(handle tcmalloc.Handle, targetLevel int, neighbors []uint64) {
-	if uint64(handle) == 0 {
+func (g *Graph) setNeighbors(off uint64, targetLevel int, neighbors []uint64) {
+	if off == 0 {
 		return
 	}
-	byteBuf := g.allocator.Resolve(handle)
-	uint64Buf := bytesToUint64(byteBuf)
-
-	offset := g.offsetForLevel(targetLevel)
-	uint64Buf[offset] = uint64(len(neighbors))
-	if len(neighbors) > 0 {
-		copy(uint64Buf[offset+1:], neighbors)
-	}
+	o := off + uint64(g.offsetForLevel(targetLevel))
+	g.nbr.data[o] = uint64(len(neighbors))
+	copy(g.nbr.data[o+1:], neighbors)
 }
 
 // randomLevel генерирует случайный уровень для новой ноды.
@@ -205,7 +250,7 @@ func (g *Graph) searchLayer(state *searchState, query []float32, entryID uint64,
 
 		// НОВЫЙ КОД (batch):
 		node := &g.nodes[closest.id]
-		neighbors := g.getNeighbors(node.NeighborsHandle, level)
+		neighbors := g.getNeighbors(node.NeighborsOff, level)
 
 		// Фаза 1: собрать offset-ы НЕПОСЕЩЁННЫХ соседей
 		state.batchOffsets = state.batchOffsets[:0]
@@ -300,7 +345,7 @@ func (g *Graph) searchLayerFiltered(state *searchState, query []float32, entryID
 		}
 
 		node := &g.nodes[closest.id]
-		neighbors := g.getNeighbors(node.NeighborsHandle, level)
+		neighbors := g.getNeighbors(node.NeighborsOff, level)
 
 		// Фаза 1: собрать offset-ы НЕПОСЕЩЁННЫХ соседей
 		state.batchOffsets = state.batchOffsets[:0]
@@ -386,7 +431,7 @@ func (g *Graph) greedyClosest(query []float32, entryID uint64, level int) uint64
 	for improved {
 		improved = false
 		node := &g.nodes[bestID]
-		for _, neighborID := range g.getNeighbors(node.NeighborsHandle, level) {
+		for _, neighborID := range g.getNeighbors(node.NeighborsOff, level) {
 			dist := g.Distance(query, g.arena.Get(g.nodes[neighborID].VectorOffset))
 			if dist < bestDist {
 				bestID = neighborID
@@ -415,10 +460,9 @@ func (g *Graph) Insert(vec []float32) uint32 {
 		g.arena = NewVectorArena(len(vec), 10000)
 	}
 	vecOffset := g.arena.Allocate(vec)
-	buf, handle := g.allocator.Alloc(g.workerID, g.neighborsBlockSize(level)*8)
-	for i := range buf {
-		buf[i] = 0
-	}
+	// Блок связей — ДО любого getNeighbors этой вставки: рост арены переносит
+	// её в новый массив, и срезы, выданные раньше, устарели бы.
+	nbrOff := g.nbr.alloc(g.neighborsBlockSize(level))
 
 	// 2. Выделяем ячейку: из free list или append в конец
 	var idx uint32
@@ -432,11 +476,11 @@ func (g *Graph) Insert(vec []float32) uint32 {
 
 	// 3. Записываем ноду по значению в плоский массив
 	g.nodes[idx] = Node{
-		ID:              uint64(idx),
-		VectorOffset:    vecOffset,
-		NeighborsHandle: handle,
-		Level:           level,
-		Alive:           true,
+		ID:           uint64(idx),
+		VectorOffset: vecOffset,
+		NeighborsOff: nbrOff,
+		Level:        level,
+		Alive:        true,
 	}
 	g.nodeCount++
 	id := uint64(idx)
@@ -483,12 +527,12 @@ func (g *Graph) Insert(vec []float32) uint32 {
 		for i, r := range results {
 			neighborIDs[i] = r.id
 		}
-		g.setNeighbors(g.nodes[idx].NeighborsHandle, lc, neighborIDs)
+		g.setNeighbors(g.nodes[idx].NeighborsOff, lc, neighborIDs)
 
 		// Шаг 4: Обратные связи через арену (★ zero-alloc через insertBuf)
 		for _, r := range results {
 			neighbor := &g.nodes[r.id]
-			existing := g.getNeighbors(neighbor.NeighborsHandle, lc)
+			existing := g.getNeighbors(neighbor.NeighborsOff, lc)
 
 			// Переиспользуем insertBuf: [existing..., id]
 			updated := g.insertBuf[:len(existing)+1]
@@ -496,10 +540,10 @@ func (g *Graph) Insert(vec []float32) uint32 {
 			updated[len(existing)] = id
 
 			if len(updated) > M {
-				g.setNeighbors(neighbor.NeighborsHandle, lc, updated[:M])
+				g.setNeighbors(neighbor.NeighborsOff, lc, updated[:M])
 				g.pruneNeighborsFromList(neighbor, lc, M, updated)
 			} else {
-				g.setNeighbors(neighbor.NeighborsHandle, lc, updated)
+				g.setNeighbors(neighbor.NeighborsOff, lc, updated)
 			}
 		}
 
@@ -525,7 +569,7 @@ func (g *Graph) Insert(vec []float32) uint32 {
 // Использует переиспользуемые буферы pruneBufItems/pruneBufIDs из Graph.
 // slices.SortFunc вместо sort.Slice — без рефлексии и аллокаций.
 func (g *Graph) pruneNeighbors(node *Node, level int, maxCount int) {
-	neighbors := g.getNeighbors(node.NeighborsHandle, level)
+	neighbors := g.getNeighbors(node.NeighborsOff, level)
 
 	// 1. Переиспользуем буфер items (расширяем при необходимости)
 	if cap(g.pruneBufItems) < len(neighbors) {
@@ -562,7 +606,7 @@ func (g *Graph) pruneNeighbors(node *Node, level int, maxCount int) {
 	for i, it := range items {
 		pruned[i] = it.id
 	}
-	g.setNeighbors(node.NeighborsHandle, level, pruned)
+	g.setNeighbors(node.NeighborsOff, level, pruned)
 }
 
 // pruneNeighborsFromList — то же что pruneNeighbors, но принимает готовый список соседей.
@@ -606,7 +650,7 @@ func (g *Graph) pruneNeighborsFromList(node *Node, level int, maxCount int, neig
 	for i, it := range items {
 		pruned[i] = it.id
 	}
-	g.setNeighbors(node.NeighborsHandle, level, pruned)
+	g.setNeighbors(node.NeighborsOff, level, pruned)
 }
 
 // selectNeighborsHeuristic — HNSW select-neighbors heuristic (Алгоритм 4 из
@@ -683,7 +727,7 @@ func (g *Graph) Delete(id uint64) bool {
 	// ═══════════════════════════════════════════════════
 	for level := 0; level <= node.Level; level++ {
 		// Копируем соседей, т.к. будем модифицировать арену
-		origNeighbors := g.getNeighbors(node.NeighborsHandle, level)
+		origNeighbors := g.getNeighbors(node.NeighborsOff, level)
 		neighbors := make([]uint64, len(origNeighbors))
 		copy(neighbors, origNeighbors)
 
@@ -696,7 +740,7 @@ func (g *Graph) Delete(id uint64) bool {
 			neighbor := &g.nodes[neighborID]
 
 			// Шаг A: Убираем удалённую ноду из списка соседей
-			nNeighbors := g.getNeighbors(neighbor.NeighborsHandle, level)
+			nNeighbors := g.getNeighbors(neighbor.NeighborsOff, level)
 			cleaned := removeID(append([]uint64{}, nNeighbors...), id)
 
 			// Шаг B: Переподключаем — добавляем других соседей удаляемой ноды
@@ -714,7 +758,7 @@ func (g *Graph) Delete(id uint64) bool {
 			if len(cleaned) > M {
 				g.pruneNeighborsFromList(neighbor, level, M, cleaned)
 			} else {
-				g.setNeighbors(neighbor.NeighborsHandle, level, cleaned)
+				g.setNeighbors(neighbor.NeighborsOff, level, cleaned)
 			}
 		}
 	}
@@ -728,7 +772,7 @@ func (g *Graph) Delete(id uint64) bool {
 			continue
 		}
 		for level := 0; level <= n.Level; level++ {
-			nNeighbors := g.getNeighbors(n.NeighborsHandle, level)
+			nNeighbors := g.getNeighbors(n.NeighborsOff, level)
 			if !containsID(nNeighbors, id) {
 				continue
 			}
@@ -737,14 +781,15 @@ func (g *Graph) Delete(id uint64) bool {
 			// Ноль аллокаций: раньше здесь копировался список соседей КАЖДОЙ
 			// ноды графа на КАЖДЫЙ Delete (основной churn upsert-пути дельты).
 			cleaned := removeID(nNeighbors, id)
-			g.setNeighbors(n.NeighborsHandle, level, cleaned)
+			g.setNeighbors(n.NeighborsOff, level, cleaned)
 		}
 	}
 
 	// ═══════════════════════════════════════════════════
 	// ФАЗА 3: Tombstone + free list
 	// ═══════════════════════════════════════════════════
-	g.allocator.Free(0, node.NeighborsHandle)
+	g.nbr.release(node.NeighborsOff, g.neighborsBlockSize(node.Level))
+	node.NeighborsOff = 0 // блок уйдёт другой ноде — мёртвая не должна смотреть в него
 	node.Alive = false
 	g.freeIDs = append(g.freeIDs, uint32(id))
 	g.nodeCount--
@@ -938,7 +983,7 @@ func (g *Graph) RepairReachability(ef int) int {
 // месте, иначе замещает самое дальнее (repair-инструмент, вне hot-path).
 func (g *Graph) forceEdgeL0(from, to uint64) {
 	node := &g.nodes[from]
-	ns := g.getNeighbors(node.NeighborsHandle, 0)
+	ns := g.getNeighbors(node.NeighborsOff, 0)
 	for _, nb := range ns {
 		if nb == to {
 			return
@@ -959,7 +1004,7 @@ func (g *Graph) forceEdgeL0(from, to uint64) {
 		}
 		buf[worst] = to
 	}
-	g.setNeighbors(node.NeighborsHandle, 0, buf)
+	g.setNeighbors(node.NeighborsOff, 0, buf)
 }
 
 // SearchResult — один результат поиска.

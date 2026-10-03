@@ -37,7 +37,6 @@ import (
 	"kvstore/kvstore/internal/ship"
 	"kvstore/kvstore/internal/store"
 	"kvstore/kvstore/internal/store/kv"
-	"kvstore/kvstore/internal/store/tcmalloc"
 	"kvstore/kvstore/internal/store/zset"
 	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
@@ -622,12 +621,7 @@ func main() {
 	// дошипливает уже-fsyncнутый хвост WAL → graceful shutdown даёт RPO=0 и удалённо.
 
 	// === 5. Pub/Sub Hub (Classic + Semantic) ===
-	// Выделенный аллокатор, НЕ общий с KV-store s: Graph семантического индекса
-	// аллоцирует из caches[workerID=0], и общий s → data race с KV-путём worker 0
-	// (тот же класс, что закрытая zset-alloc гонка). Все Alloc/Free индекса —
-	// в Add/Delete под vs.mu.Lock (Search лишь Resolve, не аллоцирует), поэтому
-	// выделенный 1-воркерный стор соблюдает single-writer MCache без реклеймера.
-	semanticIndex := vector.NewVectorStoreCosine(tcmalloc.NewTCMallocStore(1))
+	semanticIndex := vector.NewVectorStoreCosine()
 	semanticIndex.SetHNSWParams(*hnswM, *hnswEfConstruction, *hnswEfSearch)
 	semanticIndex.SetUseLSH(*hnswUseLSH)
 	hub := pubsub.NewHub(semanticIndex)

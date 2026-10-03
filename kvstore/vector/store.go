@@ -8,8 +8,6 @@ import (
 	"math"
 	"sync"
 	"unsafe"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // VectorStore — лёгкий одно-графовый векторный индекс: тонкая обёртка над HNSW
@@ -41,33 +39,30 @@ type VectorStore struct {
 	// Создаётся лениво при первой вставке (когда dim известен).
 	lsh *LSHIndex
 
-	allocator *tcmalloc.TCMallocStore // Ссылка на менеджер памяти
-	EfSearch  int                     // Явная ширина поиска HNSW (если <= 0, то K * 10)
-	UseLSH    bool                    // Включить LSH-фильтрацию для высокоразмерных векторов (по умолчанию false)
+	EfSearch int  // Явная ширина поиска HNSW (если <= 0, то K * 10)
+	UseLSH   bool // Включить LSH-фильтрацию для высокоразмерных векторов (по умолчанию false)
 
 	mu sync.RWMutex
 }
 
 // NewVectorStore создаёт хранилище векторов с произвольной метрикой.
-func NewVectorStore(distance DistanceFunc, allocator *tcmalloc.TCMallocStore) *VectorStore {
+func NewVectorStore(distance DistanceFunc) *VectorStore {
 	vs := &VectorStore{
-		keys:      make(map[uint64]string),
-		ids:       make(map[string]uint64),
-		allocator: allocator,
+		keys: make(map[uint64]string),
+		ids:  make(map[string]uint64),
 	}
-	vs.graph = NewGraph(distance, allocator)
+	vs.graph = NewGraph(distance)
 	return vs
 }
 
 // NewVectorStoreCosine создаёт хранилище для косинусного поиска.
-func NewVectorStoreCosine(allocator *tcmalloc.TCMallocStore) *VectorStore {
+func NewVectorStoreCosine() *VectorStore {
 	vs := &VectorStore{
 		keys:          make(map[uint64]string),
 		ids:           make(map[string]uint64),
 		autoNormalize: true,
-		allocator:     allocator,
 	}
-	vs.graph = NewGraph(DotProductDistance, allocator)
+	vs.graph = NewGraph(DotProductDistance)
 	return vs
 }
 
@@ -305,7 +300,7 @@ func (vs *VectorStore) Clear() {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	vs.graph = NewGraph(vs.graph.Distance, vs.allocator)
+	vs.graph = NewGraph(vs.graph.Distance)
 	vs.keys = make(map[uint64]string)
 	vs.ids = make(map[string]uint64)
 	vs.dim = 0

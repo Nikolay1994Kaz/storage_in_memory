@@ -25,8 +25,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // fseg — единый интерфейс поиска для FrozenGraph и FrozenGraphSQ.
@@ -47,8 +45,7 @@ func buildSegs(vecs [][]float32, k int, useSQ bool) []fseg {
 		if lo >= hi {
 			break
 		}
-		alloc := tcmalloc.NewTCMallocStore(1)
-		g := NewGraph(EuclideanDistance, alloc)
+		g := NewGraph(EuclideanDistance)
 		g.EfConstruction = arEfConstruction
 		keys := make(map[uint64]string, hi-lo)
 		for i := lo; i < hi; i++ {
@@ -343,12 +340,11 @@ func TestArch_P2_Segments(t *testing.T) {
 	gt := bruteGT(train, test, K)
 
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(8),
-		DeltaMax:  20_000, // мельче → больше сегментов (имитация 500k/50k фрагментации)
-		Fanout:    4,
-		EfSearch:  128,
-		UseSQ:     true,
+		Distance: EuclideanDistance,
+		DeltaMax: 20_000, // мельче → больше сегментов (имитация 500k/50k фрагментации)
+		Fanout:   4,
+		EfSearch: 128,
+		UseSQ:    true,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	t0 := time.Now()
@@ -410,12 +406,11 @@ func measureLeveled500k(t *testing.T, deltaMax int) {
 	K := 10
 	gt := bruteGT(train, test, K)
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(8),
-		DeltaMax:  deltaMax,
-		Fanout:    4,
-		EfSearch:  128,
-		UseSQ:     true,
+		Distance: EuclideanDistance,
+		DeltaMax: deltaMax,
+		Fanout:   4,
+		EfSearch: 128,
+		UseSQ:    true,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	for i, v := range train {
@@ -562,12 +557,11 @@ func TestArch_DeltaIndexed(t *testing.T) {
 	subA := train[:100_000]
 	gtA := bruteGT(subA, test, K)
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(8),
-		DeltaMax:  300_000, // высоко → авто-flush не сработает, всё в дельте
-		Fanout:    4,
-		EfSearch:  128,
-		UseSQ:     true,
+		Distance: EuclideanDistance,
+		DeltaMax: 300_000, // высоко → авто-flush не сработает, всё в дельте
+		Fanout:   4,
+		EfSearch: 128,
+		UseSQ:    true,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	for i, v := range subA {
@@ -617,12 +611,11 @@ func TestArch_DeltaFlushDebug(t *testing.T) {
 		return v
 	}
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(8),
-		DeltaMax:  300_000,
-		Fanout:    4,
-		EfSearch:  128,
-		UseSQ:     true,
+		Distance: EuclideanDistance,
+		DeltaMax: 300_000,
+		Fanout:   4,
+		EfSearch: 128,
+		UseSQ:    true,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	for i := 0; i < 100_000; i++ {
@@ -729,12 +722,11 @@ func TestArch_SQ784(t *testing.T) {
 
 	run := func(useSQ bool, label string) {
 		cfg := LeveledConfig{
-			Distance:  EuclideanDistance,
-			Allocator: tcmalloc.NewTCMallocStore(8),
-			DeltaMax:  50_000,
-			Fanout:    4,
-			EfSearch:  128,
-			UseSQ:     useSQ,
+			Distance: EuclideanDistance,
+			DeltaMax: 50_000,
+			Fanout:   4,
+			EfSearch: 128,
+			UseSQ:    useSQ,
 		}
 		lvs := NewLeveledVectorStore(cfg)
 		for i, v := range train {
@@ -784,8 +776,7 @@ func TestArch_SQ784(t *testing.T) {
 
 // buildGraph строит сырой *Graph (uint64-соседи, без uint16-overflow).
 func buildGraph(vecs [][]float32, efC int) *Graph {
-	alloc := tcmalloc.NewTCMallocStore(1)
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = efC
 	for _, v := range vecs {
 		g.Insert(v)

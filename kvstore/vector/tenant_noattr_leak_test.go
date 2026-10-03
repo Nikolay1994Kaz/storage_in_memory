@@ -4,8 +4,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestTenant_NoAttrSegmentLeak — страж изоляции тенантов при СМЕШАННОЙ истории
@@ -26,7 +24,6 @@ func TestTenant_NoAttrSegmentLeak(t *testing.T) {
 		t.Run("dim"+strconv.Itoa(dim), func(t *testing.T) {
 			cfg := LeveledConfig{
 				Distance:      EuclideanDistance,
-				Allocator:     tcmalloc.NewTCMallocStore(4),
 				DeltaMax:      10000, // большая дельта → один flush = один сегмент, без авто-merge
 				Fanout:        4,
 				EfSearch:      64,

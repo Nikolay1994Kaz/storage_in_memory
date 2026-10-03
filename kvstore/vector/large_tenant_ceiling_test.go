@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -83,7 +81,6 @@ func TestLargeTenant_FilterCeiling(t *testing.T) {
 	// ── Боевой консолидированный SQ8-стор (для пола SearchFilter) ──
 	cfg := LeveledConfig{
 		Metric:         MetricCosine,
-		Allocator:      tcmalloc.NewTCMallocStore(8),
 		DeltaMax:       len(train) + 1,
 		Fanout:         4,
 		EfConstruction: arEfConstruction,
@@ -213,8 +210,7 @@ func TestLargeTenant_FilterCeiling(t *testing.T) {
 		bruteQPS := runQPS(W, dur, queries, func(q []float32) { _ = bruteTopKCompact(matchedVecs, matchedIds, q, K) })
 
 		// ── graph: бросовый HNSW над ровно matched (оптимистичный потолок) ──
-		alloc := tcmalloc.NewTCMallocStore(2)
-		g := NewGraph(EuclideanDistance, alloc)
+		g := NewGraph(EuclideanDistance)
 		g.EfConstruction = arEfConstruction
 		node2id := make(map[uint64]int, matched)
 		tg := time.Now()

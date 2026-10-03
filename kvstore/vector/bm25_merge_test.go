@@ -9,8 +9,6 @@ import (
 	"math"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // grabL0 снимает сегменты уровня 0 (oldest→newest) для прямого merge.
@@ -87,7 +85,7 @@ func TestBM25MergeNormalizesDF(t *testing.T) {
 		t.Fatalf("до merge: df=%d N=%d len=%d, ждём 2/3/5 (фантом должен считаться)", dfBefore, nBefore, lenBefore)
 	}
 
-	merged, _ := lvs.mergeSegmentsWithAllocator(segs, tcmalloc.NewTCMallocStore(1))
+	merged, _ := lvs.mergeSegments(segs)
 	if merged == nil {
 		t.Fatal("merge вернул nil")
 	}
@@ -131,7 +129,7 @@ func TestBM25MergeAppliesTombstone(t *testing.T) {
 	lvs.Delete("doc")
 
 	segs := grabL0(t, lvs, 1)
-	merged, applied := lvs.mergeSegmentsWithAllocator(segs, tcmalloc.NewTCMallocStore(1))
+	merged, applied := lvs.mergeSegments(segs)
 	if merged == nil {
 		t.Fatal("merge вернул nil")
 	}
@@ -166,7 +164,7 @@ func TestBM25MergeMixedAndNoText(t *testing.T) {
 		}
 		lvs.FlushDeltaSync()
 
-		merged, _ := lvs.mergeSegmentsWithAllocator(grabL0(t, lvs, 2), tcmalloc.NewTCMallocStore(1))
+		merged, _ := lvs.mergeSegments(grabL0(t, lvs, 2))
 		st := merged.Text()
 		if st == nil {
 			t.Fatal("текст потерян при смешанном merge")
@@ -192,7 +190,7 @@ func TestBM25MergeMixedAndNoText(t *testing.T) {
 			segs = append(segs, lvs.levels[lvl]...)
 		}
 		lvs.mu.RUnlock()
-		merged, _ := lvs.mergeSegmentsWithAllocator(segs, tcmalloc.NewTCMallocStore(1))
+		merged, _ := lvs.mergeSegments(segs)
 		if merged == nil {
 			t.Fatal("merge вернул nil")
 		}

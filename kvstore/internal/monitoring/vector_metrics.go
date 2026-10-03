@@ -104,7 +104,7 @@ type VectorStats struct {
 	MaxLevel        int   // максимальный заполненный уровень LSM
 	SegmentsByLevel []int // [maxLevels] — число сегментов на каждом уровне
 	Tombstones      int   // активных tombstones (не применённых merge'ем)
-	AllocatorBytes  int64 // память, занятая под графы/соседей (tcmalloc)
+	AllocatorBytes  int64 // связи HNSW изменяемых графов (дельта, hnsw-сегменты)
 	DataBytes       int64 // память под векторы (float32 slab'ы frozen/hnsw)
 }
 

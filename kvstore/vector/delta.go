@@ -7,8 +7,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -72,9 +70,8 @@ type deltaShard struct {
 	text    map[string][]bm25Posting
 	nText   int
 	textLen uint64
-	keyIdx  map[string]int // ключ → индекс в data (для быстрого upsert/delete)
-	idx     *Graph         // инкрементальный HNSW-индекс для поиска (Qdrant-style)
-	alloc   *tcmalloc.TCMallocStore
+	keyIdx  map[string]int    // ключ → индекс в data (для быстрого upsert/delete)
+	idx     *Graph            // инкрементальный HNSW-индекс для поиска (Qdrant-style)
 	nodeKey map[uint32]string // id узла графа → ключ (маппинг результатов поиска)
 	keyNode map[string]uint32 // ключ → текущий id узла (для удаления при upsert/delete)
 }
@@ -112,10 +109,9 @@ type DeltaSegment struct {
 // снимает срезы уже после swap, когда в дельту не пишут) → реаллокация безопасна.
 const deltaInitSlots = 1024
 
-// newDeltaShard создаёт один шард с собственным графом и аллокатором.
+// newDeltaShard создаёт один шард с собственным графом.
 func newDeltaShard(dim, capHint int, distFn DistanceFunc, m, efC int) *deltaShard {
-	alloc := tcmalloc.NewTCMallocStore(1)
-	g := NewGraph(distFn, alloc)
+	g := NewGraph(distFn)
 	if efC > 0 {
 		g.EfConstruction = efC
 	}
@@ -135,7 +131,6 @@ func newDeltaShard(dim, capHint int, distFn DistanceFunc, m, efC int) *deltaShar
 		keys:    make([]string, 0, init),
 		keyIdx:  make(map[string]int),
 		idx:     g,
-		alloc:   alloc,
 		nodeKey: make(map[uint32]string),
 		keyNode: make(map[string]uint32),
 	}
@@ -186,16 +181,23 @@ func (d *DeltaSegment) shardFor(key string) *deltaShard {
 	return d.shards[h%uint64(d.nShards)]
 }
 
-// Close освобождает аллокаторы всех шардов (останавливает их goroutine).
-// Вызывать после swap дельты, когда она больше не используется для поиска
-// И графы больше не нужны (freeze скопировал данные / rebuild завершён).
-func (d *DeltaSegment) Close() {
+// Close — точка конца жизни дельты в протоколе компакции: вызывается после
+// swap, когда дельта больше не используется для поиска и графы не нужны.
+// Закрывать сейчас нечего: прежде здесь останавливались аллокаторы шардов
+// (их фоновые горутины держали память до Close), а теперь связи графов живут
+// в собственных аренах и уходят сборщику мусора вместе с дельтой. Метод оставлен,
+// чтобы не перекраивать протокол владения в коде компакции.
+func (d *DeltaSegment) Close() {}
+
+// NeighborBytes — память арен связей графов всех шардов (для метрики).
+func (d *DeltaSegment) NeighborBytes() int64 {
+	var n int64
 	for _, s := range d.shards {
-		if s.alloc != nil {
-			s.alloc.Close()
-			s.alloc = nil
-		}
+		s.mu.RLock()
+		n += s.idx.NeighborBytes()
+		s.mu.RUnlock()
 	}
+	return n
 }
 
 // Graph возвращает HNSW-граф для freeze-on-flush. Валидно только при nShards==1.

@@ -5,8 +5,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // tenantOfKey — демо-деривация тенанта из ключа: key = "<tenant>:<id>".
@@ -243,7 +241,6 @@ func TestTenant_CompactionProducesContiguousSegments(t *testing.T) {
 
 	cfg := LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(4),
 		DeltaMax:       2000, // мелкая дельта → много flush+merge
 		Fanout:         4,
 		EfSearch:       64,
@@ -341,7 +338,6 @@ func buildTenantStore(t *testing.T, dim int, useSQ bool, bruteThreshold int, siz
 	rng := rand.New(rand.NewSource(seed))
 	cfg := LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(4),
 		DeltaMax:       2000,
 		Fanout:         4,
 		EfSearch:       128,
@@ -501,7 +497,7 @@ func TestTenant_SearchSQ(t *testing.T) {
 
 // TestTenant_SearchModeOff — без TenantOf SearchTenant обязан вернуть ошибку.
 func TestTenant_SearchModeOff(t *testing.T) {
-	cfg := LeveledConfig{Distance: EuclideanDistance, Allocator: tcmalloc.NewTCMallocStore(1)}
+	cfg := LeveledConfig{Distance: EuclideanDistance}
 	lvs := NewLeveledVectorStore(cfg)
 	_ = lvs.Add("a", []float32{1, 2, 3})
 	if _, err := lvs.SearchTenant([]float32{1, 2, 3}, 5, 0, nil); err == nil {

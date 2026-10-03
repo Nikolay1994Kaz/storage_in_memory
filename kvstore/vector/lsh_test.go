@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // ============================================================================
@@ -26,8 +24,7 @@ import (
 // ─────────────────────────────────────────────
 
 func makeTestStore(n, dim int) *VectorStore {
-	alloc := tcmalloc.NewTCMallocStore(1)
-	vs := NewVectorStoreCosine(alloc)
+	vs := NewVectorStoreCosine()
 
 	rng := rand.New(rand.NewSource(12345))
 	for i := 0; i < n; i++ {

@@ -113,7 +113,7 @@ stop_server() { # graceful|crash
 }
 
 # drift-сэмплер: тот же набор рядов, что в CI (см. soak-test.yml, разводка гипотез
-# RSS-дрейфа: Go-куча vs off-heap tcmalloc vs tombstones/сегменты vs flush-storm).
+# RSS-дрейфа: Go-куча vs память вне кучи vs tombstones/сегменты vs flush-storm).
 drift() { # метка
   { echo "=== $(date -u +%H:%M:%S) $1 ==="
     [ -n "$SERVER_PID" ] && ps -o rss= -p "$SERVER_PID" 2>/dev/null | awk '{print "server_rss_kb="$1}'

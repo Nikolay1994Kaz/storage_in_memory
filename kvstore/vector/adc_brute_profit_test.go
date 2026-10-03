@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -132,7 +130,6 @@ func TestADCBruteProfit(t *testing.T) {
 
 	lvs := NewLeveledVectorStore(LeveledConfig{
 		Metric:         MetricCosine,
-		Allocator:      tcmalloc.NewTCMallocStore(8),
 		DeltaMax:       len(train) + 1,
 		Fanout:         4,
 		EfConstruction: arEfConstruction,

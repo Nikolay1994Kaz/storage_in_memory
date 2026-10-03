@@ -2,8 +2,6 @@ package vector
 
 import (
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // newDedupStore — общий конфиг для тестов дедупа (без партиции, Euclidean).
@@ -11,7 +9,6 @@ func newDedupStore(t *testing.T) *LeveledVectorStore {
 	t.Helper()
 	return NewLeveledVectorStore(LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(2),
 		DeltaMax:       1000,
 		Fanout:         8, // > числа сегментов в тестах → нет авто-merge
 		EfSearch:       64,
@@ -125,7 +122,7 @@ func TestMerge_DedupsByKey(t *testing.T) {
 		t.Fatalf("ожидали ≥2 сегмента в level 0, получили %d", len(segs))
 	}
 
-	merged, _ := lvs.mergeSegmentsWithAllocator(segs, tcmalloc.NewTCMallocStore(1))
+	merged, _ := lvs.mergeSegments(segs)
 	if merged == nil {
 		t.Fatal("merge вернул nil")
 	}

@@ -36,8 +36,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // Топ общеупотребимых английских термов; в проде это был бы df-порог
@@ -154,7 +152,6 @@ func TestBM25BoostExperiment(t *testing.T) {
 	} {
 		lvs := NewLeveledVectorStore(LeveledConfig{
 			Distance:       DotProductDistance,
-			Allocator:      tcmalloc.NewTCMallocStore(8),
 			DeltaMax:       len(train) + 1,
 			Fanout:         4,
 			EfConstruction: arEfConstruction,

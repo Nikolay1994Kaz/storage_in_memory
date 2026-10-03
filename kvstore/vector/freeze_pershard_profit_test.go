@@ -155,7 +155,7 @@ func runFreezePerShardProfit(t *testing.T, name string, train, test [][]float32,
 	defer lvs.Close()
 	entries := d.ExtractAll()
 	tR0 := time.Now()
-	seg := lvs.buildSegment(entries, dim, -1)
+	seg := lvs.buildSegment(entries, dim)
 	rebuild := time.Since(tR0)
 	if seg == nil {
 		t.Fatal("buildSegment вернул nil")

@@ -6,8 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -123,7 +121,6 @@ func TestAttr_SearchFilterCorrectnessThroughMerge(t *testing.T) {
 
 	cfg := LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(4),
 		DeltaMax:       1500, // мелкая дельта → много flush + merge (проверяем выживание атрибутов)
 		Fanout:         4,
 		EfSearch:       64,

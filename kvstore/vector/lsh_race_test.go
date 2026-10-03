@@ -4,8 +4,6 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestLSH_ConcurrentSearchNoRace — страж гонки на LSH-буфере кандидатов.
@@ -15,7 +13,7 @@ import (
 // под `go test -race`.
 func TestLSH_ConcurrentSearchNoRace(t *testing.T) {
 	const dim = 256 // LSH инициализируется только при dim >= 256
-	vs := NewVectorStoreCosine(tcmalloc.NewTCMallocStore(1))
+	vs := NewVectorStoreCosine()
 	vs.SetUseLSH(true)
 
 	rng := rand.New(rand.NewSource(7))

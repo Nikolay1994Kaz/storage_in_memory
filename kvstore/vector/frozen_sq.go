@@ -161,7 +161,7 @@ func FreezeGraphSQOrdered(g *Graph, metric Metric, keys map[uint64]string, pos [
 			if !g.nodes[i].Alive || g.nodes[i].Level < lyr {
 				continue
 			}
-			deg[at(i)] = uint32(len(g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)))
+			deg[at(i)] = uint32(len(g.getNeighbors(g.nodes[i].NeighborsOff, lyr)))
 		}
 		offs := make([]uint32, n+1)
 		for p := 0; p < n; p++ {
@@ -173,7 +173,7 @@ func FreezeGraphSQOrdered(g *Graph, metric Metric, keys map[uint64]string, pos [
 				continue
 			}
 			p := at(i)
-			ns := g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)
+			ns := g.getNeighbors(g.nodes[i].NeighborsOff, lyr)
 			for j, nb := range ns {
 				neigh[int(offs[p])+j] = uint32(at(int(nb)))
 			}

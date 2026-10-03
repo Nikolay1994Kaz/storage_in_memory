@@ -40,8 +40,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 type bm25BenchDoc struct {
@@ -99,8 +97,7 @@ func TestBM25HybridProfit(t *testing.T) {
 
 	cfg := LeveledConfig{
 		Distance:       DotProductDistance, // нормализованные → cosine == dot
-		Allocator:      tcmalloc.NewTCMallocStore(8),
-		DeltaMax:       len(train) + 1, // один консолидированный сегмент
+		DeltaMax:       len(train) + 1,     // один консолидированный сегмент
 		Fanout:         4,
 		EfConstruction: arEfConstruction,
 		EfSearch:       ef,

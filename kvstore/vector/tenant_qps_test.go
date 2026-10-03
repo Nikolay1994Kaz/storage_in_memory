@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -93,7 +91,6 @@ func TestTenant_SearchTenantQPSGain(t *testing.T) {
 	// Один консолидированный frozen-сегмент (как в калибровке): без авто-flush.
 	cfg := LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(8),
 		DeltaMax:       len(train) + 1,
 		Fanout:         4,
 		EfConstruction: arEfConstruction,

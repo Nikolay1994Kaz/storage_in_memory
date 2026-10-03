@@ -5,8 +5,6 @@ import (
 	"math/rand"
 	"strconv"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestAttr_DurabilityRoundTrip — колоночный слой + тенант-каталог переживают
@@ -24,7 +22,6 @@ func TestAttr_DurabilityRoundTrip(t *testing.T) {
 	mkCfg := func() LeveledConfig {
 		return LeveledConfig{
 			Distance:       EuclideanDistance,
-			Allocator:      tcmalloc.NewTCMallocStore(4),
 			DeltaMax:       1500,
 			Fanout:         4,
 			EfSearch:       64,
@@ -149,7 +146,6 @@ func TestAttr_DurabilityHNSWSegment(t *testing.T) {
 	mkCfg := func() LeveledConfig {
 		return LeveledConfig{
 			Distance:       EuclideanDistance,
-			Allocator:      tcmalloc.NewTCMallocStore(4),
 			DeltaMax:       1500,
 			Fanout:         4,
 			EfSearch:       64,
@@ -285,7 +281,6 @@ func TestAttr_DurabilityLegacyTenantOf(t *testing.T) {
 	mkCfg := func() LeveledConfig {
 		return LeveledConfig{
 			Distance:       EuclideanDistance,
-			Allocator:      tcmalloc.NewTCMallocStore(4),
 			DeltaMax:       1000,
 			Fanout:         4,
 			EfSearch:       64,

@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -95,7 +93,6 @@ func TestFilter_AttrScaleQPSGain(t *testing.T) {
 	// ── Построение: один консолидированный сегмент (DeltaMax > N → один flush) ──
 	cfg := LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(8),
 		DeltaMax:       len(train) + 1,
 		Fanout:         4,
 		EfConstruction: arEfConstruction,

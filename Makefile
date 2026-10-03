@@ -85,7 +85,7 @@ test-datasets:
 
 # ─── Bench ──────────────────────────────────────────
 bench:
-	go test ./kvstore/internal/store/tcmalloc/... -bench=. -benchmem -count=3
+	go test ./kvstore/internal/store/kv/ ./kvstore/internal/btree/ ./kvstore/internal/store/zset/ -run '^$$' -bench=. -benchmem -count=3
 	go test ./kvstore/vector/... -bench=. -benchmem -count=3
 
 # ─── Lint ───────────────────────────────────────────

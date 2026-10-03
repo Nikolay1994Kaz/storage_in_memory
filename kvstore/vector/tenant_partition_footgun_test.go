@@ -3,8 +3,6 @@ package vector
 import (
 	"strconv"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestTenant_PartitionAttr_SearchTenantFootgun — диагностика «tnt_rec=0.000»,
@@ -61,7 +59,6 @@ func TestTenant_PartitionAttr_SearchTenantFootgun(t *testing.T) {
 
 	cfg := LeveledConfig{
 		Metric:         MetricEuclidean,
-		Allocator:      tcmalloc.NewTCMallocStore(2),
 		DeltaMax:       len(all) + 1,
 		Fanout:         4,
 		EfConstruction: 200,

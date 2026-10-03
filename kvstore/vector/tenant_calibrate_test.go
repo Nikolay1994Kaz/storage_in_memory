@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -92,7 +90,6 @@ func TestTenant_CalibrateBruteThreshold(t *testing.T) {
 	// Стор в тенант-режиме, ОДНА дельта → ОДИН консолидированный frozen-сегмент.
 	cfg := LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(8),
 		DeltaMax:       len(train) + 1, // без авто-flush: всё в одной дельте
 		Fanout:         4,
 		EfConstruction: arEfConstruction,

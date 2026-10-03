@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"kvstore/kvstore/internal/store/kv"
-	"kvstore/kvstore/internal/store/tcmalloc"
 	"kvstore/kvstore/internal/wal"
 	"kvstore/kvstore/vector"
 )
@@ -546,7 +545,7 @@ func TestCompositeEvictor_Integration(t *testing.T) {
 
 	// Инициализируем хранилища
 	s := kv.New()
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
 	ttl := NewTTLManager(s)
 	defer ttl.Stop()
 
@@ -602,7 +601,7 @@ func TestCompositeEvictor_Integration(t *testing.T) {
 // для удаления просроченных векторов в оффлайне (OpExpire) и удаления по DEL (OpDel).
 func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
 	s := kv.New()
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
 	ttl := NewTTLManager(s)
 	defer ttl.Stop()
 

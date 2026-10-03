@@ -5,8 +5,6 @@ import (
 	"math/rand"
 	"strconv"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -68,7 +66,6 @@ func TestDelta_FilterPostFilterBug(t *testing.T) {
 
 	cfg := LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(4),
 		DeltaMax:       N + 1, // дельта НЕ переполняется → авто-флаша нет
 		Fanout:         4,
 		EfConstruction: arEfConstruction,

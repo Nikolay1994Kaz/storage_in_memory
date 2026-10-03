@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 	"unsafe"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -132,8 +130,7 @@ func TestDBpedia_RealEmbeddingValidation(t *testing.T) {
 	run := func(name string, useSQ bool) {
 		cfg := LeveledConfig{
 			Distance:       DotProductDistance, // нормализованные → cosine == dot
-			Allocator:      tcmalloc.NewTCMallocStore(8),
-			DeltaMax:       len(train) + 1, // один консолидированный сегмент
+			DeltaMax:       len(train) + 1,     // один консолидированный сегмент
 			Fanout:         4,
 			EfConstruction: arEfConstruction,
 			EfSearch:       ef,

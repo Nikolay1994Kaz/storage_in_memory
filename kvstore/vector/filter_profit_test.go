@@ -17,8 +17,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestFilterProfit_SelectivityCrossover доказывает (или опровергает) ДВА тезиса
@@ -48,12 +46,11 @@ func TestFilterProfit_SelectivityCrossover(t *testing.T) {
 
 	// ── Построить стор как в arch P2 (steady-state frozen-SQ сегменты) ──
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(8),
-		DeltaMax:  20_000,
-		Fanout:    4,
-		EfSearch:  128,
-		UseSQ:     true,
+		Distance: EuclideanDistance,
+		DeltaMax: 20_000,
+		Fanout:   4,
+		EfSearch: 128,
+		UseSQ:    true,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	t0 := time.Now()
@@ -146,12 +143,11 @@ func TestFilterProfit_Correlated(t *testing.T) {
 	K := 10
 
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(8),
-		DeltaMax:  20_000,
-		Fanout:    4,
-		EfSearch:  128,
-		UseSQ:     true,
+		Distance: EuclideanDistance,
+		DeltaMax: 20_000,
+		Fanout:   4,
+		EfSearch: 128,
+		UseSQ:    true,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	for i, v := range train {
@@ -353,12 +349,11 @@ func TestFilterProfit_Crossover(t *testing.T) {
 	K := 10
 
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(8),
-		DeltaMax:  20_000,
-		Fanout:    4,
-		EfSearch:  128,
-		UseSQ:     true,
+		Distance: EuclideanDistance,
+		DeltaMax: 20_000,
+		Fanout:   4,
+		EfSearch: 128,
+		UseSQ:    true,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	for i, v := range train {

@@ -6,8 +6,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -147,8 +145,7 @@ func TestFrozenGraph_Build_And_Search(t *testing.T) {
 	const n, dim, K = 2000, 128, 10
 
 	// Строим HNSW
-	alloc := newTestAllocator()
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = 200
 
 	vecs := makeRandVecs(n, dim, 42)
@@ -191,9 +188,7 @@ func TestFrozenGraph_Build_And_Search(t *testing.T) {
 
 func TestFrozenGraph_Recall(t *testing.T) {
 	const n, dim, K = 3000, 128, 10
-
-	alloc := newTestAllocator()
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = 200
 
 	vecs := makeRandVecs(n, dim, 42)
@@ -526,11 +521,6 @@ func benchmarkLeveledSearch(b *testing.B, dim int) {
 // =============================================================================
 // Вспомогательные функции
 // =============================================================================
-
-// newTestAllocator создаёт аллокатор для тестов.
-func newTestAllocator() *tcmalloc.TCMallocStore {
-	return tcmalloc.NewTCMallocStore(1)
-}
 
 // =============================================================================
 // П.H: Конкурентный тест Add/Delete/Search под -race

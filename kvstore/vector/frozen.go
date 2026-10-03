@@ -138,7 +138,7 @@ func FreezeGraphOrdered(g *Graph, distFn DistanceFunc, keys map[uint64]string, p
 			if !g.nodes[i].Alive || g.nodes[i].Level < lyr {
 				continue
 			}
-			deg[at(i)] = uint32(len(g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)))
+			deg[at(i)] = uint32(len(g.getNeighbors(g.nodes[i].NeighborsOff, lyr)))
 		}
 		offs := make([]uint32, n+1)
 		for p := 0; p < n; p++ {
@@ -150,7 +150,7 @@ func FreezeGraphOrdered(g *Graph, distFn DistanceFunc, keys map[uint64]string, p
 				continue
 			}
 			p := at(i)
-			ns := g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)
+			ns := g.getNeighbors(g.nodes[i].NeighborsOff, lyr)
 			for j, nb := range ns {
 				neigh[int(offs[p])+j] = uint32(at(int(nb)))
 			}

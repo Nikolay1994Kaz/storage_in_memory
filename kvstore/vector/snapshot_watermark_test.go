@@ -3,8 +3,6 @@ package vector
 import (
 	"bytes"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestSnapshot_WatermarkRoundTrip — страж #2 (идемпотентность recovery векторов).
@@ -17,7 +15,6 @@ func TestSnapshot_WatermarkRoundTrip(t *testing.T) {
 	const dim = 8
 	src := NewLeveledVectorStore(LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(2),
 		DeltaMax:       1000,
 		Fanout:         8,
 		EfSearch:       64,
@@ -43,7 +40,6 @@ func TestSnapshot_WatermarkRoundTrip(t *testing.T) {
 
 	dst := NewLeveledVectorStore(LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(2),
 		DeltaMax:       1000,
 		Fanout:         8,
 		EfSearch:       64,
@@ -74,10 +70,9 @@ func TestSnapshot_WatermarkRoundTrip(t *testing.T) {
 // (recovery реплеит все векторные WAL-записи, как до v6).
 func TestSnapshot_WatermarkDefaultZero(t *testing.T) {
 	lvs := NewLeveledVectorStore(LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(1),
-		DeltaMax:  1000,
-		Fanout:    8,
+		Distance: EuclideanDistance,
+		DeltaMax: 1000,
+		Fanout:   8,
 	})
 	defer lvs.Clear()
 	if got := lvs.SnapshotLSN(); got != 0 {

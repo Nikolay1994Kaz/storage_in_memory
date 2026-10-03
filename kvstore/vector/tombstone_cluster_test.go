@@ -2,8 +2,6 @@ package vector
 
 import (
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 func tombVec(dim int, fill float32) []float32 {
@@ -21,11 +19,10 @@ func tombVec(dim int, fill float32) []float32 {
 func TestTombstone_DeleteAfterUpsertNoResurrection(t *testing.T) {
 	const dim = 8
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(1),
-		DeltaMax:  10000,
-		Fanout:    4,
-		EfSearch:  64,
+		Distance: EuclideanDistance,
+		DeltaMax: 10000,
+		Fanout:   4,
+		EfSearch: 64,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 
@@ -71,17 +68,14 @@ func TestTombstone_DeleteAfterUpsertNoResurrection(t *testing.T) {
 func TestTombstone_MergeKeepsTombstoneOfNonMergedKey(t *testing.T) {
 	const dim = 4
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(1),
-		Fanout:    4,
-		EfSearch:  32,
+		Distance: EuclideanDistance,
+		Fanout:   4,
+		EfSearch: 32,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 	lvs.dim = dim
-
-	alloc := tcmalloc.NewTCMallocStore(1)
-	segMerged := lvs.buildSegmentWithAllocator([]DeltaEntry{{Key: "a", Vec: tombVec(dim, 1)}}, dim, alloc)
-	segOther := lvs.buildSegmentWithAllocator([]DeltaEntry{{Key: "z", Vec: tombVec(dim, 2)}}, dim, alloc)
+	segMerged := lvs.buildSegment([]DeltaEntry{{Key: "a", Vec: tombVec(dim, 1)}}, dim)
+	segOther := lvs.buildSegment([]DeltaEntry{{Key: "z", Vec: tombVec(dim, 2)}}, dim)
 	lvs.levels[0] = []segment{segMerged}
 	lvs.levels[1] = []segment{segOther}
 
@@ -89,7 +83,7 @@ func TestTombstone_MergeKeepsTombstoneOfNonMergedKey(t *testing.T) {
 	addTombstone(&lvs.tombstones, "z")
 
 	// Мержим только segMerged. Снапшот ts содержит "z".
-	if seg, _ := lvs.mergeSegmentsWithAllocator([]segment{segMerged}, tcmalloc.NewTCMallocStore(1)); seg == nil {
+	if seg, _ := lvs.mergeSegments([]segment{segMerged}); seg == nil {
 		t.Fatal("merge вернул nil")
 	}
 
@@ -108,11 +102,10 @@ func TestTombstone_MergeKeepsTombstoneOfNonMergedKey(t *testing.T) {
 func TestTombstone_MergeClearsWhenFullyPurged(t *testing.T) {
 	const dim = 8
 	cfg := LeveledConfig{
-		Distance:  EuclideanDistance,
-		Allocator: tcmalloc.NewTCMallocStore(1),
-		DeltaMax:  10000,
-		Fanout:    2, // 2 L0-сегмента → авто-merge в L1
-		EfSearch:  32,
+		Distance: EuclideanDistance,
+		DeltaMax: 10000,
+		Fanout:   2, // 2 L0-сегмента → авто-merge в L1
+		EfSearch: 32,
 	}
 	lvs := NewLeveledVectorStore(cfg)
 
@@ -154,7 +147,6 @@ func TestTombstone_FlushingWindowVisibility(t *testing.T) {
 	const dim = 8
 	cfg := LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(1),
 		M:              16,
 		EfConstruction: 200,
 		EfSearch:       32,

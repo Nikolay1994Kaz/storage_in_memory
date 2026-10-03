@@ -106,12 +106,12 @@ jobs:
               # Разводим гипотезу RSS-дрейфа: живой рабочий набор мал, а RSS растёт.
               #  • process_resident_memory_bytes — полный RSS процесса.
               #  • go_memstats_sys_bytes / heap_inuse — сколько держит Go-куча;
-              #    (RSS − go_sys) ≈ off-heap tcmalloc/mmap → это наш аллокатор.
+              #    (RSS − go_sys) ≈ память вне Go-кучи (mmap и т.п.).
               #  • vector_total_vectors / delta_len — размер ЖИВОГО набора.
               #  • vector_tombstones / segments{level} — накопление НЕживого
               #    (deletes на скомпакченном + несмёрженные сегменты) = гл. подозреваемый.
-              #  • vector_allocator_bytes / data_bytes — что аллокатор реально держит
-              #    под графы/соседей и под float32-slab'ы.
+              #  • vector_allocator_bytes / data_bytes — арены связей HNSW изменяемых
+              #    графов и float32-slab'ы.
               # Сопоставление этих рядов во времени скажет: копятся tombstones/сегменты
               # или это retention аллокатора без роста живого набора.
               #  • flush_delta_total — регресс-страж flush-storm (2577 flush/6мин был

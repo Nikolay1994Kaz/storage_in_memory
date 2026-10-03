@@ -6,8 +6,6 @@ import (
 	"math/rand"
 	"sort"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // ─────────────────────────────────────────────────
@@ -15,7 +13,7 @@ import (
 // ─────────────────────────────────────────────────
 
 func TestBasicInsertAndSearch(t *testing.T) {
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 
 	idA := g.Insert([]float32{0, 0})
 	g.Insert([]float32{0, 10})
@@ -48,7 +46,7 @@ func TestBasicInsertAndSearch(t *testing.T) {
 // ─────────────────────────────────────────────────
 
 func TestEdgeCases(t *testing.T) {
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 
 	// Поиск в пустом графе — не должен паниковать
 	results := g.Search([]float32{1, 2, 3}, 5, 10)
@@ -103,7 +101,7 @@ func TestRecall(t *testing.T) {
 	}
 
 	// 2. Вставляем в HNSW
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 	for _, vec := range vectors {
 		g.Insert(vec)
 	}
@@ -166,7 +164,7 @@ func TestRecall(t *testing.T) {
 // ─────────────────────────────────────────────────
 
 func TestCosineDistance(t *testing.T) {
-	g := NewGraph(CosineDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(CosineDistance)
 
 	// Три вектора с РАЗНЫМИ длинами, но одинаковым направлением
 	// A и B смотрят в одну сторону (Cosine distance ≈ 0)
@@ -221,14 +219,14 @@ func TestNormalizeEquivalence(t *testing.T) {
 	}
 
 	// Вариант 1: Cosine distance (без нормализации)
-	gCosine := NewGraph(CosineDistance, tcmalloc.NewTCMallocStore(1))
+	gCosine := NewGraph(CosineDistance)
 	for _, vec := range vectors {
 		gCosine.Insert(vec)
 	}
 	cosineResults := gCosine.Search(query, K, 50)
 
 	// Вариант 2: Euclidean distance (с нормализацией)
-	gEuclid := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	gEuclid := NewGraph(EuclideanDistance)
 	for _, vec := range vectors {
 		normalized := make([]float32, len(vec))
 		copy(normalized, vec)
@@ -290,7 +288,7 @@ func TestEfSearchAffectsRecall(t *testing.T) {
 		vectors[i] = vec
 	}
 
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 	for _, vec := range vectors {
 		g.Insert(vec)
 	}
@@ -370,7 +368,7 @@ func TestNormalize(t *testing.T) {
 // ─────────────────────────────────────────────────
 
 func TestGraphStructure(t *testing.T) {
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 
 	const n = 500
 	rng := rand.New(rand.NewSource(77))
@@ -402,7 +400,7 @@ func TestGraphStructure(t *testing.T) {
 			continue
 		}
 		for level := 0; level <= node.Level; level++ {
-			neighbors := g.getNeighbors(node.NeighborsHandle, level)
+			neighbors := g.getNeighbors(node.NeighborsOff, level)
 			maxN := g.maxNeighbors(level)
 			if len(neighbors) > maxN {
 				t.Errorf("node %d level %d: %d neighbors > max %d",
@@ -444,7 +442,7 @@ func BenchmarkSearch(b *testing.B) {
 
 	rng := rand.New(rand.NewSource(42))
 
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 	for i := 0; i < numVectors; i++ {
 		vec := make([]float32, dim)
 		for j := range vec {
@@ -474,7 +472,7 @@ func BenchmarkSearch(b *testing.B) {
 // ─────────────────────────────────────────────────
 
 func TestDelete_Basic(t *testing.T) {
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 
 	g.Insert([]float32{0, 0})
 	g.Insert([]float32{1, 0})
@@ -516,7 +514,7 @@ func TestDelete_Basic(t *testing.T) {
 			continue
 		}
 		for level := 0; level <= node.Level; level++ {
-			neighbors := g.getNeighbors(node.NeighborsHandle, level)
+			neighbors := g.getNeighbors(node.NeighborsOff, level)
 			for _, nid := range neighbors {
 				if nid == uint64(idC) {
 					t.Errorf("node %d level %d still references deleted node %d", i, level, idC)
@@ -531,7 +529,7 @@ func TestDelete_Basic(t *testing.T) {
 // ─────────────────────────────────────────────────
 
 func TestDelete_EntryPoint(t *testing.T) {
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 
 	// Вставляем 100 нод
 	rng := rand.New(rand.NewSource(55))
@@ -566,7 +564,7 @@ func TestDelete_EntryPoint(t *testing.T) {
 // ─────────────────────────────────────────────────
 
 func TestDelete_AllAndRebuild(t *testing.T) {
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 
 	// Вставляем 10 нод
 	var ids []uint32
@@ -619,7 +617,7 @@ func TestDelete_RecallAfterMassDelete(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 
 	// Вставляем
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 	vectors := make(map[uint64][]float32)
 	for i := 0; i < totalNodes; i++ {
 		vec := make([]float32, dim)

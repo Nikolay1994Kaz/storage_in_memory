@@ -2,8 +2,6 @@ package vector
 
 import (
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // Затирание освобождённой ячейки арены.
@@ -74,7 +72,7 @@ func TestArenaReuseAfterWipe(t *testing.T) {
 // путём удаляются факты, и именно он должен не оставлять следа.
 func TestGraphDeleteWipesVector(t *testing.T) {
 	const dim = 8
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 	g.arena = NewVectorArena(dim, 4)
 
 	vec := []float32{11, 22, 33, 44, 55, 66, 77, 88}

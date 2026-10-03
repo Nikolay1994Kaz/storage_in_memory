@@ -9,15 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"kvstore/kvstore/internal/store/tcmalloc"
 	"kvstore/kvstore/vector"
 )
 
 // ─── Helpers ─────────────────────────────────────────────────
 
 func newTestHub() *Hub {
-	store := tcmalloc.NewTCMallocStore(4) // 4 workers для тестов
-	index := vector.NewVectorStoreCosine(store)
+	index := vector.NewVectorStoreCosine()
 	return NewHub(index)
 }
 
@@ -498,8 +496,7 @@ func TestHub_RemoveConnCleansBoth(t *testing.T) {
 // ─── Benchmarks ──────────────────────────────────────────────
 
 func BenchmarkSemanticHub_Subscribe(b *testing.B) {
-	store := tcmalloc.NewTCMallocStore(4)
-	index := vector.NewVectorStoreCosine(store)
+	index := vector.NewVectorStoreCosine()
 	hub := NewHub(index)
 
 	vec := normalizeVec([]float32{1, 0, 0, 0})
@@ -516,8 +513,7 @@ func BenchmarkSemanticHub_Subscribe(b *testing.B) {
 }
 
 func benchmarkSemanticPublish(b *testing.B, numSubs int, dim int) {
-	store := tcmalloc.NewTCMallocStore(4)
-	index := vector.NewVectorStoreCosine(store)
+	index := vector.NewVectorStoreCosine()
 	hub := NewHub(index)
 
 	rng := rand.New(rand.NewSource(42))
@@ -573,8 +569,7 @@ func BenchmarkSemanticHub_Publish_100Subs_768D(b *testing.B) {
 }
 
 func BenchmarkSemanticHub_Publish_ConcurrentReaders(b *testing.B) {
-	store := tcmalloc.NewTCMallocStore(4)
-	index := vector.NewVectorStoreCosine(store)
+	index := vector.NewVectorStoreCosine()
 	hub := NewHub(index)
 
 	rng := rand.New(rand.NewSource(42))

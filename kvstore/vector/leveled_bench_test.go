@@ -5,9 +5,9 @@ package vector
 //
 // Что проверяем:
 //   1. Brute-force на дельте (N<=10K) — насколько быстро vs HNSW?
-//   2. CSR frozen graph search — выигрыш от cache locality vs TCMalloc graph
+//   2. CSR frozen graph search — выигрыш от cache locality vs изменяемый Graph
 //   3. Segmented search (параллельный merge) — overhead vs монолит
-//   4. Стоимость freeze (конвертация TCMalloc→CSR) — насколько дорогая компакция?
+//   4. Стоимость freeze (конвертация Graph→CSR) — насколько дорогая компакция?
 //   5. Insert throughput: sequential HNSW vs delta append
 //
 // Запуск (быстрые, только LC бенчмарки, без других тестов):
@@ -22,8 +22,6 @@ import (
 	"slices"
 	"sync"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -157,7 +155,7 @@ type lcFrozenGraph struct {
 	distFn       DistanceFunc
 }
 
-// lcFreezeGraph конвертирует *Graph (TCMalloc) → *lcFrozenGraph (CSR flat array)
+// lcFreezeGraph конвертирует *Graph → *lcFrozenGraph (CSR flat array)
 func lcFreezeGraph(g *Graph, distFn DistanceFunc, _ int) *lcFrozenGraph {
 	n := len(g.nodes)
 	if n == 0 {
@@ -191,7 +189,7 @@ func lcFreezeGraph(g *Graph, distFn DistanceFunc, _ int) *lcFrozenGraph {
 				offs[i+1] = offs[i]
 				continue
 			}
-			ns := g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)
+			ns := g.getNeighbors(g.nodes[i].NeighborsOff, lyr)
 			offs[i+1] = offs[i] + uint32(len(ns))
 		}
 		neigh := make([]uint32, offs[n])
@@ -199,7 +197,7 @@ func lcFreezeGraph(g *Graph, distFn DistanceFunc, _ int) *lcFrozenGraph {
 			if !g.nodes[i].Alive || g.nodes[i].Level < lyr {
 				continue
 			}
-			ns := g.getNeighbors(g.nodes[i].NeighborsHandle, lyr)
+			ns := g.getNeighbors(g.nodes[i].NeighborsOff, lyr)
 			for j, nb := range ns {
 				neigh[int(offs[i])+j] = uint32(nb)
 			}
@@ -427,8 +425,7 @@ func (fg *lcFrozenGraph) MemoryBytes() int {
 // =============================================================================
 
 func lcBuildGraph(n, dim int, efConstruction int, seed int64) *Graph {
-	alloc := tcmalloc.NewTCMallocStore(1)
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = efConstruction
 	rng := rand.New(rand.NewSource(seed))
 	for i := 0; i < n; i++ {
@@ -540,7 +537,7 @@ func benchmarkLCHNSWSearch(b *testing.B, n, dim int) {
 }
 
 // =============================================================================
-// BENCHMARK 2: CSR Frozen Graph vs TCMalloc Graph — cache locality
+// BENCHMARK 2: CSR Frozen Graph vs изменяемый Graph — cache locality
 //
 // Доказывает: после freeze() поиск по CSR быстрее из-за contiguous memory.
 // =============================================================================
@@ -562,7 +559,7 @@ func benchmarkLCFrozenSearch(b *testing.B, n, dim int) {
 	query := lcRandomQuery(dim, 999)
 	K := 10
 
-	b.Logf("Frozen graph memory: %.1f MB (vs Graph TCMalloc: ~%.1f MB)",
+	b.Logf("Frozen graph memory: %.1f MB (vs изменяемый Graph: ~%.1f MB)",
 		float64(frozen.MemoryBytes())/1e6,
 		float64(n*dim*4+n*33*8)/1e6, // приблизительно
 	)
@@ -574,18 +571,18 @@ func benchmarkLCFrozenSearch(b *testing.B, n, dim int) {
 	}
 }
 
-// TCMalloc Graph Search для сравнения (те же параметры)
-func BenchmarkLC_Fast_TCMallocGraph_Search_10K_dim128(b *testing.B) {
-	benchmarkLCTCMallocSearch(b, 10000, 128)
+// Поиск по изменяемому Graph для сравнения (те же параметры)
+func BenchmarkLC_Fast_MutableGraph_Search_10K_dim128(b *testing.B) {
+	benchmarkLCMutableGraphSearch(b, 10000, 128)
 }
-func BenchmarkLC_Fast_TCMallocGraph_Search_10K_dim768(b *testing.B) {
-	benchmarkLCTCMallocSearch(b, 10000, 768)
+func BenchmarkLC_Fast_MutableGraph_Search_10K_dim768(b *testing.B) {
+	benchmarkLCMutableGraphSearch(b, 10000, 768)
 }
-func BenchmarkLC_Slow_TCMallocGraph_Search_50K_dim128(b *testing.B) {
-	benchmarkLCTCMallocSearch(b, 50000, 128)
+func BenchmarkLC_Slow_MutableGraph_Search_50K_dim128(b *testing.B) {
+	benchmarkLCMutableGraphSearch(b, 50000, 128)
 }
 
-func benchmarkLCTCMallocSearch(b *testing.B, n, dim int) {
+func benchmarkLCMutableGraphSearch(b *testing.B, n, dim int) {
 	b.Helper()
 	g := lcBuildGraph(n, dim, 64, 42)
 	query := lcRandomQuery(dim, 999)
@@ -689,7 +686,7 @@ func lcMergeResults(results [][]lcResult, K int) []lcResult {
 }
 
 // =============================================================================
-// BENCHMARK 4: Стоимость Freeze (TCMalloc Graph → CSR)
+// BENCHMARK 4: Стоимость Freeze (Graph → CSR)
 //
 // Доказывает: компакция достаточно быстра чтобы делать её в фоне
 // =============================================================================
@@ -725,8 +722,7 @@ func BenchmarkLC_Fast_Insert_Delta_dim768(b *testing.B) { benchmarkLCDeltaInsert
 
 func benchmarkLCHNSWInsert(b *testing.B, dim int) {
 	b.Helper()
-	alloc := tcmalloc.NewTCMallocStore(1)
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = 64
 	// Ограничиваем N чтобы не строить граф на 1M+ векторов
 	n := b.N

@@ -16,8 +16,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // =============================================================================
@@ -302,7 +300,6 @@ func TestSecondaryLayout_Profit(t *testing.T) {
 	runStore := func(name string, all []kv) storeRes {
 		lvs := NewLeveledVectorStore(LeveledConfig{
 			Metric:         MetricCosine,
-			Allocator:      tcmalloc.NewTCMallocStore(8),
 			DeltaMax:       len(train) + 1,
 			Fanout:         4,
 			EfConstruction: arEfConstruction,

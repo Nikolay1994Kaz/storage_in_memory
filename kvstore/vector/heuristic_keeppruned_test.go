@@ -10,8 +10,6 @@ package vector
 import (
 	"math/rand"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 func TestGraph_SelfQueryReachability(t *testing.T) {
@@ -31,7 +29,7 @@ func TestGraph_SelfQueryReachability(t *testing.T) {
 		vecs[i] = v
 	}
 
-	g := NewGraph(EuclideanDistance, tcmalloc.NewTCMallocStore(1))
+	g := NewGraph(EuclideanDistance)
 	// Конфиг прод-сервера: M=32, efConstruction=400 (+ ресайз буферов под M0,
 	// как в VectorStore.SetHNSWParams).
 	g.M = 32

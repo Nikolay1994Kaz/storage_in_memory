@@ -16,9 +16,7 @@ import (
 // TestFrozenGraphSQ_Build проверяет базовое построение и MemoryBytes.
 func TestFrozenGraphSQ_Build(t *testing.T) {
 	const n, dim = 2000, 128
-
-	alloc := newTestAllocator()
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = 200
 
 	vecs := makeRandVecs(n, dim, 42)
@@ -60,9 +58,7 @@ func TestFrozenGraphSQ_Build(t *testing.T) {
 // TestFrozenGraphSQ_Recall сравнивает recall SQ8 vs FrozenGraph на 3000 векторов.
 func TestFrozenGraphSQ_Recall(t *testing.T) {
 	const n, dim, K = 3000, 128, 10
-
-	alloc := newTestAllocator()
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = 200
 
 	vecs := makeRandVecs(n, dim, 42)
@@ -123,9 +119,7 @@ func TestFrozenGraphSQ_Recall(t *testing.T) {
 // SQ8 неточнее float32, но компенсируется расширенным efSearch.
 func TestFrozenGraphSQ_RecallAtEfBoost(t *testing.T) {
 	const n, dim, K = 3000, 128, 10
-
-	alloc := newTestAllocator()
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = 200
 
 	vecs := makeRandVecs(n, dim, 42)
@@ -164,9 +158,7 @@ func TestFrozenGraphSQ_RecallAtEfBoost(t *testing.T) {
 // TestFrozenGraphSQ_SerializationRoundTrip проверяет save→load→recall.
 func TestFrozenGraphSQ_SerializationRoundTrip(t *testing.T) {
 	const n, dim, K = 1000, 128, 10
-
-	alloc := newTestAllocator()
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = 200
 
 	vecs := makeRandVecs(n, dim, 42)

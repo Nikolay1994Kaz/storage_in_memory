@@ -21,8 +21,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // buildGraphM строит сырой HNSW-граф ТОЧНО как production buildSegment:
@@ -33,8 +31,7 @@ func buildGraphM(vecs [][]float32, M, efC int) (*Graph, time.Duration) {
 
 // buildGraphMH — buildGraphM с переключателем HNSW select-neighbors heuristic.
 func buildGraphMH(vecs [][]float32, M, efC int, heuristic bool) (*Graph, time.Duration) {
-	alloc := tcmalloc.NewTCMallocStore(1)
-	g := NewGraph(EuclideanDistance, alloc)
+	g := NewGraph(EuclideanDistance)
 	g.EfConstruction = efC
 	g.HeuristicSelect = heuristic
 	if M > 0 {

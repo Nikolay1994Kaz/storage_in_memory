@@ -3,8 +3,6 @@ package vector
 import (
 	"strconv"
 	"testing"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // TestSearchFilter_NoPartition_SurvivesFlush — страж #3.
@@ -22,7 +20,6 @@ func TestSearchFilter_NoPartition_SurvivesFlush(t *testing.T) {
 	// ВАЖНО: без PartitionAttr и без TenantOf — прежде это роняло attrs на flush.
 	lvs := NewLeveledVectorStore(LeveledConfig{
 		Distance:       EuclideanDistance,
-		Allocator:      tcmalloc.NewTCMallocStore(2),
 		DeltaMax:       1000,
 		Fanout:         8,
 		EfSearch:       64,
