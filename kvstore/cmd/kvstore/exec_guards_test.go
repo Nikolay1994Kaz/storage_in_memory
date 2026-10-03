@@ -25,7 +25,7 @@ func TestExec_ClusterDisabled(t *testing.T) {
 	e.wantErrPrefix(e.do("MIGRATE", "h", "p", "k"), "ERR cluster mode is not enabled")
 }
 
-// TestExec_OomGateBlocksGrowingWrites — единый OOM-гейт в начале executeCommand.
+// TestExec_OomGateBlocksGrowingWrites — единый OOM-гейт в начале commands.execute.
 //
 // Растущие в памяти команды (SET/ZADD/VSIM.ADD) отклоняются при used>=maxmemory,
 // а удаляющие/читающие — НЕТ (иначе из OOM не выйти освобождением). Это как раз

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
+	"time"
 
 	"kvstore/kvstore/internal/cluster"
 	"kvstore/kvstore/internal/protocol"
@@ -89,4 +92,40 @@ func newClusterRouter(addr string, gossipPort, slotStart, slotEnd int,
 		return nil, fmt.Errorf("start gossip: %w", err)
 	}
 	return clusterAdapter{cl}, nil
+}
+
+// SendVectorToNode отправляет VSIM.ADD key v1 v2 ... vN на удалённую ноду через TCP.
+func SendVectorToNode(addr, key string, vec []float32) error {
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect to %s: %w", addr, err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	// Формируем массив RESP аргументов для команды VSIM.ADD
+	var sb strings.Builder
+	// Число аргументов: 2 (VSIM.ADD + key) + len(vec)
+	fmt.Fprintf(&sb, "*%d\r\n$8\r\nVSIM.ADD\r\n$%d\r\n%s\r\n", 2+len(vec), len(key), key)
+	for _, v := range vec {
+		vStr := strconv.FormatFloat(float64(v), 'f', -1, 32)
+		fmt.Fprintf(&sb, "$%d\r\n%s\r\n", len(vStr), vStr)
+	}
+
+	if _, err := conn.Write([]byte(sb.String())); err != nil {
+		return fmt.Errorf("write to %s: %w", addr, err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("read from %s: %w", addr, err)
+	}
+
+	resp := string(buf[:n])
+	if !strings.HasPrefix(resp, "+OK") {
+		return fmt.Errorf("remote VSIM.ADD failed: %s", strings.TrimSpace(resp))
+	}
+
+	return nil
 }

@@ -16,7 +16,7 @@ import (
 // задваивается при каждом рестарте.
 func TestWalApplier_HonorsSnapshotWatermark(t *testing.T) {
 	e := newExecEnv(t)
-	lvs := e.vec.(*vector.LeveledVectorStore)
+	lvs := e.vec
 
 	applier := &walApplier{
 		s: e.s, ttl: e.ttl, vec: e.vec, zsetReg: e.zset,
@@ -78,7 +78,7 @@ func TestWalApplier_HonorsSnapshotWatermark(t *testing.T) {
 // сломаться незаметно — и молча потерять документы при обновлении.
 func TestWalApplier_ReplaysLegacyDocBatch(t *testing.T) {
 	e := newExecEnv(t)
-	lvs := e.vec.(*vector.LeveledVectorStore)
+	lvs := e.vec
 	applier := &walApplier{s: e.s, ttl: e.ttl, vec: e.vec, zsetReg: e.zset}
 
 	batch := vector.SerializeDocBatch([]vector.BatchDoc{

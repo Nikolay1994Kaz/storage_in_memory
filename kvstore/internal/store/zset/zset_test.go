@@ -153,7 +153,9 @@ func TestEmptySetIsRemoved(t *testing.T) {
 	reg.ZAdd("tmp", 2, "b")
 	reg.ZRem("tmp", "a")
 	reg.ZRem("tmp", "b")
-	reg.ForEachSet(func(name string) { t.Fatalf("пустое множество %q осталось в реестре", name) })
+	reg.ForEachSet(func(name string) {
+		t.Fatalf("пустое множество %q осталось в реестре", name)
+	})
 	if !reg.ZAdd("tmp", 3, "c") || reg.ZCard("tmp") != 1 {
 		t.Fatal("после опустошения множество не создаётся заново")
 	}

@@ -29,7 +29,7 @@ import (
 type walApplier struct {
 	s       *kv.Store
 	ttl     *store.TTLManager
-	vec     vector.VectorIndex
+	vec     *vector.LeveledVectorStore
 	zsetReg *zset.ZSetRegistry
 
 	// graphLoaded/vecWatermark — вход shouldSkipVecReplay: покрыт ли
@@ -104,13 +104,8 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 			slog.Warn("failed to decode vector+attrs", "key", entry.Key, "err", err)
 			return
 		}
-		if lvs, ok := a.vec.(*vector.LeveledVectorStore); ok {
-			if err := lvs.AddWithAttrs(entry.Key, vec, attrs); err != nil {
-				slog.Warn("failed to restore vector+attrs", "key", entry.Key, "err", err)
-			}
-		} else if err := a.vec.Add(entry.Key, vec); err != nil {
-			// Индекс без attr-слоя — восстанавливаем хотя бы вектор.
-			slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
+		if err := a.vec.AddWithAttrs(entry.Key, vec, attrs); err != nil {
+			slog.Warn("failed to restore vector+attrs", "key", entry.Key, "err", err)
 		}
 		a.vecRestored++
 		a.restored++
@@ -126,13 +121,8 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 			slog.Warn("failed to decode vector+doc", "key", entry.Key, "err", err)
 			return
 		}
-		if lvs, ok := a.vec.(*vector.LeveledVectorStore); ok {
-			if err := lvs.AddDocTerms(entry.Key, vec, attrs, terms); err != nil {
-				slog.Warn("failed to restore vector+doc", "key", entry.Key, "err", err)
-			}
-		} else if err := a.vec.Add(entry.Key, vec); err != nil {
-			// Индекс без текстового слоя — восстанавливаем хотя бы вектор.
-			slog.Warn("failed to restore vector", "key", entry.Key, "err", err)
+		if err := a.vec.AddDocTerms(entry.Key, vec, attrs, terms); err != nil {
+			slog.Warn("failed to restore vector+doc", "key", entry.Key, "err", err)
 		}
 		a.vecRestored++
 		a.restored++
@@ -148,14 +138,12 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 			slog.Warn("failed to decode doc batch", "key", entry.Key, "err", err)
 			return
 		}
-		if lvs, ok := a.vec.(*vector.LeveledVectorStore); ok {
-			for _, d := range docs {
-				if err := lvs.AddDocTerms(d.Key, d.Vec, d.Attrs, d.Terms); err != nil {
-					slog.Warn("failed to restore doc from batch", "key", d.Key, "err", err)
-				}
+		for _, d := range docs {
+			if err := a.vec.AddDocTerms(d.Key, d.Vec, d.Attrs, d.Terms); err != nil {
+				slog.Warn("failed to restore doc from batch", "key", d.Key, "err", err)
 			}
-			a.vecRestored += len(docs)
 		}
+		a.vecRestored += len(docs)
 		a.restored++
 	case wal.OpVSimDel:
 		if a.skipVec(entry, isFromSnapshot) {
@@ -174,4 +162,18 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 		a.zsetReg.ZRem(entry.Key, member)
 		a.restored++
 	}
+}
+
+// shouldSkipVecReplay решает, пропустить ли ВЕКТОРНЫЙ эффект WAL-записи при
+// recovery как уже отражённый в снапшоте graph_leveled.bin. Из snapshot.wal —
+// пропускаем, если граф загружен из бинарного снапшота; из wal_*.log — если
+// LSN ≤ vecWatermark (запись уже в снапшоте). Применяется КО ВСЕМ записям,
+// меняющим вектор: OpVSimAdd/Attrs/Doc/Del И каскадным OpDel/OpExpire (KV-DEL, что
+// также удаляет вектор) — иначе старый DEL с LSN ≤ watermark удалил бы вектор,
+// воскрешённый более поздним re-add, уже присутствующий в снапшоте.
+func shouldSkipVecReplay(entry wal.Entry, isFromSnapshot, graphLoaded bool, vecWatermark uint64) bool {
+	if isFromSnapshot {
+		return graphLoaded
+	}
+	return entry.LSN <= vecWatermark
 }

@@ -15,14 +15,12 @@ import (
 	"kvstore/kvstore/vector"
 )
 
-// ─── Тест-харнесс для executeCommand ───────────────────────────────────────
+// ─── Тест-харнесс для commands.execute ─────────────────────────────────────
 //
-// executeCommand — центральный диспетчер команд сервера (~950 строк, все
-// KV/TTL/zset/vector команды), но исторически имел 0% покрытия: логика жила
-// в cmd/kvstore/main.go и дёргалась только через реальный сокет. Это чистая
-// функция (все зависимости — параметрами, ответ пишется в cs.Buf), поэтому её
-// можно гонять напрямую: собираем реальные хранилища, шлём команду, парсим
-// RESP-ответ с провода.
+// commands.execute — центральный диспетчер команд сервера (все KV/TTL/zset/
+// vector команды). Все зависимости — поля commands, ответ пишется в cs.Buf,
+// поэтому его можно гонять напрямую: собираем реальные хранилища, шлём
+// команду, парсим RESP-ответ с провода.
 //
 // recordingConn/testAddr переиспользуются из m1_pipeline_writer_test.go
 // (тот же пакет main).
@@ -36,7 +34,7 @@ type execEnv struct {
 	bw   *wal.BatchWAL
 	ttl  *store.TTLManager
 	hub  *pubsub.Hub
-	vec  vector.VectorIndex
+	vec  *vector.LeveledVectorStore
 	zset *zset.ZSetRegistry
 	cs   *server.ConnState
 
@@ -101,8 +99,11 @@ func (e *execEnv) do(cmd string, args ...string) protocol.Value {
 		byteArgs[i] = []byte(a)
 	}
 
-	executeCommand(e.s, e.bw, e.ttl, e.hub, nil, e.vec, e.zset,
-		e.iterateAll, e.saveVectors, e.cs, cmd, byteArgs)
+	// commands собирается на каждый вызов: тесты COMPACT подменяют
+	// iterateAll/saveVectors в окружении уже после его создания.
+	c := &commands{kv: e.s, wal: e.bw, ttl: e.ttl, hub: e.hub, vec: e.vec, zsets: e.zset,
+		iterateAll: e.iterateAll, saveVectors: e.saveVectors}
+	c.execute(e.cs, cmd, byteArgs)
 
 	if err := e.cs.Buf.Flush(); err != nil {
 		e.t.Fatalf("Buf.Flush(%s): %v", cmd, err)

@@ -49,9 +49,9 @@ func newAttrEnv(t *testing.T, partitionAttr string) *attrEnv {
 		for i, a := range args {
 			byteArgs[i] = []byte(a)
 		}
-		executeCommand(s, bw, ttl, hub, nil, vec, zreg,
-			func(func(byte, string, []byte)) {}, func() error { return nil },
-			cs, cmd, byteArgs)
+		c := &commands{kv: s, wal: bw, ttl: ttl, hub: hub, vec: vec, zsets: zreg,
+			iterateAll: func(func(byte, string, []byte)) {}, saveVectors: func() error { return nil }}
+		c.execute(cs, cmd, byteArgs)
 		if err := cs.Buf.Flush(); err != nil {
 			t.Fatalf("Buf.Flush(%s): %v", cmd, err)
 		}

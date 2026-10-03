@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// Покрытие KV-семейства диспетчера executeCommand: PING/SET/GET/DEL/EXISTS-нет,
+// Покрытие KV-семейства диспетчера commands.execute: PING/SET/GET/DEL/EXISTS-нет,
 // плюс контрактные детали (arity-ошибки, отсутствующий ключ, перезапись).
 
 func TestExec_Ping(t *testing.T) {
