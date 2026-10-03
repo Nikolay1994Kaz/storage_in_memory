@@ -107,7 +107,6 @@ func main() {
 	hnswM := flag.Int("hnsw-m", 32, "HNSW M parameter (number of node connections)")
 	hnswEfConstruction := flag.Int("hnsw-ef-construction", 400, "HNSW efConstruction parameter")
 	hnswEfSearch := flag.Int("hnsw-ef-search", 100, "HNSW efSearch parameter (0 = auto). 100 = рабочая точка recall@10≈0.966 на MNIST-784, ~1.56× QPS vs 200 (recall 0.983). См. step_profit_test.go:TestStep2_EfSearch")
-	hnswUseLSH := flag.Bool("hnsw-use-lsh", false, "Enable LSH pre-filtering for high-dimensional vectors (dim >= 256)")
 	hnswUseSQ := flag.Bool("hnsw-use-sq", false, "Enable Scalar Quantization (int8) for frozen segments (any dim; рекомендуется для dim>256). 4x memory compression, recall ~0.97+ на реальных эмбеддингах, higher QPS via memory bandwidth")
 	compactionWorkers := flag.Int("compaction-workers", 0, "Number of parallel segment build workers (0 = auto NumCPU/2 clamped 2-8). Build Pool: insert does not block during heavy L2 compaction")
 	deltaShards := flag.Int("delta-shards", 1, "число шардов дельты для конкурентных вставок (1 = один граф, freeze-on-flush; >1 = ~2.4× insert @4 / ~4.25× @12 ценой search-штрафа ∝ доле дельты). См. step_profit_test.go:TestStep5_ShardedAddScaling")
@@ -249,10 +248,6 @@ func main() {
 		StrictSegShadow:      *strictSegShadow,
 		IdleConsolidateAfter: *idleConsolidate,
 	})
-	// LSH не применяется в LeveledVectorStore, вызов no-op через type assertion:
-	if lsh, ok := vecStore.(interface{ SetUseLSH(bool) }); ok {
-		lsh.SetUseLSH(*hnswUseLSH)
-	}
 
 	// Регистрация gauge-метрик векторного хранилища (segments/tombstones/bytes).
 	// Provider вызывается только при scrape /metrics — 0 overhead на hot path.
@@ -384,7 +379,7 @@ func main() {
 	// === TTL: подключаем CompositeEvictor ===
 	// Теперь при истечении TTL ключа TTLManager автоматически:
 	//   1. Удаляет значение из KV Store (как раньше)
-	//   2. Удаляет вектор из HNSW графа (если ключ есть в VectorStore)
+	//   2. Удаляет вектор из векторного индекса (если ключ там есть)
 	//   3. Записывает OpVSimDel в WAL (чтобы удаление пережило рестарт)
 	ttl.SetEvictor(&compositeEvictor{kvs: s, vec: vecStore, wal: bw})
 
@@ -463,11 +458,8 @@ func main() {
 	// shipper.Stop() вызывается явно ПОСЛЕ bw.Close() в shutdown: финальный тик
 	// дошипливает уже-fsyncнутый хвост WAL → graceful shutdown даёт RPO=0 и удалённо.
 
-	// === 5. Pub/Sub Hub (Classic + Semantic) ===
-	semanticIndex := vector.NewVectorStoreCosine()
-	semanticIndex.SetHNSWParams(*hnswM, *hnswEfConstruction, *hnswEfSearch)
-	semanticIndex.SetUseLSH(*hnswUseLSH)
-	hub := pubsub.NewHub(semanticIndex)
+	// === 5. Pub/Sub ===
+	hub := pubsub.NewHub()
 
 	// === 6. Cluster (опционально, только в experimental-сборке) ===
 	// Вся обвязка вынесена за build-tag `experimental` (cluster_experimental.go).
@@ -617,15 +609,15 @@ func main() {
 	srv.IdleTimeout = *idleTimeout
 	srv.WriteTimeout = *writeTimeout
 	srv.MaxConnections = *maxConnections
-	// Отключение клиента чистит его подписки Pub/Sub (classic + semantic-вектор в
-	// HNSW). Без этого хука вектор течёт в индекс навсегда, а writePump висит.
+	// Отключение клиента чистит его подписки Pub/Sub. Без этого хука подписчик
+	// остаётся в реестре навсегда, а его writePump висит.
 	srv.OnDisconnect = hub.RemoveConn
 	// Подписчик после SUBSCRIBE легитимно молчит (получает только push'и), а
 	// idle-реапер считает активностью лишь приём данных — без эксемпта он рвал бы
 	// подписчиков ровно через idle-timeout (Redis тоже не применяет timeout к
 	// CLIENT_PUBSUB). Мёртвых peer'ов ловят TCP keepalive и ошибка writePump.
 	srv.IdleExempt = hub.IsSubscriber
-	// H3: медленный подписчик отключается через единую точку учёта epoll.
+	// H3: медленный подписчик отключается через единую точку учёта сервера.
 	hub.SetOnSlowClose(srv.CloseConn)
 
 	// TLS: если указаны сертификат и ключ — включаем шифрование.
@@ -1554,62 +1546,6 @@ func executeCommand(s *kv.Store, bw *wal.BatchWAL, ttl *store.TTLManager,
 			buf.WriteInt(0)
 		}
 
-	// === Semantic Pub/Sub (Vector-routed) ===
-	case "VSIM.SUBSCRIBE":
-		// Формат: VSIM.SUBSCRIBE <threshold> <v1> <v2> ... <vN>
-		if len(args) < 2 {
-			buf.WriteError("ERR usage: VSIM.SUBSCRIBE <threshold> <v1> <v2> ... <vN>")
-			return
-		}
-		threshold, err := strconv.ParseFloat(unsafeString(args[0]), 32)
-		if err != nil || threshold < 0 {
-			buf.WriteError("ERR invalid threshold (must be non-negative float)")
-			return
-		}
-		vec := make([]float32, len(args)-1)
-		for i := 1; i < len(args); i++ {
-			f, err := strconv.ParseFloat(unsafeString(args[i]), 32)
-			if err != nil {
-				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, unsafeString(args[i])))
-				return
-			}
-			vec[i-1] = float32(f)
-		}
-		// M1: тот же two-writer, что и в classic SUBSCRIBE — флашим накопленный
-		// в пайплайне вывод ДО старта writePump (внутри SemanticSubscribe).
-		flushBeforeWritePump(cs)
-		if _, err := hub.SemanticSubscribe(cs.Conn, vec, float32(threshold)); err != nil {
-			buf.WriteError(fmt.Sprintf("ERR %v", err))
-			return
-		}
-		// writePump отправляет подтверждение, не пишем в buf
-
-	case "VSIM.UNSUBSCRIBE":
-		if hub.SemanticUnsubscribe(cs.Conn) {
-			buf.WriteSimpleString("OK")
-		} else {
-			buf.WriteSimpleString("OK") // idempotent: OK даже если не был подписан
-		}
-
-	case "VSIM.PUBLISH":
-		// Формат: VSIM.PUBLISH <message> <v1> <v2> ... <vN>
-		if len(args) < 2 {
-			buf.WriteError("ERR usage: VSIM.PUBLISH <message> <v1> <v2> ... <vN>")
-			return
-		}
-		message := string(args[0])
-		vec := make([]float32, len(args)-1)
-		for i := 1; i < len(args); i++ {
-			f, err := strconv.ParseFloat(unsafeString(args[i]), 32)
-			if err != nil {
-				buf.WriteError(fmt.Sprintf("ERR invalid float at position %d: %s", i, unsafeString(args[i])))
-				return
-			}
-			vec[i-1] = float32(f)
-		}
-		count := hub.SemanticPublish(vec, message)
-		buf.WriteInt(count)
-
 	case "VSIM.SEARCH":
 		if len(args) < 2 {
 			buf.WriteError("ERR usage: VSIM.SEARCH <K> <v1> <v2> ... <vN>")
@@ -2277,7 +2213,7 @@ func queueTxCommand(cs *server.ConnState, args [][]byte, cmd string) {
 // меньше элементов) и рвёт соединение. Redis тоже запрещает их в транзакции.
 func forbiddenInTx(cmd string) bool {
 	switch cmd {
-	case "SUBSCRIBE", "UNSUBSCRIBE", "VSIM.SUBSCRIBE", "VSIM.UNSUBSCRIBE":
+	case "SUBSCRIBE", "UNSUBSCRIBE":
 		return true
 	}
 	return false

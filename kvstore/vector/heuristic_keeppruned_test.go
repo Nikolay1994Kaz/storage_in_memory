@@ -30,8 +30,7 @@ func TestGraph_SelfQueryReachability(t *testing.T) {
 	}
 
 	g := NewGraph(EuclideanDistance)
-	// Конфиг прод-сервера: M=32, efConstruction=400 (+ ресайз буферов под M0,
-	// как в VectorStore.SetHNSWParams).
+	// Конфиг прод-сервера: M=32, efConstruction=400 (+ ресайз буферов под M0).
 	g.M = 32
 	g.M0 = 64
 	g.EfConstruction = 400

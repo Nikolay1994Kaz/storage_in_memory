@@ -264,11 +264,7 @@ func getVectorCount(addr string) int {
 // runSubscriberSession — одна pub/sub-сессия подписчика: connect → subscribe →
 // drain push'ей до обрыва или отмены ctx. Возвращает true при чистом завершении
 // (ctx отменён), false при ошибке (вызывающий цикл сделает паузу и реконнект).
-//
-// Нечётные subID — semantic (VSIM.SUBSCRIBE регистрирует вектор в семантическом
-// индексе → путь Add его графа, грузит аллокатор индекса конкурентно с
-// KV-нагрузкой = регресс-страж фикса #5 dedicated-allocator), чётные — classic.
-func runSubscriberSession(ctx context.Context, addr string, subID, dim int,
+func runSubscriberSession(ctx context.Context, addr string, subID int,
 	completedOps, errorOps *atomic.Int64) bool {
 
 	subConn, err := net.Dial("tcp", addr)
@@ -282,26 +278,14 @@ func runSubscriberSession(ctx context.Context, addr string, subID, dim int,
 	sw := protocol.NewWriter(subConn)
 	sr := protocol.NewReader(subConn)
 
-	if subID%2 == 1 {
-		sargs := []string{"VSIM.SUBSCRIBE", "5.0"}
-		srng := rand.New(rand.NewSource(int64(subID)*7 + 1))
-		for j := 0; j < dim; j++ {
-			sargs = append(sargs, strconv.FormatFloat(srng.NormFloat64(), 'f', 4, 64))
-		}
-		if err := sendCommand(sw, sargs...); err != nil {
-			errorOps.Add(1)
-			return false
-		}
-	} else {
-		channel := fmt.Sprintf("stress:chan:%d", subID%10) // 10 общих каналов
-		if err := sendCommand(sw, "SUBSCRIBE", channel); err != nil {
-			errorOps.Add(1)
-			return false
-		}
+	channel := fmt.Sprintf("stress:chan:%d", subID%10) // 10 общих каналов
+	if err := sendCommand(sw, "SUBSCRIBE", channel); err != nil {
+		errorOps.Add(1)
+		return false
 	}
 
-	// Первый Read забирает подтверждение подписки (semantic — через writePump,
-	// classic — из буфера), дальше drain-петля читает push-сообщения.
+	// Первый Read забирает подтверждение подписки, дальше drain-петля читает
+	// push-сообщения.
 	if _, err := sr.Read(); err != nil {
 		errorOps.Add(1)
 		return false
@@ -359,7 +343,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 			defer wg.Done()
 
 			for ctx.Err() == nil {
-				if !runSubscriberSession(ctx, addr, subID, dim, &completedOps, &errorOps) {
+				if !runSubscriberSession(ctx, addr, subID, &completedOps, &errorOps) {
 					select {
 					case <-time.After(time.Second): // пауза перед реконнектом
 					case <-ctx.Done():
@@ -399,8 +383,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 					var err error
 					// Расширенный микс: помимо read/upsert/pub добавлены delete-churn
 					// (VSIM.DEL/DEL → tombstone+merge, #3), бинарный путь (VSIM.ADDBIN),
-					// filterFn-путь (VSIM.SEARCHFILTER PREFIX), semantic-routing
-					// (VSIM.PUBLISH → поиск по семантич.индексу, #5), zset-удаления
+					// filterFn-путь (VSIM.SEARCHFILTER PREFIX), zset-удаления
 					// (ZREM → btree delete/borrow/leaf-merge) и TTL-churn
 					// (SET EX/EXPIRE → active-expiry на монотонных часах).
 					switch {
@@ -474,13 +457,7 @@ func runPhase2And3(addr, metricsAddr string, testDuration time.Duration, concurr
 						}
 					case dice < 95: // 3% DEL (KV delete)
 						err = sendCommand(w, "DEL", fmt.Sprintf("key:%d", rng.Intn(5000)))
-					case dice < 99: // 4% VSIM.PUBLISH (semantic-routing → поиск по семантич.индексу)
-						args := []string{"VSIM.PUBLISH", "stress_semantic_msg"}
-						for j := 0; j < dim; j++ {
-							args = append(args, fmt.Sprintf("%.6f", rng.Float32()))
-						}
-						err = sendCommand(w, args...)
-					default: // 1% PUBLISH (classic)
+					default: // 5% PUBLISH
 						err = sendCommand(w, "PUBLISH", fmt.Sprintf("stress:chan:%d", rng.Intn(10)), "stress_message_payload_val")
 					}
 

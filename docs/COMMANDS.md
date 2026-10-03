@@ -48,10 +48,9 @@ payload/state layer, not a Redis replacement.
   compare). Unauthenticated connections may only run `AUTH` and `PING`; everything
   else gets `NOAUTH Authentication required`.
 - **Unknown command** → `ERR unknown command '<CMD>'`.
-- **Subscriber mode.** Once a connection holds any subscription (classic or
-  semantic), it is served exclusively by the pub/sub path (single socket writer =
-  `writePump`). In this mode only `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`, `PUBLISH`,
-  `VSIM.SUBSCRIBE`, `VSIM.UNSUBSCRIBE` are honored.
+- **Subscriber mode.** Once a connection holds any subscription, it is served
+  exclusively by the pub/sub path (single socket writer = `writePump`). In this
+  mode only `SUBSCRIBE`, `UNSUBSCRIBE`, `PING` and `PUBLISH` are honored.
 
 ## Cross-cutting gates
 
@@ -75,9 +74,8 @@ A new mutating command (any tier) MUST be added to both classifiers explicitly.
 - **`MULTI`** / **`EXEC`** / **`DISCARD`** — Redis-style queuing; queued commands
   reply `QUEUED`; a forbidden command in the queue aborts the whole transaction
   (`EXECABORT`, like Redis).
-- Forbidden inside a transaction: `SUBSCRIBE`, `UNSUBSCRIBE`, `VSIM.SUBSCRIBE`,
-  `VSIM.UNSUBSCRIBE` (they switch the socket to a second writer and would corrupt
-  the promised RESP array frame).
+- Forbidden inside a transaction: `SUBSCRIBE`, `UNSUBSCRIBE` (they switch the
+  socket to a second writer and would corrupt the promised RESP array frame).
 - **Isolation contract (deliberate):** `EXEC` provides *grouping and durability*,
   **not isolation**. `EXEC`s are serialized against each other, but a plain command
   from another connection may interleave between queued commands. True isolation
@@ -154,9 +152,6 @@ bad keys are rejected so poison never survives via replay), and all `Add`s happe
 | `VSIM.SEARCHFILTER` | `VSIM.SEARCHFILTER K field value v1 … vN` \| `… K PREFIX prefix v1 … vN` | flat array — KV-metadata filter (`GET field:key == value`) or key-prefix filter |
 | `VSIM.SEARCHRANGE` | `VSIM.SEARCHRANGE K zsetKey minScore maxScore v1 … vN` | flat array — B+Tree range ∩ HNSW |
 | `VSIM.INFO` | `VSIM.INFO` | bulk `vectors:… dimension:… max_level:…` — flushes delta first (sync point) |
-| `VSIM.SUBSCRIBE` | `VSIM.SUBSCRIBE threshold v1 … vN` | via writePump — semantic pub/sub |
-| `VSIM.UNSUBSCRIBE` | `VSIM.UNSUBSCRIBE` | `+OK` (idempotent) |
-| `VSIM.PUBLISH` | `VSIM.PUBLISH message v1 … vN` | `:receivers` |
 
 **Cross-engine joins** (why KV/zset live in the same process as the index):
 `VSIM.SEARCHFILTER` reads KV metadata per candidate; `VSIM.SEARCHRANGE` joins the

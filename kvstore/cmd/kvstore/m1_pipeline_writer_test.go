@@ -73,7 +73,7 @@ func TestM1_SubscribeFlushesPipelinedOutputFirst(t *testing.T) {
 		t.Fatal("предусловие: +PONG должен быть только в буфере, не на проводе")
 	}
 
-	hub := pubsub.NewHub(nil)
+	hub := pubsub.NewHub()
 	subscribeClassic(cs, hub, []string{"news"})
 
 	// writePump доставляет подтверждение асинхронно — ждём его появления.

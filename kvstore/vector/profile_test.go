@@ -1,11 +1,8 @@
 package vector
 
 import (
-	"fmt"
 	"math/rand"
-	"runtime"
 	"strconv"
-	"sync/atomic"
 	"testing"
 )
 
@@ -123,85 +120,6 @@ func BenchmarkSearch_CosinePreNorm(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		g.Search(queries[i%len(queries)], K, efSearch)
 	}
-}
-
-// BenchmarkSearch_Full_Go — поиск через VectorStore на чистом Go.
-func BenchmarkSearch_Full_Go(b *testing.B) {
-	const (
-		numVectors = 10000
-		dim        = 128
-		K          = 10
-	)
-
-	rng := rand.New(rand.NewSource(42))
-
-	vs := NewVectorStore(EuclideanDistance)
-
-	for i := 0; i < numVectors; i++ {
-		vec := make([]float32, dim)
-		for j := range vec {
-			vec[j] = rng.Float32()*2 - 1
-		}
-		vs.Add(fmt.Sprintf("vec:%d", i), vec)
-	}
-
-	queries := make([][]float32, 100)
-	for i := range queries {
-		q := make([]float32, dim)
-		for j := range q {
-			q[j] = rng.Float32()*2 - 1
-		}
-		queries[i] = q
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		vs.Search(queries[i%len(queries)], K, nil)
-	}
-}
-
-// BenchmarkSearch_Full_Go_Parallel — параллельный поиск через VectorStore.
-func BenchmarkSearch_Full_Go_Parallel(b *testing.B) {
-	const (
-		numVectors = 10000
-		dim        = 128
-		K          = 10
-	)
-
-	rng := rand.New(rand.NewSource(42))
-
-	vs := NewVectorStore(EuclideanDistance)
-
-	for i := 0; i < numVectors; i++ {
-		vec := make([]float32, dim)
-		for j := range vec {
-			vec[j] = rng.Float32()*2 - 1
-		}
-		vs.Add(fmt.Sprintf("vec:%d", i), vec)
-	}
-
-	queries := make([][]float32, 100)
-	for i := range queries {
-		q := make([]float32, dim)
-		for j := range q {
-			q[j] = rng.Float32()*2 - 1
-		}
-		queries[i] = q
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	var counter uint32
-	_ = uint32(runtime.NumCPU())
-	b.RunParallel(func(pb *testing.PB) {
-		atomic.AddUint32(&counter, 1)
-		i := 0
-		for pb.Next() {
-			vs.Search(queries[i%len(queries)], K, nil)
-			i++
-		}
-	})
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -74,7 +74,7 @@ jobs:
         run: go test -short -timeout 5m ./kvstore/vector/
 
       # 🚨Конкурентные тесты vector — ОБЯЗАТЕЛЬНО под -race. Без этого шага
-      # TestLSH_ConcurrentSearchNoRace исполнялся с
+      # TestLeveledStore_ConcurrentAddDeleteSearch и соседи исполнялись с
       # выключенным оракулом: их единственная проверка — сам детектор гонок,
       # а он тут не включался ни в CI, ни в `make test-race` (тот берёт только
       # ./kvstore/internal/...). Весь пакет под -race идёт >5.5 мин, поэтому

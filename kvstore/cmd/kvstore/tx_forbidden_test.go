@@ -18,7 +18,7 @@ func newTxConnState(t *testing.T) *server.ConnState {
 
 // TestForbiddenInTx_List — страж списка запрещённых в MULTI команд (H2).
 func TestForbiddenInTx_List(t *testing.T) {
-	for _, c := range []string{"SUBSCRIBE", "UNSUBSCRIBE", "VSIM.SUBSCRIBE", "VSIM.UNSUBSCRIBE"} {
+	for _, c := range []string{"SUBSCRIBE", "UNSUBSCRIBE"} {
 		if !forbiddenInTx(c) {
 			t.Errorf("%q обязана быть запрещена в MULTI — subscriber-mode пишет мимо cs.Buf и рвёт EXEC-кадр", c)
 		}

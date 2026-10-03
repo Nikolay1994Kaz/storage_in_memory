@@ -515,7 +515,7 @@ func BenchmarkTTL_Set_Parallel(b *testing.B) {
 // compositeEvictor - тестовый клон структуры из main.go для проверки интеграции
 type compositeEvictor struct {
 	kvs *kv.Store
-	vec *vector.VectorStore
+	vec vector.VectorIndex
 	wal *wal.BatchWAL
 }
 
@@ -528,7 +528,7 @@ func (e *compositeEvictor) Del(key string) bool {
 	return kvDeleted || vecDeleted
 }
 
-// TestCompositeEvictor_Integration проверяет совместную работу TTLManager и VectorStore
+// TestCompositeEvictor_Integration проверяет совместную работу TTLManager и векторного индекса
 func TestCompositeEvictor_Integration(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "kvstore_ttl_int_test")
 	if err != nil {
@@ -545,7 +545,8 @@ func TestCompositeEvictor_Integration(t *testing.T) {
 
 	// Инициализируем хранилища
 	s := kv.New()
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
+	vecStore := vector.NewLeveledVectorStore(vector.LeveledConfig{Distance: vector.EuclideanDistance, NumBuilders: 1})
+	defer vecStore.Close()
 	ttl := NewTTLManager(s)
 	defer ttl.Stop()
 
@@ -601,7 +602,8 @@ func TestCompositeEvictor_Integration(t *testing.T) {
 // для удаления просроченных векторов в оффлайне (OpExpire) и удаления по DEL (OpDel).
 func TestWALReplay_ExpiredKeyAndDel(t *testing.T) {
 	s := kv.New()
-	vecStore := vector.NewVectorStore(vector.EuclideanDistance)
+	vecStore := vector.NewLeveledVectorStore(vector.LeveledConfig{Distance: vector.EuclideanDistance, NumBuilders: 1})
+	defer vecStore.Close()
 	ttl := NewTTLManager(s)
 	defer ttl.Stop()
 

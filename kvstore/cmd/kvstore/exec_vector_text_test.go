@@ -89,7 +89,7 @@ func TestExec_VsimAddDocWALCarriesTerms(t *testing.T) {
 	bw := wal.NewBatchWAL(w)
 	s := kv.New()
 	ttl := store.NewTTLManager(s)
-	hub := pubsub.NewHub(nil)
+	hub := pubsub.NewHub()
 	vec := vector.NewLeveledVectorStore(vector.LeveledConfig{
 		Distance: vector.EuclideanDistance, NumBuilders: 1,
 	})

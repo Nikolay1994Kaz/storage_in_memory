@@ -14,7 +14,7 @@ import (
 // Проверяем: подписчик получает сообщение в формате RESP.
 
 func TestHub_SubscribeAndPublish(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
@@ -67,7 +67,7 @@ func TestHub_SubscribeAndPublish(t *testing.T) {
 // Здесь шлём РОВНО ОДНО сообщение и требуем, чтобы оно дошло. Если writePump
 // снова перестанет флашить — клиент упрётся в дедлайн, и тест упадёт.
 func TestHub_SingleMessageDelivered(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
@@ -121,7 +121,7 @@ func readUntil(t *testing.T, conn net.Conn, substr string, timeout time.Duration
 // в тот же сокет. Теперь subscriber-mode обслуживает такие команды здесь, и
 // ответ (ошибка) уходит через writePump — единственного писателя.
 func TestHub_SubscriberMode_RejectsForeignCommand(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
@@ -136,7 +136,7 @@ func TestHub_SubscriberMode_RejectsForeignCommand(t *testing.T) {
 
 // ─── СТРАЖ H3: PING в режиме подписки отвечает через writePump ───
 func TestHub_SubscriberMode_Ping(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
@@ -153,7 +153,7 @@ func TestHub_SubscriberMode_Ping(t *testing.T) {
 // (done). Ack «OK» ставится в канал ДО закрытия, и drain-on-done в writePump
 // обязан его дослать. После — соединение больше не подписчик.
 func TestHub_SubscriberMode_UnsubscribeAckThenExit(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
@@ -175,7 +175,7 @@ func TestHub_SubscriberMode_UnsubscribeAckThenExit(t *testing.T) {
 // Проверяем что наш Hub отправляет аналогичные подтверждения.
 
 func TestHub_SubscribeConfirmation(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -210,7 +210,7 @@ func TestHub_SubscribeConfirmation(t *testing.T) {
 // ─── Publish без подписчиков → 0 ─────────────────────────
 
 func TestHub_PublishNoSubscribers(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 
 	delivered := hub.Publish("empty-channel", "nobody hears me")
 	if delivered != 0 {
@@ -221,7 +221,7 @@ func TestHub_PublishNoSubscribers(t *testing.T) {
 // ─── Несколько подписчиков на один канал ──────────────────
 
 func TestHub_MultipleSubscribers(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 
 	const numSubs = 5
 
@@ -241,7 +241,7 @@ func TestHub_MultipleSubscribers(t *testing.T) {
 // ─── Unsubscribe от конкретного канала ────────────────────
 
 func TestHub_UnsubscribeChannel(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -266,7 +266,7 @@ func TestHub_UnsubscribeChannel(t *testing.T) {
 // ─── Unsubscribe от всех каналов (nil) ───────────────────
 
 func TestHub_UnsubscribeAll(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -292,7 +292,7 @@ func TestHub_UnsubscribeAll(t *testing.T) {
 // ─── RemoveConn (отключение клиента) ─────────────────────
 
 func TestHub_RemoveConn(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -314,7 +314,7 @@ func TestHub_RemoveConn(t *testing.T) {
 // ─── IsSubscriber ────────────────────────────────────────
 
 func TestHub_IsSubscriber(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -334,7 +334,7 @@ func TestHub_IsSubscriber(t *testing.T) {
 // ─── Повторный Subscribe (то же соединение, другой канал) ─
 
 func TestHub_ResubscribeSameConn(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -365,7 +365,7 @@ func TestHub_ResubscribeSameConn(t *testing.T) {
 // чтобы не блокировать остальных.
 
 func TestHub_SlowSubscriberDisconnected(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -392,7 +392,7 @@ func TestHub_SlowSubscriberDisconnected(t *testing.T) {
 // ─── Пустой канал удаляется из map (garbage collection) ──
 
 func TestHub_EmptyChannelCleanup(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -415,7 +415,7 @@ func TestHub_EmptyChannelCleanup(t *testing.T) {
 // в соединение, а не только в канал.
 
 func TestHub_WritePump_RealWrite(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
@@ -447,7 +447,7 @@ func TestHub_WritePump_RealWrite(t *testing.T) {
 // Стресс-тест на data race (запускай с -race!).
 
 func TestHub_ConcurrentSubscribePublish(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 
 	var wg sync.WaitGroup
 	const goroutines = 20
@@ -496,7 +496,7 @@ func TestHub_ConcurrentSubscribePublish(t *testing.T) {
 // покажет это через -race или аномальный рост памяти.
 
 func TestHub_PublishPoolReuse(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -519,7 +519,7 @@ func TestHub_PublishPoolReuse(t *testing.T) {
 // Результат: 1 подписчик, 1 доставка (не 2!).
 
 func TestHub_SubscribeSameChannelTwice(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -538,7 +538,7 @@ func TestHub_SubscribeSameChannelTwice(t *testing.T) {
 // Не должно крашиться. Существующие подписки не затрагиваются.
 
 func TestHub_UnsubscribeNonExistentChannel(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -564,7 +564,7 @@ func TestHub_UnsubscribeNonExistentChannel(t *testing.T) {
 // Клиент отключился ДО того как подписался. Не должно паниковать.
 
 func TestHub_RemoveConn_UnknownConn(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, unknownConn := net.Pipe()
 	defer unknownConn.Close()
 
@@ -591,7 +591,7 @@ func TestHub_RemoveConn_UnknownConn(t *testing.T) {
 // Без него: double-close на sub.done → panic!
 
 func TestHub_DisconnectSlow_Concurrent(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -622,7 +622,7 @@ func TestHub_DisconnectSlow_Concurrent(t *testing.T) {
 // (= Server.CloseConn → Epoll.Remove). Проверяем, что маршрут вызывается ровно
 // один раз даже при конкурентной эвикции одного подписчика.
 func TestHub_DisconnectSlow_RoutesThroughSingleClosePoint(t *testing.T) {
-	hub := NewHub(nil)
+	hub := NewHub()
 	_, serverConn := net.Pipe()
 	defer serverConn.Close()
 

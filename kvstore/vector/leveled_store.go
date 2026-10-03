@@ -2017,9 +2017,6 @@ func (lvs *LeveledVectorStore) SetHNSWParams(M, efConstruction, efSearch int) {
 	}
 }
 
-// SetUseLSH — no-op для LeveledVectorStore (LSH не используется в LSM-архитектуре).
-func (lvs *LeveledVectorStore) SetUseLSH(_ bool) {}
-
 // Len возвращает общее число векторов (delta + все сегменты).
 func (lvs *LeveledVectorStore) Len() int {
 	lvs.mu.RLock()

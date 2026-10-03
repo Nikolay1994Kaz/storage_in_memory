@@ -2,18 +2,13 @@ package vector
 
 import "io"
 
-// VectorIndex — общий интерфейс для векторных индексов. Две реализации с разными
-// ролями (обе живые, это НЕ legacy-пара):
+// VectorIndex — контракт векторного индекса, на который опираются сервер,
+// TTL-эвиктор и кластерный слой. Реализация — LeveledVectorStore (LSM-уровни,
+// сегменты, durability, фильтры/тенанты).
 //
-//   - LeveledVectorStore — движок данных (VSIM.* / WAL / снапшоты): LSM-уровни,
-//     сегменты, durability, фильтры/тенанты.
-//   - VectorStore — лёгкий одно-графовый индекс без сегментов и durability;
-//     в проде держит семантический индекс Pub/Sub-хаба (эфемерные паттерны
-//     подписок, умирают вместе с процессом — LSM-машинерия там не нужна).
-//
-// Общий контракт закреплён конформанс-тестом TestVectorIndex_Conformance
-// (index_conformance_test.go) — багфиксы семантики интерфейса должны проходить
-// в обеих реализациях.
+// Контракт закреплён конформанс-тестом TestVectorIndex_Conformance
+// (index_conformance_test.go): один сценарий на обоих путях публикации
+// сегментов — одношардовой дельте и freeze-per-shard.
 type VectorIndex interface {
 	Add(key string, vec []float32) error
 	Delete(key string) bool

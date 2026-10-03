@@ -35,8 +35,8 @@ One static binary, no external services.
   watermark, so replay skips what a snapshot already holds; read-only
   point-in-time restore (`-restore-to-lsn`); continuous WAL shipping to S3 or a
   directory, restorable on any machine.
-- **KV layer** — strings with TTL, sorted sets on a B+-tree, pub/sub (classic
-  channels and vector-routed subscriptions), `MULTI`/`EXEC` grouping. It exists
+- **KV layer** — strings with TTL, sorted sets on a B+-tree, pub/sub on named
+  channels, `MULTI`/`EXEC` grouping. It exists
   for metadata and cross-engine joins (`VSIM.SEARCHFILTER`,
   `VSIM.SEARCHRANGE`); the surface is small and frozen on purpose — this is not
   a Redis replacement ([docs/COMMANDS.md](docs/COMMANDS.md)).
