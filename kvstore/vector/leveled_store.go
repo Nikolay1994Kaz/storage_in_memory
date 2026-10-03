@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -2318,14 +2319,22 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	defer lvs.mu.Unlock()
 
 	// CRC32 (v5+): весь payload читаем через tee → hasher; 4-байтный трейлер
-	// читаем отдельно из crcSource (НЕ через tee) и сверяем. crcSource держит
-	// оригинальный ридер, r переключаем на tee — все ReadFull ниже идут через него.
-	crcSource := r
+	// читаем отдельно из crcSource (тот же буферизованный поток, но мимо tee)
+	// и сверяем. Все ReadFull ниже идут через r.
+	//
+	// Источник буферизуется здесь: формат читается полями по 2–4 байта, и на
+	// голом *os.File каждое поле было отдельным системным вызовом — снапшот
+	// 18 МБ с текстовым слоем грузился 2,2–2,8 с против 0,13–0,23 с через
+	// буфер. Буфер читает вперёд, поэтому r не должен содержать ничего после
+	// снапшота.
+	size, sized := sourceSize(r)
+	buffered := bufio.NewReaderSize(r, 256<<10)
+	crcSource := buffered
 	hasher := crc32.NewIEEE()
-	r = io.TeeReader(r, hasher)
+	r = io.TeeReader(buffered, hasher)
 	// Бюджет: счётчики из файла сверяются с его остатком до выделения памяти
 	// (snapshot_budget.go) — CRC проверяется только в конце.
-	if size, ok := sourceSize(crcSource); ok {
+	if sized {
 		r = &budgetReader{r: r, left: size}
 	}
 
