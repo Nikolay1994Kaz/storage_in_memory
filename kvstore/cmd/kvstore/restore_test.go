@@ -93,6 +93,9 @@ func TestInspectWAL(t *testing.T) {
 	w.Write(wal.Entry{Op: wal.OpSet, Key: "note:f1", Value: []byte("дедлайн март")})
 	w.Write(wal.Entry{Op: wal.OpVSimAddDoc, Key: "f1", Value: []byte("doc")})
 	w.Write(wal.Entry{Op: wal.OpVSimAddDocBatch, Key: "f2", Value: []byte("pair")})
+	w.Write(wal.Entry{Op: wal.OpPersist, Key: "note:f1"})
+	w.Write(wal.Entry{Op: wal.OpZAdd, Key: "z", Value: []byte("score+member")})
+	w.Write(wal.Entry{Op: wal.OpZRem, Key: "z", Value: []byte("member")})
 	if err := w.Close(); err != nil {
 		t.Fatalf("wal.Close: %v", err)
 	}
@@ -102,7 +105,10 @@ func TestInspectWAL(t *testing.T) {
 		t.Fatalf("inspectWAL: %v", err)
 	}
 	got := out.String()
-	for _, want := range []string{"SET", "VSIM.ADDDOC", "VSIM.ADDDOC.BATCH", "note:f1", "f2"} {
+	if strings.Contains(got, "OP(0x") {
+		t.Errorf("известная операция напечатана без имени:\n%s", got)
+	}
+	for _, want := range []string{"SET", "VSIM.ADDDOC", "VSIM.ADDDOC.BATCH", "PERSIST", "ZADD", "ZREM", "note:f1", "f2"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("в выводе нет %q:\n%s", want, got)
 		}

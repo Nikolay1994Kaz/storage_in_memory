@@ -14,6 +14,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -39,6 +40,24 @@ type walApplier struct {
 
 	restored    int
 	vecRestored int
+
+	// unknownOps — записи с операцией, которой эта версия не знает (их пишет
+	// более новая версия); unknownOp/unknownLSN — первая из них. Пропустить
+	// такие записи молча значило бы потерять данные, поэтому сервер по
+	// unknownOpsErr отказывается стартовать.
+	unknownOps int
+	unknownOp  byte
+	unknownLSN uint64
+}
+
+// unknownOpsErr — ошибка, если в журнале встретились неизвестные операции.
+func (a *walApplier) unknownOpsErr() error {
+	if a.unknownOps == 0 {
+		return nil
+	}
+	return fmt.Errorf("journal holds %d records with operations unknown to this version "+
+		"(first: op 0x%02x at LSN %d), probably written by a newer version; refusing to "+
+		"start, because skipping them would silently lose data", a.unknownOps, a.unknownOp, a.unknownLSN)
 }
 
 // skipVec решает, пропустить ли ВЕКТОРНЫЙ эффект записи как уже вошедший в
@@ -161,6 +180,11 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 		member := string(entry.Value)
 		a.zsetReg.ZRem(entry.Key, member)
 		a.restored++
+	default:
+		if a.unknownOps == 0 {
+			a.unknownOp, a.unknownLSN = entry.Op, entry.LSN
+		}
+		a.unknownOps++
 	}
 }
 

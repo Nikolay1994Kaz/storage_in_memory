@@ -40,6 +40,12 @@ func walOpName(op byte) string {
 		return "DEL"
 	case wal.OpExpire:
 		return "EXPIRE"
+	case wal.OpPersist:
+		return "PERSIST"
+	case wal.OpZAdd:
+		return "ZADD"
+	case wal.OpZRem:
+		return "ZREM"
 	case wal.OpVSimAdd:
 		return "VSIM.ADD"
 	case wal.OpVSimAddAttrs:

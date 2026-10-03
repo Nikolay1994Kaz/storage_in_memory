@@ -320,6 +320,9 @@ func main() {
 		}
 	}
 
+	if err := applier.unknownOpsErr(); err != nil {
+		logging.Fatalf("%v", err)
+	}
 	if applier.restored > 0 {
 		slog.Info("restored from WAL", "operations", applier.restored, "vectors", applier.vecRestored)
 	}

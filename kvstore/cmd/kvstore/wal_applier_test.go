@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"kvstore/kvstore/internal/wal"
@@ -99,5 +100,29 @@ func TestWalApplier_ReplaysLegacyDocBatch(t *testing.T) {
 	}
 	if len(res) != 1 || res[0].Key != "a" {
 		t.Errorf("текст документа из пакетной записи не восстановился: %v", res)
+	}
+}
+
+// TestWalApplier_RecordsUnknownOp — запись с операцией, которой эта версия не
+// знает, не пропускается молча: applier её запоминает, и сервер отказывается
+// стартовать (main.go). Такую запись пишет более новая версия, и тихий
+// пропуск означал бы потерю данных при откате.
+func TestWalApplier_RecordsUnknownOp(t *testing.T) {
+	e := newExecEnv(t)
+	applier := &walApplier{s: e.s, ttl: e.ttl, vec: e.vec, zsetReg: e.zset}
+
+	applier.apply(wal.Entry{Op: wal.OpSet, LSN: 1, Key: "a", Value: []byte("1")}, false)
+	applier.apply(wal.Entry{Op: 0x7f, LSN: 2, Key: "x", Value: []byte("?")}, false)
+	applier.apply(wal.Entry{Op: 0x7f, LSN: 3, Key: "y", Value: []byte("?")}, false)
+
+	if err := applier.unknownOpsErr(); err == nil {
+		t.Fatal("неизвестная операция журнала пропущена молча")
+	} else if !strings.Contains(err.Error(), "0x7f") || !strings.Contains(err.Error(), "LSN 2") {
+		t.Fatalf("ошибка не называет операцию и первую запись: %v", err)
+	}
+	clean := &walApplier{s: e.s, ttl: e.ttl, vec: e.vec, zsetReg: e.zset}
+	clean.apply(wal.Entry{Op: wal.OpSet, LSN: 1, Key: "a", Value: []byte("1")}, false)
+	if err := clean.unknownOpsErr(); err != nil {
+		t.Fatalf("журнал без неизвестных операций отклонён: %v", err)
 	}
 }
