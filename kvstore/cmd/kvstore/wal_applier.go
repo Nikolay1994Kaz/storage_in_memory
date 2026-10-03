@@ -191,12 +191,12 @@ func (a *walApplier) apply(entry wal.Entry, isFromSnapshot bool) {
 	case wal.OpZAdd:
 		if len(entry.Value) >= 8 {
 			score, member := zset.DecodeZAddValue(entry.Value)
-			a.zsetReg.ZAdd(0, entry.Key, score, member)
+			a.zsetReg.ZAdd(entry.Key, score, member)
 			a.restored++
 		}
 	case wal.OpZRem:
 		member := string(entry.Value)
-		a.zsetReg.ZRem(0, entry.Key, member)
+		a.zsetReg.ZRem(entry.Key, member)
 		a.restored++
 	}
 }

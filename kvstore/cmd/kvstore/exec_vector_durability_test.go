@@ -59,7 +59,7 @@ func TestExec_VsimAddFailDoesNotWriteWAL(t *testing.T) {
 	vec := vector.NewLeveledVectorStore(vector.LeveledConfig{
 		Distance: vector.EuclideanDistance, Allocator: s, NumBuilders: 1,
 	})
-	zreg := zset.New(s)
+	zreg := zset.New(s.MemoryCounter())
 	defer func() {
 		ttl.Stop()
 		s.Close()

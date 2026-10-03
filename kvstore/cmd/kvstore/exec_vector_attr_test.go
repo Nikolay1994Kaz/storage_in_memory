@@ -39,7 +39,7 @@ func newAttrEnv(t *testing.T, partitionAttr string) *attrEnv {
 		NumBuilders:   1,
 		PartitionAttr: partitionAttr,
 	})
-	zreg := zset.New(s)
+	zreg := zset.New(s.MemoryCounter())
 	t.Cleanup(func() { ttl.Stop(); _ = bw.Close(); s.Close() })
 
 	do := func(cmd string, args ...string) protocol.Value {

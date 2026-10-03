@@ -28,7 +28,7 @@ func TestSnapshotIterate_TTLAndZSetSurviveCompaction(t *testing.T) {
 	defer s.Close()
 	ttl := store.NewTTLManager(tcmalloc.NewEvictor(s))
 	defer ttl.Stop()
-	zsetReg := zset.New(s)
+	zsetReg := zset.New(s.MemoryCounter())
 
 	// Обычный KV-ключ.
 	s.Set(0, "plainkey", []byte("plainval"))
@@ -37,9 +37,9 @@ func TestSnapshotIterate_TTLAndZSetSurviveCompaction(t *testing.T) {
 	s.Set(0, "sessionkey", []byte("sessionval"))
 	ttl.Set("sessionkey", time.Hour)
 
-	// Sorted set с двумя членами (через ZAdd — он пишет и дерево, и __zidx).
-	zsetReg.ZAdd(0, "prices", 100.0, "apple")
-	zsetReg.ZAdd(0, "prices", 250.0, "banana")
+	// Sorted set с двумя членами (ZAdd пишет и дерево, и обратный индекс).
+	zsetReg.ZAdd("prices", 100.0, "apple")
+	zsetReg.ZAdd("prices", 250.0, "banana")
 
 	// ── Собираем эмитируемые записи + прямые проверки эмита ──
 	var entries []wal.Entry
@@ -76,7 +76,7 @@ func TestSnapshotIterate_TTLAndZSetSurviveCompaction(t *testing.T) {
 	defer s2.Close()
 	ttl2 := store.NewTTLManager(tcmalloc.NewEvictor(s2))
 	defer ttl2.Stop()
-	zset2 := zset.New(s2)
+	zset2 := zset.New(s2.MemoryCounter())
 
 	for _, e := range restored {
 		switch e.Op {
@@ -89,7 +89,7 @@ func TestSnapshotIterate_TTLAndZSetSurviveCompaction(t *testing.T) {
 			}
 		case wal.OpZAdd:
 			score, member := zset.DecodeZAddValue(e.Value)
-			zset2.ZAdd(0, e.Key, score, member)
+			zset2.ZAdd(e.Key, score, member)
 		}
 	}
 

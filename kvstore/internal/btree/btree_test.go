@@ -1,416 +1,295 @@
 package btree
 
 import (
-	"fmt"
+	"math"
 	"math/rand"
+	"slices"
+	"strconv"
 	"testing"
-	"unsafe"
-
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
-// newTestTree — хелпер: создаёт TCMallocStore + B+Tree для тестов.
-func newTestTree() (*BPTree, *tcmalloc.TCMallocStore) {
-	store := tcmalloc.NewTCMallocStore(1)
-	tree := New(store, 0)
-	return tree, store
-}
-
-// ── Структура node ──────────────────────────────────────────
-
-func TestNodeSize(t *testing.T) {
-	t.Logf("sizeof(item) = %d bytes", unsafe.Sizeof(item{}))
-	t.Logf("sizeof(node) = %d bytes", unsafe.Sizeof(node{}))
-	t.Logf("nodeSize var = %d bytes", nodeSize)
-
-	// node должен быть чисто числовым — проверяем что размер фиксирован
-	if nodeSize == 0 {
-		t.Fatal("nodeSize is 0")
-	}
-}
-
-// ── Базовые операции ────────────────────────────────────────
-
-func TestInsertAndSearch(t *testing.T) {
-	tree, _ := newTestTree()
-
-	tree.Insert(0, 50, "fifty")
-	tree.Insert(0, 30, "thirty")
-	tree.Insert(0, 70, "seventy")
-	tree.Insert(0, 10, "ten")
-	tree.Insert(0, 40, "forty")
-
-	tests := []struct {
-		score float64
-		want  string
-		ok    bool
-	}{
-		{50, "fifty", true},
-		{30, "thirty", true},
-		{10, "ten", true},
-		{99, "", false},
-	}
-
-	for _, tt := range tests {
-		got, ok := tree.Search(tt.score)
-		if ok != tt.ok || got != tt.want {
-			t.Errorf("Search(%v) = (%q, %v), want (%q, %v)",
-				tt.score, got, ok, tt.want, tt.ok)
+// check проверяет все инварианты дерева и возвращает его высоту:
+//   - листья на одной глубине;
+//   - некорневой узел держит от minItems до maxItems ключей;
+//   - у внутреннего узла детей на одного больше, чем разделителей;
+//   - ключи поддерева лежат в границах, заданных разделителями предков;
+//   - цепочка листьев отдаёт все элементы строго по возрастанию и их ровно Len.
+func check(t *testing.T, tr *BPTree) int {
+	t.Helper()
+	leafDepth := -1
+	var walk func(n *node, depth int, lo, hi *Item, isRoot bool)
+	walk = func(n *node, depth int, lo, hi *Item, isRoot bool) {
+		if !isRoot && (len(n.items) < minItems || len(n.items) > maxItems) {
+			t.Fatalf("узел на глубине %d держит %d ключей (допустимо %d..%d)", depth, len(n.items), minItems, maxItems)
 		}
-	}
-}
-
-// TestInsertDuplicate — composite keys: same score, different member = 2 items.
-func TestInsertDuplicate(t *testing.T) {
-	tree, _ := newTestTree()
-
-	tree.Insert(0, 10, "old")
-	tree.Insert(0, 10, "new") // другой member, тот же score → 2 элемента
-
-	if tree.Len() != 2 {
-		t.Fatalf("Len = %d, want 2 (different members at same score)", tree.Len())
-	}
-
-	// Тот же member, тот же score → update (no new item)
-	tree.Insert(0, 10, "old")
-	if tree.Len() != 2 {
-		t.Fatalf("Len = %d, want 2 (re-insert same member)", tree.Len())
-	}
-}
-
-// TestDuplicateScores — множество членов с одинаковым score.
-func TestDuplicateScores(t *testing.T) {
-	tree, _ := newTestTree()
-	tree.Insert(0, 10, "alice")
-	tree.Insert(0, 10, "bob")
-	tree.Insert(0, 10, "charlie")
-	tree.Insert(0, 20, "dave")
-
-	if tree.Len() != 4 {
-		t.Fatalf("Len = %d, want 4", tree.Len())
-	}
-
-	// RangeSearch должен вернуть все 3 элемента с score 10
-	results := tree.RangeSearch(10, 10)
-	if len(results) != 3 {
-		t.Fatalf("RangeSearch(10,10) = %d results, want 3", len(results))
-	}
-
-	// DeleteMember удаляет конкретный member
-	if !tree.DeleteMember(10, "bob") {
-		t.Fatal("DeleteMember(10, bob) should return true")
-	}
-	if tree.Len() != 3 {
-		t.Fatalf("Len after delete = %d, want 3", tree.Len())
-	}
-
-	results = tree.RangeSearch(10, 10)
-	if len(results) != 2 {
-		t.Fatalf("RangeSearch after delete = %d results, want 2", len(results))
-	}
-
-	// DeleteMember для несуществующего → false
-	if tree.DeleteMember(10, "bob") {
-		t.Fatal("DeleteMember(10, bob) should return false (already deleted)")
-	}
-}
-
-// ── Split (массовая вставка) ────────────────────────────────
-
-func TestSplit(t *testing.T) {
-	tree, _ := newTestTree()
-
-	for i := 0; i < 1000; i++ {
-		tree.Insert(0, float64(i), fmt.Sprintf("val-%d", i))
-	}
-	if tree.Len() != 1000 {
-		t.Fatalf("Len = %d, want 1000", tree.Len())
-	}
-	for i := 0; i < 1000; i++ {
-		val, ok := tree.Search(float64(i))
-		if !ok || val != fmt.Sprintf("val-%d", i) {
-			t.Fatalf("Search(%d) = (%q, %v)", i, val, ok)
-		}
-	}
-}
-
-func TestSplitReverse(t *testing.T) {
-	tree, _ := newTestTree()
-
-	for i := 999; i >= 0; i-- {
-		tree.Insert(0, float64(i), fmt.Sprintf("val-%d", i))
-	}
-	if tree.Len() != 1000 {
-		t.Fatalf("Len = %d, want 1000", tree.Len())
-	}
-	for i := 0; i < 1000; i++ {
-		val, ok := tree.Search(float64(i))
-		if !ok || val != fmt.Sprintf("val-%d", i) {
-			t.Fatalf("Search(%d) = (%q, %v)", i, val, ok)
-		}
-	}
-}
-
-// ── Delete ──────────────────────────────────────────────────
-
-func TestDelete(t *testing.T) {
-	tree, _ := newTestTree()
-
-	for i := 0; i < 100; i++ {
-		tree.Insert(0, float64(i), fmt.Sprintf("v%d", i))
-	}
-	if !tree.Delete(50) {
-		t.Fatal("Delete(50) should return true")
-	}
-	if _, ok := tree.Search(50); ok {
-		t.Fatal("score 50 should be gone")
-	}
-	if tree.Len() != 99 {
-		t.Fatalf("Len = %d, want 99", tree.Len())
-	}
-	if tree.Delete(999) {
-		t.Fatal("Delete(999) should return false")
-	}
-}
-
-func TestDeleteAll(t *testing.T) {
-	tree, _ := newTestTree()
-
-	for i := 0; i < 100; i++ {
-		tree.Insert(0, float64(i), fmt.Sprintf("v%d", i))
-	}
-	for i := 0; i < 100; i++ {
-		if !tree.Delete(float64(i)) {
-			t.Fatalf("Delete(%d) should return true", i)
-		}
-	}
-	if tree.Len() != 0 {
-		t.Fatalf("Len = %d, want 0", tree.Len())
-	}
-}
-
-// ── RangeSearch ─────────────────────────────────────────────
-
-func TestRangeSearch(t *testing.T) {
-	tree, _ := newTestTree()
-
-	for i := 0; i < 100; i++ {
-		tree.Insert(0, float64(i), fmt.Sprintf("v%d", i))
-	}
-	results := tree.RangeSearch(25, 30)
-	if len(results) != 6 { // 25,26,27,28,29,30
-		t.Fatalf("RangeSearch(25,30): got %d results, want 6", len(results))
-	}
-	for i, r := range results {
-		expected := float64(25 + i)
-		if r.Score != expected {
-			t.Fatalf("result[%d].Score = %v, want %v", i, r.Score, expected)
-		}
-	}
-}
-
-func TestRangeSearchEmpty(t *testing.T) {
-	tree, _ := newTestTree()
-
-	for i := 0; i < 10; i++ {
-		tree.Insert(0, float64(i), "v")
-	}
-	results := tree.RangeSearch(100, 200)
-	if len(results) != 0 {
-		t.Fatalf("got %d results, want 0", len(results))
-	}
-}
-
-// ── Min / Max ───────────────────────────────────────────────
-
-func TestMinMax(t *testing.T) {
-	tree, _ := newTestTree()
-
-	tree.Insert(0, 50, "a")
-	tree.Insert(0, 10, "b")
-	tree.Insert(0, 90, "c")
-
-	minK, _, _ := tree.Min()
-	maxK, _, _ := tree.Max()
-	if minK != 10 {
-		t.Fatalf("Min = %v, want 10", minK)
-	}
-	if maxK != 90 {
-		t.Fatalf("Max = %v, want 90", maxK)
-	}
-}
-
-func TestMinMaxEmpty(t *testing.T) {
-	tree, _ := newTestTree()
-
-	_, _, ok := tree.Min()
-	if ok {
-		t.Fatal("Min on empty tree should return false")
-	}
-	_, _, ok = tree.Max()
-	if ok {
-		t.Fatal("Max on empty tree should return false")
-	}
-}
-
-// ── ForEach ─────────────────────────────────────────────────
-
-func TestForEach(t *testing.T) {
-	tree, _ := newTestTree()
-
-	tree.Insert(0, 30, "c")
-	tree.Insert(0, 10, "a")
-	tree.Insert(0, 20, "b")
-
-	var scores []float64
-	tree.ForEach(func(score float64, member string) {
-		scores = append(scores, score)
-	})
-	if len(scores) != 3 || scores[0] != 10 || scores[1] != 20 || scores[2] != 30 {
-		t.Fatalf("ForEach order: %v, want [10 20 30]", scores)
-	}
-}
-
-// ── Random stress test ──────────────────────────────────────
-
-func TestRandomInsertSearch(t *testing.T) {
-	tree, _ := newTestTree()
-
-	rng := rand.New(rand.NewSource(42))
-	for i := 0; i < 10000; i++ {
-		score := float64(i) // уникальные score
-		val := fmt.Sprintf("v%d", rng.Intn(100000))
-		tree.Insert(0, score, val)
-	}
-	if tree.Len() != 10000 {
-		t.Fatalf("Len = %d, want 10000", tree.Len())
-	}
-	for i := 0; i < 10000; i++ {
-		_, ok := tree.Search(float64(i))
-		if !ok {
-			t.Fatalf("Search(%d) not found", i)
-		}
-	}
-}
-
-// ── Memory accounting ───────────────────────────────────────
-
-func TestMemoryAccounting(t *testing.T) {
-	store := tcmalloc.NewTCMallocStore(1)
-	before := store.UsedMemory()
-
-	tree := New(store, 0)
-	afterCreate := store.UsedMemory()
-
-	if afterCreate <= before {
-		t.Fatalf("creating tree should allocate memory: before=%d, after=%d",
-			before, afterCreate)
-	}
-	t.Logf("empty tree: %d bytes allocated", afterCreate-before)
-
-	for i := 0; i < 1000; i++ {
-		tree.Insert(0, float64(i), fmt.Sprintf("member-%d", i))
-	}
-	afterInsert := store.UsedMemory()
-	t.Logf("1000 inserts: %d bytes total (%d bytes for tree data)",
-		afterInsert-before, afterInsert-afterCreate)
-
-	// IsOOM должен видеть память B+Tree
-	store.SetMaxMemory(afterInsert + 1)
-	if store.IsOOM() {
-		t.Fatal("should not be OOM yet")
-	}
-	store.SetMaxMemory(1) // лимит 1 байт
-	if !store.IsOOM() {
-		t.Fatal("should be OOM now")
-	}
-}
-
-// ── Benchmarks ──────────────────────────────────────────────
-
-func BenchmarkInsert(b *testing.B) {
-	tree, _ := newTestTree()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tree.Insert(0, float64(i), "v")
-	}
-}
-
-func BenchmarkSearch(b *testing.B) {
-	tree, _ := newTestTree()
-	for i := 0; i < 100000; i++ {
-		tree.Insert(0, float64(i), "v")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tree.Search(float64(i % 100000))
-	}
-}
-
-func BenchmarkRangeSearch(b *testing.B) {
-	tree, _ := newTestTree()
-	for i := 0; i < 100000; i++ {
-		tree.Insert(0, float64(i), "v")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tree.RangeSearch(float64(i%99000), float64(i%99000+100))
-	}
-}
-
-// ── Concurrent Benchmarks (seqlock) ─────────────────────────
-
-// BenchmarkSearchParallel — параллельные lock-free Search'ы.
-// С RWMutex: reader'ы конкурируют через RLock atomic counter.
-// С seqlock: reader'ы полностью независимы, zero contention.
-func BenchmarkSearchParallel(b *testing.B) {
-	tree, _ := newTestTree()
-	for i := 0; i < 100000; i++ {
-		tree.Insert(0, float64(i), "v")
-	}
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			tree.Search(float64(i % 100000))
-			i++
-		}
-	})
-}
-
-// BenchmarkSearchParallelWithWrites — 90% read / 10% write mix.
-// Показывает эффект lock-free Search при конкурентных Insert/Delete.
-// Writer'ы берут mu.Lock, но reader'ы (Search) НЕ блокируются.
-func BenchmarkSearchParallelWithWrites(b *testing.B) {
-	tree, _ := newTestTree()
-	for i := 0; i < 100000; i++ {
-		tree.Insert(0, float64(i), "v")
-	}
-
-	// Фоновый writer: Insert + Delete в цикле
-	stopCh := make(chan struct{})
-	go func() {
-		j := 200000
-		for {
-			select {
-			case <-stopCh:
-				return
-			default:
-				tree.Insert(0, float64(j), "w")
-				tree.Delete(float64(j))
-				j++
+		for i, it := range n.items {
+			if i > 0 && !n.items[i-1].less(it) {
+				t.Fatalf("ключи узла не по возрастанию: %v, %v", n.items[i-1], it)
+			}
+			if lo != nil && it.less(*lo) {
+				t.Fatalf("ключ %v меньше нижней границы %v", it, *lo)
+			}
+			if hi != nil && !it.less(*hi) {
+				t.Fatalf("ключ %v не меньше верхней границы %v", it, *hi)
 			}
 		}
-	}()
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			tree.Search(float64(i % 100000))
-			i++
+		if n.leaf() {
+			if leafDepth == -1 {
+				leafDepth = depth
+			} else if depth != leafDepth {
+				t.Fatalf("листья на разной глубине: %d и %d", leafDepth, depth)
+			}
+			return
 		}
-	})
-	b.StopTimer()
-	close(stopCh)
+		if len(n.children) != len(n.items)+1 {
+			t.Fatalf("детей %d при %d разделителях", len(n.children), len(n.items))
+		}
+		for i, c := range n.children {
+			clo, chi := lo, hi
+			if i > 0 {
+				clo = &n.items[i-1]
+			}
+			if i < len(n.items) {
+				chi = &n.items[i]
+			}
+			walk(c, depth+1, clo, chi, false)
+		}
+	}
+	walk(tr.root, 1, nil, nil, true)
+
+	var all []Item
+	tr.ForEach(func(it Item) bool { all = append(all, it); return true })
+	for i := 1; i < len(all); i++ {
+		if !all[i-1].less(all[i]) {
+			t.Fatalf("цепочка листьев не по возрастанию: %v, %v", all[i-1], all[i])
+		}
+	}
+	if len(all) != tr.Len() {
+		t.Fatalf("в цепочке листьев %d элементов, Len()=%d", len(all), tr.Len())
+	}
+	return leafDepth
+}
+
+func rangeOf(tr *BPTree, min, max float64) []Item {
+	var out []Item
+	tr.Range(min, max, func(it Item) bool { out = append(out, it); return true })
+	return out
+}
+
+func TestInsertDuplicatePair(t *testing.T) {
+	tr := New()
+	if !tr.Insert(10, "old") || !tr.Insert(10, "new") {
+		t.Fatal("разные member с одним score — два разных элемента")
+	}
+	if tr.Insert(10, "old") {
+		t.Fatal("повторная вставка той же пары должна вернуть false")
+	}
+	if tr.Len() != 2 {
+		t.Fatalf("Len=%d, ожидали 2", tr.Len())
+	}
+}
+
+// Регресс: равные score, растянутые на несколько листов. Прежнее дерево
+// спускалось к началу диапазона в САМЫЙ ПРАВЫЙ лист с этим score и теряло
+// все левые: из 300 member с score=5 ZRANGEBYSCORE 5 5 отдавал 1.
+func TestRangeEqualScoresAcrossLeaves(t *testing.T) {
+	tr := New()
+	for i := 0; i < 300; i++ {
+		tr.Insert(5, "m"+strconv.Itoa(1000+i))
+	}
+	for i := 0; i < 50; i++ {
+		tr.Insert(1, "low"+strconv.Itoa(i))
+		tr.Insert(9, "high"+strconv.Itoa(i))
+	}
+	if h := check(t, tr); h < 2 {
+		t.Fatalf("высота %d: тест обязан растянуть score=5 на несколько листов", h)
+	}
+	cases := []struct {
+		min, max float64
+		want     int
+	}{
+		{5, 5, 300},
+		{5, 9, 350},
+		{1, 5, 350},
+		{math.Inf(-1), math.Inf(1), 400},
+		{2, 4, 0},
+		{9, 1, 0}, // min > max
+	}
+	for _, c := range cases {
+		if got := len(rangeOf(tr, c.min, c.max)); got != c.want {
+			t.Errorf("Range(%v, %v) = %d, ожидали %d", c.min, c.max, got, c.want)
+		}
+	}
+	// Внутри одного score — алфавитный порядок member, как в Redis.
+	got := rangeOf(tr, 5, 5)
+	if !slices.IsSortedFunc(got, func(a, b Item) int { return compareStr(a.Member, b.Member) }) {
+		t.Fatal("member с равным score не в алфавитном порядке")
+	}
+}
+
+func compareStr(a, b string) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+func TestRangeEarlyStop(t *testing.T) {
+	tr := New()
+	for i := 0; i < 1000; i++ {
+		tr.Insert(float64(i), "m")
+	}
+	n := 0
+	tr.Range(0, 999, func(Item) bool { n++; return n < 10 })
+	if n != 10 {
+		t.Fatalf("fn вызвана %d раз после false, ожидали остановку на 10", n)
+	}
+}
+
+func TestRangeNaNBoundIsEmpty(t *testing.T) {
+	tr := New()
+	tr.Insert(1, "a")
+	if len(rangeOf(tr, math.NaN(), 10)) != 0 || len(rangeOf(tr, 0, math.NaN())) != 0 {
+		t.Fatal("диапазон с NaN-границей должен быть пустым")
+	}
+}
+
+// Вставка по возрастанию и по убыванию — два худших порядка для делений.
+func TestSequentialInsertsAndDeleteAll(t *testing.T) {
+	for _, desc := range []bool{false, true} {
+		tr := New()
+		const n = 20_000
+		for i := 0; i < n; i++ {
+			s := i
+			if desc {
+				s = n - 1 - i
+			}
+			tr.Insert(float64(s), "m"+strconv.Itoa(s))
+		}
+		if h := check(t, tr); h < 3 {
+			t.Fatalf("desc=%v: высота %d для %d элементов — деления не происходят", desc, h, n)
+		}
+		for i := 0; i < n; i++ {
+			if !tr.Delete(float64(i), "m"+strconv.Itoa(i)) {
+				t.Fatalf("desc=%v: Delete(%d) не нашёл элемент", desc, i)
+			}
+			if i%997 == 0 {
+				check(t, tr)
+			}
+		}
+		// Слияния обязаны вернуть дерево к одному пустому листу: прежде узлы
+		// не освобождались вовсе, и дерево держало пиковый объём навсегда.
+		if tr.Len() != 0 || !tr.root.leaf() || len(tr.root.items) != 0 {
+			t.Fatalf("desc=%v: после удаления всего Len=%d, корень-лист=%v, ключей в корне %d",
+				desc, tr.Len(), tr.root.leaf(), len(tr.root.items))
+		}
+	}
+}
+
+func TestDeleteMissing(t *testing.T) {
+	tr := New()
+	tr.Insert(1, "a")
+	if tr.Delete(1, "b") || tr.Delete(2, "a") {
+		t.Fatal("удаление отсутствующей пары должно вернуть false")
+	}
+	if tr.Len() != 1 {
+		t.Fatalf("Len=%d", tr.Len())
+	}
+}
+
+// Модельный тест: случайные вставки, удаления и диапазоны против оракула —
+// отсортированного среза. Мало различных score, чтобы равные score постоянно
+// растягивались по листьям — тот самый режим, где падало прежнее дерево.
+func TestRandomizedAgainstOracle(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	tr := New()
+	var oracle []Item
+	cmp := func(a, b Item) int {
+		if a.less(b) {
+			return -1
+		}
+		if b.less(a) {
+			return 1
+		}
+		return 0
+	}
+	steps := 60_000
+	if testing.Short() {
+		steps = 20_000
+	}
+	for step := 0; step < steps; step++ {
+		it := Item{Score: float64(rng.Intn(40)), Member: "m" + strconv.Itoa(rng.Intn(3000))}
+		pos, found := slices.BinarySearchFunc(oracle, it, cmp)
+		switch op := rng.Intn(10); {
+		case op < 6:
+			if got := tr.Insert(it.Score, it.Member); got != !found {
+				t.Fatalf("шаг %d: Insert(%v)=%v, оракул: новый=%v", step, it, got, !found)
+			}
+			if !found {
+				oracle = slices.Insert(oracle, pos, it)
+			}
+		case op < 9:
+			if got := tr.Delete(it.Score, it.Member); got != found {
+				t.Fatalf("шаг %d: Delete(%v)=%v, оракул: был=%v", step, it, got, found)
+			}
+			if found {
+				oracle = slices.Delete(oracle, pos, pos+1)
+			}
+		default:
+			lo := float64(rng.Intn(40))
+			hi := lo + float64(rng.Intn(5))
+			got := rangeOf(tr, lo, hi)
+			var want []Item
+			for _, o := range oracle {
+				if o.Score >= lo && o.Score <= hi {
+					want = append(want, o)
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("шаг %d: Range(%v,%v) дал %d элементов, оракул %d", step, lo, hi, len(got), len(want))
+			}
+		}
+		if step%5000 == 0 {
+			check(t, tr)
+		}
+	}
+	check(t, tr)
+	var all []Item
+	tr.ForEach(func(it Item) bool { all = append(all, it); return true })
+	if !slices.Equal(all, oracle) {
+		t.Fatalf("итог разошёлся с оракулом: %d против %d", len(all), len(oracle))
+	}
+}
+
+func BenchmarkInsert(b *testing.B) {
+	tr := New()
+	members := make([]string, 4096)
+	for i := range members {
+		members[i] = "member:" + strconv.Itoa(i)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tr.Insert(float64(i), members[i&4095])
+	}
+}
+
+func BenchmarkRange100(b *testing.B) {
+	tr := New()
+	for i := 0; i < 100_000; i++ {
+		tr.Insert(float64(i), "member:"+strconv.Itoa(i))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lo := float64(i % 99_900)
+		n := 0
+		tr.Range(lo, lo+99, func(Item) bool { n++; return true })
+		if n != 100 {
+			b.Fatalf("n=%d", n)
+		}
+	}
 }

@@ -62,7 +62,7 @@ func newExecEnv(t *testing.T) *execEnv {
 		Allocator:   s,
 		NumBuilders: 1,
 	})
-	zreg := zset.New(s)
+	zreg := zset.New(s.MemoryCounter())
 
 	e := &execEnv{
 		t:           t,

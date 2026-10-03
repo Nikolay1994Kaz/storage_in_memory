@@ -29,7 +29,6 @@ import (
 	"unsafe"
 
 	"kvstore/kvstore/internal/auditchain"
-	"kvstore/kvstore/internal/btree"
 	"kvstore/kvstore/internal/keyring"
 	"kvstore/kvstore/internal/logging"
 	"kvstore/kvstore/internal/monitoring"
@@ -422,7 +421,7 @@ func main() {
 	}
 
 	// === 2.5. Инициализация sorted sets (ZSet) ===
-	zsetReg := zset.New(s)
+	zsetReg := zset.New(s.MemoryCounter())
 
 	graphPath := filepath.Join(dataDir, "graph_leveled.bin")
 	graphLoaded := false
@@ -3216,12 +3215,14 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		setName := string(args[0])
 		score, err := strconv.ParseFloat(unsafeString(args[1]), 64)
-		if err != nil {
+		// NaN ParseFloat принимает молча, а в упорядоченном индексе он ломает
+		// сравнение — Redis тоже отвечает на него ошибкой.
+		if err != nil || math.IsNaN(score) {
 			buf.WriteError("ERR invalid score (must be a float)")
 			return
 		}
 		member := string(args[2])
-		isNew := zsetReg.ZAdd(workerID, setName, score, member)
+		isNew := zsetReg.ZAdd(setName, score, member)
 		// WAL
 		bw.Write(wal.Entry{Op: wal.OpZAdd, Key: setName, Value: zset.EncodeZAddValue(score, member)})
 		if isNew {
@@ -3253,7 +3254,7 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		setName := string(args[0])
 		member := string(args[1])
-		ok := zsetReg.ZRem(workerID, setName, member)
+		ok := zsetReg.ZRem(setName, member)
 		if ok {
 			bw.Write(wal.Entry{Op: wal.OpZRem, Key: setName, Value: []byte(member)})
 			buf.WriteInt(1)
@@ -3269,12 +3270,12 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		setName := string(args[0])
 		minScore, err := strconv.ParseFloat(unsafeString(args[1]), 64)
-		if err != nil {
+		if err != nil || math.IsNaN(minScore) {
 			buf.WriteError("ERR invalid min score")
 			return
 		}
 		maxScore, err := strconv.ParseFloat(unsafeString(args[2]), 64)
-		if err != nil {
+		if err != nil || math.IsNaN(maxScore) {
 			buf.WriteError("ERR invalid max score")
 			return
 		}
@@ -3324,12 +3325,12 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 		}
 		setName := string(args[1])
 		minScore, err := strconv.ParseFloat(unsafeString(args[2]), 64)
-		if err != nil {
+		if err != nil || math.IsNaN(minScore) {
 			buf.WriteError("ERR invalid minScore")
 			return
 		}
 		maxScore, err := strconv.ParseFloat(unsafeString(args[3]), 64)
-		if err != nil {
+		if err != nil || math.IsNaN(maxScore) {
 			buf.WriteError("ERR invalid maxScore")
 			return
 		}
@@ -3348,21 +3349,21 @@ func executeCommand(s *tcmalloc.TCMallocStore, bw *wal.BatchWAL, ttl *store.TTLM
 			query[i] = float32(f)
 		}
 
-		// Шаг 1: B+Tree RangeCollectHashes → множество memberHash'ей (1 alloc)
-		// Оптимизация: вместо 113 allocs (resolveMember × N) — 1 alloc (map[uint64]).
-		allowed := zsetReg.MembersInRangeHashed(setName, minScore, maxScore)
+		// Шаг 1: B+-дерево → множество member в диапазоне. Строки не копируются:
+		// map держит те же строки, что и дерево. Сравнение точное, без прежних
+		// FNV-хешей и их коллизий.
+		allowed := zsetReg.MembersInRange(setName, minScore, maxScore)
 		if allowed == nil {
 			// Пустой sorted set или нет элементов в диапазоне
 			buf.WriteArrayHeader(0)
 			return
 		}
 
-		// Шаг 2: HNSW SearchFiltered с hash-фильтром
-		// HashMember(key) — inline FNV-1a (~15ns), zero-alloc.
+		// Шаг 2: HNSW SearchFiltered с фильтром «member в множестве».
 		monitoring.VectorSearchTotal.Inc()
 		searchStart := time.Now()
 		results, err := vecStore.SearchFiltered(query, K, func(key string) bool {
-			_, ok := allowed[btree.HashMember(key)]
+			_, ok := allowed[key]
 			return ok
 		}, nil)
 		monitoring.VectorSearchDuration.Update(time.Since(searchStart).Seconds())
@@ -3454,14 +3455,14 @@ func SendVectorToNode(addr, key string, vec []float32) error {
 // сюда, теряется после рестарта.
 //
 //   - обычные KV-ключи → OpSet;
-//   - внутренние __zidx-ключи ПРОПУСКАЕМ — zset перестраивается из реестра
-//     через OpZAdd (S2). Иначе split-brain: __zidx выживает как OpSet, а
-//     дерево нет; к тому же при реплее __zidx (OpSet) ДО OpZAdd ранний return
-//     ZAdd (oldScore==score) не вставил бы member в дерево;
+//   - ключи "__zidx:" ПРОПУСКАЕМ — это пространство имён прежнего обратного
+//     индекса zset, когда он жил в общем KV. Теперь индекс внутри реестра и
+//     такие ключи не создаются, но снапшот, снятый до фикса S2, мог их
+//     принести: после первой компакции они выметаются;
 //   - TTL → OpExpire с абсолютным временем смерти (S1): иначе после компакции
 //     ключи с TTL становятся бессмертными (correctness + утечка памяти);
-//   - zset-деревья → OpZAdd (score+member) (S2): реплей восстанавливает И
-//     дерево, И __zidx-обратный индекс.
+//   - zset → OpZAdd (score+member) (S2): реплей восстанавливает и дерево, и
+//     обратный индекс member → score.
 //
 // snapshotIterateSealed — тот же обход, но VMEM-якоря уезжают в снапшот под
 // конвертом своего скоупа.

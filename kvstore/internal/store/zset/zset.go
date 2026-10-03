@@ -4,72 +4,66 @@ import (
 	"encoding/binary"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	"kvstore/kvstore/internal/btree"
-	"kvstore/kvstore/internal/store/tcmalloc"
 )
 
 // ============================================================================
-// ZSetRegistry — реестр sorted sets на базе B+Tree
+// ZSetRegistry — реестр sorted sets
 // ============================================================================
 //
-// Каждый sorted set — это BPTree (score → member), создаётся лениво при ZADD.
-// Обратный индекс (member → score) хранится в KV store:
-//   key = "__zidx:<setName>:<member>"  →  value = 8 bytes float64 (LE)
+// Каждое множество — B+-дерево пар (score, member) плюс обратный индекс
+// member → score в обычной map; оба под одним RWMutex множества:
+//   ZADD/ZREM            — Lock (check-then-act атомарен: нет дублей в дереве)
+//   ZSCORE/ZCARD/ZRANGE  — RLock (читатели одного множества не мешают друг другу)
 //
-// Lock-free чтение (zero mutex на горячем пути):
-//   sets.Load("prices")              ← sync.Map atomic.Pointer (lock-free)
-//   tree.RangeSearch(min, max)       ← RLock (batch read)
-//   tree.Search(score)              ← seqlock (lock-free)
-//   kvStore.Get("__zidx:prices:X")   ← lock-free HashTable
+// Прежде обратный индекс лежал в общем KV под ключами "__zidx:<set>:<member>",
+// а узлы дерева — в арене самописного аллокатора. Отсюда три следствия, которых
+// больше нет: DBSIZE считал служебные ключи, снапшот обязан был их вырезать,
+// а память дерева нельзя было отдать сборщику мусора.
 //
-// Единый аллокатор:
-//   B+Tree nodes, member strings, KV data, vectors — всё в TCMalloc.
-//   Один MemoryCounter, один DeferFree, один HeapStats.
+// Опустевшее множество снимается с реестра (как в Redis: ZREM последнего
+// member удаляет ключ). Иначе каждое когда-либо созданное имя жило бы вечно.
 
-// zsetEntry — один sorted set: дерево + writer-мьютекс.
-//
-// S3: ZAdd/ZRem — это check-then-act (Get(__zidx) → DeleteMember → Insert →
-// Set(__zidx)). Без сериализации два конкурентных ZAdd одного member оба
-// читают «не существует» → оба Insert → ДУБЛЬ в дереве + сирота в обратном
-// индексе навсегда (ZCARD раздут, призрак в range). mu делает RMW атомарным
-// per-set. Readers (ZScore/ZRange/ZCard/ForEach) mu НЕ берут — их защищают
-// собственные локи BPTree (RLock/seqlock) и lock-free __zidx.
+// Оценки служебных байт для гейта maxmemory (учёт приближённый, как и у KV).
+const (
+	// memberOverhead — элемент в листе дерева (24 Б) с запасом на
+	// недозаполнение узлов, слот обратного индекса (заголовок строки и float64)
+	// и служебные байты таблицы. Сама строка member общая у дерева и индекса и
+	// считается один раз.
+	memberOverhead = 80
+	// setOverhead — запись реестра, пустые дерево и map.
+	setOverhead = 256
+)
+
+// zsetEntry — одно множество.
 type zsetEntry struct {
-	tree *btree.BPTree
-	mu   sync.Mutex // сериализует writers одного set
+	mu     sync.RWMutex
+	tree   *btree.BPTree
+	scores map[string]float64
+	// dead — множество опустело и снято с реестра. Писатель, взявший запись
+	// до снятия и дождавшийся лока, видит флаг и берёт свежую запись — иначе
+	// его ZADD ушёл бы в запись, которой уже нет в реестре.
+	dead bool
 }
 
 // ZSetRegistry — реестр sorted sets.
 type ZSetRegistry struct {
-	sets  sync.Map // map[string]*zsetEntry — lock-free Load для существующих
-	store *tcmalloc.TCMallocStore
+	sets sync.Map // map[string]*zsetEntry
+	mem  *atomic.Int64
 }
 
-// New создаёт реестр sorted sets.
-func New(store *tcmalloc.TCMallocStore) *ZSetRegistry {
-	return &ZSetRegistry{
-		store: store,
+// New создаёт реестр. mem — общий счётчик учтённой памяти (тот же, что у KV,
+// чтобы ZADD упирался в тот же maxmemory); nil — без учёта.
+func New(mem *atomic.Int64) *ZSetRegistry {
+	return &ZSetRegistry{mem: mem}
+}
+
+func (r *ZSetRegistry) account(delta int64) {
+	if r.mem != nil {
+		r.mem.Add(delta)
 	}
-}
-
-// reverseKey — ключ обратного индекса в KV store.
-// Формат: "__zidx:<setName>:<member>" → 8 bytes float64 (LE).
-func reverseKey(setName, member string) string {
-	// Прямая конкатенация — быстрее fmt.Sprintf.
-	return "__zidx:" + setName + ":" + member
-}
-
-// encodeScore кодирует float64 в 8 байт (little-endian).
-func encodeScore(score float64) []byte {
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], math.Float64bits(score))
-	return buf[:]
-}
-
-// DecodeScore декодирует float64 из 8 байт (little-endian).
-func DecodeScore(data []byte) float64 {
-	return math.Float64frombits(binary.LittleEndian.Uint64(data))
 }
 
 // EncodeZAddValue кодирует score + member для WAL Entry.Value.
@@ -90,25 +84,6 @@ func DecodeZAddValue(data []byte) (float64, string) {
 
 // ── Public API ──────────────────────────────────────────────
 
-// getOrCreate возвращает существующее дерево или создаёт новое.
-// sync.Map.LoadOrStore — lock-free для существующих, мьютекс только при первом создании.
-//
-// workerID вызывающего воркера прокидывается в btree.New (аллокация корня из
-// его MCache) — иначе все деревья аллоцировали бы из общего caches[0] из
-// произвольных epoll-горутин (data race, см. [[zset alloc race]]).
-func (r *ZSetRegistry) getOrCreate(workerID int, setName string) *zsetEntry {
-	if v, ok := r.sets.Load(setName); ok {
-		return v.(*zsetEntry)
-	}
-	// Lazy create — sync.Map корректно обрабатывает concurrent LoadOrStore.
-	// Если два ZADD одновременно создают "prices" — один entry победит,
-	// второй будет GC'd (один лишний узел, не страшно).
-	e := &zsetEntry{tree: btree.New(r.store, workerID)}
-	actual, _ := r.sets.LoadOrStore(setName, e)
-	return actual.(*zsetEntry)
-}
-
-// get возвращает entry или nil если set не существует.
 func (r *ZSetRegistry) get(setName string) *zsetEntry {
 	v, ok := r.sets.Load(setName)
 	if !ok {
@@ -117,73 +92,88 @@ func (r *ZSetRegistry) get(setName string) *zsetEntry {
 	return v.(*zsetEntry)
 }
 
-// ZAdd добавляет member с score в sorted set.
-// Если member уже существует — обновляет score.
-// Возвращает true если новый member добавлен (не обновление).
-func (r *ZSetRegistry) ZAdd(workerID int, setName string, score float64, member string) bool {
-	e := r.getOrCreate(workerID, setName)
-	rk := reverseKey(setName, member)
+func (r *ZSetRegistry) getOrCreate(setName string) *zsetEntry {
+	if e := r.get(setName); e != nil {
+		return e
+	}
+	e := &zsetEntry{tree: btree.New(), scores: make(map[string]float64)}
+	actual, loaded := r.sets.LoadOrStore(setName, e)
+	if !loaded {
+		r.account(setOverhead + int64(len(setName)))
+	}
+	return actual.(*zsetEntry)
+}
 
-	// S3: весь check-then-act под per-set мьютексом — иначе конкурентные ZAdd
-	// одного member дают дубль в дереве + сироту в обратном индексе.
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Проверяем обратный индекс: есть ли уже этот member?
-	oldScoreBytes, existed := r.store.Get(rk)
-
-	if existed {
-		oldScore := DecodeScore(oldScoreBytes)
-		if oldScore == score {
-			// Тот же score — ничего не делаем
+// ZAdd добавляет member или меняет его score. true — member новый.
+// NaN не принимается (false, ничего не меняется): Redis отвечает на него
+// ошибкой, а в упорядоченном индексе NaN ломает сравнение. Обработчик ZADD
+// отсекает NaN раньше; здесь — защита реплея журнала, записанного версией,
+// которая NaN пропускала.
+func (r *ZSetRegistry) ZAdd(setName string, score float64, member string) bool {
+	if math.IsNaN(score) {
+		return false
+	}
+	for {
+		e := r.getOrCreate(setName)
+		e.mu.Lock()
+		if e.dead {
+			e.mu.Unlock()
+			continue
+		}
+		old, existed := e.scores[member]
+		if existed && old == score {
+			e.mu.Unlock()
 			return false
 		}
-		// Удаляем старую запись из дерева (по old score + member)
-		e.tree.DeleteMember(oldScore, member)
+		if existed {
+			e.tree.Delete(old, member)
+		}
+		e.tree.Insert(score, member)
+		e.scores[member] = score
+		e.mu.Unlock()
+		if !existed {
+			r.account(memberOverhead + int64(len(member)))
+		}
+		return !existed
 	}
-
-	// Вставляем новую запись (аллокация из кэша этого воркера)
-	e.tree.Insert(workerID, score, member)
-
-	// Обновляем обратный индекс
-	r.store.Set(workerID, rk, encodeScore(score))
-
-	return !existed
 }
 
-// ZScore возвращает score для member в sorted set.
-// Lock-free: читает из KV store (atomic HashTable).
+// ZScore возвращает score member.
 func (r *ZSetRegistry) ZScore(setName, member string) (float64, bool) {
-	rk := reverseKey(setName, member)
-	data, ok := r.store.Get(rk)
-	if !ok {
+	e := r.get(setName)
+	if e == nil {
 		return 0, false
 	}
-	return DecodeScore(data), true
+	e.mu.RLock()
+	score, ok := e.scores[member]
+	e.mu.RUnlock()
+	return score, ok
 }
 
-// ZRem удаляет member из sorted set.
-// Возвращает true если member существовал.
-func (r *ZSetRegistry) ZRem(workerID int, setName, member string) bool {
+// ZRem удаляет member. true — member был.
+func (r *ZSetRegistry) ZRem(setName, member string) bool {
 	e := r.get(setName)
 	if e == nil {
 		return false
 	}
-
-	rk := reverseKey(setName, member)
-
-	// S3: check-then-act под тем же per-set мьютексом, что и ZAdd.
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	oldScoreBytes, existed := r.store.Get(rk)
-	if !existed {
+	score, ok := e.scores[member]
+	if !ok {
+		e.mu.Unlock()
 		return false
 	}
-
-	oldScore := DecodeScore(oldScoreBytes)
-	e.tree.DeleteMember(oldScore, member)
-	r.store.Del(workerID, rk)
+	delete(e.scores, member)
+	e.tree.Delete(score, member)
+	emptied := len(e.scores) == 0
+	if emptied {
+		e.dead = true
+		r.sets.CompareAndDelete(setName, e)
+	}
+	e.mu.Unlock()
+	r.account(-(memberOverhead + int64(len(member))))
+	if emptied {
+		r.account(-(setOverhead + int64(len(setName))))
+	}
 	return true
 }
 
@@ -193,90 +183,81 @@ type RangeResult struct {
 	Member string
 }
 
-// ZRangeByScore возвращает все members в диапазоне [minScore, maxScore].
-// Результаты отсортированы по score (B+Tree гарантирует порядок).
+// ZRangeByScore возвращает member с minScore ≤ score ≤ maxScore по порядку
+// (score, затем member).
 func (r *ZSetRegistry) ZRangeByScore(setName string, minScore, maxScore float64) []RangeResult {
 	e := r.get(setName)
 	if e == nil {
 		return nil
 	}
-
-	raw := e.tree.RangeSearch(minScore, maxScore)
-	results := make([]RangeResult, len(raw))
-	for i, item := range raw {
-		results[i] = RangeResult{Score: item.Score, Member: item.Member}
-	}
-	return results
+	var out []RangeResult
+	e.mu.RLock()
+	e.tree.Range(minScore, maxScore, func(it btree.Item) bool {
+		out = append(out, RangeResult{Score: it.Score, Member: it.Member})
+		return true
+	})
+	e.mu.RUnlock()
+	return out
 }
 
-// ZCard возвращает количество элементов в sorted set.
-// Lock-free: atomic.Int64.Load().
+// ZCard возвращает число member в множестве.
 func (r *ZSetRegistry) ZCard(setName string) int {
 	e := r.get(setName)
 	if e == nil {
 		return 0
 	}
-	return e.tree.Len()
+	e.mu.RLock()
+	n := len(e.scores)
+	e.mu.RUnlock()
+	return n
 }
 
-// MembersInRange возвращает множество member'ов в диапазоне score.
-// Оптимизирован для VSIM.SEARCHRANGE: B+Tree RangeSearch → map[string]bool.
-func (r *ZSetRegistry) MembersInRange(setName string, minScore, maxScore float64) map[string]bool {
+// MembersInRange возвращает множество member со score в [minScore, maxScore]
+// (nil — пусто). Нужен VSIM.SEARCHRANGE как фильтр кандидатов HNSW. Строки
+// member не копируются: map держит те же строки, что и дерево. Прежде здесь
+// было множество FNV-хешей member — ради того, чтобы не копировать строки из
+// арены, ценой ложных совпадений при коллизии хеша.
+func (r *ZSetRegistry) MembersInRange(setName string, minScore, maxScore float64) map[string]struct{} {
 	e := r.get(setName)
 	if e == nil {
 		return nil
 	}
-
-	raw := e.tree.RangeSearch(minScore, maxScore)
-	if len(raw) == 0 {
-		return nil
-	}
-
-	result := make(map[string]bool, len(raw))
-	for _, item := range raw {
-		result[item.Member] = true
-	}
-	return result
+	var out map[string]struct{}
+	e.mu.RLock()
+	e.tree.Range(minScore, maxScore, func(it btree.Item) bool {
+		if out == nil {
+			out = make(map[string]struct{})
+		}
+		out[it.Member] = struct{}{}
+		return true
+	})
+	e.mu.RUnlock()
+	return out
 }
 
-// MembersInRangeHashed — ★ ОПТИМИЗИРОВАННАЯ ★ версия MembersInRange.
-//
-// Вместо N аллокаций строк (resolveMember × N) возвращает множество
-// FNV-1a хешей member'ов. Фильтрация HNSW кандидата:
-//
-//	allowed := zsetReg.MembersInRangeHashed("prices", 100, 500)
-//	filterFn := func(key string) bool {
-//	    _, ok := allowed[btree.HashMember(key)]
-//	    return ok
-//	}
-//
-// Аллокации: 1 (map) вместо 113 (map + 101 строк + slices).
-// Latency: ~1.5 µs вместо ~10 µs на 100 элементов.
-//
-// Caveat: FNV-1a коллизия теоретически возможна (~1/2^64).
-// Для mission-critical фильтрации можно верифицировать через ZSCORE.
-func (r *ZSetRegistry) MembersInRangeHashed(setName string, minScore, maxScore float64) map[uint64]struct{} {
-	e := r.get(setName)
-	if e == nil {
-		return nil
-	}
-	return e.tree.RangeCollectHashes(minScore, maxScore)
-}
-
-// ForEach итерирует по sorted set в порядке score.
-// Для snapshot/WAL compaction.
+// ForEach обходит множество по порядку — для снапшота. Элементы копируются под
+// RLock, а fn вызывается уже без лока: запись снапшота на диск не держит
+// писателей этого множества.
 func (r *ZSetRegistry) ForEach(setName string, fn func(score float64, member string)) {
 	e := r.get(setName)
 	if e == nil {
 		return
 	}
-	e.tree.ForEach(fn)
+	e.mu.RLock()
+	items := make([]btree.Item, 0, e.tree.Len())
+	e.tree.ForEach(func(it btree.Item) bool {
+		items = append(items, it)
+		return true
+	})
+	e.mu.RUnlock()
+	for _, it := range items {
+		fn(it.Score, it.Member)
+	}
 }
 
-// ForEachSet итерирует по всем sorted sets.
-// Для snapshot (сохранение всех ZADD при compaction).
+// ForEachSet обходит имена всех множеств — для снапшота.
 func (r *ZSetRegistry) ForEachSet(fn func(setName string)) {
-	r.sets.Range(func(key, value any) bool {
+	r.sets.Range(func(key, _ any) bool {
 		fn(key.(string))
 		return true
 	})
