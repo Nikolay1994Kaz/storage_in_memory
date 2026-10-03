@@ -94,7 +94,7 @@ func newExecEnv(t *testing.T) *execEnv {
 func (e *execEnv) do(cmd string, args ...string) protocol.Value {
 	e.t.Helper()
 	rc := &recordingConn{}
-	e.cs = &server.ConnState{Conn: rc, Buf: server.NewConnBuf(rc), WorkerID: 0, Authenticated: true}
+	e.cs = &server.ConnState{Conn: rc, Buf: server.NewConnBuf(rc), Authenticated: true}
 
 	byteArgs := make([][]byte, len(args))
 	for i, a := range args {

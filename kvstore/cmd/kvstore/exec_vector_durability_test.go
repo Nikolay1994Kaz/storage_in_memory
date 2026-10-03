@@ -67,7 +67,7 @@ func TestExec_VsimAddFailDoesNotWriteWAL(t *testing.T) {
 
 	do := func(cmd string, args ...string) {
 		rc := &recordingConn{}
-		cs := &server.ConnState{Conn: rc, Buf: server.NewConnBuf(rc), WorkerID: 0, Authenticated: true}
+		cs := &server.ConnState{Conn: rc, Buf: server.NewConnBuf(rc), Authenticated: true}
 		byteArgs := make([][]byte, len(args))
 		for i, a := range args {
 			byteArgs[i] = []byte(a)

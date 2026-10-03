@@ -2,10 +2,11 @@ package server
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
-	"runtime"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,54 +14,25 @@ import (
 	"kvstore/kvstore/internal/monitoring"
 )
 
-const (
-	// ReadTimeout — максимальное время ожидания данных от клиента.
-	// Защита от Slowloris-атаки: если клиент прислал полкоманды
-	// и замолчал — через 5 секунд соединение закроется.
-	ReadTimeout = 5 * time.Second
-
-	// drainTimeout — предел ожидания завершения воркеров в Stop(). Страховка на
-	// случай, когда закрытие epoll-fd не разбудило заблокированный epoll_wait
-	// (idle-timeout=0 → timeoutMs=-1): shutdown не должен зависать навсегда.
-	drainTimeout = 5 * time.Second
-)
+// drainTimeout — предел ожидания завершения обработчиков в Stop(). Страховка на
+// случай непредвиденной блокировки: shutdown не должен зависать навсегда.
+const drainTimeout = 5 * time.Second
 
 // ConnState хранит состояние соединения.
 //
-// Buf — per-connection ring buffer (заменяет bufio.Reader + bufio.Writer).
-// WorkerID — идентификатор epoll-воркера для TCMallocStore MCache.
+// Buf — per-connection буфер чтения/записи (заменяет bufio.Reader + bufio.Writer).
 type ConnState struct {
 	Conn          net.Conn
-	Buf           *ConnBuf // ← заменяет Reader + Writer
-	WorkerID      int
+	Buf           *ConnBuf
 	InTx          bool
-	TxQueue       [][][]byte // ← was [][]protocol.Value
-	TxAborted     bool       // H2: в MULTI встретилась запрещённая команда → EXEC вернёт EXECABORT
-	Authenticated bool       // true после успешной AUTH команды
+	TxQueue       [][][]byte
+	TxAborted     bool // H2: в MULTI встретилась запрещённая команда → EXEC вернёт EXECABORT
+	Authenticated bool // true после успешной AUTH команды
 
-	// LastActivity — unix-наносекунды последней активности (приём данных).
-	// Реапер закрывает соединения, неактивные дольше Server.IdleTimeout. В этой
-	// epoll-архитектуре дедлайн на сокете не реапит молчащие conn (EpollWait не
-	// проснётся от Go-дедлайна), поэтому реапинг — по этому полю.
-	LastActivity atomic.Int64
-}
-
-// WorkerReclaimer — хук QSBR-управления памятью аллокатора (см. tcmalloc).
-//
-// Воркер сообщает «тихое» состояние (ReportQuiescent) после пробуждения из
-// epoll_wait — до обработки команд, и уходит offline (GoOffline) перед
-// блокировкой в epoll_wait, когда гарантированно не держит ни одного хендла.
-// Это позволяет аллокатору освобождать отложенные слоты не по таймеру, а по
-// кворуму quiescence (фикс UAF T2). nil = не используется.
-type WorkerReclaimer interface {
-	ReportQuiescent(workerID int)
-	GoOffline(workerID int)
+	closeOnce sync.Once
 }
 
 // Handler — функция обработки RESP-команды.
-//
-// Было:  func(cs, args []Value) Value   — создаёт Value, возвращает Value
-// Стало: func(cs, args [][]byte)        — читает из ring buffer, пишет в ring buffer
 //
 // Handler НЕ возвращает значение. Вместо этого пишет ответ прямо в cs.Buf:
 //
@@ -69,350 +41,295 @@ type WorkerReclaimer interface {
 //	cs.Buf.WriteError("ERR ...")
 type Handler func(cs *ConnState, args [][]byte)
 
-// worker — один воркер со своим epoll instance.
-type worker struct {
-	id    int
-	epoll *Epoll
-}
-
-// Server — TCP-сервер на базе per-worker epoll.
+// Server — TCP-сервер: горутина на соединение поверх netpoller Go.
+//
+// Прежде здесь был свой слой epoll: net.Listener отдавал соединение, его fd
+// регистрировался во втором epoll-инстансе на воркер (в первом его уже держит
+// netpoller рантайма), а читалось всё равно через conn.Read Go. Свой epoll
+// нёс одну функцию — стабильный WorkerID для MCache самописного аллокатора;
+// аллокатора больше нет, и вместе с ним ушли:
+//   - TLS, падавший паникой на первом соединении (socketFD приводил conn к
+//     *net.TCPConn, а TLS-листенер отдаёт *tls.Conn); «минимальный фикс» через
+//     NetConn() не спасал — tls.Conn вычитывает из сокета несколько записей в
+//     свой буфер, epoll больше не просыпается, и конвейер команд висит;
+//   - собственные wake-pipe, реапер и учёт fd, на которые пришлась половина
+//     фиксов этого пакета; Linux-only.
+//
+// Горячий путь прежний: ConnBuf (разбор без аллокаций), жадный дочит готовых
+// байт без ожидания (TryRead), один Flush на пачку ответов.
 type Server struct {
 	addr      string
 	handler   Handler
 	listener  net.Listener
-	workers   []*worker
-	next      atomic.Uint64
 	TLSConfig *tls.Config // nil = plain TCP, not-nil = TLS
 
-	// IdleTimeout — макс. время без активности, после которого соединение
-	// реапится (защита от Slowloris/брошенных conn). 0 = реапинг выключен.
+	// IdleTimeout — макс. время без приёма данных, после которого соединение
+	// закрывается (Slowloris, брошенные соединения). Реализовано дедлайном
+	// чтения: каждое чтение ждёт не дольше IdleTimeout. 0 = не закрывать.
 	IdleTimeout time.Duration
 
-	// WriteTimeout — макс. время на отправку ответа (Flush). Защита от застрявшего
-	// reader, блокирующего горутину воркера. 0 = без дедлайна.
+	// WriteTimeout — макс. время на отправку ответа (Flush). Защита от
+	// застрявшего читателя на той стороне. 0 = без дедлайна.
 	WriteTimeout time.Duration
 
 	// MaxConnections — потолок одновременных соединений (защита от исчерпания
-	// fd/RAM). 0 = без лимита. Сверх лимита acceptLoop сразу закрывает новый conn.
+	// fd/RAM). 0 = без лимита. Сверх лимита acceptLoop сразу закрывает новое.
 	MaxConnections int
 
-	// OnDisconnect — колбэк на закрытие любого соединения (единая точка в
-	// Epoll.Remove). Обычно = hub.RemoveConn, чтобы отключение клиента чистило
-	// его подписки Pub/Sub (иначе течёт семантический вектор в HNSW). nil = нет.
+	// OnDisconnect — колбэк на закрытие любого соединения (единая точка
+	// closeConn). Обычно = hub.RemoveConn, чтобы отключение клиента чистило его
+	// подписки Pub/Sub (иначе течёт семантический вектор в HNSW). nil = нет.
 	OnDisconnect func(net.Conn)
 
-	// IdleExempt — предикат освобождения соединения от idle-реапа. Обычно =
-	// hub.IsSubscriber: pub/sub-подписчик после SUBSCRIBE легитимно молчит
-	// (LastActivity обновляется только на приём, push-выдача её не трогает),
-	// и без эксемпта реапер рвал бы его через IdleTimeout даже при активной
-	// доставке. nil = реапятся все неактивные (как раньше).
+	// IdleExempt — предикат освобождения соединения от закрытия по IdleTimeout.
+	// Обычно = hub.IsSubscriber: подписчик после SUBSCRIBE легитимно молчит
+	// (получает только push'и), Redis тоже не применяет timeout к CLIENT_PUBSUB.
+	// Мёртвых peer'ов среди них ловят TCP keepalive и ошибка записи writePump.
+	// nil = закрываются все молчащие.
 	IdleExempt func(net.Conn) bool
 
-	// Reclaimer — необязательный хук QSBR-освобождения памяти аллокатора.
-	// Обычно = tcmalloc-store. nil = воркеры не рапортуют quiescence (тесты).
-	Reclaimer WorkerReclaimer
-
-	// activeConns — текущее число живых соединений (общий счётчик по всем epoll;
-	// inc в Epoll.Add, dec в Epoll.Remove). Читается acceptLoop для проверки лимита.
+	// activeConns — текущее число живых соединений. Inc в acceptLoop (до старта
+	// горутины соединения), dec в closeConn — ровно один раз на соединение.
 	activeConns atomic.Int64
 
-	// stopping — выставляется в Stop(); воркеры выходят из eventLoop, а не
-	// крутятся в tight-loop на EpollWait-ошибке после закрытия epoll-fd.
+	// stopping — выставляется в Stop(): acceptLoop и горутины соединений
+	// выходят на ближайшей границе, а не продолжают работу.
 	stopping atomic.Bool
 
-	// wg отслеживает горутины воркеров для graceful drain: Stop() дожидается
-	// завершения in-flight обработчиков, чтобы их WAL-записи попали в канал
-	// ДО того, как вызывающий закроет WAL (иначе — send на закрытый канал).
+	// wg отслеживает горутины соединений для graceful drain: Stop() дожидается
+	// in-flight обработчиков, чтобы их WAL-записи попали в канал ДО того, как
+	// вызывающий закроет WAL (иначе — send на закрытый канал).
 	wg sync.WaitGroup
+
+	mu    sync.Mutex
+	conns map[net.Conn]*ConnState // живые соединения — для CloseConn и Stop
 }
 
 func NewServer(addr string, handler Handler) *Server {
 	return &Server{
 		addr:    addr,
 		handler: handler,
+		conns:   make(map[net.Conn]*ConnState),
 	}
 }
 
-// Start запускает сервер с per-worker epoll архитектурой.
+// Start открывает листенер и начинает принимать соединения.
 func (s *Server) Start() error {
-	var err error
-
-	s.listener, err = net.Listen("tcp", s.addr)
+	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.addr, err)
 	}
-
-	// TLS: оборачиваем listener, если TLSConfig задан.
-	// Весь остальной код (epoll, ConnBuf) работает без изменений —
-	// TLS прозрачно шифрует на уровне listener, conn.Read/Write те же.
 	if s.TLSConfig != nil {
-		s.listener = tls.NewListener(s.listener, s.TLSConfig)
+		ln = tls.NewListener(ln, s.TLSConfig)
 		slog.Info("TLS enabled")
 	}
-
-	numWorkers := runtime.NumCPU()
-	s.workers = make([]*worker, numWorkers)
-
-	for i := 0; i < numWorkers; i++ {
-		ep, err := NewEpoll()
-		if err != nil {
-			return fmt.Errorf("failed to create epoll for worker %d: %w", i, err)
-		}
-		ep.connCount = &s.activeConns // общий счётчик соединений на все воркеры
-		ep.onRemove = s.OnDisconnect  // очистка подписок Pub/Sub при отключении
-		s.workers[i] = &worker{id: i, epoll: ep}
-
-		s.wg.Add(1)
-		go s.eventLoop(s.workers[i])
-	}
-
-	go s.acceptLoop()
-
-	slog.Info("server listening", "addr", s.addr, "mode", "epoll", "workers", numWorkers)
+	s.startOn(ln)
+	slog.Info("server listening", "addr", s.addr, "mode", "goroutine-per-conn")
 	return nil
 }
 
-// nextWorker выбирает следующего воркера по Round Robin.
-func (s *Server) nextWorker() *worker {
-	idx := s.next.Add(1)
-	return s.workers[idx%uint64(len(s.workers))]
+// startOn запускает приём на готовом листенере (тесты подставляют свой).
+func (s *Server) startOn(ln net.Listener) {
+	s.listener = ln
+	go s.acceptLoop()
 }
 
-// acceptLoop принимает соединения и распределяет по воркерам.
+// acceptLoop принимает соединения и запускает на каждое свою горутину.
+//
+// Временная ошибка Accept (EMFILE/ENFILE — кончились дескрипторы,
+// ECONNABORTED) не останавливает приём: пауза с ростом до секунды и повтор,
+// как в net/http. Прежде любая ошибка завершала цикл навсегда — процесс жил,
+// но новых клиентов больше не принимал.
 func (s *Server) acceptLoop() {
+	var backoff time.Duration
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			if s.stopping.Load() {
-				return // штатная остановка: listener закрыт
+			if s.stopping.Load() || errors.Is(err, net.ErrClosed) {
+				return
 			}
-			slog.Error("accept error", "err", err)
+			var ne net.Error
+			//nolint:staticcheck // Temporary() — единственный признак EMFILE/ENFILE у ошибки Accept.
+			if errors.As(err, &ne) && ne.Temporary() {
+				if backoff == 0 {
+					backoff = 5 * time.Millisecond
+				} else if backoff *= 2; backoff > time.Second {
+					backoff = time.Second
+				}
+				slog.Error("accept error, retrying", "err", err, "backoff", backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			slog.Error("accept error, listener stopped", "err", err)
 			return
 		}
+		backoff = 0
 
-		// Потолок одновременных соединений: защита от исчерпания fd/RAM. Сразу
-		// рвём лишнее соединение, не регистрируя его в epoll (не выделяя rbuf).
-		// acceptLoop — единственная горутина-аксептор, поэтому проверка-перед-Add
-		// без гонки: предыдущее соединение уже учтено (Add синхронный) к этому шагу.
+		// Потолок одновременных соединений: acceptLoop — единственный аксептор,
+		// счётчик увеличивается здесь же, поэтому проверка-перед-Add без гонки.
 		if s.MaxConnections > 0 && s.activeConns.Load() >= int64(s.MaxConnections) {
 			conn.Close()
 			monitoring.ConnRejected.Inc()
 			continue
 		}
 
-		w := s.nextWorker()
-
-		cs := &ConnState{
-			Conn:     conn,
-			Buf:      NewConnBuf(conn), // ← ConnBuf вместо Reader+Writer
-			WorkerID: w.id,
-		}
+		cs := &ConnState{Conn: conn, Buf: NewConnBuf(conn)}
 		cs.Buf.WriteTimeout = s.WriteTimeout
-		cs.LastActivity.Store(time.Now().UnixNano())
 
-		if err := w.epoll.Add(cs); err != nil {
-			slog.Error("epoll add error", "worker", w.id, "err", err)
-			conn.Close()
-			continue
-		}
-	}
-}
-
-// eventLoop — главный цикл воркера.
-//
-// Если IdleTimeout задан, EpollWait получает конечный таймаут (вместо -1), чтобы
-// воркер периодически просыпался и реапил неактивные соединения — даже когда по
-// ним нет событий (молчащий Slowloris-клиент epoll не разбудит).
-func (s *Server) eventLoop(w *worker) {
-	defer s.wg.Done()
-
-	timeoutMs := -1 // по умолчанию блокируем бесконечно (реапинг выключен)
-	if s.IdleTimeout > 0 {
-		tick := s.IdleTimeout
-		if tick > time.Second {
-			tick = time.Second // подметаем не реже раза в секунду
-		}
-		timeoutMs = int(tick / time.Millisecond)
-		if timeoutMs < 1 {
-			timeoutMs = 1
-		}
-	}
-
-	for {
-		// Проверяем остановку и на таймаут-пробуждении, а не только на ошибке
-		// Wait: закрытие epoll-fd из другой горутины не всегда будит уже
-		// заблокированный epoll_wait, но при заданном idle-timeout воркер
-		// просыпается по тику и выходит здесь чисто (graceful drain).
+		s.mu.Lock()
 		if s.stopping.Load() {
+			// Stop уже обошёл карту соединений — это соединение он не увидит.
+			s.mu.Unlock()
+			conn.Close()
 			return
 		}
-		// QSBR: уходим offline перед блокировкой в epoll_wait. Здесь воркер
-		// гарантированно не держит ни одного хендла (все команды обработаны,
-		// значения скопированы), поэтому исключение из кворума безопасно и не
-		// даёт спящему воркеру заморозить reclaim (см. tcmalloc/reclaim.go).
-		if s.Reclaimer != nil {
-			s.Reclaimer.GoOffline(w.id)
-		}
-		states, err := w.epoll.Wait(timeoutMs)
-		// Проснулись → online: публикуем наблюдаемое поколение ДО обработки
-		// команд (до любого lock-free Get).
-		if s.Reclaimer != nil {
-			s.Reclaimer.ReportQuiescent(w.id)
-		}
-		if err != nil {
-			if s.stopping.Load() {
-				return // сервер останавливается, epoll-fd закрыт — выходим чисто
-			}
-			slog.Error("epoll wait error", "worker", w.id, "err", err)
-			continue
-		}
+		s.conns[conn] = cs
+		s.mu.Unlock()
+		s.activeConns.Add(1)
+		monitoring.ActiveConnections.Inc()
 
-		for _, cs := range states {
-			s.handleConn(w, cs)
-		}
-
-		if s.IdleTimeout > 0 {
-			w.epoll.reapIdle(s.IdleTimeout, s.IdleExempt)
-		}
+		s.wg.Add(1)
+		go s.serve(cs)
 	}
 }
 
-// handleConn обрабатывает команды от клиента.
-//
-// ★ HYBRID: RING BUFFER + GREEDY DRAIN ★
-//
-// Цикл:
-//  1. ReadFromConn() — основной read (epoll гарантирует данные)
-//  2. ParseCommand() loop — разбираем ВСЕ команды из буфера
-//  3. TryRead() — non-blocking raw syscall.Read:
-//     пока мы обрабатывали команды (~100μs), клиент уже мог
-//     отправить следующую. Ловим её БЕЗ нового epoll_wait.
-//  4. Если TryRead вернул данные — обрабатываем и повторяем
-//  5. Flush() — ONE write() для всех ответов
-//
-// Это то, что делает bufio.Reader "бесплатно" — жадно читает
-// больше данных чем нужно. Мы делаем то же, но осознанно и
-// без overhead bufio (без двойного буфера, без лишних memcpy).
-func (s *Server) handleConn(w *worker, cs *ConnState) {
-	// Defense-in-depth: паника в парсере или хендлере НЕ должна ронять воркер
-	// (а с ним весь процесс). Закрываем только это соединение и живём дальше.
+// serve — жизнь одного соединения: чтение → разбор всех готовых команд →
+// жадный дочит → один Flush на пачку ответов.
+func (s *Server) serve(cs *ConnState) {
+	defer s.wg.Done()
+	defer s.closeConn(cs)
+	// Паника в парсере или обработчике закрывает только это соединение.
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("recovered panic on connection, closing it", "worker", w.id, "panic", r)
-			w.epoll.Remove(cs)
+			slog.Error("recovered panic on connection, closing it", "panic", r)
 		}
 	}()
 
-	n, err := cs.Buf.ReadFromConn()
-	if n > 0 {
-		cs.LastActivity.Store(time.Now().UnixNano()) // сбрасываем счётчик idle
-	}
-	// ReadFromConn ставит ProtoErr, когда rbuf упёрся в потолок maxRbufSize
-	// (клиент льёт данные без завершённого кадра → mem-DoS). Рвём с ошибкой.
-	if cs.Buf.ProtoErr() {
-		s.closeProtoErr(w, cs)
-		return
-	}
-	if n == 0 || err != nil {
-		w.epoll.Remove(cs)
-		return
-	}
-
 	for {
-		// Разбираем и обрабатываем ВСЕ команды из буфера
-		for {
-			args := cs.Buf.ParseCommand()
-			if args == nil {
-				break
-			}
-			s.handler(cs, args)
+		if s.IdleTimeout > 0 {
+			_ = cs.Conn.SetReadDeadline(time.Now().Add(s.IdleTimeout))
 		}
-
-		// Нарушение протокола (невалидная/огромная bulk-длина, count > maxArgs):
-		// битый кадр нельзя «дождать» — он застрянет в буфере. Рвём conn с ошибкой.
-		if cs.Buf.ProtoErr() {
-			s.closeProtoErr(w, cs)
+		// Проверка ПОСЛЕ взвода дедлайна: Stop выставляет stopping, затем
+		// дедлайн «сейчас»; если мы взвели свой позже его, то увидим stopping
+		// здесь, а не уснём в чтении на весь IdleTimeout.
+		if s.stopping.Load() {
 			return
 		}
-
-		// Greedy drain: пробуем забрать ещё данные (non-blocking)
-		if cs.Buf.TryRead() == 0 {
-			break // нет данных — выходим
+		n, err := cs.Buf.ReadFromConn()
+		// ReadFromConn ставит ProtoErr, когда rbuf упёрся в потолок maxRbufSize
+		// (клиент льёт данные без завершённого кадра → mem-DoS).
+		if cs.Buf.ProtoErr() {
+			s.writeProtoErr(cs)
+			return
 		}
-		// Есть данные — продолжаем обработку
-	}
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) && !s.stopping.Load() {
+				if s.IdleExempt != nil && s.IdleExempt(cs.Conn) {
+					continue
+				}
+				monitoring.IdleReaped.Inc()
+			}
+			return
+		}
+		if n == 0 {
+			continue
+		}
 
-	// TryRead в greedy-цикле тоже мог упереться в потолок rbuf.
-	if cs.Buf.ProtoErr() {
-		s.closeProtoErr(w, cs)
-		return
-	}
-
-	// Один write() для ВСЕХ ответов (включая greedy drain). Ошибка (в т.ч.
-	// write-таймаут на застрявшем reader) → закрываем соединение, чтобы залипший
-	// клиент не держал воркера и буфер.
-	if err := cs.Buf.Flush(); err != nil {
-		w.epoll.Remove(cs)
+		for {
+			for {
+				args := cs.Buf.ParseCommand()
+				if args == nil {
+					break
+				}
+				s.handler(cs, args)
+			}
+			// Битый кадр (невалидная/огромная bulk-длина, count > maxArgs) нельзя
+			// «дождать» — он застрянет в буфере. Рвём соединение с ошибкой.
+			if cs.Buf.ProtoErr() {
+				s.writeProtoErr(cs)
+				return
+			}
+			// Жадный дочит: пока разбирали, клиент мог прислать ещё —
+			// забираем без ожидания и отвечаем на всё одним Flush.
+			if cs.Buf.TryRead() == 0 {
+				break
+			}
+		}
+		if cs.Buf.ProtoErr() {
+			s.writeProtoErr(cs)
+			return
+		}
+		// Ошибка записи (в т.ч. WriteTimeout на застрявшем читателе) — закрываем.
+		if err := cs.Buf.Flush(); err != nil {
+			return
+		}
 	}
 }
 
-// closeProtoErr отвечает RESP-ошибкой и закрывает соединение при нарушении
-// протокола или достижении потолка буфера. Битый/негодный кадр нельзя «дождать»,
-// поэтому соединение рвётся (защита от wedge и mem-DoS).
-func (s *Server) closeProtoErr(w *worker, cs *ConnState) {
+// writeProtoErr отвечает RESP-ошибкой перед закрытием соединения при нарушении
+// протокола или достижении потолка буфера.
+func (s *Server) writeProtoErr(cs *ConnState) {
 	cs.Buf.WriteError("ERR Protocol error")
-	cs.Buf.Flush()
-	w.epoll.Remove(cs)
+	_ = cs.Buf.Flush()
 }
 
-// CloseConn закрывает соединение по net.Conn через ЕДИНУЮ точку (Epoll.Remove):
-// декремент connCount/ActiveConnections + EpollCtl DEL + удаление из карты epoll
-// + очистка подписок (onRemove) + conn.Close().
+// closeConn — ЕДИНАЯ точка закрытия соединения: снять с учёта, вызвать
+// OnDisconnect, закрыть. Ровно один раз на соединение, сколько бы путей ни
+// пришли сюда одновременно (выход горутины, CloseConn, Stop) — иначе
+// задвоенный декремент или утёкший слот (ложный отказ по MaxConnections) и
+// неочищенная подписка Pub/Sub.
+func (s *Server) closeConn(cs *ConnState) {
+	cs.closeOnce.Do(func() {
+		s.mu.Lock()
+		delete(s.conns, cs.Conn)
+		s.mu.Unlock()
+		s.activeConns.Add(-1)
+		monitoring.ActiveConnections.Dec()
+		// Вне s.mu: RemoveConn берёт свой лок в Hub, пересечения блокировок нет.
+		if s.OnDisconnect != nil {
+			s.OnDisconnect(cs.Conn)
+		}
+		cs.Conn.Close()
+	})
+}
+
+// CloseConn закрывает соединение по net.Conn через единую точку closeConn.
 //
 // H3: Hub.disconnectSlow (эвикция медленного подписчика) обязан ходить сюда, а
-// не звать conn.Close() напрямую — иначе учёт epoll не чистится и слот течёт
-// навсегда → перманентный DoS при MaxConnections.
-//
-// Поиск по идентичности conn (а не по fd) — чтобы не звать socketFD на, возможно,
-// уже закрытом соединении (паника) и быть устойчивым к гонке двойного закрытия.
-// Путь редкий (эвикция) → O(N) допустим. Remove идемпотентен (M4): гейт по
-// identity в карте epoll делает повторный Remove no-op'ом без двойного
-// декремента — независимо от исхода EpollCtl DEL.
+// не звать conn.Close() напрямую — иначе учёт не чистится и слот течёт навсегда
+// → перманентный DoS при MaxConnections. Горутина этого соединения получит
+// ошибку чтения и выйдет; её собственный вызов closeConn будет no-op.
 func (s *Server) CloseConn(conn net.Conn) {
-	for _, w := range s.workers {
-		var target *ConnState
-		w.epoll.mu.RLock()
-		for _, cs := range w.epoll.connections {
-			if cs.Conn == conn {
-				target = cs
-				break
-			}
-		}
-		w.epoll.mu.RUnlock()
-		if target != nil {
-			w.epoll.Remove(target)
-			return
-		}
+	s.mu.Lock()
+	cs := s.conns[conn]
+	s.mu.Unlock()
+	if cs != nil {
+		s.closeConn(cs)
+		return
 	}
-	// Не найдено среди epoll (уже снято / не регистрировалось) — закрываем прямо.
+	// Не найдено (уже снято или не регистрировалось) — закрываем прямо.
 	conn.Close()
 }
 
 // Stop останавливает сервер.
+//
+// Порядок: перестать принимать → разбудить горутины, ждущие данных (дедлайн
+// чтения «сейчас»), не трогая тех, кто в обработчике, → дождаться их выхода
+// (их WAL-записи уходят в канал ДО того, как вызывающий закроет WAL) → закрыть
+// то, что осталось после drainTimeout.
 func (s *Server) Stop() error {
-	s.stopping.Store(true) // воркеры выйдут из eventLoop, а не зациклятся на ошибке
-	s.listener.Close()
-
-	// Будим воркеров, стоящих в epoll_wait, ЧЕРЕЗ self-pipe — но пока НЕ закрываем
-	// epoll-fd: закрытие под заблокированным epoll_wait его не разбудит. Разбуженный
-	// воркер видит stopping=true и выходит из eventLoop сам.
-	for _, w := range s.workers {
-		w.epoll.Wake()
+	s.stopping.Store(true)
+	if s.listener != nil {
+		s.listener.Close()
 	}
 
-	// Graceful drain: дожидаемся выхода воркеров — их in-flight обработчики
-	// дозавершатся и отправят свои WAL-записи в канал ДО его закрытия вызывающим.
-	// Ограничиваем drainTimeout, чтобы shutdown не завис при непредвиденной блокировке.
+	now := time.Now()
+	s.mu.Lock()
+	for conn := range s.conns {
+		_ = conn.SetReadDeadline(now)
+	}
+	s.mu.Unlock()
+
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -424,18 +341,14 @@ func (s *Server) Stop() error {
 		slog.Warn("server stop: drain timeout — продолжаем остановку")
 	}
 
-	// Воркеры вышли (или таймаут) — теперь безопасно закрыть epoll-fd и соединения.
-	for _, w := range s.workers {
-		w.epoll.Close()
+	s.mu.Lock()
+	rest := make([]*ConnState, 0, len(s.conns))
+	for _, cs := range s.conns {
+		rest = append(rest, cs)
+	}
+	s.mu.Unlock()
+	for _, cs := range rest {
+		s.closeConn(cs)
 	}
 	return nil
-}
-
-// Stats — мониторинг распределения нагрузки по воркерам.
-func (s *Server) Stats() map[int]int {
-	stats := make(map[int]int, len(s.workers))
-	for _, w := range s.workers {
-		stats[w.id] = w.epoll.Count()
-	}
-	return stats
 }

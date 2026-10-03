@@ -44,7 +44,7 @@ func newAttrEnv(t *testing.T, partitionAttr string) *attrEnv {
 	do := func(cmd string, args ...string) protocol.Value {
 		t.Helper()
 		rc := &recordingConn{}
-		cs := &server.ConnState{Conn: rc, Buf: server.NewConnBuf(rc), WorkerID: 0, Authenticated: true}
+		cs := &server.ConnState{Conn: rc, Buf: server.NewConnBuf(rc), Authenticated: true}
 		byteArgs := make([][]byte, len(args))
 		for i, a := range args {
 			byteArgs[i] = []byte(a)

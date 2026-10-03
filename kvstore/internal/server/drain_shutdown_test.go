@@ -9,10 +9,10 @@ import (
 
 // TestServer_StopDrainsInFlight — страж graceful drain.
 //
-// Репро дефекта: Stop() возвращался сразу после закрытия epoll, НЕ дожидаясь
+// Репро дефекта (времён epoll-слоя): Stop() возвращался, НЕ дожидаясь
 // завершения обработчиков «в полёте». В main это приводило к тому, что bw.Close()
-// (закрытие WAL-канала) мог выполниться, пока воркер ещё в handleConn и вот-вот
-// вызовет bw.Write → паника send-на-закрытый-канал + потеря последней команды.
+// (закрытие WAL-канала) мог выполниться, пока обработчик вот-вот вызовет
+// bw.Write → паника send-на-закрытый-канал + потеря последней команды.
 //
 // Корректное поведение: Stop() блокируется, пока in-flight обработчик не завершился.
 func TestServer_StopDrainsInFlight(t *testing.T) {
@@ -30,8 +30,8 @@ func TestServer_StopDrainsInFlight(t *testing.T) {
 		finished.Store(true)
 		cs.Buf.WriteSimpleString("OK")
 	})
-	// Малый idle-timeout → простаивающие воркеры выходят по тику, не завися от
-	// того, будит ли закрытие epoll-fd заблокированный epoll_wait. Тест быстрый.
+	// Малый idle-timeout — тест быстрый и проверяет заодно, что дедлайн чтения
+	// не рвёт соединение, обработчик которого ещё в полёте.
 	srv.IdleTimeout = 50 * time.Millisecond
 
 	if err := srv.Start(); err != nil {

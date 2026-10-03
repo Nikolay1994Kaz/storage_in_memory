@@ -52,15 +52,15 @@ type Hub struct {
 	nextSemID atomic.Uint64
 
 	// onSlowClose — маршрут закрытия соединения через ЕДИНУЮ точку сервера
-	// (Epoll.Remove): декремент connCount/ActiveConnections + EpollCtl DEL +
-	// удаление из карты epoll. Без него disconnectSlow закрывал бы conn напрямую,
-	// минуя учёт epoll → slot течёт → DoS при MaxConnections (H3). nil в юнит-
+	// (Server.CloseConn): снятие с учёта activeConns/ActiveConnections и из
+	// карты соединений. Без него disconnectSlow закрывал бы conn напрямую,
+	// минуя учёт сервера → slot течёт → DoS при MaxConnections (H3). nil в юнит-
 	// тестах без сервера → fallback на conn.Close(). Вызывается ВНЕ h.mu.
 	onSlowClose func(net.Conn)
 }
 
 // SetOnSlowClose задаёт маршрут закрытия соединения для disconnectSlow.
-// Сервер связывает его со Server.CloseConn (единая точка учёта epoll).
+// Сервер связывает его со Server.CloseConn (единая точка учёта соединений).
 func (h *Hub) SetOnSlowClose(fn func(net.Conn)) {
 	h.mu.Lock()
 	h.onSlowClose = fn
