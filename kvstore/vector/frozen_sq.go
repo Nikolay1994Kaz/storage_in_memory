@@ -707,6 +707,14 @@ func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 	dim := int(binary.LittleEndian.Uint32(hdr[4:8]))
 	maxLevel := int(binary.LittleEndian.Uint32(hdr[8:12]))
 	entryPointID := uint32(binary.LittleEndian.Uint32(hdr[12:16]))
+	// Калибровка (sqMin, sqScale) занимает 8 байт на измерение, коды — dim
+	// байт на вектор.
+	if err := needBytes(r, int64(dim), 8); err != nil {
+		return nil, fmt.Errorf("frozenSQ: calibration: %w", err)
+	}
+	if err := needBytes(r, int64(n), int64(dim)); err != nil {
+		return nil, fmt.Errorf("frozenSQ: codes: %w", err)
+	}
 
 	fg := &FrozenGraphSQ{
 		n:            n,
@@ -750,12 +758,18 @@ func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 		return nil, fmt.Errorf("frozenSQ: read nLayers: %w", err)
 	}
 	nLayers := int(binary.LittleEndian.Uint32(u4[:]))
+	if err := needBytes(r, int64(nLayers), 8); err != nil {
+		return nil, fmt.Errorf("frozenSQ: layers: %w", err)
+	}
 	fg.layers = make([]FlatLayer, nLayers)
 	for i := range fg.layers {
 		if _, err := io.ReadFull(r, u4[:]); err != nil {
 			return nil, fmt.Errorf("frozenSQ: read nOffs[%d]: %w", i, err)
 		}
 		nOffs := int(binary.LittleEndian.Uint32(u4[:]))
+		if err := needBytes(r, int64(nOffs), 4); err != nil {
+			return nil, fmt.Errorf("frozenSQ: offs[%d]: %w", i, err)
+		}
 		if nOffs > 0 {
 			fg.layers[i].offs = make([]uint32, nOffs)
 			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.layers[i].offs[0])), nOffs*4)
@@ -767,6 +781,9 @@ func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 			return nil, fmt.Errorf("frozenSQ: read nNeigh[%d]: %w", i, err)
 		}
 		nNeigh := int(binary.LittleEndian.Uint32(u4[:]))
+		if err := needBytes(r, int64(nNeigh), 4); err != nil {
+			return nil, fmt.Errorf("frozenSQ: neigh[%d]: %w", i, err)
+		}
 		if nNeigh > 0 {
 			fg.layers[i].neigh = make([]uint32, nNeigh)
 			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.layers[i].neigh[0])), nNeigh*4)
@@ -781,6 +798,9 @@ func ReadFrozenGraphSQ(r io.Reader, metric Metric) (*FrozenGraphSQ, error) {
 		return nil, fmt.Errorf("frozenSQ: read nKeys: %w", err)
 	}
 	nKeys := int(binary.LittleEndian.Uint32(u4[:]))
+	if err := needBytes(r, int64(nKeys), 2); err != nil {
+		return nil, fmt.Errorf("frozenSQ: keys: %w", err)
+	}
 	offs := make([]uint32, nKeys+1)
 	var blob []byte
 	var klen [2]byte

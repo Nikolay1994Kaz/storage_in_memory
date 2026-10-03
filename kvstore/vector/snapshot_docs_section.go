@@ -59,6 +59,10 @@ func readDocsSection(r io.Reader, n int) ([]DeltaEntry, error) {
 	if nGroups == 0 {
 		return nil, nil
 	}
+	// Группа на диске: маркер, nDocs и длина payload — не меньше 9 байт.
+	if err := needBytes(r, int64(nGroups), 9); err != nil {
+		return nil, fmt.Errorf("docs section: %w", err)
+	}
 	entries := make([]DeltaEntry, n)
 
 	for g := uint32(0); g < nGroups; g++ {
@@ -75,6 +79,10 @@ func readDocsSection(r io.Reader, n int) ([]DeltaEntry, error) {
 		nDocs, err := getU32(r)
 		if err != nil {
 			return nil, fmt.Errorf("docs section: read nDocs[%d]: %w", g, err)
+		}
+		// Документ на диске: позиция и длина ключа — не меньше 8 байт.
+		if err := needBytes(r, int64(nDocs), 8); err != nil {
+			return nil, fmt.Errorf("docs section: %w", err)
 		}
 
 		positions := make([]int, 0, nDocs)
@@ -98,6 +106,9 @@ func readDocsSection(r io.Reader, n int) ([]DeltaEntry, error) {
 		payloadLen, err := getU32(r)
 		if err != nil {
 			return nil, fmt.Errorf("docs section: read payloadLen: %w", err)
+		}
+		if err := needBytes(r, int64(payloadLen), 1); err != nil {
+			return nil, fmt.Errorf("docs section: %w", err)
 		}
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(r, payload); err != nil {

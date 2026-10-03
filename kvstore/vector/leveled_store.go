@@ -2323,6 +2323,11 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 	crcSource := r
 	hasher := crc32.NewIEEE()
 	r = io.TeeReader(r, hasher)
+	// Бюджет: счётчики из файла сверяются с его остатком до выделения памяти
+	// (snapshot_budget.go) — CRC проверяется только в конце.
+	if size, ok := sourceSize(crcSource); ok {
+		r = &budgetReader{r: r, left: size}
+	}
 
 	// Проверяем магию: префикс 'LVLV' обязателен, версия в байте [5].
 	var magic [8]byte
@@ -2392,6 +2397,9 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 		nSegs := int(binary.LittleEndian.Uint32(u4[:]))
 		if nSegs == 0 {
 			continue
+		}
+		if err := needBytes(r, int64(nSegs), 1); err != nil {
+			return fmt.Errorf("leveled: segments[%d]: %w", lyr, err)
 		}
 
 		for si := 0; si < nSegs; si++ {
@@ -2468,6 +2476,10 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 					return fmt.Errorf("leveled: read nVecs[%d][%d]: %w", lyr, si, err)
 				}
 				nVecs := int(binary.LittleEndian.Uint32(u4[:]))
+				// Вектор на диске: длина ключа и dim float32.
+				if err := needBytes(r, int64(nVecs), 2+int64(dim)*4); err != nil {
+					return fmt.Errorf("leveled: hnsw[%d][%d]: %w", lyr, si, err)
+				}
 
 				entries := make([]DeltaEntry, 0, nVecs)
 				var klen [2]byte
@@ -2541,6 +2553,9 @@ func (lvs *LeveledVectorStore) LoadBinary(r io.Reader) error {
 			return fmt.Errorf("leveled: read nTombstones: %w", err)
 		}
 		tcount := int(binary.LittleEndian.Uint32(u4[:]))
+		if err := needBytes(r, int64(tcount), 2); err != nil {
+			return fmt.Errorf("leveled: tombstones: %w", err)
+		}
 		if tcount > 0 {
 			tomb = make(map[string]struct{}, tcount)
 			var tklen [2]byte

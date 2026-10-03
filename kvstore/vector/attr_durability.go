@@ -45,6 +45,9 @@ func readStr(r io.Reader) (string, error) {
 	if n == 0 {
 		return "", nil
 	}
+	if err := needBytes(r, int64(n), 1); err != nil {
+		return "", err
+	}
 	b := make([]byte, n)
 	if _, err := io.ReadFull(r, b); err != nil {
 		return "", err
@@ -119,6 +122,10 @@ func readAttrs(r io.Reader) (Attributes, error) {
 	if err != nil {
 		return a, err
 	}
+	// Элемент на диске: две длины строк (имя и значение) — не меньше 8 байт.
+	if err := needBytes(r, int64(nCat), 8); err != nil {
+		return a, err
+	}
 	if nCat > 0 {
 		a.Cat = make(map[string]string, nCat)
 		for i := uint32(0); i < nCat; i++ {
@@ -135,6 +142,10 @@ func readAttrs(r io.Reader) (Attributes, error) {
 	}
 	nNum, err := getU32(r)
 	if err != nil {
+		return a, err
+	}
+	// Элемент на диске: длина имени и float64 — не меньше 12 байт.
+	if err := needBytes(r, int64(nNum), 12); err != nil {
 		return a, err
 	}
 	if nNum > 0 {
@@ -274,6 +285,9 @@ func readSegMeta(r io.Reader) (*TenantCatalog, *segmentAttrs, error) {
 		if err != nil {
 			return nil, nil, err
 		}
+		if err := needBytes(r, int64(nr), 17); err != nil {
+			return nil, nil, err
+		}
 		cat = &TenantCatalog{ranges: make(map[uint64]TenantRange, nr), bruteThreshold: int(bt)}
 		var buf [17]byte
 		for i := uint32(0); i < nr; i++ {
@@ -307,6 +321,10 @@ func readSegMeta(r io.Reader) (*TenantCatalog, *segmentAttrs, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// Колонка на диске: длина имени, nVals и nCodes — не меньше 12 байт.
+	if err := needBytes(r, int64(nCat), 12); err != nil {
+		return nil, nil, err
+	}
 	for i := uint32(0); i < nCat; i++ {
 		name, err := readStr(r)
 		if err != nil {
@@ -314,6 +332,9 @@ func readSegMeta(r io.Reader) (*TenantCatalog, *segmentAttrs, error) {
 		}
 		nVals, err := getU32(r)
 		if err != nil {
+			return nil, nil, err
+		}
+		if err := needBytes(r, int64(nVals), 4); err != nil {
 			return nil, nil, err
 		}
 		dict := &attrDict{code: make(map[string]uint32, nVals), vals: make([]string, nVals)}
@@ -327,6 +348,9 @@ func readSegMeta(r io.Reader) (*TenantCatalog, *segmentAttrs, error) {
 		}
 		nCodes, err := getU32(r)
 		if err != nil {
+			return nil, nil, err
+		}
+		if err := needBytes(r, int64(nCodes), 4); err != nil {
 			return nil, nil, err
 		}
 		codes := make([]uint32, nCodes)
@@ -344,6 +368,10 @@ func readSegMeta(r io.Reader) (*TenantCatalog, *segmentAttrs, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// Колонка на диске: длина имени и nVals — не меньше 8 байт.
+	if err := needBytes(r, int64(nNum), 8); err != nil {
+		return nil, nil, err
+	}
 	for i := uint32(0); i < nNum; i++ {
 		name, err := readStr(r)
 		if err != nil {
@@ -351,6 +379,9 @@ func readSegMeta(r io.Reader) (*TenantCatalog, *segmentAttrs, error) {
 		}
 		nVals, err := getU32(r)
 		if err != nil {
+			return nil, nil, err
+		}
+		if err := needBytes(r, int64(nVals), 8); err != nil {
 			return nil, nil, err
 		}
 		vals := make([]float64, nVals)

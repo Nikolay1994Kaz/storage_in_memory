@@ -55,6 +55,10 @@ func readTerms(r io.Reader) ([]TermTF, error) {
 	if n == 0 {
 		return nil, nil
 	}
+	// Терм на диске: длина строки и tf — не меньше 6 байт.
+	if err := needBytes(r, int64(n), 6); err != nil {
+		return nil, err
+	}
 	out := make([]TermTF, 0, n)
 	prev := ""
 	var u2 [2]byte
@@ -137,6 +141,9 @@ func readSegText(r io.Reader) (*segmentText, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := needBytes(r, int64(nDocs), 4); err != nil {
+		return nil, err
+	}
 	st := &segmentText{
 		dict:   newAttrDict(),
 		docLen: make([]uint32, nDocs),
@@ -154,6 +161,10 @@ func readSegText(r io.Reader) (*segmentText, error) {
 	}
 	nTerms, err := getU32(r)
 	if err != nil {
+		return nil, err
+	}
+	// Терм на диске: длина строки, nPost и хотя бы один постинг — 14 байт.
+	if err := needBytes(r, int64(nTerms), 14); err != nil {
 		return nil, err
 	}
 	var u2 [2]byte
@@ -174,6 +185,9 @@ func readSegText(r io.Reader) (*segmentText, error) {
 		}
 		if nPost == 0 {
 			return nil, fmt.Errorf("segText: пустой постинг-лист терма %q (df врал бы)", term)
+		}
+		if err := needBytes(r, int64(nPost), 6); err != nil {
+			return nil, err
 		}
 		pl := make([]bm25Posting, 0, nPost)
 		prev := int64(-1)

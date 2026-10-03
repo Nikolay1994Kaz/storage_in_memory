@@ -561,6 +561,9 @@ func ReadFrozenGraph(r io.Reader, distFn DistanceFunc) (*FrozenGraph, error) {
 	dim := int(binary.LittleEndian.Uint32(hdr[4:8]))
 	maxLevel := int(binary.LittleEndian.Uint32(hdr[8:12]))
 	entryPointID := uint32(binary.LittleEndian.Uint32(hdr[12:16]))
+	if err := needBytes(r, int64(n), int64(dim)*4); err != nil {
+		return nil, fmt.Errorf("frozen: data: %w", err)
+	}
 
 	fg := &FrozenGraph{
 		n:            n,
@@ -585,6 +588,9 @@ func ReadFrozenGraph(r io.Reader, distFn DistanceFunc) (*FrozenGraph, error) {
 		return nil, fmt.Errorf("frozen: read nLayers: %w", err)
 	}
 	nLayers := int(binary.LittleEndian.Uint32(u4[:]))
+	if err := needBytes(r, int64(nLayers), 8); err != nil {
+		return nil, fmt.Errorf("frozen: layers: %w", err)
+	}
 	fg.layers = make([]FlatLayer, nLayers)
 	for i := range fg.layers {
 		// offs
@@ -592,6 +598,9 @@ func ReadFrozenGraph(r io.Reader, distFn DistanceFunc) (*FrozenGraph, error) {
 			return nil, fmt.Errorf("frozen: read nOffs[%d]: %w", i, err)
 		}
 		nOffs := int(binary.LittleEndian.Uint32(u4[:]))
+		if err := needBytes(r, int64(nOffs), 4); err != nil {
+			return nil, fmt.Errorf("frozen: offs[%d]: %w", i, err)
+		}
 		if nOffs > 0 {
 			fg.layers[i].offs = make([]uint32, nOffs)
 			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.layers[i].offs[0])), nOffs*4)
@@ -604,6 +613,9 @@ func ReadFrozenGraph(r io.Reader, distFn DistanceFunc) (*FrozenGraph, error) {
 			return nil, fmt.Errorf("frozen: read nNeigh[%d]: %w", i, err)
 		}
 		nNeigh := int(binary.LittleEndian.Uint32(u4[:]))
+		if err := needBytes(r, int64(nNeigh), 4); err != nil {
+			return nil, fmt.Errorf("frozen: neigh[%d]: %w", i, err)
+		}
 		if nNeigh > 0 {
 			fg.layers[i].neigh = make([]uint32, nNeigh)
 			b := unsafe.Slice((*byte)(unsafe.Pointer(&fg.layers[i].neigh[0])), nNeigh*4)
@@ -618,6 +630,9 @@ func ReadFrozenGraph(r io.Reader, distFn DistanceFunc) (*FrozenGraph, error) {
 		return nil, fmt.Errorf("frozen: read nKeys: %w", err)
 	}
 	nKeys := int(binary.LittleEndian.Uint32(u4[:]))
+	if err := needBytes(r, int64(nKeys), 2); err != nil {
+		return nil, fmt.Errorf("frozen: keys: %w", err)
+	}
 	offs := make([]uint32, nKeys+1)
 	var blob []byte
 	var klen [2]byte
